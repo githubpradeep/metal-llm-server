@@ -15,9 +15,8 @@ pub struct Gemma4GpuModel {
     pub ctx: MetalContext,
     pub config: Gemma4TextConfig,
 
-    // Embedding tables (kept in CPU memory for lookup)
-    pub embed_tokens: Vec<f32>,           // [vocab_size, hidden_size]
-    pub embed_tokens_per_layer: Vec<f32>, // [vocab_size, num_layers * ple_dim]
+    // Embedding table (kept as bf16 for memory efficiency)
+    pub embed_tokens_f16: Vec<u16>,  // [vocab_size * hidden_size] as bf16 (~1.3GB)
 
     // Per-layer weights on GPU
     pub layers: Vec<Gemma4GpuLayer>,
@@ -157,31 +156,32 @@ impl Gemma4GpuModel {
         // We'll use a helper that loads a shard and returns a HashMap of tensors
         let prefix = "model.language_model.";
 
-        println!("  Loading embeddings...");
+        println!("  Loading embeddings (f16, memory-efficient)...");
 
-        // Load embed_tokens and embed_tokens_per_layer from shards
-        let mut embed_tokens: Vec<f32> = Vec::new();
-        let mut embed_tokens_per_layer: Vec<f32> = Vec::new();
+        // embed_tokens: [262144, 2560] in bf16 = 1.34 GB (keep as u16 vec)
+        // embed_tokens_per_layer: SKIPPED for now (5.6 GB, too large)
+        // PLE will be disabled until we implement memory-mapped access
+        let mut embed_tokens_f16: Vec<u16> = Vec::new();
         let mut final_norm_data: Vec<f32> = Vec::new();
         let mut per_layer_proj_norm_data: Vec<f32> = Vec::new();
 
-        // Load global weights from shards
+        // Load global weights from shards — use memory mapping to avoid loading entire file
         for shard_file in &shard_files {
             let shard_path = Path::new(model_dir).join(shard_file);
-            let data = fs::read(&shard_path)
-                .unwrap_or_else(|_| panic!("Failed to read shard: {}", shard_file));
-            let safetensors = SafeTensors::deserialize(&data)
+            let file = fs::File::open(&shard_path)
+                .unwrap_or_else(|_| panic!("Failed to open shard: {}", shard_file));
+            let mmap = unsafe { memmap2::Mmap::map(&file) }
+                .unwrap_or_else(|_| panic!("Failed to mmap shard: {}", shard_file));
+            let safetensors = SafeTensors::deserialize(&mmap)
                 .expect("Failed to deserialize safetensors");
 
             for (name, tensor_view) in safetensors.tensors() {
                 let clean_name = name.strip_prefix(prefix).unwrap_or(&name);
 
-                if clean_name == "embed_tokens.weight" && embed_tokens.is_empty() {
-                    embed_tokens = decode_tensor_to_f32(&tensor_view);
-                    println!("    embed_tokens: {:?}", tensor_view.shape());
-                } else if clean_name == "embed_tokens_per_layer.weight" && embed_tokens_per_layer.is_empty() {
-                    embed_tokens_per_layer = decode_tensor_to_f32(&tensor_view);
-                    println!("    embed_tokens_per_layer: {:?}", tensor_view.shape());
+                if clean_name == "embed_tokens.weight" && embed_tokens_f16.is_empty() {
+                    embed_tokens_f16 = raw_to_u16(tensor_view.data());
+                    println!("    embed_tokens: {:?} (kept as f16, {:.1} MB)",
+                             tensor_view.shape(), embed_tokens_f16.len() * 2 / 1024 / 1024);
                 } else if clean_name == "model.norm.weight" || clean_name == "norm.weight" {
                     if final_norm_data.is_empty() {
                         final_norm_data = decode_tensor_to_f32(&tensor_view);
@@ -194,11 +194,10 @@ impl Gemma4GpuModel {
                     }
                 }
             }
-            // Drop shard data here
+            // mmap dropped here
         }
 
-        assert!(!embed_tokens.is_empty(), "embed_tokens not found");
-        assert!(!embed_tokens_per_layer.is_empty(), "embed_tokens_per_layer not found");
+        assert!(!embed_tokens_f16.is_empty(), "embed_tokens not found");
 
         let final_norm_weight = ctx.buffer_from_slice(&final_norm_data);
         let per_layer_projection_norm_weight = ctx.buffer_from_slice(&per_layer_proj_norm_data);
@@ -220,9 +219,11 @@ impl Gemma4GpuModel {
 
             for shard_file in &shard_files {
                 let shard_path = Path::new(model_dir).join(shard_file);
-                let data = fs::read(&shard_path)
-                    .unwrap_or_else(|_| panic!("Failed to read shard: {}", shard_file));
-                let safetensors = SafeTensors::deserialize(&data)
+                let file = fs::File::open(&shard_path)
+                    .unwrap_or_else(|_| panic!("Failed to open shard: {}", shard_file));
+                let mmap = unsafe { memmap2::Mmap::map(&file) }
+                    .unwrap_or_else(|_| panic!("Failed to mmap shard: {}", shard_file));
+                let safetensors = SafeTensors::deserialize(&mmap)
                     .expect("Failed to deserialize safetensors");
 
                 for (name, tensor_view) in safetensors.tensors() {
@@ -319,9 +320,8 @@ impl Gemma4GpuModel {
         let q_normed_buf = ctx.buffer_empty(max_q_out);
         let k_normed_buf = ctx.buffer_empty(max_kv_out);
 
-        // KV cache: use sliding_window for sliding layers, full context for full layers
-        // For simplicity, allocate max capacity (full context) for all layers
-        let kv_capacity = config.max_position_embeddings.min(8192) as u32; // cap at 8K for memory
+        // KV cache: cap at 1024 positions to fit in memory
+        let kv_capacity = config.max_position_embeddings.min(1024) as u32;
         let mut k_cache = Vec::with_capacity(num_layers);
         let mut v_cache = Vec::with_capacity(num_layers);
         for i in 0..num_layers {
@@ -339,8 +339,7 @@ impl Gemma4GpuModel {
         Gemma4GpuModel {
             ctx,
             config,
-            embed_tokens,
-            embed_tokens_per_layer,
+            embed_tokens_f16,
             layers,
             final_norm_weight,
             per_layer_projection_norm_weight,
@@ -385,10 +384,13 @@ impl Gemma4GpuModel {
         let ple_dim = self.config.hidden_size_per_layer_input;
         let num_layers = self.config.num_hidden_layers;
 
-        // Embed token (CPU)
+        // Embed token (CPU — decode from f16 on the fly)
         let embed_offset = token_id * hidden_size;
-        let embed_slice = &self.embed_tokens[embed_offset..embed_offset + hidden_size];
-        MetalContext::write_buffer(&self.hidden_buf, embed_slice);
+        let mut embed_f32 = vec![0.0f32; hidden_size];
+        for i in 0..hidden_size {
+            embed_f32[i] = bf16_to_f32(self.embed_tokens_f16[embed_offset + i]);
+        }
+        MetalContext::write_buffer(&self.hidden_buf, &embed_f32);
 
         let kv_seq = self.kv_seq_len;
 
@@ -449,41 +451,14 @@ impl Gemma4GpuModel {
             let scale = 1.0 / (head_dim as f32).sqrt();
             let rotary_dim = rotary_dim_per_layer[layer_idx];
 
-            // Write PLE embedding and rotary data before encoding this layer's GPU work
-            let ple_offset = token_id * (num_layers * ple_dim) + layer_idx * ple_dim;
-            let ple_slice = &self.embed_tokens_per_layer[ple_offset..ple_offset + ple_dim];
-            MetalContext::write_buffer(&self.ple_embed_buf, ple_slice);
+            // Write rotary data before encoding this layer's GPU work
             MetalContext::write_buffer(&self.cos_buf, &rotary_cos_per_layer[layer_idx]);
             MetalContext::write_buffer(&self.sin_buf, &rotary_sin_per_layer[layer_idx]);
 
             let encoder = cmd.new_compute_command_encoder();
 
-            // ─── Per-Layer Embedding (PLE) ───
-            // Gate: ple_gated = per_layer_input_gate @ hidden_state → [ple_dim]
-            self.ctx.encode_matvec_q4(encoder, &layer.per_layer_input_gate_weight,
-                &self.hidden_buf, &self.ple_gated_buf, ple_dim as u32, hidden_size as u32);
-
-            // Element-wise multiply: ple_gated = ple_embed * ple_gated
-            self.ctx.encode_vec_mul(encoder, &self.ple_embed_buf, &self.ple_gated_buf,
-                &self.ple_gated_buf, ple_dim as u32);
-
-            // RMSNorm the gated PLE with per_layer_projection_norm
-            self.ctx.encode_rmsnorm(encoder, &self.ple_gated_buf,
-                &self.per_layer_projection_norm_weight, &self.ple_normed_buf,
-                ple_dim as u32, eps);
-
-            // Project: ple_projected = per_layer_projection @ ple_normed → [hidden_size]
-            self.ctx.encode_matvec_q4(encoder, &layer.per_layer_projection_weight,
-                &self.ple_normed_buf, &self.ple_projected_buf, hidden_size as u32, ple_dim as u32);
-
-            // Post-PLE norm on projected output
-            self.ctx.encode_rmsnorm(encoder, &self.ple_projected_buf,
-                &layer.post_per_layer_input_norm_weight, &self.ple_projected_buf,
-                hidden_size as u32, eps);
-
-            // Add PLE to hidden: hidden = hidden + ple_projected
-            self.ctx.encode_vec_add(encoder, &self.hidden_buf, &self.ple_projected_buf,
-                &self.hidden_buf, hidden_size as u32);
+            // ─── PLE DISABLED (embed_tokens_per_layer too large for 16GB RAM) ───
+            // TODO: implement memory-mapped PLE access
 
             // ─── Attention Block ───
             // Save residual
@@ -603,12 +578,12 @@ impl Gemma4GpuModel {
         // Read normed hidden state and compute logits on CPU (tied embeddings)
         let normed = MetalContext::read_buffer(&self.normed_buf, hidden_size);
         let mut logits = vec![0.0f32; vocab_size];
-        // logits = embed_tokens @ normed (embed_tokens is [vocab_size, hidden_size])
+        // logits = embed_tokens @ normed (embed_tokens is [vocab_size, hidden_size] in f16)
         for v in 0..vocab_size {
             let offset = v * hidden_size;
             let mut dot = 0.0f32;
             for d in 0..hidden_size {
-                dot += self.embed_tokens[offset + d] * normed[d];
+                dot += bf16_to_f32(self.embed_tokens_f16[offset + d]) * normed[d];
             }
             logits[v] = dot;
         }
@@ -703,4 +678,11 @@ fn half_to_f32(bits: u16) -> f32 {
 
 fn bf16_to_f32(bits: u16) -> f32 {
     f32::from_bits((bits as u32) << 16)
+}
+
+/// Convert raw bytes to Vec<u16> (for storing bf16/f16 data compactly).
+fn raw_to_u16(data: &[u8]) -> Vec<u16> {
+    data.chunks_exact(2)
+        .map(|b| u16::from_le_bytes([b[0], b[1]]))
+        .collect()
 }
