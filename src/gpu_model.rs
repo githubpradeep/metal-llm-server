@@ -412,14 +412,34 @@ impl GpuLlamaModel {
         // Final norm (only last token needed for logits, but norm all for correctness)
         self.ctx.encode_rmsnorm_batch(encoder, &hidden_buf, &self.final_norm_weight, &normed_buf, hidden_size as u32, eps, sl);
 
-        // LM head on last token only: extract last row, matvec
-        // For simplicity, compute logits for all tokens and take the last
-        let logits_buf = self.ctx.buffer_empty(seq_len * vocab_size);
-        self.ctx.encode_matmul(encoder, &normed_buf, &self.lm_head_weight, &logits_buf, sl, vocab_size as u32, hidden_size as u32);
+        // LM head on LAST token only (avoid massive seq×vocab matmul)
+        // normed_buf has (seq_len, hidden_size) — last token starts at offset (seq_len-1)*hidden_size
+        // We use matvec on the last row only by creating a view at the right offset
+        let last_token_offset = ((seq_len - 1) * hidden_size * 4) as u64; // byte offset
+        let logits_buf = self.ctx.buffer_empty(vocab_size);
 
+        // End current encoder, submit, wait — then do lm_head with offset
         encoder.end_encoding();
         cmd.commit();
         cmd.wait_until_completed();
+
+        // LM head on last token (separate small command)
+        let cmd2 = self.ctx.queue.new_command_buffer();
+        let enc2 = cmd2.new_compute_command_encoder();
+        enc2.set_compute_pipeline_state(&self.ctx.matvec_pipeline);
+        enc2.set_buffer(0, Some(&self.lm_head_weight), 0);
+        enc2.set_buffer(1, Some(&normed_buf), last_token_offset);
+        enc2.set_buffer(2, Some(&logits_buf), 0);
+        let m_val = vocab_size as u32;
+        let k_val = hidden_size as u32;
+        enc2.set_bytes(3, 4, &m_val as *const u32 as *const _);
+        enc2.set_bytes(4, 4, &k_val as *const u32 as *const _);
+        let threads = MTLSize::new(m_val as u64, 1, 1);
+        let tg_size = MTLSize::new(self.ctx.matvec_pipeline.thread_execution_width().min(m_val as u64), 1, 1);
+        enc2.dispatch_threads(threads, tg_size);
+        enc2.end_encoding();
+        cmd2.commit();
+        cmd2.wait_until_completed();
 
         // Update tracking
         self.total_tokens += seq_len;
@@ -427,9 +447,7 @@ impl GpuLlamaModel {
             *seq += sl;
         }
 
-        // Read only the last token's logits
-        let all_logits = MetalContext::read_buffer(&logits_buf, seq_len * vocab_size);
-        let last_offset = (seq_len - 1) * vocab_size;
-        all_logits[last_offset..last_offset + vocab_size].to_vec()
+        // Read logits (just vocab_size floats for last token)
+        MetalContext::read_buffer(&logits_buf, vocab_size)
     }
 }
