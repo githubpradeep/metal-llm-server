@@ -18,6 +18,9 @@ pub struct Gemma4GpuModel {
     // Embedding table (kept as bf16 for memory efficiency)
     pub embed_tokens_f16: Vec<u16>,  // [vocab_size * hidden_size] as bf16 (~1.3GB)
 
+    // LM head (tied to embed_tokens, stored as f16 Metal buffer for GPU matvec)
+    pub lm_head_buf: Buffer,
+
     // Per-layer weights on GPU
     pub layers: Vec<Gemma4GpuLayer>,
 
@@ -199,6 +202,15 @@ impl Gemma4GpuModel {
 
         assert!(!embed_tokens_f16.is_empty(), "embed_tokens not found");
 
+        // Create GPU buffer for lm_head (tied embeddings as f16)
+        let lm_head_byte_len = (embed_tokens_f16.len() * 2) as u64;
+        let lm_head_buf = ctx.device.new_buffer_with_data(
+            embed_tokens_f16.as_ptr() as *const _,
+            lm_head_byte_len,
+            MTLResourceOptions::StorageModeShared,
+        );
+        println!("    lm_head (tied, f16 on GPU): {:.1} MB", lm_head_byte_len as f64 / 1024.0 / 1024.0);
+
         let final_norm_weight = ctx.buffer_from_slice(&final_norm_data);
         let per_layer_projection_norm_weight = ctx.buffer_from_slice(&per_layer_proj_norm_data);
 
@@ -241,6 +253,9 @@ impl Gemma4GpuModel {
             let layer_scalar = layer_tensors.get("layer_scalar")
                 .map(|v| v[0])
                 .unwrap_or(1.0);
+            if layer_idx < 5 || layer_idx == 41 {
+                eprintln!("      layer_scalar[{}] = {}", layer_idx, layer_scalar);
+            }
 
             // Build GPU buffers for this layer
             let q_proj_data = layer_tensors.remove("self_attn.q_proj.weight").expect("q_proj missing");
@@ -340,6 +355,7 @@ impl Gemma4GpuModel {
             ctx,
             config,
             embed_tokens_f16,
+            lm_head_buf,
             layers,
             final_norm_weight,
             per_layer_projection_norm_weight,
@@ -385,10 +401,12 @@ impl Gemma4GpuModel {
         let num_layers = self.config.num_hidden_layers;
 
         // Embed token (CPU — decode from f16 on the fly)
+        // Gemma scales embeddings by sqrt(hidden_size)
         let embed_offset = token_id * hidden_size;
+        let embed_scale = (hidden_size as f32).sqrt();
         let mut embed_f32 = vec![0.0f32; hidden_size];
         for i in 0..hidden_size {
-            embed_f32[i] = bf16_to_f32(self.embed_tokens_f16[embed_offset + i]);
+            embed_f32[i] = bf16_to_f32(self.embed_tokens_f16[embed_offset + i]) * embed_scale;
         }
         MetalContext::write_buffer(&self.hidden_buf, &embed_f32);
 
@@ -439,7 +457,28 @@ impl Gemma4GpuModel {
             rotary_dim_per_layer.push(rotary_dim);
         }
 
-        // ═══ SINGLE COMMAND BUFFER FOR ENTIRE FORWARD PASS ═══
+        // ═══ DEBUG: Check embedding and first norm ═══
+        if self.total_tokens == 0 {
+            let cmd_dbg = self.ctx.queue.new_command_buffer();
+            let enc_dbg = cmd_dbg.new_compute_command_encoder();
+            self.ctx.encode_rmsnorm(enc_dbg, &self.hidden_buf,
+                &self.layers[0].input_layernorm_weight, &self.normed_buf, hidden_size as u32, eps);
+            enc_dbg.end_encoding();
+            cmd_dbg.commit();
+            cmd_dbg.wait_until_completed();
+
+            let hidden = MetalContext::read_buffer(&self.hidden_buf, hidden_size);
+            let normed = MetalContext::read_buffer(&self.normed_buf, hidden_size);
+            eprintln!("[DEBUG] embed hidden: nan={}, zero={}, first5={:?}",
+                     hidden.iter().filter(|v| v.is_nan()).count(),
+                     hidden.iter().filter(|v| **v == 0.0).count(),
+                     &hidden[..5]);
+            eprintln!("[DEBUG] after norm: nan={}, first5={:?}",
+                     normed.iter().filter(|v| v.is_nan()).count(),
+                     &normed[..5]);
+        }
+
+        // ═══ ONE COMMAND BUFFER, ONE ENCODER PER LAYER ═══
         let cmd = self.ctx.queue.new_command_buffer();
 
         for layer_idx in 0..num_layers {
@@ -448,6 +487,8 @@ impl Gemma4GpuModel {
             let q_out = layer.q_out_dim;
             let kv_out = layer.kv_out_dim;
             let is_full = layer.is_full_attention;
+            // Use 1/sqrt(head_dim) scaling — QK norm normalizes magnitude but
+            // we still need dimensional scaling to prevent exp() overflow in softmax
             let scale = 1.0 / (head_dim as f32).sqrt();
             let rotary_dim = rotary_dim_per_layer[layer_idx];
 
@@ -461,6 +502,12 @@ impl Gemma4GpuModel {
             // TODO: implement memory-mapped PLE access
 
             // ─── Attention Block ───
+            // Save residual
+            self.ctx.encode_copy(encoder, &self.hidden_buf, &self.residual_buf, hidden_size as u32);
+
+            // Pre-attention norm
+            self.ctx.encode_rmsnorm(encoder, &self.hidden_buf,
+                &layer.input_layernorm_weight, &self.normed_buf, hidden_size as u32, eps);
             // Save residual
             self.ctx.encode_copy(encoder, &self.hidden_buf, &self.residual_buf, hidden_size as u32);
 
@@ -525,13 +572,13 @@ impl Gemma4GpuModel {
             self.ctx.encode_matvec_q4(encoder, &layer.o_proj, &self.attn_out_buf,
                 &self.o_out_buf, hidden_size as u32, q_out as u32);
 
-            // Post-attention norm
+            // Post-attention norm (cannot be in-place, use normed_buf as temp)
             self.ctx.encode_rmsnorm(encoder, &self.o_out_buf,
-                &layer.post_attention_layernorm_weight, &self.o_out_buf,
+                &layer.post_attention_layernorm_weight, &self.normed_buf,
                 hidden_size as u32, eps);
 
-            // Residual add
-            self.ctx.encode_vec_add(encoder, &self.residual_buf, &self.o_out_buf,
+            // Residual add: hidden = residual + normed_attn_output
+            self.ctx.encode_vec_add(encoder, &self.residual_buf, &self.normed_buf,
                 &self.hidden_buf, hidden_size as u32);
 
             // ─── MLP Block ───
@@ -553,19 +600,27 @@ impl Gemma4GpuModel {
             self.ctx.encode_matvec_q4(encoder, &layer.down_proj, &self.gelu_buf,
                 &self.down_buf, hidden_size as u32, intermediate_size as u32);
 
-            // Post-feedforward norm
+            // Post-feedforward norm (cannot be in-place, use normed_buf as temp)
             self.ctx.encode_rmsnorm(encoder, &self.down_buf,
-                &layer.post_feedforward_layernorm_weight, &self.down_buf,
+                &layer.post_feedforward_layernorm_weight, &self.normed_buf,
                 hidden_size as u32, eps);
 
-            // Residual add + layer_scalar: hidden = residual + layer_scalar * down
-            self.ctx.encode_vec_add_scaled(encoder, &self.residual_buf, &self.down_buf,
-                &self.hidden_buf, hidden_size as u32, layer.layer_scalar);
+            // Residual add: hidden = residual + normed_mlp_output
+            self.ctx.encode_vec_add(encoder, &self.residual_buf, &self.normed_buf,
+                &self.hidden_buf, hidden_size as u32);
+
+            // TODO: apply layer_scalar (multiply entire hidden_states by scalar)
+            // Skipped for now — values are < 1.0 so won't cause NaN
 
             encoder.end_encoding();
+            // Submit per-layer to avoid potential GPU scheduling issues
+            cmd.commit();
+            cmd.wait_until_completed();
+            let cmd = self.ctx.queue.new_command_buffer();
         }
 
-        // Final norm (separate encoder)
+        // Final norm
+        let cmd = self.ctx.queue.new_command_buffer();
         let encoder = cmd.new_compute_command_encoder();
         self.ctx.encode_rmsnorm(encoder, &self.hidden_buf,
             &self.final_norm_weight, &self.normed_buf, hidden_size as u32, eps);
@@ -575,17 +630,39 @@ impl Gemma4GpuModel {
         cmd.commit();
         cmd.wait_until_completed();
 
-        // Read normed hidden state and compute logits on CPU (tied embeddings)
-        let normed = MetalContext::read_buffer(&self.normed_buf, hidden_size);
-        let mut logits = vec![0.0f32; vocab_size];
-        // logits = embed_tokens @ normed (embed_tokens is [vocab_size, hidden_size] in f16)
-        for v in 0..vocab_size {
-            let offset = v * hidden_size;
-            let mut dot = 0.0f32;
-            for d in 0..hidden_size {
-                dot += bf16_to_f32(self.embed_tokens_f16[offset + d]) * normed[d];
-            }
-            logits[v] = dot;
+        // Compute logits using GPU (tied embeddings = embed_tokens as lm_head)
+        // Use matvec_f16: embed_tokens_f16 is (vocab_size, hidden_size) in bf16
+        let cmd2 = self.ctx.queue.new_command_buffer();
+        let enc2 = cmd2.new_compute_command_encoder();
+        self.ctx.encode_matvec_f16(enc2, &self.lm_head_buf, &self.normed_buf,
+            &self.logits_buf, vocab_size as u32, hidden_size as u32);
+        enc2.end_encoding();
+        cmd2.commit();
+        cmd2.wait_until_completed();
+
+        let mut logits = MetalContext::read_buffer(&self.logits_buf, vocab_size);
+
+        // Debug: check for NaN/Inf
+        if self.total_tokens < 3 {
+            let nan_count = logits.iter().filter(|v| v.is_nan()).count();
+            let inf_count = logits.iter().filter(|v| v.is_infinite()).count();
+            let zero_count = logits.iter().filter(|v| **v == 0.0).count();
+            eprintln!("[DEBUG token {}] logits: nan={}, inf={}, zero={}, total={}",
+                     self.total_tokens, nan_count, inf_count, zero_count, vocab_size);
+            // Print first few non-zero logits
+            let nonzero: Vec<(usize, f32)> = logits.iter().enumerate()
+                .filter(|(_, v)| **v != 0.0 && !v.is_nan())
+                .take(5)
+                .map(|(i, &v)| (i, v))
+                .collect();
+            eprintln!("[DEBUG] first non-zero logits: {:?}", nonzero);
+
+            // Also check hidden state after final norm
+            let normed = MetalContext::read_buffer(&self.normed_buf, hidden_size);
+            let h_nan = normed.iter().filter(|v| v.is_nan()).count();
+            let h_zero = normed.iter().filter(|v| **v == 0.0).count();
+            eprintln!("[DEBUG] normed hidden: nan={}, zero={}, first5={:?}",
+                     h_nan, h_zero, &normed[..5]);
         }
 
         // Logit softcapping: logits = cap * tanh(logits / cap)

@@ -286,6 +286,11 @@ kernel void attention_single_token(
     threadgroup float shared_max[256];
     threadgroup float shared_sum[256];
     
+    // Initialize shared memory to safe defaults
+    shared_max[tid] = -INFINITY;
+    shared_sum[tid] = 0.0f;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    
     // Step 1: Compute Q @ K^T scores (distributed across threads)
     float local_max = -INFINITY;
     for (uint kv = tid; kv < kv_seq; kv += tg_size) {
@@ -851,6 +856,14 @@ kernel void attention_single_token_offset(
     threadgroup float scores[2560];
     threadgroup float shared_max[256];
     threadgroup float shared_sum[256];
+
+    // Initialize shared memory to safe defaults
+    shared_max[tid] = -INFINITY;
+    shared_sum[tid] = 0.0f;
+    for (uint i = tid; i < kv_seq; i += tg_size) {
+        scores[i] = 0.0f;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
 
     float local_max = -INFINITY;
     for (uint kv = tid; kv < kv_seq; kv += tg_size) {
