@@ -287,3 +287,42 @@ kernel void vec_add(
     if (gid >= n) return;
     c[gid] = a[gid] + b[gid];
 }
+
+// ─── Buffer Copy ─────────────────────────────────────────────────────────────
+// Copy n floats from src to dst (used for residual save)
+
+kernel void buf_copy(
+    device const float* src [[buffer(0)]],
+    device float* dst [[buffer(1)]],
+    constant uint& n [[buffer(2)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    if (gid >= n) return;
+    dst[gid] = src[gid];
+}
+
+// ─── KV Cache Append ─────────────────────────────────────────────────────────
+// Append a single token's K or V (num_kv_heads * head_dim) into the cache buffer.
+// Cache layout: (num_kv_heads, capacity, head_dim)
+// New data layout: (num_kv_heads, head_dim) — one token
+
+kernel void kv_cache_append(
+    device const float* new_data [[buffer(0)]],  // (num_kv_heads * head_dim)
+    device float* cache [[buffer(1)]],           // (num_kv_heads * capacity * head_dim)
+    constant uint& num_kv_heads [[buffer(2)]],
+    constant uint& head_dim [[buffer(3)]],
+    constant uint& capacity [[buffer(4)]],
+    constant uint& cur_seq [[buffer(5)]],        // current seq length (write position)
+    uint gid [[thread_position_in_grid]]
+) {
+    uint total = num_kv_heads * head_dim;
+    if (gid >= total) return;
+    
+    uint h = gid / head_dim;
+    uint d = gid % head_dim;
+    
+    uint src_offset = h * head_dim + d;
+    uint dst_offset = h * capacity * head_dim + cur_seq * head_dim + d;
+    
+    cache[dst_offset] = new_data[src_offset];
+}

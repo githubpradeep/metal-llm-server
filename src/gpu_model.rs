@@ -1,36 +1,56 @@
 use metal::*;
-use crate::cache::StreamingKVCache;
 use crate::config::LlamaConfig;
 use crate::gpu::MetalContext;
 use crate::weights::ModelWeights;
 
-/// GPU-resident model: all weights stored as Metal buffers in shared memory.
-/// Forward pass runs entirely on GPU, only logits are read back to CPU.
+/// GPU-resident model with persistent KV cache on GPU.
+/// All operations for one token are encoded into a SINGLE command buffer.
 pub struct GpuLlamaModel {
     pub ctx: MetalContext,
     pub config: LlamaConfig,
 
-    // Embedding table (vocab_size * hidden_size)
-    pub embed_tokens: Vec<f32>, // kept on CPU for token lookup (tiny cost)
-
-    // Per-layer weights as Metal buffers
+    pub embed_tokens: Vec<f32>,
     pub layers: Vec<GpuDecoderLayer>,
-
-    // Final norm
     pub final_norm_weight: Buffer,
+    pub lm_head_weight: Buffer,
 
-    // LM head
-    pub lm_head_weight: Buffer, // (vocab_size, hidden_size)
+    // Pre-allocated scratch buffers (reused every token)
+    pub hidden_buf: Buffer,
+    pub normed_buf: Buffer,
+    pub residual_buf: Buffer,
+    pub q_buf: Buffer,
+    pub k_buf: Buffer,
+    pub v_buf: Buffer,
+    pub attn_out_buf: Buffer,
+    pub o_out_buf: Buffer,
+    pub gate_buf: Buffer,
+    pub up_buf: Buffer,
+    pub silu_buf: Buffer,
+    pub down_buf: Buffer,
+    pub logits_buf: Buffer,
+
+    // GPU-resident KV cache per layer
+    pub k_cache: Vec<Buffer>,
+    pub v_cache: Vec<Buffer>,
+    pub kv_seq_lens: Vec<u32>,
+    pub kv_capacity: u32,
+
+    // Rotary precomputed
+    pub inv_freq: Vec<f32>,
+    pub cos_buf: Buffer,
+    pub sin_buf: Buffer,
+
+    pub total_tokens: usize,
 }
 
 pub struct GpuDecoderLayer {
-    pub q_proj: Buffer,    // (num_heads * head_dim, hidden_size)
-    pub k_proj: Buffer,    // (num_kv_heads * head_dim, hidden_size)
-    pub v_proj: Buffer,    // (num_kv_heads * head_dim, hidden_size)
-    pub o_proj: Buffer,    // (hidden_size, num_heads * head_dim)
-    pub gate_proj: Buffer, // (intermediate_size, hidden_size)
-    pub up_proj: Buffer,   // (intermediate_size, hidden_size)
-    pub down_proj: Buffer, // (hidden_size, intermediate_size)
+    pub q_proj: Buffer,
+    pub k_proj: Buffer,
+    pub v_proj: Buffer,
+    pub o_proj: Buffer,
+    pub gate_proj: Buffer,
+    pub up_proj: Buffer,
+    pub down_proj: Buffer,
     pub input_ln_weight: Buffer,
     pub post_ln_weight: Buffer,
 }
@@ -38,185 +58,233 @@ pub struct GpuDecoderLayer {
 impl GpuLlamaModel {
     pub fn new(config: &LlamaConfig, weights: &ModelWeights) -> Self {
         let ctx = MetalContext::new();
+        let hidden_size = config.hidden_size;
+        let head_dim = config.head_dim();
+        let num_heads = config.num_attention_heads;
+        let num_kv_heads = config.num_key_value_heads;
+        let intermediate_size = config.intermediate_size;
+        let vocab_size = config.vocab_size;
 
         let embed_tokens = weights.get_1d_raw("model.embed_tokens.weight");
 
         let mut layers = Vec::with_capacity(config.num_hidden_layers);
         for i in 0..config.num_hidden_layers {
             println!("  Loading GPU layer {}/{}", i + 1, config.num_hidden_layers);
-            let layer = GpuDecoderLayer {
-                q_proj: ctx.buffer_from_slice(
-                    &weights.get_1d_raw(&format!("model.layers.{}.self_attn.q_proj.weight", i))
-                ),
-                k_proj: ctx.buffer_from_slice(
-                    &weights.get_1d_raw(&format!("model.layers.{}.self_attn.k_proj.weight", i))
-                ),
-                v_proj: ctx.buffer_from_slice(
-                    &weights.get_1d_raw(&format!("model.layers.{}.self_attn.v_proj.weight", i))
-                ),
-                o_proj: ctx.buffer_from_slice(
-                    &weights.get_1d_raw(&format!("model.layers.{}.self_attn.o_proj.weight", i))
-                ),
-                gate_proj: ctx.buffer_from_slice(
-                    &weights.get_1d_raw(&format!("model.layers.{}.mlp.gate_proj.weight", i))
-                ),
-                up_proj: ctx.buffer_from_slice(
-                    &weights.get_1d_raw(&format!("model.layers.{}.mlp.up_proj.weight", i))
-                ),
-                down_proj: ctx.buffer_from_slice(
-                    &weights.get_1d_raw(&format!("model.layers.{}.mlp.down_proj.weight", i))
-                ),
-                input_ln_weight: ctx.buffer_from_slice(
-                    &weights.get_1d(&format!("model.layers.{}.input_layernorm.weight", i))
-                ),
-                post_ln_weight: ctx.buffer_from_slice(
-                    &weights.get_1d(&format!("model.layers.{}.post_attention_layernorm.weight", i))
-                ),
-            };
-            layers.push(layer);
+            layers.push(GpuDecoderLayer {
+                q_proj: ctx.buffer_from_slice(&weights.get_1d_raw(&format!("model.layers.{}.self_attn.q_proj.weight", i))),
+                k_proj: ctx.buffer_from_slice(&weights.get_1d_raw(&format!("model.layers.{}.self_attn.k_proj.weight", i))),
+                v_proj: ctx.buffer_from_slice(&weights.get_1d_raw(&format!("model.layers.{}.self_attn.v_proj.weight", i))),
+                o_proj: ctx.buffer_from_slice(&weights.get_1d_raw(&format!("model.layers.{}.self_attn.o_proj.weight", i))),
+                gate_proj: ctx.buffer_from_slice(&weights.get_1d_raw(&format!("model.layers.{}.mlp.gate_proj.weight", i))),
+                up_proj: ctx.buffer_from_slice(&weights.get_1d_raw(&format!("model.layers.{}.mlp.up_proj.weight", i))),
+                down_proj: ctx.buffer_from_slice(&weights.get_1d_raw(&format!("model.layers.{}.mlp.down_proj.weight", i))),
+                input_ln_weight: ctx.buffer_from_slice(&weights.get_1d(&format!("model.layers.{}.input_layernorm.weight", i))),
+                post_ln_weight: ctx.buffer_from_slice(&weights.get_1d(&format!("model.layers.{}.post_attention_layernorm.weight", i))),
+            });
         }
 
         let final_norm_weight = ctx.buffer_from_slice(&weights.get_1d("model.norm.weight"));
+        let lm_head_weight = ctx.buffer_from_slice(&weights.get_1d_raw("lm_head.weight"));
 
-        let lm_head_data = weights.get_1d_raw("lm_head.weight");
-        let lm_head_weight = ctx.buffer_from_slice(&lm_head_data);
+        // Pre-allocate scratch buffers
+        let hidden_buf = ctx.buffer_empty(hidden_size);
+        let normed_buf = ctx.buffer_empty(hidden_size);
+        let residual_buf = ctx.buffer_empty(hidden_size);
+        let q_buf = ctx.buffer_empty(num_heads * head_dim);
+        let k_buf = ctx.buffer_empty(num_kv_heads * head_dim);
+        let v_buf = ctx.buffer_empty(num_kv_heads * head_dim);
+        let attn_out_buf = ctx.buffer_empty(num_heads * head_dim);
+        let o_out_buf = ctx.buffer_empty(hidden_size);
+        let gate_buf = ctx.buffer_empty(intermediate_size);
+        let up_buf = ctx.buffer_empty(intermediate_size);
+        let silu_buf = ctx.buffer_empty(intermediate_size);
+        let down_buf = ctx.buffer_empty(hidden_size);
+        let logits_buf = ctx.buffer_empty(vocab_size);
+
+        // KV cache: pre-allocate for sink_size + window_size tokens
+        let kv_capacity = 128u32; // sink(4) + window(64) + headroom
+        let mut k_cache = Vec::with_capacity(config.num_hidden_layers);
+        let mut v_cache = Vec::with_capacity(config.num_hidden_layers);
+        for _ in 0..config.num_hidden_layers {
+            k_cache.push(ctx.buffer_empty(num_kv_heads * kv_capacity as usize * head_dim));
+            v_cache.push(ctx.buffer_empty(num_kv_heads * kv_capacity as usize * head_dim));
+        }
+        let kv_seq_lens = vec![0u32; config.num_hidden_layers];
+
+        // Rotary
+        let inv_freq: Vec<f32> = (0..head_dim)
+            .step_by(2)
+            .map(|i| 1.0 / config.rope_theta.powf(i as f64 / head_dim as f64) as f32)
+            .collect();
+        let cos_buf = ctx.buffer_empty(head_dim);
+        let sin_buf = ctx.buffer_empty(head_dim);
 
         GpuLlamaModel {
-            ctx,
-            config: config.clone(),
-            embed_tokens,
-            layers,
-            final_norm_weight,
-            lm_head_weight,
+            ctx, config: config.clone(), embed_tokens, layers,
+            final_norm_weight, lm_head_weight,
+            hidden_buf, normed_buf, residual_buf,
+            q_buf, k_buf, v_buf, attn_out_buf, o_out_buf,
+            gate_buf, up_buf, silu_buf, down_buf, logits_buf,
+            k_cache, v_cache, kv_seq_lens, kv_capacity,
+            inv_freq, cos_buf, sin_buf,
+            total_tokens: 0,
         }
     }
 
-    /// Run a single-token forward pass on GPU.
-    /// Returns logits as Vec<f32> on CPU.
-    pub fn forward_single_token(
-        &self,
-        token_id: usize,
-        kv_cache: &mut StreamingKVCache,
-    ) -> Vec<f32> {
+    /// Forward one token. ALL GPU work in a SINGLE command buffer submission.
+    pub fn forward_single_token(&mut self, token_id: usize) -> Vec<f32> {
         let hidden_size = self.config.hidden_size;
         let head_dim = self.config.head_dim();
         let num_heads = self.config.num_attention_heads;
         let num_kv_heads = self.config.num_key_value_heads;
-        let num_kv_groups = num_heads / num_kv_heads;
+        let num_kv_groups = (num_heads / num_kv_heads) as u32;
         let intermediate_size = self.config.intermediate_size;
         let vocab_size = self.config.vocab_size;
         let eps = self.config.rms_norm_eps as f32;
+        let scale = 1.0 / (head_dim as f32).sqrt();
 
-        // Embed token (CPU lookup, tiny)
+        // Embed token (CPU, trivial)
         let embed_offset = token_id * hidden_size;
         let embed_slice = &self.embed_tokens[embed_offset..embed_offset + hidden_size];
+        MetalContext::write_buffer(&self.hidden_buf, embed_slice);
 
-        // Compute position embeddings (CPU, tiny)
-        let pos = kv_cache.num_items() as f32;
+        // Compute rotary cos/sin for current position (CPU, trivial)
+        let pos = self.total_tokens as f32;
         let half_dim = head_dim / 2;
         let mut cos_data = vec![0.0f32; head_dim];
         let mut sin_data = vec![0.0f32; head_dim];
-        let inv_freq: Vec<f32> = (0..head_dim)
-            .step_by(2)
-            .map(|i| 1.0 / self.config.rope_theta.powf(i as f64 / head_dim as f64) as f32)
-            .collect();
-        for (i, &freq) in inv_freq.iter().enumerate() {
+        for (i, &freq) in self.inv_freq.iter().enumerate() {
             let angle = pos * freq;
             cos_data[i] = angle.cos();
             cos_data[i + half_dim] = angle.cos();
             sin_data[i] = angle.sin();
             sin_data[i + half_dim] = angle.sin();
         }
+        MetalContext::write_buffer(&self.cos_buf, &cos_data);
+        MetalContext::write_buffer(&self.sin_buf, &sin_data);
 
-        // Upload to GPU buffers
-        let mut hidden_buf = self.ctx.buffer_from_slice(embed_slice);
-        let cos_buf = self.ctx.buffer_from_slice(&cos_data);
-        let sin_buf = self.ctx.buffer_from_slice(&sin_data);
+        // Current KV sequence length (same for all layers in streaming mode)
+        let kv_seq = self.kv_seq_lens[0];
 
-        // Scratch buffers
-        let normed_buf = self.ctx.buffer_empty(hidden_size);
-        let q_buf = self.ctx.buffer_empty(num_heads * head_dim);
-        let k_buf = self.ctx.buffer_empty(num_kv_heads * head_dim);
-        let v_buf = self.ctx.buffer_empty(num_kv_heads * head_dim);
-        let attn_out_buf = self.ctx.buffer_empty(num_heads * head_dim);
-        let o_out_buf = self.ctx.buffer_empty(hidden_size);
-        let residual_buf = self.ctx.buffer_empty(hidden_size);
-        let gate_buf = self.ctx.buffer_empty(intermediate_size);
-        let up_buf = self.ctx.buffer_empty(intermediate_size);
-        let silu_buf = self.ctx.buffer_empty(intermediate_size);
-        let down_buf = self.ctx.buffer_empty(hidden_size);
+        // ═══ SINGLE COMMAND BUFFER FOR ENTIRE FORWARD PASS ═══
+        let cmd = self.ctx.queue.new_command_buffer();
+        let encoder = cmd.new_compute_command_encoder();
 
         for (layer_idx, layer) in self.layers.iter().enumerate() {
-            // Save residual (copy hidden → residual)
-            // Use vec_add with zero to copy (or just read/write)
-            let hidden_data = MetalContext::read_buffer(&hidden_buf, hidden_size);
-            MetalContext::write_buffer(&residual_buf, &hidden_data);
+            // Copy hidden → residual
+            self.ctx.encode_copy(encoder, &self.hidden_buf, &self.residual_buf, hidden_size as u32);
 
             // RMS Norm
-            self.ctx.rmsnorm(&hidden_buf, &layer.input_ln_weight, &normed_buf, hidden_size as u32, eps);
+            self.ctx.encode_rmsnorm(encoder, &self.hidden_buf, &layer.input_ln_weight, &self.normed_buf, hidden_size as u32, eps);
 
             // Q, K, V projections
-            self.ctx.matvec(&layer.q_proj, &normed_buf, &q_buf, (num_heads * head_dim) as u32, hidden_size as u32);
-            self.ctx.matvec(&layer.k_proj, &normed_buf, &k_buf, (num_kv_heads * head_dim) as u32, hidden_size as u32);
-            self.ctx.matvec(&layer.v_proj, &normed_buf, &v_buf, (num_kv_heads * head_dim) as u32, hidden_size as u32);
+            self.ctx.encode_matvec(encoder, &layer.q_proj, &self.normed_buf, &self.q_buf, (num_heads * head_dim) as u32, hidden_size as u32);
+            self.ctx.encode_matvec(encoder, &layer.k_proj, &self.normed_buf, &self.k_buf, (num_kv_heads * head_dim) as u32, hidden_size as u32);
+            self.ctx.encode_matvec(encoder, &layer.v_proj, &self.normed_buf, &self.v_buf, (num_kv_heads * head_dim) as u32, hidden_size as u32);
 
             // Rotary embeddings
-            self.ctx.apply_rotary(&q_buf, &k_buf, &cos_buf, &sin_buf, num_heads as u32, num_kv_heads as u32, head_dim as u32);
+            self.ctx.encode_rotary(encoder, &self.q_buf, &self.k_buf, &self.cos_buf, &self.sin_buf, num_heads as u32, num_kv_heads as u32, head_dim as u32);
 
-            // Update KV cache (CPU side — cache is small)
-            let k_data = MetalContext::read_buffer(&k_buf, num_kv_heads * head_dim);
-            let v_data = MetalContext::read_buffer(&v_buf, num_kv_heads * head_dim);
-            let kv_seq = kv_cache.update(&k_data, &v_data, 1, num_kv_heads, head_dim, layer_idx);
+            // Append K, V to GPU cache
+            self.ctx.encode_kv_append(encoder, &self.k_buf, &self.k_cache[layer_idx], num_kv_heads as u32, head_dim as u32, self.kv_capacity, kv_seq);
+            self.ctx.encode_kv_append(encoder, &self.v_buf, &self.v_cache[layer_idx], num_kv_heads as u32, head_dim as u32, self.kv_capacity, kv_seq);
 
-            // Upload KV cache to GPU for attention
-            let (k_cache_slice, _, k_cap) = kv_cache.get_key_slice(layer_idx);
-            let (v_cache_slice, _, v_cap) = kv_cache.get_value_slice(layer_idx);
-            let k_cache_buf = self.ctx.buffer_from_slice(k_cache_slice);
-            let v_cache_buf = self.ctx.buffer_from_slice(v_cache_slice);
-
-            // Attention
-            let scale = 1.0 / (head_dim as f32).sqrt();
-            self.ctx.attention_single_token(
-                &q_buf, &k_cache_buf, &v_cache_buf, &attn_out_buf,
-                num_heads as u32, num_kv_heads as u32, num_kv_groups as u32,
-                head_dim as u32, kv_seq as u32, k_cap as u32, scale,
-            );
+            // Attention (kv_seq + 1 because we just appended)
+            let attn_kv_seq = kv_seq + 1;
+            self.ctx.encode_attention(encoder, &self.q_buf, &self.k_cache[layer_idx], &self.v_cache[layer_idx], &self.attn_out_buf,
+                num_heads as u32, num_kv_heads as u32, num_kv_groups,
+                head_dim as u32, attn_kv_seq, self.kv_capacity, scale);
 
             // O projection
-            self.ctx.matvec(&layer.o_proj, &attn_out_buf, &o_out_buf, hidden_size as u32, (num_heads * head_dim) as u32);
+            self.ctx.encode_matvec(encoder, &layer.o_proj, &self.attn_out_buf, &self.o_out_buf, hidden_size as u32, (num_heads * head_dim) as u32);
 
-            // Residual add
-            self.ctx.vec_add(&residual_buf, &o_out_buf, &hidden_buf, hidden_size as u32);
+            // Residual add → hidden
+            self.ctx.encode_vec_add(encoder, &self.residual_buf, &self.o_out_buf, &self.hidden_buf, hidden_size as u32);
 
-            // Save residual
-            let hidden_data = MetalContext::read_buffer(&hidden_buf, hidden_size);
-            MetalContext::write_buffer(&residual_buf, &hidden_data);
+            // Copy hidden → residual (for MLP residual)
+            self.ctx.encode_copy(encoder, &self.hidden_buf, &self.residual_buf, hidden_size as u32);
 
             // Post-attention norm
-            self.ctx.rmsnorm(&hidden_buf, &layer.post_ln_weight, &normed_buf, hidden_size as u32, eps);
+            self.ctx.encode_rmsnorm(encoder, &self.hidden_buf, &layer.post_ln_weight, &self.normed_buf, hidden_size as u32, eps);
 
-            // MLP: gate and up projections
-            self.ctx.matvec(&layer.gate_proj, &normed_buf, &gate_buf, intermediate_size as u32, hidden_size as u32);
-            self.ctx.matvec(&layer.up_proj, &normed_buf, &up_buf, intermediate_size as u32, hidden_size as u32);
+            // MLP
+            self.ctx.encode_matvec(encoder, &layer.gate_proj, &self.normed_buf, &self.gate_buf, intermediate_size as u32, hidden_size as u32);
+            self.ctx.encode_matvec(encoder, &layer.up_proj, &self.normed_buf, &self.up_buf, intermediate_size as u32, hidden_size as u32);
+            self.ctx.encode_silu_mul(encoder, &self.gate_buf, &self.up_buf, &self.silu_buf, intermediate_size as u32);
+            self.ctx.encode_matvec(encoder, &layer.down_proj, &self.silu_buf, &self.down_buf, hidden_size as u32, intermediate_size as u32);
 
-            // SiLU(gate) * up
-            self.ctx.silu_mul(&gate_buf, &up_buf, &silu_buf, intermediate_size as u32);
-
-            // Down projection
-            self.ctx.matvec(&layer.down_proj, &silu_buf, &down_buf, hidden_size as u32, intermediate_size as u32);
-
-            // Residual add
-            self.ctx.vec_add(&residual_buf, &down_buf, &hidden_buf, hidden_size as u32);
+            // Residual add → hidden
+            self.ctx.encode_vec_add(encoder, &self.residual_buf, &self.down_buf, &self.hidden_buf, hidden_size as u32);
         }
 
         // Final norm
-        self.ctx.rmsnorm(&hidden_buf, &self.final_norm_weight, &normed_buf, hidden_size as u32, eps);
+        self.ctx.encode_rmsnorm(encoder, &self.hidden_buf, &self.final_norm_weight, &self.normed_buf, hidden_size as u32, eps);
 
         // LM head
-        let logits_buf = self.ctx.buffer_empty(vocab_size);
-        self.ctx.matvec(&self.lm_head_weight, &normed_buf, &logits_buf, vocab_size as u32, hidden_size as u32);
+        self.ctx.encode_matvec(encoder, &self.lm_head_weight, &self.normed_buf, &self.logits_buf, vocab_size as u32, hidden_size as u32);
 
-        // Read logits back to CPU
-        MetalContext::read_buffer(&logits_buf, vocab_size)
+        // Submit and wait
+        encoder.end_encoding();
+        cmd.commit();
+        cmd.wait_until_completed();
+
+        // Update KV tracking
+        self.total_tokens += 1;
+        for seq in self.kv_seq_lens.iter_mut() {
+            *seq += 1;
+        }
+
+        // Evict middle tokens if cache exceeds sink + window budget
+        let keep_total = 68u32; // sink(4) + window(64)
+        let sink_size = 4u32;
+        let window_size = 64u32;
+        if self.kv_seq_lens[0] > keep_total {
+            self.evict_kv_cache(sink_size, window_size);
+        }
+
+        // Read logits back
+        MetalContext::read_buffer(&self.logits_buf, vocab_size)
+    }
+
+    /// Evict middle tokens from KV cache: keep first sink_size + last window_size.
+    /// Done on CPU since it's infrequent and the cache is small.
+    fn evict_kv_cache(&mut self, sink_size: u32, window_size: u32) {
+        let head_dim = self.config.head_dim();
+        let num_kv_heads = self.config.num_key_value_heads;
+        let cap = self.kv_capacity as usize;
+        let cur_seq = self.kv_seq_lens[0] as usize;
+        let keep_total = (sink_size + window_size) as usize;
+        let tail_start = cur_seq - window_size as usize;
+
+        for layer_idx in 0..self.config.num_hidden_layers {
+            let k_data = MetalContext::read_buffer(&self.k_cache[layer_idx], num_kv_heads * cap * head_dim);
+            let v_data = MetalContext::read_buffer(&self.v_cache[layer_idx], num_kv_heads * cap * head_dim);
+
+            let mut new_k = k_data.clone();
+            let mut new_v = v_data.clone();
+
+            // For each head: move tail tokens right after sink tokens
+            for h in 0..num_kv_heads {
+                let base = h * cap * head_dim;
+                let sink_end = base + sink_size as usize * head_dim;
+                let tail_src = base + tail_start * head_dim;
+                let tail_len = window_size as usize * head_dim;
+
+                // Copy tail after sink
+                new_k.copy_within(tail_src..tail_src + tail_len, sink_end);
+                new_v.copy_within(tail_src..tail_src + tail_len, sink_end);
+            }
+
+            MetalContext::write_buffer(&self.k_cache[layer_idx], &new_k);
+            MetalContext::write_buffer(&self.v_cache[layer_idx], &new_v);
+        }
+
+        for seq in self.kv_seq_lens.iter_mut() {
+            *seq = keep_total as u32;
+        }
+    }
+
+    pub fn num_items(&self) -> usize {
+        self.total_tokens
     }
 }

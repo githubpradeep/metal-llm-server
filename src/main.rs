@@ -35,7 +35,7 @@ fn main() {
         let start = Instant::now();
 
         let (wts, config) = weights::ModelWeights::load(&model_dir);
-        let gpu_model = gpu_model::GpuLlamaModel::new(&config, &wts);
+        let mut gpu_model = gpu_model::GpuLlamaModel::new(&config, &wts);
 
         let tokenizer_path = std::path::Path::new(&model_dir).join("tokenizer.json");
         let tokenizer = tokenizers::Tokenizer::from_file(&tokenizer_path)
@@ -54,7 +54,7 @@ fn main() {
         generate_gpu(
             "Once upon a time",
             &tokenizer,
-            &gpu_model,
+            &mut gpu_model,
             200,
             sink_size,
             window_size,
@@ -90,23 +90,21 @@ fn main() {
 fn generate_gpu(
     prompt: &str,
     tokenizer: &tokenizers::Tokenizer,
-    model: &gpu_model::GpuLlamaModel,
+    model: &mut gpu_model::GpuLlamaModel,
     max_tokens: usize,
     sink_size: usize,
     window_size: usize,
 ) {
-    let mut kv_cache = cache::StreamingKVCache::new(sink_size, window_size);
-
     let encoding = tokenizer.encode(prompt, true).expect("Failed to encode");
     let input_ids: Vec<u32> = encoding.get_ids().to_vec();
 
     print!("{}", prompt);
     io::stdout().flush().unwrap();
 
-    // Prefill: process prompt tokens one at a time through GPU
+    // Prefill: process prompt tokens
     let mut logits = Vec::new();
     for &tok in &input_ids {
-        logits = model.forward_single_token(tok as usize, &mut kv_cache);
+        logits = model.forward_single_token(tok as usize);
     }
 
     // Decode loop
@@ -121,7 +119,7 @@ fn generate_gpu(
         io::stdout().flush().unwrap();
         tokens_generated += 1;
 
-        logits = model.forward_single_token(next_token, &mut kv_cache);
+        logits = model.forward_single_token(next_token);
     }
 
     let elapsed = start_time.elapsed().as_secs_f64();
