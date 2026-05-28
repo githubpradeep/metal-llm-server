@@ -82,22 +82,20 @@ kernel void matvec_f16(
 
 // ─── Q4_0 Matrix-Vector Multiply ─────────────────────────────────────────────
 // Weights quantized to 4-bit with group size 32 (Q4_0 format).
-// Each group: 16 bytes of packed int4 pairs + 2 bytes f16 scale = 18 bytes per 32 weights.
-// Layout per row: num_groups consecutive blocks, each block is:
-//   [half scale][uint8_t quants[16]] — 16 bytes hold 32 x 4-bit values
-// Total bytes per row = (K / 32) * 18
-// Values are unsigned 4-bit (0-15), dequantized as: (q - 8) * scale
+// Each group: [f16 scale][16 bytes packed 4-bit pairs] = 18 bytes per 32 weights.
+// Values dequantized as: (nibble - 8) * scale
 //
 // Each SIMD group (32 threads) handles one row.
-// Each thread processes one group (32 weights) at a time, striding by SIMD_SIZE groups.
+// Each thread processes groups strided by SIMD_SIZE.
+// Inner loop unrolled 4 bytes at a time for better ILP.
 
 constant uint Q4_GROUP_SIZE = 32;
-constant uint Q4_BLOCK_BYTES = 18;  // 2 (scale) + 16 (quants)
+constant uint Q4_BLOCK_BYTES = 18;
 
 kernel void matvec_q4(
-    device const uchar* W_q4 [[buffer(0)]],  // quantized weights, packed
-    device const float* x [[buffer(1)]],      // (K,) f32 activations
-    device float* y [[buffer(2)]],            // (M,) f32 output
+    device const uchar* W_q4 [[buffer(0)]],
+    device const float* x [[buffer(1)]],
+    device float* y [[buffer(2)]],
     constant uint& M [[buffer(3)]],
     constant uint& K [[buffer(4)]],
     uint tgid [[threadgroup_position_in_grid]],
@@ -114,25 +112,33 @@ kernel void matvec_q4(
     for (uint g = tid; g < num_groups; g += SIMD_SIZE) {
         uint block_offset = row_byte_offset + g * Q4_BLOCK_BYTES;
         
-        // Read scale (first 2 bytes as half)
+        // Read scale
         half scale_h = *reinterpret_cast<device const half*>(&W_q4[block_offset]);
         float scale = float(scale_h);
         
-        // Read 16 bytes of packed quants (32 x 4-bit values)
+        // Read packed quants
         device const uchar* quants = &W_q4[block_offset + 2];
-        
-        // Dequantize and dot with x
         uint x_offset = g * Q4_GROUP_SIZE;
         
-        for (uint i = 0; i < 16; i++) {
-            uchar packed = quants[i];
-            // Low nibble = first value, high nibble = second value
-            int q0 = int(packed & 0x0F) - 8;
-            int q1 = int(packed >> 4) - 8;
+        // Unrolled: process 4 bytes (8 weights) per iteration
+        float local_acc = 0.0f;
+        for (uint i = 0; i < 16; i += 4) {
+            uchar p0 = quants[i];
+            uchar p1 = quants[i + 1];
+            uchar p2 = quants[i + 2];
+            uchar p3 = quants[i + 3];
             
-            acc += (float(q0) * scale) * x[x_offset + i * 2];
-            acc += (float(q1) * scale) * x[x_offset + i * 2 + 1];
+            uint base = x_offset + i * 2;
+            local_acc += float(int(p0 & 0x0F) - 8) * x[base];
+            local_acc += float(int(p0 >> 4) - 8) * x[base + 1];
+            local_acc += float(int(p1 & 0x0F) - 8) * x[base + 2];
+            local_acc += float(int(p1 >> 4) - 8) * x[base + 3];
+            local_acc += float(int(p2 & 0x0F) - 8) * x[base + 4];
+            local_acc += float(int(p2 >> 4) - 8) * x[base + 5];
+            local_acc += float(int(p3 & 0x0F) - 8) * x[base + 6];
+            local_acc += float(int(p3 >> 4) - 8) * x[base + 7];
         }
+        acc += local_acc * scale;
     }
     
     acc = simd_sum(acc);
