@@ -113,6 +113,18 @@ impl ModelWeights {
             .unwrap_or_else(|| panic!("Weight not found: {}", key));
         data.clone()
     }
+
+    /// Get raw weight data (handles lm_head fallback).
+    pub fn get_1d_raw(&self, key: &str) -> Vec<f32> {
+        let actual_key = if key == "lm_head.weight" && !self.tensors.contains_key(key) {
+            "model.embed_tokens.weight"
+        } else {
+            key
+        };
+        let data = self.tensors.get(actual_key)
+            .unwrap_or_else(|| panic!("Weight not found: {}", actual_key));
+        data.clone()
+    }
 }
 
 /// Convert f16 bits to f32.
