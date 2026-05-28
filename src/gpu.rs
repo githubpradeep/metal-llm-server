@@ -30,6 +30,7 @@ pub struct MetalContext {
     pub rmsnorm_per_head_pipeline: ComputePipelineState,
     pub rotary_partial_pipeline: ComputePipelineState,
     pub attention_offset_pipeline: ComputePipelineState,
+    pub vec_scale_pipeline: ComputePipelineState,
 }
 
 impl MetalContext {
@@ -80,6 +81,7 @@ impl MetalContext {
         let rmsnorm_per_head_pipeline = get_fn("rmsnorm_per_head");
         let rotary_partial_pipeline = get_fn("apply_rotary_partial");
         let attention_offset_pipeline = get_fn("attention_single_token_offset");
+        let vec_scale_pipeline = get_fn("vec_scale");
 
         MetalContext {
             device,
@@ -109,6 +111,7 @@ impl MetalContext {
             rmsnorm_per_head_pipeline,
             rotary_partial_pipeline,
             attention_offset_pipeline,
+            vec_scale_pipeline,
         }
     }
 
@@ -329,6 +332,18 @@ impl MetalContext {
         encoder.set_buffer(2, Some(out_buf), 0);
         encoder.set_bytes(3, 4, &n as *const u32 as *const _);
         encoder.set_bytes(4, 4, &scale as *const f32 as *const _);
+        encoder.dispatch_threads(MTLSize::new(n as u64, 1, 1), MTLSize::new(256, 1, 1));
+    }
+
+    pub fn encode_vec_scale(
+        &self, encoder: &ComputeCommandEncoderRef,
+        src_buf: &Buffer, dst_buf: &Buffer, n: u32, scale: f32,
+    ) {
+        encoder.set_compute_pipeline_state(&self.vec_scale_pipeline);
+        encoder.set_buffer(0, Some(src_buf), 0);
+        encoder.set_buffer(1, Some(dst_buf), 0);
+        encoder.set_bytes(2, 4, &n as *const u32 as *const _);
+        encoder.set_bytes(3, 4, &scale as *const f32 as *const _);
         encoder.dispatch_threads(MTLSize::new(n as u64, 1, 1), MTLSize::new(256, 1, 1));
     }
 

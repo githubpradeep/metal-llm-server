@@ -214,11 +214,12 @@ impl Gemma4GpuModel {
         let final_norm_weight = ctx.buffer_from_slice(&final_norm_data);
         let per_layer_projection_norm_weight = ctx.buffer_from_slice(&per_layer_proj_norm_data);
 
-        // Now load layers one by one
-        println!("  Loading layers (Q4_0 quantized)...");
-        let mut layers = Vec::with_capacity(num_layers);
+        // Load all layers
+        let num_layers_to_load = num_layers;
+        println!("  Loading layers (Q4_0 quantized, {} layers)...", num_layers_to_load);
+        let mut layers = Vec::with_capacity(num_layers_to_load);
 
-        for layer_idx in 0..num_layers {
+        for layer_idx in 0..num_layers_to_load {
             println!("    Layer {}/{}", layer_idx + 1, num_layers);
             let is_full = config.is_full_attention(layer_idx);
             let head_dim = config.layer_head_dim(layer_idx);
@@ -253,9 +254,6 @@ impl Gemma4GpuModel {
             let layer_scalar = layer_tensors.get("layer_scalar")
                 .map(|v| v[0])
                 .unwrap_or(1.0);
-            if layer_idx < 5 || layer_idx == 41 {
-                eprintln!("      layer_scalar[{}] = {}", layer_idx, layer_scalar);
-            }
 
             // Build GPU buffers for this layer
             let q_proj_data = layer_tensors.remove("self_attn.q_proj.weight").expect("q_proj missing");
@@ -414,11 +412,11 @@ impl Gemma4GpuModel {
 
         // Precompute all rotary cos/sin per layer (CPU, trivial)
         let pos = self.total_tokens as f32;
-        let mut rotary_cos_per_layer: Vec<Vec<f32>> = Vec::with_capacity(num_layers);
-        let mut rotary_sin_per_layer: Vec<Vec<f32>> = Vec::with_capacity(num_layers);
-        let mut rotary_dim_per_layer: Vec<usize> = Vec::with_capacity(num_layers);
+        let mut rotary_cos_per_layer: Vec<Vec<f32>> = Vec::with_capacity(self.layers.len());
+        let mut rotary_sin_per_layer: Vec<Vec<f32>> = Vec::with_capacity(self.layers.len());
+        let mut rotary_dim_per_layer: Vec<usize> = Vec::with_capacity(self.layers.len());
 
-        for layer_idx in 0..num_layers {
+        for layer_idx in 0..self.layers.len() {
             let layer = &self.layers[layer_idx];
             let head_dim = layer.head_dim;
             let is_full = layer.is_full_attention;
@@ -457,31 +455,11 @@ impl Gemma4GpuModel {
             rotary_dim_per_layer.push(rotary_dim);
         }
 
-        // ═══ DEBUG: Check embedding and first norm ═══
-        if self.total_tokens == 0 {
-            let cmd_dbg = self.ctx.queue.new_command_buffer();
-            let enc_dbg = cmd_dbg.new_compute_command_encoder();
-            self.ctx.encode_rmsnorm(enc_dbg, &self.hidden_buf,
-                &self.layers[0].input_layernorm_weight, &self.normed_buf, hidden_size as u32, eps);
-            enc_dbg.end_encoding();
-            cmd_dbg.commit();
-            cmd_dbg.wait_until_completed();
-
-            let hidden = MetalContext::read_buffer(&self.hidden_buf, hidden_size);
-            let normed = MetalContext::read_buffer(&self.normed_buf, hidden_size);
-            eprintln!("[DEBUG] embed hidden: nan={}, zero={}, first5={:?}",
-                     hidden.iter().filter(|v| v.is_nan()).count(),
-                     hidden.iter().filter(|v| **v == 0.0).count(),
-                     &hidden[..5]);
-            eprintln!("[DEBUG] after norm: nan={}, first5={:?}",
-                     normed.iter().filter(|v| v.is_nan()).count(),
-                     &normed[..5]);
-        }
-
         // ═══ ONE COMMAND BUFFER, ONE ENCODER PER LAYER ═══
         let cmd = self.ctx.queue.new_command_buffer();
+        let actual_num_layers = self.layers.len();
 
-        for layer_idx in 0..num_layers {
+        for layer_idx in 0..actual_num_layers {
             let layer = &self.layers[layer_idx];
             let head_dim = layer.head_dim;
             let q_out = layer.q_out_dim;
@@ -609,14 +587,13 @@ impl Gemma4GpuModel {
             self.ctx.encode_vec_add(encoder, &self.residual_buf, &self.normed_buf,
                 &self.hidden_buf, hidden_size as u32);
 
-            // TODO: apply layer_scalar (multiply entire hidden_states by scalar)
-            // Skipped for now — values are < 1.0 so won't cause NaN
+            // Layer scalar: hidden *= layer_scalar (prevents signal growth across layers)
+            // Use residual_buf as temp to avoid in-place read/write race
+            self.ctx.encode_vec_scale(encoder, &self.hidden_buf, &self.residual_buf,
+                hidden_size as u32, layer.layer_scalar);
+            self.ctx.encode_copy(encoder, &self.residual_buf, &self.hidden_buf, hidden_size as u32);
 
             encoder.end_encoding();
-            // Submit per-layer to avoid potential GPU scheduling issues
-            cmd.commit();
-            cmd.wait_until_completed();
-            let cmd = self.ctx.queue.new_command_buffer();
         }
 
         // Final norm
@@ -641,29 +618,6 @@ impl Gemma4GpuModel {
         cmd2.wait_until_completed();
 
         let mut logits = MetalContext::read_buffer(&self.logits_buf, vocab_size);
-
-        // Debug: check for NaN/Inf
-        if self.total_tokens < 3 {
-            let nan_count = logits.iter().filter(|v| v.is_nan()).count();
-            let inf_count = logits.iter().filter(|v| v.is_infinite()).count();
-            let zero_count = logits.iter().filter(|v| **v == 0.0).count();
-            eprintln!("[DEBUG token {}] logits: nan={}, inf={}, zero={}, total={}",
-                     self.total_tokens, nan_count, inf_count, zero_count, vocab_size);
-            // Print first few non-zero logits
-            let nonzero: Vec<(usize, f32)> = logits.iter().enumerate()
-                .filter(|(_, v)| **v != 0.0 && !v.is_nan())
-                .take(5)
-                .map(|(i, &v)| (i, v))
-                .collect();
-            eprintln!("[DEBUG] first non-zero logits: {:?}", nonzero);
-
-            // Also check hidden state after final norm
-            let normed = MetalContext::read_buffer(&self.normed_buf, hidden_size);
-            let h_nan = normed.iter().filter(|v| v.is_nan()).count();
-            let h_zero = normed.iter().filter(|v| **v == 0.0).count();
-            eprintln!("[DEBUG] normed hidden: nan={}, zero={}, first5={:?}",
-                     h_nan, h_zero, &normed[..5]);
-        }
 
         // Logit softcapping: logits = cap * tanh(logits / cap)
         let cap = self.config.final_logit_softcapping;

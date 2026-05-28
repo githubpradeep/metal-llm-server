@@ -739,6 +739,20 @@ kernel void vec_add_scaled(
     out[gid] = a[gid] + scale * b[gid];
 }
 
+// ─── Vector Scale (in-place safe: reads from src, writes to dst) ─────────────
+// dst[i] = scale * src[i]
+
+kernel void vec_scale(
+    device const float* src [[buffer(0)]],
+    device float* dst [[buffer(1)]],
+    constant uint& n [[buffer(2)]],
+    constant float& scale [[buffer(3)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    if (gid >= n) return;
+    dst[gid] = scale * src[gid];
+}
+
 // ─── Per-Head RMS Norm ───────────────────────────────────────────────────────
 // Apply RMSNorm independently to each head in a [num_heads * head_dim] buffer.
 // weight is [head_dim] and is shared across all heads.
