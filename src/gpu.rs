@@ -7,6 +7,7 @@ pub struct MetalContext {
     pub queue: CommandQueue,
     pub matvec_pipeline: ComputePipelineState,
     pub matvec_f16_pipeline: ComputePipelineState,
+    pub matvec_q4_pipeline: ComputePipelineState,
     pub matmul_pipeline: ComputePipelineState,
     pub rmsnorm_pipeline: ComputePipelineState,
     pub rmsnorm_batch_pipeline: ComputePipelineState,
@@ -50,6 +51,7 @@ impl MetalContext {
 
         let matvec_pipeline = get_fn("matvec");
         let matvec_f16_pipeline = get_fn("matvec_f16");
+        let matvec_q4_pipeline = get_fn("matvec_q4");
         let matmul_pipeline = get_fn("matmul");
         let rmsnorm_pipeline = get_fn("rmsnorm");
         let rmsnorm_batch_pipeline = get_fn("rmsnorm_batch");
@@ -72,6 +74,7 @@ impl MetalContext {
             queue,
             matvec_pipeline,
             matvec_f16_pipeline,
+            matvec_q4_pipeline,
             matmul_pipeline,
             rmsnorm_pipeline,
             rmsnorm_batch_pipeline,
@@ -106,6 +109,19 @@ impl MetalContext {
         let byte_len = (f16_data.len() * 2) as u64;
         self.device.new_buffer_with_data(
             f16_data.as_ptr() as *const _,
+            byte_len,
+            MTLResourceOptions::StorageModeShared,
+        )
+    }
+
+    /// Create a Metal buffer with Q4_0 quantized data from f32.
+    /// Format: for each group of 32 values: [f16 scale][16 bytes of packed 4-bit pairs]
+    /// Total: 18 bytes per 32 weights.
+    pub fn buffer_from_f32_as_q4(&self, data: &[f32], rows: usize, cols: usize) -> Buffer {
+        let q4_data = quantize_q4_0(data, rows, cols);
+        let byte_len = q4_data.len() as u64;
+        self.device.new_buffer_with_data(
+            q4_data.as_ptr() as *const _,
             byte_len,
             MTLResourceOptions::StorageModeShared,
         )
@@ -150,6 +166,22 @@ impl MetalContext {
         w_buf: &Buffer, x_buf: &Buffer, y_buf: &Buffer, m: u32, k: u32,
     ) {
         encoder.set_compute_pipeline_state(&self.matvec_f16_pipeline);
+        encoder.set_buffer(0, Some(w_buf), 0);
+        encoder.set_buffer(1, Some(x_buf), 0);
+        encoder.set_buffer(2, Some(y_buf), 0);
+        encoder.set_bytes(3, 4, &m as *const u32 as *const _);
+        encoder.set_bytes(4, 4, &k as *const u32 as *const _);
+        let num_tgs = MTLSize::new(m as u64, 1, 1);
+        let tg_size = MTLSize::new(32, 1, 1);
+        encoder.dispatch_thread_groups(num_tgs, tg_size);
+    }
+
+    /// Q4_0 weight matvec: W is 4-bit quantized, x and y are f32.
+    pub fn encode_matvec_q4(
+        &self, encoder: &ComputeCommandEncoderRef,
+        w_buf: &Buffer, x_buf: &Buffer, y_buf: &Buffer, m: u32, k: u32,
+    ) {
+        encoder.set_compute_pipeline_state(&self.matvec_q4_pipeline);
         encoder.set_buffer(0, Some(w_buf), 0);
         encoder.set_buffer(1, Some(x_buf), 0);
         encoder.set_buffer(2, Some(y_buf), 0);
@@ -495,4 +527,55 @@ fn f32_to_f16(value: f32) -> u16 {
     } else {
         (sign | ((exp as u32) << 10) | mant) as u16
     }
+}
+
+/// Quantize f32 weights to Q4_0 format.
+/// For each row, process groups of 32 values:
+///   - Find max absolute value → scale = max_abs / 7
+///   - Quantize each value to 4-bit unsigned: q = round(v / scale) + 8, clamped to [0, 15]
+///   - Pack pairs of 4-bit values into bytes (low nibble first)
+///   - Store: [f16 scale][16 bytes packed quants]
+fn quantize_q4_0(data: &[f32], rows: usize, cols: usize) -> Vec<u8> {
+    assert_eq!(cols % 32, 0, "cols must be divisible by 32 for Q4_0");
+    let num_groups_per_row = cols / 32;
+    let bytes_per_row = num_groups_per_row * 18; // 18 bytes per group
+    let mut output = vec![0u8; rows * bytes_per_row];
+
+    for row in 0..rows {
+        for g in 0..num_groups_per_row {
+            let group_start = row * cols + g * 32;
+            let group = &data[group_start..group_start + 32];
+
+            // Find max absolute value
+            let mut max_abs = 0.0f32;
+            for &v in group {
+                let a = v.abs();
+                if a > max_abs {
+                    max_abs = a;
+                }
+            }
+
+            let scale = if max_abs > 0.0 { max_abs / 7.0 } else { 1.0 };
+            let inv_scale = 1.0 / scale;
+
+            // Write scale as f16
+            let scale_f16 = f32_to_f16(scale);
+            let out_offset = row * bytes_per_row + g * 18;
+            output[out_offset] = (scale_f16 & 0xFF) as u8;
+            output[out_offset + 1] = (scale_f16 >> 8) as u8;
+
+            // Quantize and pack pairs
+            for i in 0..16 {
+                let v0 = group[i * 2];
+                let v1 = group[i * 2 + 1];
+
+                let q0 = ((v0 * inv_scale).round() as i32 + 8).clamp(0, 15) as u8;
+                let q1 = ((v1 * inv_scale).round() as i32 + 8).clamp(0, 15) as u8;
+
+                output[out_offset + 2 + i] = q0 | (q1 << 4);
+            }
+        }
+    }
+
+    output
 }

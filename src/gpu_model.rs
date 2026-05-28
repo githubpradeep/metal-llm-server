@@ -69,22 +69,28 @@ impl GpuLlamaModel {
 
         let mut layers = Vec::with_capacity(config.num_hidden_layers);
         for i in 0..config.num_hidden_layers {
-            println!("  Loading GPU layer {}/{} (f16 weights)", i + 1, config.num_hidden_layers);
+            println!("  Loading GPU layer {}/{} (Q4_0 quantized)", i + 1, config.num_hidden_layers);
+            let hidden = config.hidden_size;
+            let q_out = config.num_attention_heads * head_dim;
+            let kv_out = config.num_key_value_heads * head_dim;
+            let inter = config.intermediate_size;
+
             layers.push(GpuDecoderLayer {
-                q_proj: ctx.buffer_from_f32_as_f16(&weights.get_1d_raw(&format!("model.layers.{}.self_attn.q_proj.weight", i))),
-                k_proj: ctx.buffer_from_f32_as_f16(&weights.get_1d_raw(&format!("model.layers.{}.self_attn.k_proj.weight", i))),
-                v_proj: ctx.buffer_from_f32_as_f16(&weights.get_1d_raw(&format!("model.layers.{}.self_attn.v_proj.weight", i))),
-                o_proj: ctx.buffer_from_f32_as_f16(&weights.get_1d_raw(&format!("model.layers.{}.self_attn.o_proj.weight", i))),
-                gate_proj: ctx.buffer_from_f32_as_f16(&weights.get_1d_raw(&format!("model.layers.{}.mlp.gate_proj.weight", i))),
-                up_proj: ctx.buffer_from_f32_as_f16(&weights.get_1d_raw(&format!("model.layers.{}.mlp.up_proj.weight", i))),
-                down_proj: ctx.buffer_from_f32_as_f16(&weights.get_1d_raw(&format!("model.layers.{}.mlp.down_proj.weight", i))),
+                q_proj: ctx.buffer_from_f32_as_q4(&weights.get_1d_raw(&format!("model.layers.{}.self_attn.q_proj.weight", i)), q_out, hidden),
+                k_proj: ctx.buffer_from_f32_as_q4(&weights.get_1d_raw(&format!("model.layers.{}.self_attn.k_proj.weight", i)), kv_out, hidden),
+                v_proj: ctx.buffer_from_f32_as_q4(&weights.get_1d_raw(&format!("model.layers.{}.self_attn.v_proj.weight", i)), kv_out, hidden),
+                o_proj: ctx.buffer_from_f32_as_q4(&weights.get_1d_raw(&format!("model.layers.{}.self_attn.o_proj.weight", i)), hidden, q_out),
+                gate_proj: ctx.buffer_from_f32_as_q4(&weights.get_1d_raw(&format!("model.layers.{}.mlp.gate_proj.weight", i)), inter, hidden),
+                up_proj: ctx.buffer_from_f32_as_q4(&weights.get_1d_raw(&format!("model.layers.{}.mlp.up_proj.weight", i)), inter, hidden),
+                down_proj: ctx.buffer_from_f32_as_q4(&weights.get_1d_raw(&format!("model.layers.{}.mlp.down_proj.weight", i)), hidden, inter),
                 input_ln_weight: ctx.buffer_from_slice(&weights.get_1d(&format!("model.layers.{}.input_layernorm.weight", i))),
                 post_ln_weight: ctx.buffer_from_slice(&weights.get_1d(&format!("model.layers.{}.post_attention_layernorm.weight", i))),
             });
         }
 
         let final_norm_weight = ctx.buffer_from_slice(&weights.get_1d("model.norm.weight"));
-        let lm_head_weight = ctx.buffer_from_f32_as_f16(&weights.get_1d_raw("lm_head.weight"));
+        let lm_head_data = weights.get_1d_raw("lm_head.weight");
+        let lm_head_weight = ctx.buffer_from_f32_as_q4(&lm_head_data, config.vocab_size, config.hidden_size);
 
         // Pre-allocate scratch buffers
         let hidden_buf = ctx.buffer_empty(hidden_size);
@@ -178,9 +184,9 @@ impl GpuLlamaModel {
             self.ctx.encode_rmsnorm(encoder, &self.hidden_buf, &layer.input_ln_weight, &self.normed_buf, hidden_size as u32, eps);
 
             // Q, K, V projections
-            self.ctx.encode_matvec_f16(encoder, &layer.q_proj, &self.normed_buf, &self.q_buf, (num_heads * head_dim) as u32, hidden_size as u32);
-            self.ctx.encode_matvec_f16(encoder, &layer.k_proj, &self.normed_buf, &self.k_buf, (num_kv_heads * head_dim) as u32, hidden_size as u32);
-            self.ctx.encode_matvec_f16(encoder, &layer.v_proj, &self.normed_buf, &self.v_buf, (num_kv_heads * head_dim) as u32, hidden_size as u32);
+            self.ctx.encode_matvec_q4(encoder, &layer.q_proj, &self.normed_buf, &self.q_buf, (num_heads * head_dim) as u32, hidden_size as u32);
+            self.ctx.encode_matvec_q4(encoder, &layer.k_proj, &self.normed_buf, &self.k_buf, (num_kv_heads * head_dim) as u32, hidden_size as u32);
+            self.ctx.encode_matvec_q4(encoder, &layer.v_proj, &self.normed_buf, &self.v_buf, (num_kv_heads * head_dim) as u32, hidden_size as u32);
 
             // Rotary embeddings
             self.ctx.encode_rotary(encoder, &self.q_buf, &self.k_buf, &self.cos_buf, &self.sin_buf, num_heads as u32, num_kv_heads as u32, head_dim as u32);
@@ -196,7 +202,7 @@ impl GpuLlamaModel {
                 head_dim as u32, attn_kv_seq, self.kv_capacity, scale);
 
             // O projection
-            self.ctx.encode_matvec_f16(encoder, &layer.o_proj, &self.attn_out_buf, &self.o_out_buf, hidden_size as u32, (num_heads * head_dim) as u32);
+            self.ctx.encode_matvec_q4(encoder, &layer.o_proj, &self.attn_out_buf, &self.o_out_buf, hidden_size as u32, (num_heads * head_dim) as u32);
 
             // Residual add → hidden
             self.ctx.encode_vec_add(encoder, &self.residual_buf, &self.o_out_buf, &self.hidden_buf, hidden_size as u32);
@@ -208,10 +214,10 @@ impl GpuLlamaModel {
             self.ctx.encode_rmsnorm(encoder, &self.hidden_buf, &layer.post_ln_weight, &self.normed_buf, hidden_size as u32, eps);
 
             // MLP
-            self.ctx.encode_matvec_f16(encoder, &layer.gate_proj, &self.normed_buf, &self.gate_buf, intermediate_size as u32, hidden_size as u32);
-            self.ctx.encode_matvec_f16(encoder, &layer.up_proj, &self.normed_buf, &self.up_buf, intermediate_size as u32, hidden_size as u32);
+            self.ctx.encode_matvec_q4(encoder, &layer.gate_proj, &self.normed_buf, &self.gate_buf, intermediate_size as u32, hidden_size as u32);
+            self.ctx.encode_matvec_q4(encoder, &layer.up_proj, &self.normed_buf, &self.up_buf, intermediate_size as u32, hidden_size as u32);
             self.ctx.encode_silu_mul(encoder, &self.gate_buf, &self.up_buf, &self.silu_buf, intermediate_size as u32);
-            self.ctx.encode_matvec_f16(encoder, &layer.down_proj, &self.silu_buf, &self.down_buf, hidden_size as u32, intermediate_size as u32);
+            self.ctx.encode_matvec_q4(encoder, &layer.down_proj, &self.silu_buf, &self.down_buf, hidden_size as u32, intermediate_size as u32);
 
             // Residual add → hidden
             self.ctx.encode_vec_add(encoder, &self.residual_buf, &self.down_buf, &self.hidden_buf, hidden_size as u32);
@@ -221,7 +227,7 @@ impl GpuLlamaModel {
         self.ctx.encode_rmsnorm(encoder, &self.hidden_buf, &self.final_norm_weight, &self.normed_buf, hidden_size as u32, eps);
 
         // LM head
-        self.ctx.encode_matvec_f16(encoder, &self.lm_head_weight, &self.normed_buf, &self.logits_buf, vocab_size as u32, hidden_size as u32);
+        self.ctx.encode_matvec_q4(encoder, &self.lm_head_weight, &self.normed_buf, &self.logits_buf, vocab_size as u32, hidden_size as u32);
 
         // Submit and wait
         encoder.end_encoding();

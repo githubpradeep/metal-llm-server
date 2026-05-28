@@ -80,6 +80,67 @@ kernel void matvec_f16(
     }
 }
 
+// ─── Q4_0 Matrix-Vector Multiply ─────────────────────────────────────────────
+// Weights quantized to 4-bit with group size 32 (Q4_0 format).
+// Each group: 16 bytes of packed int4 pairs + 2 bytes f16 scale = 18 bytes per 32 weights.
+// Layout per row: num_groups consecutive blocks, each block is:
+//   [half scale][uint8_t quants[16]] — 16 bytes hold 32 x 4-bit values
+// Total bytes per row = (K / 32) * 18
+// Values are unsigned 4-bit (0-15), dequantized as: (q - 8) * scale
+//
+// Each SIMD group (32 threads) handles one row.
+// Each thread processes one group (32 weights) at a time, striding by SIMD_SIZE groups.
+
+constant uint Q4_GROUP_SIZE = 32;
+constant uint Q4_BLOCK_BYTES = 18;  // 2 (scale) + 16 (quants)
+
+kernel void matvec_q4(
+    device const uchar* W_q4 [[buffer(0)]],  // quantized weights, packed
+    device const float* x [[buffer(1)]],      // (K,) f32 activations
+    device float* y [[buffer(2)]],            // (M,) f32 output
+    constant uint& M [[buffer(3)]],
+    constant uint& K [[buffer(4)]],
+    uint tgid [[threadgroup_position_in_grid]],
+    uint tid [[thread_index_in_threadgroup]]
+) {
+    if (tgid >= M) return;
+    
+    uint num_groups = K / Q4_GROUP_SIZE;
+    uint row_byte_offset = tgid * num_groups * Q4_BLOCK_BYTES;
+    
+    float acc = 0.0f;
+    
+    // Each thread handles groups strided by SIMD_SIZE
+    for (uint g = tid; g < num_groups; g += SIMD_SIZE) {
+        uint block_offset = row_byte_offset + g * Q4_BLOCK_BYTES;
+        
+        // Read scale (first 2 bytes as half)
+        half scale_h = *reinterpret_cast<device const half*>(&W_q4[block_offset]);
+        float scale = float(scale_h);
+        
+        // Read 16 bytes of packed quants (32 x 4-bit values)
+        device const uchar* quants = &W_q4[block_offset + 2];
+        
+        // Dequantize and dot with x
+        uint x_offset = g * Q4_GROUP_SIZE;
+        
+        for (uint i = 0; i < 16; i++) {
+            uchar packed = quants[i];
+            // Low nibble = first value, high nibble = second value
+            int q0 = int(packed & 0x0F) - 8;
+            int q1 = int(packed >> 4) - 8;
+            
+            acc += (float(q0) * scale) * x[x_offset + i * 2];
+            acc += (float(q1) * scale) * x[x_offset + i * 2 + 1];
+        }
+    }
+    
+    acc = simd_sum(acc);
+    if (tid == 0) {
+        y[tgid] = acc;
+    }
+}
+
 // ─── SIMD-Group Batched Matrix Multiply (for prefill) ────────────────────────
 // C = A * B^T where A is (M, K), B is (N, K), C is (M, N)
 // Each SIMD group computes one element of C (dot product of row A and row B).
