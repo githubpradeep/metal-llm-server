@@ -282,7 +282,7 @@ kernel void attention_single_token(
     uint v_head_base = kv_h * k_cap * head_dim;  // same layout
     
     // Shared memory for scores and reduction
-    threadgroup float scores[1024];  // max kv_seq
+    threadgroup float scores[2560];  // max kv_seq
     threadgroup float shared_max[256];
     threadgroup float shared_sum[256];
     
@@ -627,7 +627,7 @@ kernel void attention_causal(
     // (since during prefill, kv_seq == q_len and positions are 0-indexed)
     uint attend_len = qi + 1;
     
-    threadgroup float scores[1024];
+    threadgroup float scores[2560];
     threadgroup float shared_max[256];
     threadgroup float shared_sum[256];
     

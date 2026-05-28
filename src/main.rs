@@ -44,10 +44,8 @@ fn main() {
         println!("Model loaded in {:.2}s", start.elapsed().as_secs_f64());
 
         println!("{}", "=".repeat(60));
-        println!("STREAMING ATTENTION SINKS GENERATION (Metal GPU)");
-        println!("  Sink tokens: {}", sink_size);
-        println!("  Window size: {}", window_size);
-        println!("  Total attention per token: {}", sink_size + window_size);
+        println!("FULL CONTEXT GENERATION (Metal GPU, Q4_0)");
+        println!("  Max context: {}", config.max_position_embeddings);
         println!("{}", "=".repeat(60));
 
         let gen_start = Instant::now();
@@ -56,8 +54,6 @@ fn main() {
             &tokenizer,
             &mut gpu_model,
             200,
-            sink_size,
-            window_size,
         );
         println!("\nTotal time: {:.2}s", gen_start.elapsed().as_secs_f64());
     } else {
@@ -92,8 +88,6 @@ fn generate_gpu(
     tokenizer: &tokenizers::Tokenizer,
     model: &mut gpu_model::GpuLlamaModel,
     max_tokens: usize,
-    sink_size: usize,
-    window_size: usize,
 ) {
     let encoding = tokenizer.encode(prompt, true).expect("Failed to encode");
     let input_ids: Vec<u32> = encoding.get_ids().to_vec();
@@ -123,9 +117,9 @@ fn generate_gpu(
     let elapsed = start_time.elapsed().as_secs_f64();
     let tps = if elapsed > 0.0 { tokens_generated as f64 / elapsed } else { 0.0 };
 
-    println!("\n\n[Streaming Sinks Generation - Metal GPU]");
+    println!("\n\n[Full Context Generation - Metal GPU, Q4_0]");
     println!("  Tokens: {}", tokens_generated);
     println!("  Throughput: {:.2} tok/s", tps);
-    println!("  Window: {} sink + {} recent = {} total attention", sink_size, window_size, sink_size + window_size);
+    println!("  Context length: {} tokens", model.num_items());
     println!("  Elapsed: {:.2}s", elapsed);
 }

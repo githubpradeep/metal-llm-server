@@ -107,8 +107,8 @@ impl GpuLlamaModel {
         let down_buf = ctx.buffer_empty(hidden_size);
         let logits_buf = ctx.buffer_empty(vocab_size);
 
-        // KV cache: pre-allocate for sink_size + window_size tokens
-        let kv_capacity = 128u32; // sink(4) + window(64) + headroom
+        // KV cache: pre-allocate for full context window (no eviction)
+        let kv_capacity = config.max_position_embeddings as u32; // full context
         let mut k_cache = Vec::with_capacity(config.num_hidden_layers);
         let mut v_cache = Vec::with_capacity(config.num_hidden_layers);
         for _ in 0..config.num_hidden_layers {
@@ -240,54 +240,8 @@ impl GpuLlamaModel {
             *seq += 1;
         }
 
-        // Evict middle tokens if cache exceeds sink + window budget
-        let keep_total = 68u32; // sink(4) + window(64)
-        let sink_size = 4u32;
-        let window_size = 64u32;
-        if self.kv_seq_lens[0] > keep_total {
-            self.evict_kv_cache(sink_size, window_size);
-        }
-
         // Read logits back
         MetalContext::read_buffer(&self.logits_buf, vocab_size)
-    }
-
-    /// Evict middle tokens from KV cache: keep first sink_size + last window_size.
-    /// Done on CPU since it's infrequent and the cache is small.
-    fn evict_kv_cache(&mut self, sink_size: u32, window_size: u32) {
-        let head_dim = self.config.head_dim();
-        let num_kv_heads = self.config.num_key_value_heads;
-        let cap = self.kv_capacity as usize;
-        let cur_seq = self.kv_seq_lens[0] as usize;
-        let keep_total = (sink_size + window_size) as usize;
-        let tail_start = cur_seq - window_size as usize;
-
-        for layer_idx in 0..self.config.num_hidden_layers {
-            let k_data = MetalContext::read_buffer(&self.k_cache[layer_idx], num_kv_heads * cap * head_dim);
-            let v_data = MetalContext::read_buffer(&self.v_cache[layer_idx], num_kv_heads * cap * head_dim);
-
-            let mut new_k = k_data.clone();
-            let mut new_v = v_data.clone();
-
-            // For each head: move tail tokens right after sink tokens
-            for h in 0..num_kv_heads {
-                let base = h * cap * head_dim;
-                let sink_end = base + sink_size as usize * head_dim;
-                let tail_src = base + tail_start * head_dim;
-                let tail_len = window_size as usize * head_dim;
-
-                // Copy tail after sink
-                new_k.copy_within(tail_src..tail_src + tail_len, sink_end);
-                new_v.copy_within(tail_src..tail_src + tail_len, sink_end);
-            }
-
-            MetalContext::write_buffer(&self.k_cache[layer_idx], &new_k);
-            MetalContext::write_buffer(&self.v_cache[layer_idx], &new_v);
-        }
-
-        for seq in self.kv_seq_lens.iter_mut() {
-            *seq = keep_total as u32;
-        }
     }
 
     pub fn num_items(&self) -> usize {
