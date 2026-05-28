@@ -124,9 +124,10 @@ impl MetalContext {
         encoder.set_buffer(2, Some(y_buf), 0);
         encoder.set_bytes(3, 4, &m as *const u32 as *const _);
         encoder.set_bytes(4, 4, &k as *const u32 as *const _);
-        let threads = MTLSize::new(m as u64, 1, 1);
-        let tg_size = MTLSize::new(self.matvec_pipeline.thread_execution_width().min(m as u64), 1, 1);
-        encoder.dispatch_threads(threads, tg_size);
+        // One threadgroup per row, 32 threads per group (SIMD group)
+        let num_tgs = MTLSize::new(m as u64, 1, 1);
+        let tg_size = MTLSize::new(32, 1, 1);
+        encoder.dispatch_thread_groups(num_tgs, tg_size);
     }
 
     pub fn encode_rmsnorm(

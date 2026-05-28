@@ -1,10 +1,13 @@
 #include <metal_stdlib>
 using namespace metal;
 
-// ─── Matrix-Vector Multiply ──────────────────────────────────────────────────
+// ─── SIMD-Group Matrix-Vector Multiply ───────────────────────────────────────
 // Computes y = W * x where W is (M, K) and x is (K,), y is (M,)
-// Each thread computes one output element.
-// Dispatched with threadgroups covering M rows.
+// Uses SIMD groups (32 threads) to parallelize the dot product per row.
+// Each SIMD group computes ONE output row cooperatively.
+// Dispatched with M threadgroups, each with SIMD_SIZE threads.
+
+constant uint SIMD_SIZE = 32;
 
 kernel void matvec(
     device const float* W [[buffer(0)]],   // (M, K) row-major
@@ -12,31 +15,45 @@ kernel void matvec(
     device float* y [[buffer(2)]],         // (M,)
     constant uint& M [[buffer(3)]],
     constant uint& K [[buffer(4)]],
-    uint gid [[thread_position_in_grid]]
+    uint tgid [[threadgroup_position_in_grid]],    // which row
+    uint tid [[thread_index_in_threadgroup]]        // lane within SIMD group
 ) {
-    if (gid >= M) return;
+    if (tgid >= M) return;
     
-    uint row_offset = gid * K;
+    uint row_offset = tgid * K;
+    
+    // Each thread accumulates a partial sum over K/SIMD_SIZE elements
     float acc = 0.0f;
     
-    // Vectorized accumulation (4-wide)
-    uint k = 0;
-    for (; k + 4 <= K; k += 4) {
-        float4 w = float4(W[row_offset + k], W[row_offset + k + 1],
-                          W[row_offset + k + 2], W[row_offset + k + 3]);
-        float4 xv = float4(x[k], x[k + 1], x[k + 2], x[k + 3]);
+    // Stride by SIMD_SIZE, each thread handles every 32nd element
+    // Use float4 vectorized loads for 4x memory throughput
+    uint k = tid * 4;
+    uint stride = SIMD_SIZE * 4;  // 128 elements per iteration across all threads
+    
+    for (; k + 3 < K; k += stride) {
+        float4 w = *reinterpret_cast<device const float4*>(&W[row_offset + k]);
+        float4 xv = *reinterpret_cast<device const float4*>(&x[k]);
         acc += dot(w, xv);
     }
-    for (; k < K; k++) {
-        acc += W[row_offset + k] * x[k];
+    
+    // Handle remainder
+    for (uint kk = tid + (K / stride) * stride; kk < K; kk += SIMD_SIZE) {
+        acc += W[row_offset + kk] * x[kk];
     }
     
-    y[gid] = acc;
+    // SIMD group reduction — sum across all 32 lanes
+    acc = simd_sum(acc);
+    
+    // Lane 0 writes the result
+    if (tid == 0) {
+        y[tgid] = acc;
+    }
 }
 
-// ─── Batched Matrix Multiply (for prefill) ───────────────────────────────────
+// ─── SIMD-Group Batched Matrix Multiply (for prefill) ────────────────────────
 // C = A * B^T where A is (M, K), B is (N, K), C is (M, N)
-// Each thread computes one element of C.
+// Each SIMD group computes one element of C (dot product of row A and row B).
+// For small M (prefill), this gives good parallelism across N.
 
 kernel void matmul(
     device const float* A [[buffer(0)]],   // (M, K)

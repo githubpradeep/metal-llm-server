@@ -434,9 +434,10 @@ impl GpuLlamaModel {
         let k_val = hidden_size as u32;
         enc2.set_bytes(3, 4, &m_val as *const u32 as *const _);
         enc2.set_bytes(4, 4, &k_val as *const u32 as *const _);
-        let threads = MTLSize::new(m_val as u64, 1, 1);
-        let tg_size = MTLSize::new(self.ctx.matvec_pipeline.thread_execution_width().min(m_val as u64), 1, 1);
-        enc2.dispatch_threads(threads, tg_size);
+        // SIMD-group dispatch: one threadgroup per row, 32 threads each
+        let num_tgs = MTLSize::new(m_val as u64, 1, 1);
+        let tg_size = MTLSize::new(32, 1, 1);
+        enc2.dispatch_thread_groups(num_tgs, tg_size);
         enc2.end_encoding();
         cmd2.commit();
         cmd2.wait_until_completed();
