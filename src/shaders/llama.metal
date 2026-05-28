@@ -686,6 +686,225 @@ kernel void attention_causal(
     }
 }
 
+// ─── GeLU (PyTorch tanh approximation) ───────────────────────────────────────
+// out[i] = 0.5 * x * (1 + tanh(sqrt(2/pi) * (x + 0.044715 * x^3)))
+// This is the "gelu_pytorch_tanh" variant used in Gemma models.
+
+kernel void gelu_mul(
+    device const float* gate [[buffer(0)]],
+    device const float* up [[buffer(1)]],
+    device float* out [[buffer(2)]],
+    constant uint& n [[buffer(3)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    if (gid >= n) return;
+    float x = gate[gid];
+    // sqrt(2/pi) ≈ 0.7978845608
+    float inner = 0.7978845608f * (x + 0.044715f * x * x * x);
+    float gelu = 0.5f * x * (1.0f + tanh(inner));
+    out[gid] = gelu * up[gid];
+}
+
+// ─── Element-wise Multiply ───────────────────────────────────────────────────
+// out[i] = a[i] * b[i]
+
+kernel void vec_mul(
+    device const float* a [[buffer(0)]],
+    device const float* b [[buffer(1)]],
+    device float* out [[buffer(2)]],
+    constant uint& n [[buffer(3)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    if (gid >= n) return;
+    out[gid] = a[gid] * b[gid];
+}
+
+// ─── Scaled Vector Add ───────────────────────────────────────────────────────
+// out[i] = a[i] + scale * b[i]
+
+kernel void vec_add_scaled(
+    device const float* a [[buffer(0)]],
+    device const float* b [[buffer(1)]],
+    device float* out [[buffer(2)]],
+    constant uint& n [[buffer(3)]],
+    constant float& scale [[buffer(4)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    if (gid >= n) return;
+    out[gid] = a[gid] + scale * b[gid];
+}
+
+// ─── Per-Head RMS Norm ───────────────────────────────────────────────────────
+// Apply RMSNorm independently to each head in a [num_heads * head_dim] buffer.
+// weight is [head_dim] and is shared across all heads.
+// One threadgroup per head.
+
+kernel void rmsnorm_per_head(
+    device const float* x [[buffer(0)]],       // (num_heads * head_dim)
+    device const float* weight [[buffer(1)]],  // (head_dim)
+    device float* out [[buffer(2)]],           // (num_heads * head_dim)
+    constant uint& num_heads [[buffer(3)]],
+    constant uint& head_dim [[buffer(4)]],
+    constant float& eps [[buffer(5)]],
+    uint tid [[thread_index_in_threadgroup]],
+    uint tg_size [[threads_per_threadgroup]],
+    uint tgid [[threadgroup_position_in_grid]]
+) {
+    uint h = tgid;
+    if (h >= num_heads) return;
+    uint base = h * head_dim;
+
+    threadgroup float shared_sum[256];
+
+    float partial_sum = 0.0f;
+    for (uint i = tid; i < head_dim; i += tg_size) {
+        float val = x[base + i];
+        partial_sum += val * val;
+    }
+    shared_sum[tid] = partial_sum;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint stride = tg_size / 2; stride > 0; stride >>= 1) {
+        if (tid < stride) shared_sum[tid] += shared_sum[tid + stride];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    float inv_rms = rsqrt(shared_sum[0] / float(head_dim) + eps);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint i = tid; i < head_dim; i += tg_size) {
+        out[base + i] = x[base + i] * inv_rms * weight[i];
+    }
+}
+
+// ─── Partial Rotary Position Embedding ───────────────────────────────────────
+// Apply rotary only to the first rotary_dim elements of each head.
+// The remaining elements are copied unchanged.
+
+kernel void apply_rotary_partial(
+    device float* q [[buffer(0)]],
+    device float* k [[buffer(1)]],
+    device const float* cos_buf [[buffer(2)]],
+    device const float* sin_buf [[buffer(3)]],
+    constant uint& num_heads [[buffer(4)]],
+    constant uint& num_kv_heads [[buffer(5)]],
+    constant uint& head_dim [[buffer(6)]],
+    constant uint& rotary_dim [[buffer(7)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    uint half_rot = rotary_dim / 2;
+    uint total_q = num_heads * half_rot;
+    uint total_k = num_kv_heads * half_rot;
+
+    if (gid < total_q) {
+        uint h = gid / half_rot;
+        uint d = gid % half_rot;
+        uint base = h * head_dim;
+        float q1 = q[base + d];
+        float q2 = q[base + d + half_rot];
+        float c = cos_buf[d];
+        float s = sin_buf[d];
+        q[base + d] = q1 * c - q2 * s;
+        q[base + d + half_rot] = q2 * c + q1 * s;
+    } else if (gid < total_q + total_k) {
+        uint idx = gid - total_q;
+        uint h = idx / half_rot;
+        uint d = idx % half_rot;
+        uint base = h * head_dim;
+        float k1 = k[base + d];
+        float k2 = k[base + d + half_rot];
+        float c = cos_buf[d];
+        float s = sin_buf[d];
+        k[base + d] = k1 * c - k2 * s;
+        k[base + d + half_rot] = k2 * c + k1 * s;
+    }
+}
+
+// ─── Attention with KV offset (for sliding window) ──────────────────────────
+// Same as attention_single_token but starts reading from kv_start position.
+
+kernel void attention_single_token_offset(
+    device const float* Q [[buffer(0)]],
+    device const float* K_cache [[buffer(1)]],
+    device const float* V_cache [[buffer(2)]],
+    device float* output [[buffer(3)]],
+    constant uint& num_heads [[buffer(4)]],
+    constant uint& num_kv_heads [[buffer(5)]],
+    constant uint& num_kv_groups [[buffer(6)]],
+    constant uint& head_dim [[buffer(7)]],
+    constant uint& kv_seq [[buffer(8)]],
+    constant uint& k_cap [[buffer(9)]],
+    constant float& scale [[buffer(10)]],
+    constant uint& kv_start [[buffer(11)]],
+    uint tid [[thread_index_in_threadgroup]],
+    uint tg_size [[threads_per_threadgroup]],
+    uint tgid [[threadgroup_position_in_grid]]
+) {
+    uint h = tgid;
+    if (h >= num_heads) return;
+
+    uint kv_h = h / num_kv_groups;
+    uint q_offset = h * head_dim;
+    uint k_head_base = kv_h * k_cap * head_dim;
+    uint v_head_base = kv_h * k_cap * head_dim;
+
+    threadgroup float scores[2560];
+    threadgroup float shared_max[256];
+    threadgroup float shared_sum[256];
+
+    float local_max = -INFINITY;
+    for (uint kv = tid; kv < kv_seq; kv += tg_size) {
+        float dot = 0.0f;
+        uint actual_pos = kv_start + kv;
+        uint k_offset = k_head_base + actual_pos * head_dim;
+        for (uint d = 0; d < head_dim; d++) {
+            dot += Q[q_offset + d] * K_cache[k_offset + d];
+        }
+        float s = dot * scale;
+        scores[kv] = s;
+        local_max = max(local_max, s);
+    }
+    shared_max[tid] = local_max;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint stride = tg_size / 2; stride > 0; stride >>= 1) {
+        if (tid < stride) shared_max[tid] = max(shared_max[tid], shared_max[tid + stride]);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    float max_score = shared_max[0];
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    float local_sum = 0.0f;
+    for (uint kv = tid; kv < kv_seq; kv += tg_size) {
+        float e = exp(scores[kv] - max_score);
+        scores[kv] = e;
+        local_sum += e;
+    }
+    shared_sum[tid] = local_sum;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint stride = tg_size / 2; stride > 0; stride >>= 1) {
+        if (tid < stride) shared_sum[tid] += shared_sum[tid + stride];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    float inv_sum = 1.0f / shared_sum[0];
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint kv = tid; kv < kv_seq; kv += tg_size) {
+        scores[kv] *= inv_sum;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint d = tid; d < head_dim; d += tg_size) {
+        float acc = 0.0f;
+        for (uint kv = 0; kv < kv_seq; kv++) {
+            uint actual_pos = kv_start + kv;
+            acc += scores[kv] * V_cache[v_head_base + actual_pos * head_dim + d];
+        }
+        output[q_offset + d] = acc;
+    }
+}
+
 // ─── Transpose: (seq, heads, head_dim) → (heads, seq, head_dim) ─────────────
 
 kernel void transpose_shd_to_hsd(

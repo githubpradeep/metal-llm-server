@@ -5,6 +5,8 @@ mod layers;
 mod cache;
 mod gpu;
 mod gpu_model;
+mod gemma4_config;
+mod gemma4_gpu_model;
 mod model;
 mod quantize;
 mod sampling;
@@ -31,31 +33,63 @@ fn main() {
     let window_size = 64;
 
     if use_gpu {
-        println!("Loading model (GPU/Metal) from: {}", model_dir);
-        let start = Instant::now();
+        // Detect if this is a Gemma4 model by checking for text_config in config.json
+        let config_path = std::path::Path::new(&model_dir).join("config.json");
+        let config_str = std::fs::read_to_string(&config_path)
+            .expect("Failed to read config.json");
+        let is_gemma4 = config_str.contains("\"gemma4\"") || config_str.contains("text_config");
 
-        let (wts, config) = weights::ModelWeights::load(&model_dir);
-        let mut gpu_model = gpu_model::GpuLlamaModel::new(&config, &wts);
+        if is_gemma4 {
+            println!("Loading Gemma4 model (GPU/Metal) from: {}", model_dir);
+            let start = Instant::now();
 
-        let tokenizer_path = std::path::Path::new(&model_dir).join("tokenizer.json");
-        let tokenizer = tokenizers::Tokenizer::from_file(&tokenizer_path)
-            .expect("Failed to load tokenizer.json");
+            let mut gpu_model = gemma4_gpu_model::Gemma4GpuModel::new(&model_dir);
 
-        println!("Model loaded in {:.2}s", start.elapsed().as_secs_f64());
+            let tokenizer_path = std::path::Path::new(&model_dir).join("tokenizer.json");
+            let tokenizer = tokenizers::Tokenizer::from_file(&tokenizer_path)
+                .expect("Failed to load tokenizer.json");
 
-        println!("{}", "=".repeat(60));
-        println!("FULL CONTEXT GENERATION (Metal GPU, Q4_0)");
-        println!("  Max context: {}", config.max_position_embeddings);
-        println!("{}", "=".repeat(60));
+            println!("Model loaded in {:.2}s", start.elapsed().as_secs_f64());
 
-        let gen_start = Instant::now();
-        generate_gpu(
-            "Once upon a time",
-            &tokenizer,
-            &mut gpu_model,
-            200,
-        );
-        println!("\nTotal time: {:.2}s", gen_start.elapsed().as_secs_f64());
+            println!("{}", "=".repeat(60));
+            println!("GEMMA4 E4B GENERATION (Metal GPU, Q4_0)");
+            println!("{}", "=".repeat(60));
+
+            let gen_start = Instant::now();
+            generate_gemma4_gpu(
+                "Once upon a time",
+                &tokenizer,
+                &mut gpu_model,
+                200,
+            );
+            println!("\nTotal time: {:.2}s", gen_start.elapsed().as_secs_f64());
+        } else {
+            println!("Loading model (GPU/Metal) from: {}", model_dir);
+            let start = Instant::now();
+
+            let (wts, config) = weights::ModelWeights::load(&model_dir);
+            let mut gpu_model = gpu_model::GpuLlamaModel::new(&config, &wts);
+
+            let tokenizer_path = std::path::Path::new(&model_dir).join("tokenizer.json");
+            let tokenizer = tokenizers::Tokenizer::from_file(&tokenizer_path)
+                .expect("Failed to load tokenizer.json");
+
+            println!("Model loaded in {:.2}s", start.elapsed().as_secs_f64());
+
+            println!("{}", "=".repeat(60));
+            println!("FULL CONTEXT GENERATION (Metal GPU, Q4_0)");
+            println!("  Max context: {}", config.max_position_embeddings);
+            println!("{}", "=".repeat(60));
+
+            let gen_start = Instant::now();
+            generate_gpu(
+                "Once upon a time",
+                &tokenizer,
+                &mut gpu_model,
+                200,
+            );
+            println!("\nTotal time: {:.2}s", gen_start.elapsed().as_secs_f64());
+        }
     } else {
         println!("Loading model (CPU/Accelerate) from: {}", model_dir);
         let start = Instant::now();
@@ -118,6 +152,47 @@ fn generate_gpu(
     let tps = if elapsed > 0.0 { tokens_generated as f64 / elapsed } else { 0.0 };
 
     println!("\n\n[Full Context Generation - Metal GPU, Q4_0]");
+    println!("  Tokens: {}", tokens_generated);
+    println!("  Throughput: {:.2} tok/s", tps);
+    println!("  Context length: {} tokens", model.num_items());
+    println!("  Elapsed: {:.2}s", elapsed);
+}
+
+fn generate_gemma4_gpu(
+    prompt: &str,
+    tokenizer: &tokenizers::Tokenizer,
+    model: &mut gemma4_gpu_model::Gemma4GpuModel,
+    max_tokens: usize,
+) {
+    let encoding = tokenizer.encode(prompt, true).expect("Failed to encode");
+    let input_ids: Vec<u32> = encoding.get_ids().to_vec();
+
+    print!("{}", prompt);
+    io::stdout().flush().unwrap();
+
+    // Prefill
+    let token_ids: Vec<usize> = input_ids.iter().map(|&t| t as usize).collect();
+    let mut logits = model.forward_prefill(&token_ids);
+
+    // Decode loop
+    let start_time = Instant::now();
+    let mut tokens_generated = 0;
+
+    for _ in 0..max_tokens {
+        let next_token = sampling::min_p_sampling(&logits, 0.1);
+
+        let tok_str = tokenizer.decode(&[next_token as u32], false).unwrap_or_default();
+        print!("{}", tok_str);
+        io::stdout().flush().unwrap();
+        tokens_generated += 1;
+
+        logits = model.forward_single_token(next_token);
+    }
+
+    let elapsed = start_time.elapsed().as_secs_f64();
+    let tps = if elapsed > 0.0 { tokens_generated as f64 / elapsed } else { 0.0 };
+
+    println!("\n\n[Gemma4 E4B Generation - Metal GPU, Q4_0]");
     println!("  Tokens: {}", tokens_generated);
     println!("  Throughput: {:.2} tok/s", tps);
     println!("  Context length: {} tokens", model.num_items());
