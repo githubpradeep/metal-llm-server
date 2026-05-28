@@ -1,34 +1,28 @@
 #include <metal_stdlib>
 using namespace metal;
 
-// ─── SIMD-Group Matrix-Vector Multiply ───────────────────────────────────────
-// Computes y = W * x where W is (M, K) and x is (K,), y is (M,)
+// ─── SIMD-Group Matrix-Vector Multiply (f32 weights) ─────────────────────────
+// Computes y = W * x where W is (M, K) f32 and x is (K,) f32, y is (M,) f32
 // Uses SIMD groups (32 threads) to parallelize the dot product per row.
-// Each SIMD group computes ONE output row cooperatively.
-// Dispatched with M threadgroups, each with SIMD_SIZE threads.
 
 constant uint SIMD_SIZE = 32;
 
 kernel void matvec(
-    device const float* W [[buffer(0)]],   // (M, K) row-major
-    device const float* x [[buffer(1)]],   // (K,)
-    device float* y [[buffer(2)]],         // (M,)
+    device const float* W [[buffer(0)]],
+    device const float* x [[buffer(1)]],
+    device float* y [[buffer(2)]],
     constant uint& M [[buffer(3)]],
     constant uint& K [[buffer(4)]],
-    uint tgid [[threadgroup_position_in_grid]],    // which row
-    uint tid [[thread_index_in_threadgroup]]        // lane within SIMD group
+    uint tgid [[threadgroup_position_in_grid]],
+    uint tid [[thread_index_in_threadgroup]]
 ) {
     if (tgid >= M) return;
     
     uint row_offset = tgid * K;
-    
-    // Each thread accumulates a partial sum over K/SIMD_SIZE elements
     float acc = 0.0f;
     
-    // Stride by SIMD_SIZE, each thread handles every 32nd element
-    // Use float4 vectorized loads for 4x memory throughput
     uint k = tid * 4;
-    uint stride = SIMD_SIZE * 4;  // 128 elements per iteration across all threads
+    uint stride = SIMD_SIZE * 4;
     
     for (; k + 3 < K; k += stride) {
         float4 w = *reinterpret_cast<device const float4*>(&W[row_offset + k]);
@@ -36,15 +30,51 @@ kernel void matvec(
         acc += dot(w, xv);
     }
     
-    // Handle remainder
     for (uint kk = tid + (K / stride) * stride; kk < K; kk += SIMD_SIZE) {
         acc += W[row_offset + kk] * x[kk];
     }
     
-    // SIMD group reduction — sum across all 32 lanes
     acc = simd_sum(acc);
+    if (tid == 0) {
+        y[tgid] = acc;
+    }
+}
+
+// ─── SIMD-Group Matrix-Vector Multiply (f16 weights) ─────────────────────────
+// Weights stored as half (2 bytes), activations as float.
+// Reads half the memory bandwidth vs f32 weights.
+// Accumulates in f32 for precision.
+
+kernel void matvec_f16(
+    device const half* W [[buffer(0)]],    // (M, K) row-major, half precision
+    device const float* x [[buffer(1)]],   // (K,) f32
+    device float* y [[buffer(2)]],         // (M,) f32
+    constant uint& M [[buffer(3)]],
+    constant uint& K [[buffer(4)]],
+    uint tgid [[threadgroup_position_in_grid]],
+    uint tid [[thread_index_in_threadgroup]]
+) {
+    if (tgid >= M) return;
     
-    // Lane 0 writes the result
+    uint row_offset = tgid * K;
+    float acc = 0.0f;
+    
+    // Use half4 vectorized loads (8 bytes = 4 halfs at once)
+    uint k = tid * 4;
+    uint stride = SIMD_SIZE * 4;
+    
+    for (; k + 3 < K; k += stride) {
+        half4 w = *reinterpret_cast<device const half4*>(&W[row_offset + k]);
+        float4 xv = *reinterpret_cast<device const float4*>(&x[k]);
+        // Convert half4 to float4 and dot
+        acc += dot(float4(w), xv);
+    }
+    
+    for (uint kk = tid + (K / stride) * stride; kk < K; kk += SIMD_SIZE) {
+        acc += float(W[row_offset + kk]) * x[kk];
+    }
+    
+    acc = simd_sum(acc);
     if (tid == 0) {
         y[tgid] = acc;
     }

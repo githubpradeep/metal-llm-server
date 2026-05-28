@@ -6,6 +6,7 @@ pub struct MetalContext {
     pub device: Device,
     pub queue: CommandQueue,
     pub matvec_pipeline: ComputePipelineState,
+    pub matvec_f16_pipeline: ComputePipelineState,
     pub matmul_pipeline: ComputePipelineState,
     pub rmsnorm_pipeline: ComputePipelineState,
     pub rmsnorm_batch_pipeline: ComputePipelineState,
@@ -48,6 +49,7 @@ impl MetalContext {
         };
 
         let matvec_pipeline = get_fn("matvec");
+        let matvec_f16_pipeline = get_fn("matvec_f16");
         let matmul_pipeline = get_fn("matmul");
         let rmsnorm_pipeline = get_fn("rmsnorm");
         let rmsnorm_batch_pipeline = get_fn("rmsnorm_batch");
@@ -69,6 +71,7 @@ impl MetalContext {
             device,
             queue,
             matvec_pipeline,
+            matvec_f16_pipeline,
             matmul_pipeline,
             rmsnorm_pipeline,
             rmsnorm_batch_pipeline,
@@ -92,6 +95,17 @@ impl MetalContext {
         let byte_len = (data.len() * std::mem::size_of::<f32>()) as u64;
         self.device.new_buffer_with_data(
             data.as_ptr() as *const _,
+            byte_len,
+            MTLResourceOptions::StorageModeShared,
+        )
+    }
+
+    /// Create a Metal buffer with f16 data converted from f32.
+    pub fn buffer_from_f32_as_f16(&self, data: &[f32]) -> Buffer {
+        let f16_data: Vec<u16> = data.iter().map(|&v| f32_to_f16(v)).collect();
+        let byte_len = (f16_data.len() * 2) as u64;
+        self.device.new_buffer_with_data(
+            f16_data.as_ptr() as *const _,
             byte_len,
             MTLResourceOptions::StorageModeShared,
         )
@@ -125,6 +139,22 @@ impl MetalContext {
         encoder.set_bytes(3, 4, &m as *const u32 as *const _);
         encoder.set_bytes(4, 4, &k as *const u32 as *const _);
         // One threadgroup per row, 32 threads per group (SIMD group)
+        let num_tgs = MTLSize::new(m as u64, 1, 1);
+        let tg_size = MTLSize::new(32, 1, 1);
+        encoder.dispatch_thread_groups(num_tgs, tg_size);
+    }
+
+    /// f16 weight matvec: W is half precision, x and y are f32.
+    pub fn encode_matvec_f16(
+        &self, encoder: &ComputeCommandEncoderRef,
+        w_buf: &Buffer, x_buf: &Buffer, y_buf: &Buffer, m: u32, k: u32,
+    ) {
+        encoder.set_compute_pipeline_state(&self.matvec_f16_pipeline);
+        encoder.set_buffer(0, Some(w_buf), 0);
+        encoder.set_buffer(1, Some(x_buf), 0);
+        encoder.set_buffer(2, Some(y_buf), 0);
+        encoder.set_bytes(3, 4, &m as *const u32 as *const _);
+        encoder.set_bytes(4, 4, &k as *const u32 as *const _);
         let num_tgs = MTLSize::new(m as u64, 1, 1);
         let tg_size = MTLSize::new(32, 1, 1);
         encoder.dispatch_thread_groups(num_tgs, tg_size);
@@ -440,5 +470,29 @@ impl MetalContext {
         encoder.end_encoding();
         cmd.commit();
         cmd.wait_until_completed();
+    }
+}
+
+
+/// Convert f32 to f16 (IEEE 754 half-precision).
+fn f32_to_f16(value: f32) -> u16 {
+    let bits = value.to_bits();
+    let sign = (bits >> 16) & 0x8000;
+    let exp = ((bits >> 23) & 0xFF) as i32 - 127 + 15;
+    let mant = (bits >> 13) & 0x3FF;
+
+    if exp <= 0 {
+        // Subnormal or zero
+        if exp < -10 {
+            sign as u16
+        } else {
+            let mant = (mant | 0x400) >> (1 - exp);
+            (sign | mant) as u16
+        }
+    } else if exp >= 31 {
+        // Overflow → infinity
+        (sign | 0x7C00) as u16
+    } else {
+        (sign | ((exp as u32) << 10) | mant) as u16
     }
 }
