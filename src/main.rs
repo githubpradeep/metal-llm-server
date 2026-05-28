@@ -101,11 +101,9 @@ fn generate_gpu(
     print!("{}", prompt);
     io::stdout().flush().unwrap();
 
-    // Prefill: process prompt tokens
-    let mut logits = Vec::new();
-    for &tok in &input_ids {
-        logits = model.forward_single_token(tok as usize);
-    }
+    // Batched prefill: process all prompt tokens at once
+    let token_ids: Vec<usize> = input_ids.iter().map(|&t| t as usize).collect();
+    let mut logits = model.forward_prefill(&token_ids);
 
     // Decode loop
     let start_time = Instant::now();

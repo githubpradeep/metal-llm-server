@@ -287,4 +287,149 @@ impl GpuLlamaModel {
     pub fn num_items(&self) -> usize {
         self.total_tokens
     }
+
+    /// Batched prefill: process all prompt tokens in one GPU submission per layer.
+    /// Much faster than processing one token at a time.
+    pub fn forward_prefill(&mut self, token_ids: &[usize]) -> Vec<f32> {
+        let seq_len = token_ids.len();
+        let hidden_size = self.config.hidden_size;
+        let head_dim = self.config.head_dim();
+        let num_heads = self.config.num_attention_heads;
+        let num_kv_heads = self.config.num_key_value_heads;
+        let num_kv_groups = (num_heads / num_kv_heads) as u32;
+        let intermediate_size = self.config.intermediate_size;
+        let vocab_size = self.config.vocab_size;
+        let eps = self.config.rms_norm_eps as f32;
+        let scale = 1.0 / (head_dim as f32).sqrt();
+        let half_dim = head_dim / 2;
+
+        // Embed all tokens
+        let mut embed_data = vec![0.0f32; seq_len * hidden_size];
+        for (i, &tid) in token_ids.iter().enumerate() {
+            let src = tid * hidden_size;
+            embed_data[i * hidden_size..(i + 1) * hidden_size]
+                .copy_from_slice(&self.embed_tokens[src..src + hidden_size]);
+        }
+
+        // Compute cos/sin for all positions
+        let mut cos_data = vec![0.0f32; seq_len * head_dim];
+        let mut sin_data = vec![0.0f32; seq_len * head_dim];
+        for s in 0..seq_len {
+            let pos = (self.total_tokens + s) as f32;
+            let offset = s * head_dim;
+            for (i, &freq) in self.inv_freq.iter().enumerate() {
+                let angle = pos * freq;
+                cos_data[offset + i] = angle.cos();
+                cos_data[offset + i + half_dim] = angle.cos();
+                sin_data[offset + i] = angle.sin();
+                sin_data[offset + i + half_dim] = angle.sin();
+            }
+        }
+
+        // Allocate prefill buffers
+        let hidden_buf = self.ctx.buffer_from_slice(&embed_data);
+        let cos_buf = self.ctx.buffer_from_slice(&cos_data);
+        let sin_buf = self.ctx.buffer_from_slice(&sin_data);
+        let normed_buf = self.ctx.buffer_empty(seq_len * hidden_size);
+        let residual_buf = self.ctx.buffer_empty(seq_len * hidden_size);
+        let q_buf = self.ctx.buffer_empty(seq_len * num_heads * head_dim);
+        let k_buf = self.ctx.buffer_empty(seq_len * num_kv_heads * head_dim);
+        let v_buf = self.ctx.buffer_empty(seq_len * num_kv_heads * head_dim);
+        let q_t_buf = self.ctx.buffer_empty(num_heads * seq_len * head_dim);
+        let k_t_buf = self.ctx.buffer_empty(num_kv_heads * seq_len * head_dim);
+        let v_t_buf = self.ctx.buffer_empty(num_kv_heads * seq_len * head_dim);
+        let attn_out_buf = self.ctx.buffer_empty(num_heads * seq_len * head_dim);
+        let attn_out_t_buf = self.ctx.buffer_empty(seq_len * num_heads * head_dim);
+        let o_out_buf = self.ctx.buffer_empty(seq_len * hidden_size);
+        let gate_buf = self.ctx.buffer_empty(seq_len * intermediate_size);
+        let up_buf = self.ctx.buffer_empty(seq_len * intermediate_size);
+        let silu_buf = self.ctx.buffer_empty(seq_len * intermediate_size);
+        let down_buf = self.ctx.buffer_empty(seq_len * hidden_size);
+
+        let total_hidden = (seq_len * hidden_size) as u32;
+        let sl = seq_len as u32;
+
+        // Single command buffer for entire prefill
+        let cmd = self.ctx.queue.new_command_buffer();
+        let encoder = cmd.new_compute_command_encoder();
+
+        for (layer_idx, layer) in self.layers.iter().enumerate() {
+            // Copy hidden → residual
+            self.ctx.encode_copy(encoder, &hidden_buf, &residual_buf, total_hidden);
+
+            // Batched RMS Norm
+            self.ctx.encode_rmsnorm_batch(encoder, &hidden_buf, &layer.input_ln_weight, &normed_buf, hidden_size as u32, eps, sl);
+
+            // Q, K, V: matmul (seq_len, hidden) × (out, hidden)^T → (seq_len, out)
+            self.ctx.encode_matmul(encoder, &normed_buf, &layer.q_proj, &q_buf, sl, (num_heads * head_dim) as u32, hidden_size as u32);
+            self.ctx.encode_matmul(encoder, &normed_buf, &layer.k_proj, &k_buf, sl, (num_kv_heads * head_dim) as u32, hidden_size as u32);
+            self.ctx.encode_matmul(encoder, &normed_buf, &layer.v_proj, &v_buf, sl, (num_kv_heads * head_dim) as u32, hidden_size as u32);
+
+            // Transpose Q: (seq, heads, hd) → (heads, seq, hd)
+            self.ctx.encode_transpose_shd(encoder, &q_buf, &q_t_buf, sl, num_heads as u32, head_dim as u32);
+            self.ctx.encode_transpose_shd(encoder, &k_buf, &k_t_buf, sl, num_kv_heads as u32, head_dim as u32);
+            self.ctx.encode_transpose_shd(encoder, &v_buf, &v_t_buf, sl, num_kv_heads as u32, head_dim as u32);
+
+            // Rotary (batched)
+            self.ctx.encode_rotary_batch(encoder, &q_t_buf, &k_t_buf, &cos_buf, &sin_buf, num_heads as u32, num_kv_heads as u32, head_dim as u32, sl);
+
+            // Append all K, V to cache
+            let kv_seq = self.kv_seq_lens[layer_idx];
+            self.ctx.encode_kv_batch_append(encoder, &k_t_buf, &self.k_cache[layer_idx], num_kv_heads as u32, head_dim as u32, self.kv_capacity, kv_seq, sl);
+            self.ctx.encode_kv_batch_append(encoder, &v_t_buf, &self.v_cache[layer_idx], num_kv_heads as u32, head_dim as u32, self.kv_capacity, kv_seq, sl);
+
+            // Causal attention
+            let attn_kv_seq = kv_seq + sl;
+            self.ctx.encode_attention_causal(encoder, &q_t_buf, &self.k_cache[layer_idx], &self.v_cache[layer_idx], &attn_out_buf,
+                num_heads as u32, num_kv_heads as u32, num_kv_groups,
+                head_dim as u32, attn_kv_seq, self.kv_capacity, scale, sl);
+
+            // Transpose back: (heads, seq, hd) → (seq, heads, hd)
+            self.ctx.encode_transpose_hsd(encoder, &attn_out_buf, &attn_out_t_buf, sl, num_heads as u32, head_dim as u32);
+
+            // O projection: (seq, hidden) × (hidden, hidden)^T
+            self.ctx.encode_matmul(encoder, &attn_out_t_buf, &layer.o_proj, &o_out_buf, sl, hidden_size as u32, (num_heads * head_dim) as u32);
+
+            // Residual add
+            self.ctx.encode_vec_add_batch(encoder, &residual_buf, &o_out_buf, &hidden_buf, total_hidden);
+
+            // Copy hidden → residual
+            self.ctx.encode_copy(encoder, &hidden_buf, &residual_buf, total_hidden);
+
+            // Post-attention norm
+            self.ctx.encode_rmsnorm_batch(encoder, &hidden_buf, &layer.post_ln_weight, &normed_buf, hidden_size as u32, eps, sl);
+
+            // MLP
+            self.ctx.encode_matmul(encoder, &normed_buf, &layer.gate_proj, &gate_buf, sl, intermediate_size as u32, hidden_size as u32);
+            self.ctx.encode_matmul(encoder, &normed_buf, &layer.up_proj, &up_buf, sl, intermediate_size as u32, hidden_size as u32);
+            self.ctx.encode_silu_mul_batch(encoder, &gate_buf, &up_buf, &silu_buf, (seq_len * intermediate_size) as u32);
+            self.ctx.encode_matmul(encoder, &silu_buf, &layer.down_proj, &down_buf, sl, hidden_size as u32, intermediate_size as u32);
+
+            // Residual add
+            self.ctx.encode_vec_add_batch(encoder, &residual_buf, &down_buf, &hidden_buf, total_hidden);
+        }
+
+        // Final norm (only last token needed for logits, but norm all for correctness)
+        self.ctx.encode_rmsnorm_batch(encoder, &hidden_buf, &self.final_norm_weight, &normed_buf, hidden_size as u32, eps, sl);
+
+        // LM head on last token only: extract last row, matvec
+        // For simplicity, compute logits for all tokens and take the last
+        let logits_buf = self.ctx.buffer_empty(seq_len * vocab_size);
+        self.ctx.encode_matmul(encoder, &normed_buf, &self.lm_head_weight, &logits_buf, sl, vocab_size as u32, hidden_size as u32);
+
+        encoder.end_encoding();
+        cmd.commit();
+        cmd.wait_until_completed();
+
+        // Update tracking
+        self.total_tokens += seq_len;
+        for seq in self.kv_seq_lens.iter_mut() {
+            *seq += sl;
+        }
+
+        // Read only the last token's logits
+        let all_logits = MetalContext::read_buffer(&logits_buf, seq_len * vocab_size);
+        let last_offset = (seq_len - 1) * vocab_size;
+        all_logits[last_offset..last_offset + vocab_size].to_vec()
+    }
 }

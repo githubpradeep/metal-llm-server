@@ -326,3 +326,296 @@ kernel void kv_cache_append(
     
     cache[dst_offset] = new_data[src_offset];
 }
+
+// ─── KV Cache Batch Append ───────────────────────────────────────────────────
+// Append seq_len tokens of K or V into the cache.
+// new_data layout: (num_kv_heads, seq_len, head_dim)
+// cache layout: (num_kv_heads, capacity, head_dim)
+
+kernel void kv_cache_batch_append(
+    device const float* new_data [[buffer(0)]],
+    device float* cache [[buffer(1)]],
+    constant uint& num_kv_heads [[buffer(2)]],
+    constant uint& head_dim [[buffer(3)]],
+    constant uint& capacity [[buffer(4)]],
+    constant uint& cur_seq [[buffer(5)]],
+    constant uint& seq_len [[buffer(6)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    uint total = num_kv_heads * seq_len * head_dim;
+    if (gid >= total) return;
+    
+    uint h = gid / (seq_len * head_dim);
+    uint remainder = gid % (seq_len * head_dim);
+    uint s = remainder / head_dim;
+    uint d = remainder % head_dim;
+    
+    uint src_offset = h * seq_len * head_dim + s * head_dim + d;
+    uint dst_offset = h * capacity * head_dim + (cur_seq + s) * head_dim + d;
+    
+    cache[dst_offset] = new_data[src_offset];
+}
+
+// ─── Batched RMS Norm ────────────────────────────────────────────────────────
+// Normalize each row of a (seq_len, dim) matrix independently.
+// One threadgroup per row.
+
+kernel void rmsnorm_batch(
+    device const float* x [[buffer(0)]],       // (seq_len * dim)
+    device const float* weight [[buffer(1)]],  // (dim)
+    device float* out [[buffer(2)]],           // (seq_len * dim)
+    constant uint& dim [[buffer(3)]],
+    constant float& eps [[buffer(4)]],
+    uint tid [[thread_index_in_threadgroup]],
+    uint tg_size [[threads_per_threadgroup]],
+    uint tgid [[threadgroup_position_in_grid]]
+) {
+    uint row = tgid;
+    uint row_offset = row * dim;
+    
+    threadgroup float shared_sum[256];
+    
+    float partial_sum = 0.0f;
+    for (uint i = tid; i < dim; i += tg_size) {
+        float val = x[row_offset + i];
+        partial_sum += val * val;
+    }
+    shared_sum[tid] = partial_sum;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    
+    for (uint stride = tg_size / 2; stride > 0; stride >>= 1) {
+        if (tid < stride) shared_sum[tid] += shared_sum[tid + stride];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    
+    float inv_rms = rsqrt(shared_sum[0] / float(dim) + eps);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    
+    for (uint i = tid; i < dim; i += tg_size) {
+        out[row_offset + i] = x[row_offset + i] * inv_rms * weight[i];
+    }
+}
+
+// ─── Batched SiLU * Up ──────────────────────────────────────────────────────
+
+kernel void silu_mul_batch(
+    device const float* gate [[buffer(0)]],  // (seq_len * intermediate)
+    device const float* up [[buffer(1)]],    // (seq_len * intermediate)
+    device float* out [[buffer(2)]],         // (seq_len * intermediate)
+    constant uint& n [[buffer(3)]],          // total elements = seq_len * intermediate
+    uint gid [[thread_position_in_grid]]
+) {
+    if (gid >= n) return;
+    float g = gate[gid];
+    out[gid] = (g / (1.0f + exp(-g))) * up[gid];
+}
+
+// ─── Batched Vec Add ─────────────────────────────────────────────────────────
+
+kernel void vec_add_batch(
+    device const float* a [[buffer(0)]],
+    device const float* b [[buffer(1)]],
+    device float* c [[buffer(2)]],
+    constant uint& n [[buffer(3)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    if (gid >= n) return;
+    c[gid] = a[gid] + b[gid];
+}
+
+// ─── Batched Rotary Embedding ────────────────────────────────────────────────
+// Apply rotary to Q: (num_heads, seq_len, head_dim) and K: (num_kv_heads, seq_len, head_dim)
+// cos/sin: (seq_len, head_dim)
+
+kernel void apply_rotary_batch(
+    device float* q [[buffer(0)]],
+    device float* k [[buffer(1)]],
+    device const float* cos_buf [[buffer(2)]],
+    device const float* sin_buf [[buffer(3)]],
+    constant uint& num_heads [[buffer(4)]],
+    constant uint& num_kv_heads [[buffer(5)]],
+    constant uint& head_dim [[buffer(6)]],
+    constant uint& seq_len [[buffer(7)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    uint half_dim = head_dim / 2;
+    uint total_q = num_heads * seq_len * half_dim;
+    uint total_k = num_kv_heads * seq_len * half_dim;
+    
+    if (gid < total_q) {
+        uint h = gid / (seq_len * half_dim);
+        uint remainder = gid % (seq_len * half_dim);
+        uint s = remainder / half_dim;
+        uint d = remainder % half_dim;
+        
+        uint base = (h * seq_len + s) * head_dim;
+        uint cs_offset = s * head_dim;
+        
+        float q1 = q[base + d];
+        float q2 = q[base + d + half_dim];
+        float c = cos_buf[cs_offset + d];
+        float sv = sin_buf[cs_offset + d];
+        q[base + d] = q1 * c - q2 * sv;
+        q[base + d + half_dim] = q2 * c + q1 * sv;
+    } else if (gid < total_q + total_k) {
+        uint idx = gid - total_q;
+        uint h = idx / (seq_len * half_dim);
+        uint remainder = idx % (seq_len * half_dim);
+        uint s = remainder / half_dim;
+        uint d = remainder % half_dim;
+        
+        uint base = (h * seq_len + s) * head_dim;
+        uint cs_offset = s * head_dim;
+        
+        float k1 = k[base + d];
+        float k2 = k[base + d + half_dim];
+        float c = cos_buf[cs_offset + d];
+        float sv = sin_buf[cs_offset + d];
+        k[base + d] = k1 * c - k2 * sv;
+        k[base + d + half_dim] = k2 * c + k1 * sv;
+    }
+}
+
+// ─── Causal Multi-Token Attention ────────────────────────────────────────────
+// Q: (num_heads, q_len, head_dim)
+// K_cache: (num_kv_heads, capacity, head_dim) — first kv_seq positions valid
+// V_cache: same layout
+// Output: (num_heads, q_len, head_dim)
+// One threadgroup per (head, query_position) pair.
+
+kernel void attention_causal(
+    device const float* Q [[buffer(0)]],
+    device const float* K_cache [[buffer(1)]],
+    device const float* V_cache [[buffer(2)]],
+    device float* output [[buffer(3)]],
+    constant uint& num_heads [[buffer(4)]],
+    constant uint& num_kv_heads [[buffer(5)]],
+    constant uint& num_kv_groups [[buffer(6)]],
+    constant uint& head_dim [[buffer(7)]],
+    constant uint& kv_seq [[buffer(8)]],
+    constant uint& k_cap [[buffer(9)]],
+    constant float& scale [[buffer(10)]],
+    constant uint& q_len [[buffer(11)]],
+    uint tid [[thread_index_in_threadgroup]],
+    uint tg_size [[threads_per_threadgroup]],
+    uint tgid [[threadgroup_position_in_grid]]
+) {
+    uint h = tgid / q_len;
+    uint qi = tgid % q_len;
+    if (h >= num_heads) return;
+    
+    uint kv_h = h / num_kv_groups;
+    uint q_offset = (h * q_len + qi) * head_dim;
+    uint k_head_base = kv_h * k_cap * head_dim;
+    uint v_head_base = kv_h * k_cap * head_dim;
+    
+    // Causal mask: this query at position qi can attend to positions 0..qi+1
+    // (since during prefill, kv_seq == q_len and positions are 0-indexed)
+    uint attend_len = qi + 1;
+    
+    threadgroup float scores[1024];
+    threadgroup float shared_max[256];
+    threadgroup float shared_sum[256];
+    
+    // Compute scores
+    float local_max = -INFINITY;
+    for (uint kv = tid; kv < attend_len; kv += tg_size) {
+        float dot = 0.0f;
+        uint k_offset = k_head_base + kv * head_dim;
+        for (uint d = 0; d < head_dim; d++) {
+            dot += Q[q_offset + d] * K_cache[k_offset + d];
+        }
+        float s = dot * scale;
+        scores[kv] = s;
+        local_max = max(local_max, s);
+    }
+    shared_max[tid] = local_max;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    
+    for (uint stride = tg_size / 2; stride > 0; stride >>= 1) {
+        if (tid < stride) shared_max[tid] = max(shared_max[tid], shared_max[tid + stride]);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    float max_score = shared_max[0];
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    
+    // Softmax
+    float local_sum = 0.0f;
+    for (uint kv = tid; kv < attend_len; kv += tg_size) {
+        float e = exp(scores[kv] - max_score);
+        scores[kv] = e;
+        local_sum += e;
+    }
+    shared_sum[tid] = local_sum;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    
+    for (uint stride = tg_size / 2; stride > 0; stride >>= 1) {
+        if (tid < stride) shared_sum[tid] += shared_sum[tid + stride];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    float inv_sum = 1.0f / shared_sum[0];
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    
+    for (uint kv = tid; kv < attend_len; kv += tg_size) {
+        scores[kv] *= inv_sum;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    
+    // Weighted sum of V
+    uint out_offset = (h * q_len + qi) * head_dim;
+    for (uint d = tid; d < head_dim; d += tg_size) {
+        float acc = 0.0f;
+        for (uint kv = 0; kv < attend_len; kv++) {
+            acc += scores[kv] * V_cache[v_head_base + kv * head_dim + d];
+        }
+        output[out_offset + d] = acc;
+    }
+}
+
+// ─── Transpose: (seq, heads, head_dim) → (heads, seq, head_dim) ─────────────
+
+kernel void transpose_shd_to_hsd(
+    device const float* input [[buffer(0)]],   // (seq_len, num_heads, head_dim)
+    device float* output [[buffer(1)]],        // (num_heads, seq_len, head_dim)
+    constant uint& seq_len [[buffer(2)]],
+    constant uint& num_heads [[buffer(3)]],
+    constant uint& head_dim [[buffer(4)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    uint total = seq_len * num_heads * head_dim;
+    if (gid >= total) return;
+    
+    // Input index: (s, h, d)
+    uint s = gid / (num_heads * head_dim);
+    uint remainder = gid % (num_heads * head_dim);
+    uint h = remainder / head_dim;
+    uint d = remainder % head_dim;
+    
+    // Output index: (h, s, d)
+    uint out_idx = (h * seq_len + s) * head_dim + d;
+    output[out_idx] = input[gid];
+}
+
+// ─── Transpose: (heads, seq, head_dim) → (seq, heads, head_dim) ─────────────
+
+kernel void transpose_hsd_to_shd(
+    device const float* input [[buffer(0)]],   // (num_heads, seq_len, head_dim)
+    device float* output [[buffer(1)]],        // (seq_len, num_heads, head_dim)
+    constant uint& seq_len [[buffer(2)]],
+    constant uint& num_heads [[buffer(3)]],
+    constant uint& head_dim [[buffer(4)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    uint total = seq_len * num_heads * head_dim;
+    if (gid >= total) return;
+    
+    // Input index: (h, s, d)
+    uint h = gid / (seq_len * head_dim);
+    uint remainder = gid % (seq_len * head_dim);
+    uint s = remainder / head_dim;
+    uint d = remainder % head_dim;
+    
+    // Output index: (s, h, d)
+    uint out_idx = (s * num_heads + h) * head_dim + d;
+    output[out_idx] = input[gid];
+}
