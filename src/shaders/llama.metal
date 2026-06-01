@@ -796,6 +796,46 @@ kernel void rmsnorm_per_head(
     }
 }
 
+// ─── Per-Head RMS Norm (no weight) ──────────────────────────────────────────
+// Same as above but without weight multiplication (for V norm in Gemma4).
+
+kernel void rmsnorm_per_head_noweight(
+    device const float* x [[buffer(0)]],
+    device float* out [[buffer(1)]],
+    constant uint& num_heads [[buffer(2)]],
+    constant uint& head_dim [[buffer(3)]],
+    constant float& eps [[buffer(4)]],
+    uint tid [[thread_index_in_threadgroup]],
+    uint tg_size [[threads_per_threadgroup]],
+    uint tgid [[threadgroup_position_in_grid]]
+) {
+    uint h = tgid;
+    if (h >= num_heads) return;
+    uint base = h * head_dim;
+
+    threadgroup float shared_sum[256];
+
+    float partial_sum = 0.0f;
+    for (uint i = tid; i < head_dim; i += tg_size) {
+        float val = x[base + i];
+        partial_sum += val * val;
+    }
+    shared_sum[tid] = partial_sum;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint stride = tg_size / 2; stride > 0; stride >>= 1) {
+        if (tid < stride) shared_sum[tid] += shared_sum[tid + stride];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    float inv_rms = rsqrt(shared_sum[0] / float(head_dim) + eps);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint i = tid; i < head_dim; i += tg_size) {
+        out[base + i] = x[base + i] * inv_rms;
+    }
+}
+
 // ─── Partial Rotary Position Embedding ───────────────────────────────────────
 // Apply rotary only to the first rotary_dim elements of each head.
 // The remaining elements are copied unchanged.

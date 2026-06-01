@@ -15,8 +15,10 @@ pub struct Gemma4GpuModel {
     pub ctx: MetalContext,
     pub config: Gemma4TextConfig,
 
-    // Embedding table (kept as bf16 for memory efficiency)
+    // Embedding table (Q4 quantized for memory efficiency)
     pub embed_tokens_f16: Vec<u16>,  // [vocab_size * hidden_size] as bf16 (~1.3GB)
+    // Per-layer embedding table (Q4 quantized, ~1.6GB)
+    pub embed_tokens_per_layer_f16: Vec<u16>,  // [vocab_size * num_layers * ple_dim] as bf16
 
     // LM head (tied to embed_tokens, stored as f16 Metal buffer for GPU matvec)
     pub lm_head_buf: Buffer,
@@ -162,9 +164,9 @@ impl Gemma4GpuModel {
         println!("  Loading embeddings (f16, memory-efficient)...");
 
         // embed_tokens: [262144, 2560] in bf16 = 1.34 GB (keep as u16 vec)
-        // embed_tokens_per_layer: SKIPPED for now (5.6 GB, too large)
-        // PLE will be disabled until we implement memory-mapped access
+        // embed_tokens_per_layer: [262144, 10752] in bf16 = 5.6 GB (keep as u16 vec)
         let mut embed_tokens_f16: Vec<u16> = Vec::new();
+        let mut embed_tokens_per_layer_f16: Vec<u16> = Vec::new();
         let mut final_norm_data: Vec<f32> = Vec::new();
         let mut per_layer_proj_norm_data: Vec<f32> = Vec::new();
 
@@ -185,6 +187,10 @@ impl Gemma4GpuModel {
                     embed_tokens_f16 = raw_to_u16(tensor_view.data());
                     println!("    embed_tokens: {:?} (kept as f16, {:.1} MB)",
                              tensor_view.shape(), embed_tokens_f16.len() * 2 / 1024 / 1024);
+                } else if clean_name == "embed_tokens_per_layer.weight" && embed_tokens_per_layer_f16.is_empty() {
+                    embed_tokens_per_layer_f16 = raw_to_u16(tensor_view.data());
+                    println!("    embed_tokens_per_layer: {:?} (kept as f16, {:.1} MB)",
+                             tensor_view.shape(), embed_tokens_per_layer_f16.len() * 2 / 1024 / 1024);
                 } else if clean_name == "model.norm.weight" || clean_name == "norm.weight" {
                     if final_norm_data.is_empty() {
                         final_norm_data = decode_tensor_to_f32(&tensor_view);
@@ -201,6 +207,7 @@ impl Gemma4GpuModel {
         }
 
         assert!(!embed_tokens_f16.is_empty(), "embed_tokens not found");
+        assert!(!embed_tokens_per_layer_f16.is_empty(), "embed_tokens_per_layer not found");
 
         // Create GPU buffer for lm_head (tied embeddings as f16)
         let lm_head_byte_len = (embed_tokens_f16.len() * 2) as u64;
@@ -353,6 +360,7 @@ impl Gemma4GpuModel {
             ctx,
             config,
             embed_tokens_f16,
+            embed_tokens_per_layer_f16,
             lm_head_buf,
             layers,
             final_norm_weight,
@@ -465,9 +473,8 @@ impl Gemma4GpuModel {
             let q_out = layer.q_out_dim;
             let kv_out = layer.kv_out_dim;
             let is_full = layer.is_full_attention;
-            // Use 1/sqrt(head_dim) scaling — QK norm normalizes magnitude but
-            // we still need dimensional scaling to prevent exp() overflow in softmax
-            let scale = 1.0 / (head_dim as f32).sqrt();
+            // Gemma4 uses attention_scale = 1.0 (QK norm handles scaling)
+            let scale = 1.0f32;
             let rotary_dim = rotary_dim_per_layer[layer_idx];
 
             // Write rotary data before encoding this layer's GPU work
@@ -476,8 +483,17 @@ impl Gemma4GpuModel {
 
             let encoder = cmd.new_compute_command_encoder();
 
-            // ─── PLE DISABLED (embed_tokens_per_layer too large for 16GB RAM) ───
-            // TODO: implement memory-mapped PLE access
+            // Write PLE embedding for this layer (decode from f16 on CPU)
+            let ple_total_dim = num_layers * ple_dim;
+            let ple_token_offset = token_id * ple_total_dim + layer_idx * ple_dim;
+            let mut ple_f32 = vec![0.0f32; ple_dim];
+            if ple_token_offset + ple_dim <= self.embed_tokens_per_layer_f16.len() {
+                let ple_scale = (ple_dim as f32).sqrt(); // scaled embedding
+                for i in 0..ple_dim {
+                    ple_f32[i] = bf16_to_f32(self.embed_tokens_per_layer_f16[ple_token_offset + i]) * ple_scale;
+                }
+            }
+            MetalContext::write_buffer(&self.ple_embed_buf, &ple_f32);
 
             // ─── Attention Block ───
             // Save residual
@@ -507,6 +523,11 @@ impl Gemma4GpuModel {
             self.ctx.encode_rmsnorm_per_head(encoder, &self.k_buf, &layer.k_norm_weight,
                 &self.k_normed_buf, num_kv_heads as u32, head_dim as u32, eps);
 
+            // V Norm: RMSNorm without weight (Gemma4 specific)
+            // Use gate_buf as temp to avoid in-place race on v_buf
+            self.ctx.encode_rmsnorm_per_head_noweight(encoder, &self.v_buf, &self.gate_buf,
+                num_kv_heads as u32, head_dim as u32, eps);
+
             // Apply rotary to Q and K
             if rotary_dim == head_dim {
                 self.ctx.encode_rotary(encoder, &self.q_normed_buf, &self.k_normed_buf,
@@ -517,10 +538,10 @@ impl Gemma4GpuModel {
                     head_dim as u32, rotary_dim as u32);
             }
 
-            // Append K, V to cache
+            // Append K (normed), V (normed, in gate_buf) to cache
             self.ctx.encode_kv_append(encoder, &self.k_normed_buf, &self.k_cache[layer_idx],
                 num_kv_heads as u32, head_dim as u32, self.kv_capacity, kv_seq);
-            self.ctx.encode_kv_append(encoder, &self.v_buf, &self.v_cache[layer_idx],
+            self.ctx.encode_kv_append(encoder, &self.gate_buf, &self.v_cache[layer_idx],
                 num_kv_heads as u32, head_dim as u32, self.kv_capacity, kv_seq);
 
             // Attention
@@ -585,6 +606,28 @@ impl Gemma4GpuModel {
 
             // Residual add: hidden = residual + normed_mlp_output
             self.ctx.encode_vec_add(encoder, &self.residual_buf, &self.normed_buf,
+                &self.hidden_buf, hidden_size as u32);
+
+            // ─── Per-Layer Embedding (PLE) — after MLP, before layer_scalar ───
+            // Save residual for PLE
+            self.ctx.encode_copy(encoder, &self.hidden_buf, &self.residual_buf, hidden_size as u32);
+            // Gate: ple_gated = per_layer_input_gate(hidden) → [ple_dim]
+            self.ctx.encode_matvec_q4(encoder, &layer.per_layer_input_gate_weight,
+                &self.hidden_buf, &self.ple_gated_buf, ple_dim as u32, hidden_size as u32);
+            // GeLU activation (PLE uses GeLU, not the model's hidden_activation)
+            // Reuse gelu_mul with up=ple_embed (element-wise multiply after gelu)
+            // gelu_mul does: out = gelu(gate) * up
+            self.ctx.encode_gelu_mul(encoder, &self.ple_gated_buf, &self.ple_embed_buf,
+                &self.ple_normed_buf, ple_dim as u32);
+            // Project back: ple_projected = per_layer_projection(ple_normed) → [hidden]
+            self.ctx.encode_matvec_q4(encoder, &layer.per_layer_projection_weight,
+                &self.ple_normed_buf, &self.ple_projected_buf, hidden_size as u32, ple_dim as u32);
+            // Post-PLE norm
+            self.ctx.encode_rmsnorm(encoder, &self.ple_projected_buf,
+                &layer.post_per_layer_input_norm_weight, &self.o_out_buf,
+                hidden_size as u32, eps);
+            // Residual: hidden = hidden + ple_output
+            self.ctx.encode_vec_add(encoder, &self.residual_buf, &self.o_out_buf,
                 &self.hidden_buf, hidden_size as u32);
 
             // Layer scalar: hidden *= layer_scalar (prevents signal growth across layers)
