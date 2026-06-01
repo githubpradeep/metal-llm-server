@@ -394,14 +394,15 @@ impl Gemma4GpuModel {
         let q_normed_buf = ctx.buffer_empty(max_q_out);
         let k_normed_buf = ctx.buffer_empty(max_kv_out);
 
-        // KV cache: cap at 1024 positions to fit in memory
+        // KV cache: f16 precision to halve memory bandwidth
         let kv_capacity = config.max_position_embeddings.min(1024) as u32;
         let mut k_cache = Vec::with_capacity(num_layers);
         let mut v_cache = Vec::with_capacity(num_layers);
         for i in 0..num_layers {
             let hd = config.layer_head_dim(i);
-            k_cache.push(ctx.buffer_empty(num_kv_heads * kv_capacity as usize * hd));
-            v_cache.push(ctx.buffer_empty(num_kv_heads * kv_capacity as usize * hd));
+            let byte_len = (num_kv_heads * kv_capacity as usize * hd * 2) as u64; // f16 = 2 bytes
+            k_cache.push(ctx.device.new_buffer(byte_len, MTLResourceOptions::StorageModeShared));
+            v_cache.push(ctx.device.new_buffer(byte_len, MTLResourceOptions::StorageModeShared));
         }
 
         // Rotary buffers (allocate for max head_dim)
@@ -670,10 +671,10 @@ impl Gemma4GpuModel {
                 self.ctx.encode_rmsnorm_per_head_noweight(encoder, &self.v_buf, &self.gate_buf,
                     num_kv_heads as u32, head_dim as u32, eps);
 
-                // Append to this layer's cache
-                self.ctx.encode_kv_append(encoder, &self.k_normed_buf, &self.k_cache[layer_idx],
+                // Append to this layer's cache (f16)
+                self.ctx.encode_kv_append_f16(encoder, &self.k_normed_buf, &self.k_cache[layer_idx],
                     num_kv_heads as u32, head_dim as u32, self.kv_capacity, kv_seq);
-                self.ctx.encode_kv_append(encoder, &self.gate_buf, &self.v_cache[layer_idx],
+                self.ctx.encode_kv_append_f16(encoder, &self.gate_buf, &self.v_cache[layer_idx],
                     num_kv_heads as u32, head_dim as u32, self.kv_capacity, kv_seq);
             }
 
@@ -694,7 +695,7 @@ impl Gemma4GpuModel {
                 0u32
             };
 
-            self.ctx.encode_attention_with_offset(encoder,
+            self.ctx.encode_attention_with_offset_f16(encoder,
                 &self.q_normed_buf, &self.k_cache[layer.kv_source_layer], &self.v_cache[layer.kv_source_layer],
                 &self.attn_out_buf,
                 num_heads as u32, num_kv_heads as u32, num_kv_groups,

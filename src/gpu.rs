@@ -21,6 +21,7 @@ pub struct MetalContext {
     pub vec_add_batch_pipeline: ComputePipelineState,
     pub buf_copy_pipeline: ComputePipelineState,
     pub kv_append_pipeline: ComputePipelineState,
+    pub kv_append_f16_pipeline: ComputePipelineState,
     pub kv_batch_append_pipeline: ComputePipelineState,
     pub transpose_shd_pipeline: ComputePipelineState,
     pub transpose_hsd_pipeline: ComputePipelineState,
@@ -31,6 +32,7 @@ pub struct MetalContext {
     pub rmsnorm_per_head_noweight_pipeline: ComputePipelineState,
     pub rotary_partial_pipeline: ComputePipelineState,
     pub attention_offset_pipeline: ComputePipelineState,
+    pub attention_offset_f16_pipeline: ComputePipelineState,
     pub vec_scale_pipeline: ComputePipelineState,
 }
 
@@ -73,6 +75,7 @@ impl MetalContext {
         let vec_add_batch_pipeline = get_fn("vec_add_batch");
         let buf_copy_pipeline = get_fn("buf_copy");
         let kv_append_pipeline = get_fn("kv_cache_append");
+        let kv_append_f16_pipeline = get_fn("kv_cache_append_f16");
         let kv_batch_append_pipeline = get_fn("kv_cache_batch_append");
         let transpose_shd_pipeline = get_fn("transpose_shd_to_hsd");
         let transpose_hsd_pipeline = get_fn("transpose_hsd_to_shd");
@@ -83,6 +86,7 @@ impl MetalContext {
         let rmsnorm_per_head_noweight_pipeline = get_fn("rmsnorm_per_head_noweight");
         let rotary_partial_pipeline = get_fn("apply_rotary_partial");
         let attention_offset_pipeline = get_fn("attention_single_token_offset");
+        let attention_offset_f16_pipeline = get_fn("attention_single_token_offset_f16");
         let vec_scale_pipeline = get_fn("vec_scale");
 
         MetalContext {
@@ -104,6 +108,7 @@ impl MetalContext {
             vec_add_batch_pipeline,
             buf_copy_pipeline,
             kv_append_pipeline,
+            kv_append_f16_pipeline,
             kv_batch_append_pipeline,
             transpose_shd_pipeline,
             transpose_hsd_pipeline,
@@ -114,6 +119,7 @@ impl MetalContext {
             rmsnorm_per_head_noweight_pipeline,
             rotary_partial_pipeline,
             attention_offset_pipeline,
+            attention_offset_f16_pipeline,
             vec_scale_pipeline,
         }
     }
@@ -268,6 +274,23 @@ impl MetalContext {
         encoder.dispatch_threads(threads, MTLSize::new(256, 1, 1));
     }
 
+    pub fn encode_kv_append_f16(
+        &self, encoder: &ComputeCommandEncoderRef,
+        new_data: &Buffer, cache: &Buffer,
+        num_kv_heads: u32, head_dim: u32, capacity: u32, cur_seq: u32,
+    ) {
+        let total = num_kv_heads * head_dim;
+        encoder.set_compute_pipeline_state(&self.kv_append_f16_pipeline);
+        encoder.set_buffer(0, Some(new_data), 0);
+        encoder.set_buffer(1, Some(cache), 0);
+        encoder.set_bytes(2, 4, &num_kv_heads as *const u32 as *const _);
+        encoder.set_bytes(3, 4, &head_dim as *const u32 as *const _);
+        encoder.set_bytes(4, 4, &capacity as *const u32 as *const _);
+        encoder.set_bytes(5, 4, &cur_seq as *const u32 as *const _);
+        let threads = MTLSize::new(total as u64, 1, 1);
+        encoder.dispatch_threads(threads, MTLSize::new(256, 1, 1));
+    }
+
     pub fn encode_attention(
         &self, encoder: &ComputeCommandEncoderRef,
         q_buf: &Buffer, k_cache_buf: &Buffer, v_cache_buf: &Buffer, out_buf: &Buffer,
@@ -409,6 +432,29 @@ impl MetalContext {
         head_dim: u32, kv_seq: u32, k_cap: u32, scale: f32, kv_start: u32,
     ) {
         encoder.set_compute_pipeline_state(&self.attention_offset_pipeline);
+        encoder.set_buffer(0, Some(q_buf), 0);
+        encoder.set_buffer(1, Some(k_cache_buf), 0);
+        encoder.set_buffer(2, Some(v_cache_buf), 0);
+        encoder.set_buffer(3, Some(out_buf), 0);
+        encoder.set_bytes(4, 4, &num_heads as *const u32 as *const _);
+        encoder.set_bytes(5, 4, &num_kv_heads as *const u32 as *const _);
+        encoder.set_bytes(6, 4, &num_kv_groups as *const u32 as *const _);
+        encoder.set_bytes(7, 4, &head_dim as *const u32 as *const _);
+        encoder.set_bytes(8, 4, &kv_seq as *const u32 as *const _);
+        encoder.set_bytes(9, 4, &k_cap as *const u32 as *const _);
+        encoder.set_bytes(10, 4, &scale as *const f32 as *const _);
+        encoder.set_bytes(11, 4, &kv_start as *const u32 as *const _);
+        let tg_size = MTLSize::new(64, 1, 1);
+        encoder.dispatch_thread_groups(MTLSize::new(num_heads as u64, 1, 1), tg_size);
+    }
+
+    pub fn encode_attention_with_offset_f16(
+        &self, encoder: &ComputeCommandEncoderRef,
+        q_buf: &Buffer, k_cache_buf: &Buffer, v_cache_buf: &Buffer, out_buf: &Buffer,
+        num_heads: u32, num_kv_heads: u32, num_kv_groups: u32,
+        head_dim: u32, kv_seq: u32, k_cap: u32, scale: f32, kv_start: u32,
+    ) {
+        encoder.set_compute_pipeline_state(&self.attention_offset_f16_pipeline);
         encoder.set_buffer(0, Some(q_buf), 0);
         encoder.set_buffer(1, Some(k_cache_buf), 0);
         encoder.set_buffer(2, Some(v_cache_buf), 0);
