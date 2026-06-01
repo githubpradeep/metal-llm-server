@@ -117,9 +117,28 @@ struct SafetensorsIndex {
 }
 
 impl Gemma4GpuModel {
-    /// Load model weights layer-by-layer to stay within 16GB RAM.
-    /// Each shard is loaded, relevant tensors extracted and quantized, then dropped.
+    /// Load model weights. Uses a Q4 cache file for fast subsequent loads.
+    /// First run: loads safetensors, quantizes, saves cache (~116s).
+    /// Subsequent runs: loads pre-quantized cache directly (~5-10s).
     pub fn new(model_dir: &str) -> Self {
+        let cache_path = Path::new(model_dir).join("model.q4cache");
+
+        if cache_path.exists() {
+            println!("  Found Q4 cache, loading pre-quantized weights...");
+            return Self::load_from_cache(model_dir, &cache_path);
+        }
+
+        println!("  No Q4 cache found, quantizing from safetensors (one-time)...");
+        let model = Self::load_from_safetensors(model_dir);
+
+        // Save cache for next time
+        println!("  Saving Q4 cache for fast future loads...");
+        model.save_cache(&cache_path);
+
+        model
+    }
+
+    fn load_from_safetensors(model_dir: &str) -> Self {
         let config_path = Path::new(model_dir).join("config.json");
         let config_str = fs::read_to_string(&config_path)
             .expect("Failed to read config.json");
@@ -463,6 +482,303 @@ impl Gemma4GpuModel {
             per_layer_cos_bufs,
             per_layer_sin_bufs,
             per_layer_ple_bufs,
+            total_tokens: 0,
+        }
+    }
+
+    /// Save all quantized weights to a binary cache file for fast loading.
+    fn save_cache(&self, path: &Path) {
+        use std::io::Write;
+        let mut file = fs::File::create(path).expect("Failed to create cache file");
+        let magic = b"GQ4C"; // Gemma Q4 Cache
+        file.write_all(magic).unwrap();
+
+        // Save embeddings (raw bf16)
+        let embed_bytes = unsafe {
+            std::slice::from_raw_parts(
+                self.embed_tokens_f16.as_ptr() as *const u8,
+                self.embed_tokens_f16.len() * 2,
+            )
+        };
+        let len = embed_bytes.len() as u64;
+        file.write_all(&len.to_le_bytes()).unwrap();
+        file.write_all(embed_bytes).unwrap();
+
+        // Save embed_tokens_per_layer (raw bf16)
+        let ple_bytes = unsafe {
+            std::slice::from_raw_parts(
+                self.embed_tokens_per_layer_f16.as_ptr() as *const u8,
+                self.embed_tokens_per_layer_f16.len() * 2,
+            )
+        };
+        let len = ple_bytes.len() as u64;
+        file.write_all(&len.to_le_bytes()).unwrap();
+        file.write_all(ple_bytes).unwrap();
+
+        // Save lm_head (Q4 on GPU)
+        let lm_head_len = self.lm_head_buf.length() as u64;
+        file.write_all(&lm_head_len.to_le_bytes()).unwrap();
+        let lm_head_bytes = unsafe {
+            std::slice::from_raw_parts(self.lm_head_buf.contents() as *const u8, lm_head_len as usize)
+        };
+        file.write_all(lm_head_bytes).unwrap();
+
+        // Save per_layer_model_projection (Q4 on GPU)
+        let proj_len = self.per_layer_model_projection_weight.length() as u64;
+        file.write_all(&proj_len.to_le_bytes()).unwrap();
+        let proj_bytes = unsafe {
+            std::slice::from_raw_parts(self.per_layer_model_projection_weight.contents() as *const u8, proj_len as usize)
+        };
+        file.write_all(proj_bytes).unwrap();
+
+        // Save norms
+        let norm_len = self.final_norm_weight.length() as u64;
+        file.write_all(&norm_len.to_le_bytes()).unwrap();
+        let norm_bytes = unsafe {
+            std::slice::from_raw_parts(self.final_norm_weight.contents() as *const u8, norm_len as usize)
+        };
+        file.write_all(norm_bytes).unwrap();
+
+        let pnorm_len = self.per_layer_projection_norm_weight.length() as u64;
+        file.write_all(&pnorm_len.to_le_bytes()).unwrap();
+        let pnorm_bytes = unsafe {
+            std::slice::from_raw_parts(self.per_layer_projection_norm_weight.contents() as *const u8, pnorm_len as usize)
+        };
+        file.write_all(pnorm_bytes).unwrap();
+
+        // Save per-layer weights
+        let num_layers = self.layers.len() as u32;
+        file.write_all(&num_layers.to_le_bytes()).unwrap();
+        for layer in &self.layers {
+            // Save all GPU buffers as raw bytes
+            let save_buf = |f: &mut fs::File, buf: &Buffer| {
+                let len = buf.length() as u64;
+                f.write_all(&len.to_le_bytes()).unwrap();
+                let bytes = unsafe { std::slice::from_raw_parts(buf.contents() as *const u8, len as usize) };
+                f.write_all(bytes).unwrap();
+            };
+            save_buf(&mut file, &layer.q_proj);
+            save_buf(&mut file, &layer.k_proj);
+            save_buf(&mut file, &layer.v_proj);
+            save_buf(&mut file, &layer.o_proj);
+            save_buf(&mut file, &layer.gate_proj);
+            save_buf(&mut file, &layer.up_proj);
+            save_buf(&mut file, &layer.down_proj);
+            save_buf(&mut file, &layer.input_layernorm_weight);
+            save_buf(&mut file, &layer.post_attention_layernorm_weight);
+            save_buf(&mut file, &layer.pre_feedforward_layernorm_weight);
+            save_buf(&mut file, &layer.post_feedforward_layernorm_weight);
+            save_buf(&mut file, &layer.post_per_layer_input_norm_weight);
+            save_buf(&mut file, &layer.per_layer_input_gate_weight);
+            save_buf(&mut file, &layer.per_layer_projection_weight);
+            save_buf(&mut file, &layer.q_norm_weight);
+            save_buf(&mut file, &layer.k_norm_weight);
+            file.write_all(&layer.layer_scalar.to_le_bytes()).unwrap();
+            file.write_all(&(layer.is_full_attention as u8).to_le_bytes()).unwrap();
+            file.write_all(&(layer.has_kv as u8).to_le_bytes()).unwrap();
+            file.write_all(&(layer.kv_source_layer as u32).to_le_bytes()).unwrap();
+            file.write_all(&(layer.head_dim as u32).to_le_bytes()).unwrap();
+            file.write_all(&(layer.q_out_dim as u32).to_le_bytes()).unwrap();
+            file.write_all(&(layer.kv_out_dim as u32).to_le_bytes()).unwrap();
+        }
+        println!("  Cache saved: {:.1} MB", file.metadata().map(|m| m.len()).unwrap_or(0) as f64 / 1024.0 / 1024.0);
+    }
+
+    /// Load model from pre-quantized cache file (fast path).
+    fn load_from_cache(model_dir: &str, cache_path: &Path) -> Self {
+        use std::io::Read;
+
+        let config_path = Path::new(model_dir).join("config.json");
+        let config_str = fs::read_to_string(&config_path).expect("Failed to read config.json");
+        let outer: serde_json::Value = serde_json::from_str(&config_str).expect("Failed to parse config.json");
+        let config: Gemma4TextConfig = if let Some(tc) = outer.get("text_config") {
+            serde_json::from_value(tc.clone()).expect("Failed to parse text_config")
+        } else {
+            serde_json::from_str(&config_str).expect("Failed to parse config")
+        };
+
+        let ctx = MetalContext::new();
+        let hidden_size = config.hidden_size;
+        let num_heads = config.num_attention_heads;
+        let num_kv_heads = config.num_key_value_heads;
+        let intermediate_size = config.intermediate_size;
+        let vocab_size = config.vocab_size;
+        let num_layers = config.num_hidden_layers;
+        let ple_dim = config.hidden_size_per_layer_input;
+        let max_head_dim = config.global_head_dim;
+        let max_q_out = num_heads * max_head_dim;
+        let max_kv_out = num_kv_heads * max_head_dim;
+
+        let mut file = fs::File::open(cache_path).expect("Failed to open cache");
+        let mut magic = [0u8; 4];
+        file.read_exact(&mut magic).unwrap();
+        assert_eq!(&magic, b"GQ4C", "Invalid cache magic");
+
+        let read_len = |f: &mut fs::File| -> u64 {
+            let mut buf = [0u8; 8];
+            f.read_exact(&mut buf).unwrap();
+            u64::from_le_bytes(buf)
+        };
+
+        let read_buf = |f: &mut fs::File, device: &Device| -> Buffer {
+            let len = read_len(f);
+            let mut data = vec![0u8; len as usize];
+            f.read_exact(&mut data).unwrap();
+            device.new_buffer_with_data(data.as_ptr() as *const _, len, MTLResourceOptions::StorageModeShared)
+        };
+
+        // Load embeddings
+        let embed_len = read_len(&mut file) as usize;
+        let mut embed_bytes = vec![0u8; embed_len];
+        file.read_exact(&mut embed_bytes).unwrap();
+        let embed_tokens_f16: Vec<u16> = embed_bytes.chunks_exact(2)
+            .map(|b| u16::from_le_bytes([b[0], b[1]]))
+            .collect();
+        println!("    embed_tokens: {:.1} MB", embed_len as f64 / 1024.0 / 1024.0);
+
+        // Load embed_tokens_per_layer
+        let ple_embed_len = read_len(&mut file) as usize;
+        let mut ple_bytes = vec![0u8; ple_embed_len];
+        file.read_exact(&mut ple_bytes).unwrap();
+        let embed_tokens_per_layer_f16: Vec<u16> = ple_bytes.chunks_exact(2)
+            .map(|b| u16::from_le_bytes([b[0], b[1]]))
+            .collect();
+        println!("    embed_tokens_per_layer: {:.1} MB", ple_embed_len as f64 / 1024.0 / 1024.0);
+
+        // Load lm_head, projection, norms
+        let lm_head_buf = read_buf(&mut file, &ctx.device);
+        let per_layer_model_projection_weight = read_buf(&mut file, &ctx.device);
+        let final_norm_weight = read_buf(&mut file, &ctx.device);
+        let per_layer_projection_norm_weight = read_buf(&mut file, &ctx.device);
+
+        // Load layers
+        let mut nl_buf = [0u8; 4];
+        file.read_exact(&mut nl_buf).unwrap();
+        let num_layers_in_cache = u32::from_le_bytes(nl_buf) as usize;
+        assert_eq!(num_layers_in_cache, num_layers);
+
+        let mut layers = Vec::with_capacity(num_layers);
+        for layer_idx in 0..num_layers {
+            let q_proj = read_buf(&mut file, &ctx.device);
+            let k_proj = read_buf(&mut file, &ctx.device);
+            let v_proj = read_buf(&mut file, &ctx.device);
+            let o_proj = read_buf(&mut file, &ctx.device);
+            let gate_proj = read_buf(&mut file, &ctx.device);
+            let up_proj = read_buf(&mut file, &ctx.device);
+            let down_proj = read_buf(&mut file, &ctx.device);
+            let input_layernorm_weight = read_buf(&mut file, &ctx.device);
+            let post_attention_layernorm_weight = read_buf(&mut file, &ctx.device);
+            let pre_feedforward_layernorm_weight = read_buf(&mut file, &ctx.device);
+            let post_feedforward_layernorm_weight = read_buf(&mut file, &ctx.device);
+            let post_per_layer_input_norm_weight = read_buf(&mut file, &ctx.device);
+            let per_layer_input_gate_weight = read_buf(&mut file, &ctx.device);
+            let per_layer_projection_weight = read_buf(&mut file, &ctx.device);
+            let q_norm_weight = read_buf(&mut file, &ctx.device);
+            let k_norm_weight = read_buf(&mut file, &ctx.device);
+
+            let mut scalar_buf = [0u8; 4];
+            file.read_exact(&mut scalar_buf).unwrap();
+            let layer_scalar = f32::from_le_bytes(scalar_buf);
+
+            let mut meta = [0u8; 1];
+            file.read_exact(&mut meta).unwrap();
+            let is_full_attention = meta[0] != 0;
+            file.read_exact(&mut meta).unwrap();
+            let has_kv = meta[0] != 0;
+
+            let mut u32_buf = [0u8; 4];
+            file.read_exact(&mut u32_buf).unwrap();
+            let kv_source_layer = u32::from_le_bytes(u32_buf) as usize;
+            file.read_exact(&mut u32_buf).unwrap();
+            let head_dim = u32::from_le_bytes(u32_buf) as usize;
+            file.read_exact(&mut u32_buf).unwrap();
+            let q_out_dim = u32::from_le_bytes(u32_buf) as usize;
+            file.read_exact(&mut u32_buf).unwrap();
+            let kv_out_dim = u32::from_le_bytes(u32_buf) as usize;
+
+            if (layer_idx + 1) % 10 == 0 || layer_idx == num_layers - 1 {
+                println!("    Loaded layer {}/{}", layer_idx + 1, num_layers);
+            }
+
+            layers.push(Gemma4GpuLayer {
+                q_proj, k_proj, v_proj, o_proj,
+                gate_proj, up_proj, down_proj,
+                input_layernorm_weight, post_attention_layernorm_weight,
+                pre_feedforward_layernorm_weight, post_feedforward_layernorm_weight,
+                post_per_layer_input_norm_weight,
+                per_layer_input_gate_weight, per_layer_projection_weight,
+                layer_scalar,
+                q_norm_weight, k_norm_weight,
+                is_full_attention, has_kv, kv_source_layer,
+                head_dim, q_out_dim, kv_out_dim,
+            });
+        }
+
+        // Allocate scratch buffers (same as load_from_safetensors)
+        let hidden_buf = ctx.buffer_empty(hidden_size);
+        let normed_buf = ctx.buffer_empty(hidden_size);
+        let residual_buf = ctx.buffer_empty(hidden_size);
+        let q_buf = ctx.buffer_empty(max_q_out);
+        let k_buf = ctx.buffer_empty(max_kv_out);
+        let v_buf = ctx.buffer_empty(max_kv_out);
+        let attn_out_buf = ctx.buffer_empty(max_q_out);
+        let o_out_buf = ctx.buffer_empty(hidden_size);
+        let gate_buf = ctx.buffer_empty(intermediate_size);
+        let up_buf = ctx.buffer_empty(intermediate_size);
+        let gelu_buf = ctx.buffer_empty(intermediate_size);
+        let down_buf = ctx.buffer_empty(hidden_size);
+        let logits_buf = ctx.buffer_empty(vocab_size);
+        let ple_embed_buf = ctx.buffer_empty(ple_dim);
+        let ple_gated_buf = ctx.buffer_empty(ple_dim);
+        let ple_normed_buf = ctx.buffer_empty(ple_dim);
+        let ple_projected_buf = ctx.buffer_empty(hidden_size);
+        let ple_context_proj_buf = ctx.buffer_empty(num_layers * ple_dim);
+        let ple_token_id_buf = ctx.buffer_empty(num_layers * ple_dim);
+        let ple_combined_buf = ctx.buffer_empty(num_layers * ple_dim);
+        let q_normed_buf = ctx.buffer_empty(max_q_out);
+        let k_normed_buf = ctx.buffer_empty(max_kv_out);
+
+        let kv_capacity = config.max_position_embeddings.min(1024) as u32;
+        let mut k_cache = Vec::with_capacity(num_layers);
+        let mut v_cache = Vec::with_capacity(num_layers);
+        for i in 0..num_layers {
+            let hd = config.layer_head_dim(i);
+            let byte_len = (num_kv_heads * kv_capacity as usize * hd * 2) as u64;
+            k_cache.push(ctx.device.new_buffer(byte_len, MTLResourceOptions::StorageModeShared));
+            v_cache.push(ctx.device.new_buffer(byte_len, MTLResourceOptions::StorageModeShared));
+        }
+
+        let cos_buf = ctx.buffer_empty(max_head_dim);
+        let sin_buf = ctx.buffer_empty(max_head_dim);
+
+        let mut per_layer_cos_bufs = Vec::with_capacity(num_layers);
+        let mut per_layer_sin_bufs = Vec::with_capacity(num_layers);
+        let mut per_layer_ple_bufs = Vec::with_capacity(num_layers);
+        for i in 0..num_layers {
+            let hd = config.layer_head_dim(i);
+            per_layer_cos_bufs.push(ctx.buffer_empty(hd));
+            per_layer_sin_bufs.push(ctx.buffer_empty(hd));
+            per_layer_ple_bufs.push(ctx.buffer_empty(ple_dim));
+        }
+
+        println!("  Loaded from Q4 cache successfully");
+
+        Gemma4GpuModel {
+            ctx, config,
+            embed_tokens_f16, embed_tokens_per_layer_f16,
+            lm_head_buf, layers,
+            final_norm_weight, per_layer_projection_norm_weight,
+            per_layer_model_projection_weight,
+            hidden_buf, normed_buf, residual_buf,
+            q_buf, k_buf, v_buf, attn_out_buf, o_out_buf,
+            gate_buf, up_buf, gelu_buf, down_buf, logits_buf,
+            ple_embed_buf, ple_gated_buf, ple_normed_buf, ple_projected_buf,
+            ple_context_proj_buf, ple_token_id_buf, ple_combined_buf,
+            q_normed_buf, k_normed_buf,
+            k_cache, v_cache,
+            kv_seq_len: 0, kv_capacity,
+            cos_buf, sin_buf,
+            per_layer_cos_bufs, per_layer_sin_bufs, per_layer_ple_bufs,
             total_tokens: 0,
         }
     }
