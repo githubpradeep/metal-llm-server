@@ -95,6 +95,8 @@ pub struct Gemma4GpuLayer {
 
     // Layer properties
     pub is_full_attention: bool,
+    pub has_kv: bool,           // false for shared KV layers (layers 24-41)
+    pub kv_source_layer: usize, // which layer's KV cache to use
     pub head_dim: usize,
     pub q_out_dim: usize,
     pub kv_out_dim: usize,
@@ -284,13 +286,13 @@ impl Gemma4GpuModel {
             let k_norm_data = layer_tensors.remove("self_attn.k_norm.weight").expect("k_norm missing");
 
             let layer = Gemma4GpuLayer {
-                q_proj: ctx.buffer_from_f32_as_q4(&q_proj_data, q_out, hidden_size),
-                k_proj: ctx.buffer_from_f32_as_q4(&k_proj_data, kv_out, hidden_size),
-                v_proj: ctx.buffer_from_f32_as_q4(&v_proj_data, kv_out, hidden_size),
-                o_proj: ctx.buffer_from_f32_as_q4(&o_proj_data, hidden_size, q_out),
-                gate_proj: ctx.buffer_from_f32_as_q4(&gate_proj_data, intermediate_size, hidden_size),
-                up_proj: ctx.buffer_from_f32_as_q4(&up_proj_data, intermediate_size, hidden_size),
-                down_proj: ctx.buffer_from_f32_as_q4(&down_proj_data, hidden_size, intermediate_size),
+                q_proj: ctx.buffer_from_f32_as_f16(&q_proj_data),
+                k_proj: ctx.buffer_from_f32_as_f16(&k_proj_data),
+                v_proj: ctx.buffer_from_f32_as_f16(&v_proj_data),
+                o_proj: ctx.buffer_from_f32_as_f16(&o_proj_data),
+                gate_proj: ctx.buffer_from_f32_as_f16(&gate_proj_data),
+                up_proj: ctx.buffer_from_f32_as_f16(&up_proj_data),
+                down_proj: ctx.buffer_from_f32_as_f16(&down_proj_data),
 
                 input_layernorm_weight: ctx.buffer_from_slice(&input_ln),
                 post_attention_layernorm_weight: ctx.buffer_from_slice(&post_attn_ln),
@@ -298,14 +300,16 @@ impl Gemma4GpuModel {
                 post_feedforward_layernorm_weight: ctx.buffer_from_slice(&post_ff_ln),
                 post_per_layer_input_norm_weight: ctx.buffer_from_slice(&post_ple_norm),
 
-                per_layer_input_gate_weight: ctx.buffer_from_f32_as_q4(&ple_gate_data, ple_dim, hidden_size),
-                per_layer_projection_weight: ctx.buffer_from_f32_as_q4(&ple_proj_data, hidden_size, ple_dim),
+                per_layer_input_gate_weight: ctx.buffer_from_f32_as_f16(&ple_gate_data),
+                per_layer_projection_weight: ctx.buffer_from_f32_as_f16(&ple_proj_data),
                 layer_scalar,
 
                 q_norm_weight: ctx.buffer_from_slice(&q_norm_data),
                 k_norm_weight: ctx.buffer_from_slice(&k_norm_data),
 
                 is_full_attention: is_full,
+                has_kv: layer_idx < (num_layers - config.num_kv_shared_layers),
+                kv_source_layer: 0, // will be computed below
                 head_dim,
                 q_out_dim: q_out,
                 kv_out_dim: kv_out,
@@ -314,6 +318,29 @@ impl Gemma4GpuModel {
             layers.push(layer);
             // layer_tensors dropped here, freeing memory
         }
+
+        // Compute kv_source_layer for shared layers
+        // For each shared layer, find the last non-shared layer of the same type
+        let first_kv_shared = num_layers - config.num_kv_shared_layers;
+        for i in first_kv_shared..num_layers {
+            let layer_type = &config.layer_types[i];
+            // Find the last non-shared layer with the same type
+            let mut source = 0;
+            for j in (0..first_kv_shared).rev() {
+                if &config.layer_types[j] == layer_type {
+                    source = j;
+                    break;
+                }
+            }
+            layers[i].kv_source_layer = source;
+        }
+        // Non-shared layers use their own index
+        for i in 0..first_kv_shared {
+            layers[i].kv_source_layer = i;
+        }
+
+        println!("  KV sharing: layers 0-{} have own KV, layers {}-{} share",
+                 first_kv_shared - 1, first_kv_shared, num_layers - 1);
 
         // Pre-allocate scratch buffers
         let hidden_buf = ctx.buffer_empty(hidden_size);
@@ -509,40 +536,53 @@ impl Gemma4GpuModel {
             self.ctx.encode_rmsnorm(encoder, &self.hidden_buf,
                 &layer.input_layernorm_weight, &self.normed_buf, hidden_size as u32, eps);
 
-            // Q, K, V projections
-            self.ctx.encode_matvec_q4(encoder, &layer.q_proj, &self.normed_buf,
+            // Q projection (always computed)
+            self.ctx.encode_matvec_f16(encoder, &layer.q_proj, &self.normed_buf,
                 &self.q_buf, q_out as u32, hidden_size as u32);
-            self.ctx.encode_matvec_q4(encoder, &layer.k_proj, &self.normed_buf,
-                &self.k_buf, kv_out as u32, hidden_size as u32);
-            self.ctx.encode_matvec_q4(encoder, &layer.v_proj, &self.normed_buf,
-                &self.v_buf, kv_out as u32, hidden_size as u32);
 
-            // QK Norm: apply RMSNorm per-head to Q and K
+            // QK Norm on Q
             self.ctx.encode_rmsnorm_per_head(encoder, &self.q_buf, &layer.q_norm_weight,
                 &self.q_normed_buf, num_heads as u32, head_dim as u32, eps);
-            self.ctx.encode_rmsnorm_per_head(encoder, &self.k_buf, &layer.k_norm_weight,
-                &self.k_normed_buf, num_kv_heads as u32, head_dim as u32, eps);
 
-            // V Norm: RMSNorm without weight (Gemma4 specific)
-            // Use gate_buf as temp to avoid in-place race on v_buf
-            self.ctx.encode_rmsnorm_per_head_noweight(encoder, &self.v_buf, &self.gate_buf,
-                num_kv_heads as u32, head_dim as u32, eps);
-
-            // Apply rotary to Q and K
+            // Apply rotary to Q
             if rotary_dim == head_dim {
                 self.ctx.encode_rotary(encoder, &self.q_normed_buf, &self.k_normed_buf,
-                    &self.cos_buf, &self.sin_buf, num_heads as u32, num_kv_heads as u32, head_dim as u32);
+                    &self.cos_buf, &self.sin_buf, num_heads as u32, 0, head_dim as u32);
             } else {
                 self.ctx.encode_rotary_partial(encoder, &self.q_normed_buf, &self.k_normed_buf,
-                    &self.cos_buf, &self.sin_buf, num_heads as u32, num_kv_heads as u32,
+                    &self.cos_buf, &self.sin_buf, num_heads as u32, 0,
                     head_dim as u32, rotary_dim as u32);
             }
 
-            // Append K (normed), V (normed, in gate_buf) to cache
-            self.ctx.encode_kv_append(encoder, &self.k_normed_buf, &self.k_cache[layer_idx],
-                num_kv_heads as u32, head_dim as u32, self.kv_capacity, kv_seq);
-            self.ctx.encode_kv_append(encoder, &self.gate_buf, &self.v_cache[layer_idx],
-                num_kv_heads as u32, head_dim as u32, self.kv_capacity, kv_seq);
+            // K, V only for non-shared layers
+            if layer.has_kv {
+                self.ctx.encode_matvec_f16(encoder, &layer.k_proj, &self.normed_buf,
+                    &self.k_buf, kv_out as u32, hidden_size as u32);
+                self.ctx.encode_matvec_f16(encoder, &layer.v_proj, &self.normed_buf,
+                    &self.v_buf, kv_out as u32, hidden_size as u32);
+
+                // K norm + rotary
+                self.ctx.encode_rmsnorm_per_head(encoder, &self.k_buf, &layer.k_norm_weight,
+                    &self.k_normed_buf, num_kv_heads as u32, head_dim as u32, eps);
+                if rotary_dim == head_dim {
+                    self.ctx.encode_rotary(encoder, &self.q_buf, &self.k_normed_buf,
+                        &self.cos_buf, &self.sin_buf, 0, num_kv_heads as u32, head_dim as u32);
+                } else {
+                    self.ctx.encode_rotary_partial(encoder, &self.q_buf, &self.k_normed_buf,
+                        &self.cos_buf, &self.sin_buf, 0, num_kv_heads as u32,
+                        head_dim as u32, rotary_dim as u32);
+                }
+
+                // V norm (no weight)
+                self.ctx.encode_rmsnorm_per_head_noweight(encoder, &self.v_buf, &self.gate_buf,
+                    num_kv_heads as u32, head_dim as u32, eps);
+
+                // Append to this layer's cache
+                self.ctx.encode_kv_append(encoder, &self.k_normed_buf, &self.k_cache[layer_idx],
+                    num_kv_heads as u32, head_dim as u32, self.kv_capacity, kv_seq);
+                self.ctx.encode_kv_append(encoder, &self.gate_buf, &self.v_cache[layer_idx],
+                    num_kv_heads as u32, head_dim as u32, self.kv_capacity, kv_seq);
+            }
 
             // Attention
             let attn_kv_seq = kv_seq + 1;
@@ -562,13 +602,13 @@ impl Gemma4GpuModel {
             };
 
             self.ctx.encode_attention_with_offset(encoder,
-                &self.q_normed_buf, &self.k_cache[layer_idx], &self.v_cache[layer_idx],
+                &self.q_normed_buf, &self.k_cache[layer.kv_source_layer], &self.v_cache[layer.kv_source_layer],
                 &self.attn_out_buf,
                 num_heads as u32, num_kv_heads as u32, num_kv_groups,
                 head_dim as u32, effective_kv_seq, self.kv_capacity, scale, kv_start);
 
             // O projection
-            self.ctx.encode_matvec_q4(encoder, &layer.o_proj, &self.attn_out_buf,
+            self.ctx.encode_matvec_f16(encoder, &layer.o_proj, &self.attn_out_buf,
                 &self.o_out_buf, hidden_size as u32, q_out as u32);
 
             // Post-attention norm (cannot be in-place, use normed_buf as temp)
@@ -590,13 +630,13 @@ impl Gemma4GpuModel {
                 hidden_size as u32, eps);
 
             // MLP: gate_proj, up_proj, GeLU activation, down_proj
-            self.ctx.encode_matvec_q4(encoder, &layer.gate_proj, &self.normed_buf,
+            self.ctx.encode_matvec_f16(encoder, &layer.gate_proj, &self.normed_buf,
                 &self.gate_buf, intermediate_size as u32, hidden_size as u32);
-            self.ctx.encode_matvec_q4(encoder, &layer.up_proj, &self.normed_buf,
+            self.ctx.encode_matvec_f16(encoder, &layer.up_proj, &self.normed_buf,
                 &self.up_buf, intermediate_size as u32, hidden_size as u32);
             self.ctx.encode_gelu_mul(encoder, &self.gate_buf, &self.up_buf,
                 &self.gelu_buf, intermediate_size as u32);
-            self.ctx.encode_matvec_q4(encoder, &layer.down_proj, &self.gelu_buf,
+            self.ctx.encode_matvec_f16(encoder, &layer.down_proj, &self.gelu_buf,
                 &self.down_buf, hidden_size as u32, intermediate_size as u32);
 
             // Post-feedforward norm (cannot be in-place, use normed_buf as temp)
@@ -612,7 +652,7 @@ impl Gemma4GpuModel {
             // Save residual for PLE
             self.ctx.encode_copy(encoder, &self.hidden_buf, &self.residual_buf, hidden_size as u32);
             // Gate: ple_gated = per_layer_input_gate(hidden) → [ple_dim]
-            self.ctx.encode_matvec_q4(encoder, &layer.per_layer_input_gate_weight,
+            self.ctx.encode_matvec_f16(encoder, &layer.per_layer_input_gate_weight,
                 &self.hidden_buf, &self.ple_gated_buf, ple_dim as u32, hidden_size as u32);
             // GeLU activation (PLE uses GeLU, not the model's hidden_activation)
             // Reuse gelu_mul with up=ple_embed (element-wise multiply after gelu)
@@ -620,7 +660,7 @@ impl Gemma4GpuModel {
             self.ctx.encode_gelu_mul(encoder, &self.ple_gated_buf, &self.ple_embed_buf,
                 &self.ple_normed_buf, ple_dim as u32);
             // Project back: ple_projected = per_layer_projection(ple_normed) → [hidden]
-            self.ctx.encode_matvec_q4(encoder, &layer.per_layer_projection_weight,
+            self.ctx.encode_matvec_f16(encoder, &layer.per_layer_projection_weight,
                 &self.ple_normed_buf, &self.ple_projected_buf, hidden_size as u32, ple_dim as u32);
             // Post-PLE norm
             self.ctx.encode_rmsnorm(encoder, &self.ple_projected_buf,
