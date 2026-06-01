@@ -57,7 +57,7 @@ fn main() {
 
             let gen_start = Instant::now();
             generate_gemma4_gpu(
-                "Once upon a time",
+                "<start_of_turn>user\nWrite a short story that begins with: Once upon a time<end_of_turn>\n<start_of_turn>model\n",
                 &tokenizer,
                 &mut gpu_model,
                 200,

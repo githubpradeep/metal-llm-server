@@ -706,6 +706,8 @@ kernel void gelu_mul(
     float x = gate[gid];
     // sqrt(2/pi) ≈ 0.7978845608
     float inner = 0.7978845608f * (x + 0.044715f * x * x * x);
+    // Clamp to prevent tanh overflow (tanh saturates at ±1 for |x| > ~10)
+    inner = clamp(inner, -10.0f, 10.0f);
     float gelu = 0.5f * x * (1.0f + tanh(inner));
     out[gid] = gelu * up[gid];
 }

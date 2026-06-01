@@ -655,7 +655,7 @@ impl MetalContext {
 
 
 /// Convert f32 to f16 (IEEE 754 half-precision).
-fn f32_to_f16(value: f32) -> u16 {
+pub fn f32_to_f16(value: f32) -> u16 {
     let bits = value.to_bits();
     let sign = (bits >> 16) & 0x8000;
     let exp = ((bits >> 23) & 0xFF) as i32 - 127 + 15;

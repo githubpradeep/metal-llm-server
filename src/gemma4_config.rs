@@ -48,7 +48,11 @@ pub struct RopeConfig {
     pub rope_type: String,
     #[serde(default = "default_partial_rotary")]
     pub partial_rotary_factor: f64,
+    #[serde(default = "default_rope_factor")]
+    pub factor: f64,
 }
+
+fn default_rope_factor() -> f64 { 1.0 }
 
 fn default_global_head_dim() -> usize { 512 }
 fn default_hidden_size_per_layer() -> usize { 256 }
@@ -90,5 +94,17 @@ impl Gemma4TextConfig {
         self.rope_parameters.as_ref()
             .and_then(|r| r.full_attention.as_ref())
             .map_or(0.25, |c| c.partial_rotary_factor)
+    }
+
+    pub fn full_rope_factor(&self) -> f64 {
+        self.rope_parameters.as_ref()
+            .and_then(|r| r.full_attention.as_ref())
+            .map_or(1.0, |c| c.factor)
+    }
+
+    pub fn sliding_rope_factor(&self) -> f64 {
+        self.rope_parameters.as_ref()
+            .and_then(|r| r.sliding_attention.as_ref())
+            .map_or(1.0, |c| c.factor)
     }
 }

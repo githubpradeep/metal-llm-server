@@ -7,7 +7,7 @@ use safetensors::SafeTensors;
 use serde::Deserialize;
 
 use crate::gemma4_config::Gemma4TextConfig;
-use crate::gpu::MetalContext;
+use crate::gpu::{MetalContext, f32_to_f16};
 
 /// Gemma 4 E4B GPU-resident model with persistent KV cache on Metal.
 /// All operations for one token are encoded into a SINGLE command buffer.
@@ -29,6 +29,7 @@ pub struct Gemma4GpuModel {
     // Shared weights
     pub final_norm_weight: Buffer,
     pub per_layer_projection_norm_weight: Buffer,
+    pub per_layer_model_projection_weight: Buffer, // [num_layers * ple_dim, hidden_size] f16
 
     // Pre-allocated scratch buffers (reused every token)
     pub hidden_buf: Buffer,
@@ -50,6 +51,8 @@ pub struct Gemma4GpuModel {
     pub ple_gated_buf: Buffer,    // [ple_dim]
     pub ple_normed_buf: Buffer,   // [ple_dim]
     pub ple_projected_buf: Buffer, // [hidden_size]
+    pub ple_context_proj_buf: Buffer, // [num_layers * ple_dim] for context projection
+    pub ple_combined_buf: Buffer,     // [ple_dim] combined token + context
 
     // QK norm scratch
     pub q_normed_buf: Buffer,
@@ -171,6 +174,7 @@ impl Gemma4GpuModel {
         let mut embed_tokens_per_layer_f16: Vec<u16> = Vec::new();
         let mut final_norm_data: Vec<f32> = Vec::new();
         let mut per_layer_proj_norm_data: Vec<f32> = Vec::new();
+        let mut per_layer_model_proj_data: Vec<f32> = Vec::new();
 
         // Load global weights from shards — use memory mapping to avoid loading entire file
         for shard_file in &shard_files {
@@ -203,6 +207,13 @@ impl Gemma4GpuModel {
                     if per_layer_proj_norm_data.is_empty() {
                         per_layer_proj_norm_data = decode_tensor_to_f32(&tensor_view);
                     }
+                } else if clean_name == "model.per_layer_model_projection.weight"
+                    || clean_name == "per_layer_model_projection.weight"
+                {
+                    if per_layer_model_proj_data.is_empty() {
+                        per_layer_model_proj_data = decode_tensor_to_f32(&tensor_view);
+                        println!("    per_layer_model_projection: {:?}", tensor_view.shape());
+                    }
                 }
             }
             // mmap dropped here
@@ -211,17 +222,29 @@ impl Gemma4GpuModel {
         assert!(!embed_tokens_f16.is_empty(), "embed_tokens not found");
         assert!(!embed_tokens_per_layer_f16.is_empty(), "embed_tokens_per_layer not found");
 
-        // Create GPU buffer for lm_head (tied embeddings as f16)
-        let lm_head_byte_len = (embed_tokens_f16.len() * 2) as u64;
+        // Create GPU buffer for lm_head (tied embeddings — convert bf16 → f16 for GPU kernel)
+        // The embed_tokens are stored as bf16 in safetensors, but our matvec_f16 kernel
+        // expects IEEE f16 (half). Convert bf16 → f32 → f16.
+        let lm_head_f16: Vec<u16> = embed_tokens_f16.iter()
+            .map(|&bits| f32_to_f16(bf16_to_f32(bits)))
+            .collect();
+        let lm_head_byte_len = (lm_head_f16.len() * 2) as u64;
         let lm_head_buf = ctx.device.new_buffer_with_data(
-            embed_tokens_f16.as_ptr() as *const _,
+            lm_head_f16.as_ptr() as *const _,
             lm_head_byte_len,
             MTLResourceOptions::StorageModeShared,
         );
-        println!("    lm_head (tied, f16 on GPU): {:.1} MB", lm_head_byte_len as f64 / 1024.0 / 1024.0);
+        println!("    lm_head (tied, bf16→f16 on GPU): {:.1} MB", lm_head_byte_len as f64 / 1024.0 / 1024.0);
 
         let final_norm_weight = ctx.buffer_from_slice(&final_norm_data);
         let per_layer_projection_norm_weight = ctx.buffer_from_slice(&per_layer_proj_norm_data);
+        let per_layer_model_projection_weight = if !per_layer_model_proj_data.is_empty() {
+            ctx.buffer_from_f32_as_f16(&per_layer_model_proj_data)
+        } else {
+            // Fallback: create empty buffer (shouldn't happen for E4B)
+            println!("  WARNING: per_layer_model_projection not found, PLE context projection disabled");
+            ctx.buffer_empty(1)
+        };
 
         // Load all layers
         let num_layers_to_load = num_layers;
@@ -362,6 +385,8 @@ impl Gemma4GpuModel {
         let ple_gated_buf = ctx.buffer_empty(ple_dim);
         let ple_normed_buf = ctx.buffer_empty(ple_dim);
         let ple_projected_buf = ctx.buffer_empty(hidden_size);
+        let ple_context_proj_buf = ctx.buffer_empty(num_layers * ple_dim);
+        let ple_combined_buf = ctx.buffer_empty(ple_dim);
 
         // QK norm scratch (max head_dim per head)
         let q_normed_buf = ctx.buffer_empty(max_q_out);
@@ -392,6 +417,7 @@ impl Gemma4GpuModel {
             layers,
             final_norm_weight,
             per_layer_projection_norm_weight,
+            per_layer_model_projection_weight,
             hidden_buf,
             normed_buf,
             residual_buf,
@@ -409,6 +435,8 @@ impl Gemma4GpuModel {
             ple_gated_buf,
             ple_normed_buf,
             ple_projected_buf,
+            ple_context_proj_buf,
+            ple_combined_buf,
             q_normed_buf,
             k_normed_buf,
             k_cache,
@@ -421,7 +449,7 @@ impl Gemma4GpuModel {
         }
     }
 
-    /// Forward one token through the entire model. ALL GPU work in a SINGLE command buffer.
+    /// Forward one token through the entire model. One command buffer per layer.
     pub fn forward_single_token(&mut self, token_id: usize) -> Vec<f32> {
         let hidden_size = self.config.hidden_size;
         let num_heads = self.config.num_attention_heads;
@@ -445,11 +473,82 @@ impl Gemma4GpuModel {
 
         let kv_seq = self.kv_seq_len;
 
+        // ─── PLE: Compute per-layer inputs (token identity + context projection) ───
+        // Reference: Gemma4TextModel.get_per_layer_inputs() + project_per_layer_inputs()
+        //
+        // 1. Token identity: embed_tokens_per_layer(token_id) * sqrt(ple_dim)
+        //    → [num_layers * ple_dim], then reshape to [num_layers, ple_dim]
+        // 2. Context projection: per_layer_model_projection(embed) * (1/sqrt(hidden_size))
+        //    → [num_layers * ple_dim], then per_layer_projection_norm per layer
+        // 3. Combined: (context_proj + token_identity) * (1/sqrt(2))
+        let ple_total_dim = num_layers * ple_dim;
+        let ple_input_scale = std::f32::consts::FRAC_1_SQRT_2; // 1/sqrt(2) = 2^(-0.5)
+        let context_proj_scale = 1.0 / (hidden_size as f32).sqrt();
+
+        // Step 1: Token identity from embed_tokens_per_layer (CPU, decode bf16)
+        let ple_token_offset = token_id * ple_total_dim;
+        let ple_scale = (ple_dim as f32).sqrt();
+        let mut ple_token_identity = vec![0.0f32; ple_total_dim];
+        if ple_token_offset + ple_total_dim <= self.embed_tokens_per_layer_f16.len() {
+            for i in 0..ple_total_dim {
+                ple_token_identity[i] = bf16_to_f32(self.embed_tokens_per_layer_f16[ple_token_offset + i]) * ple_scale;
+            }
+        }
+
+        // Step 2: Context projection (CPU matvec: per_layer_model_projection is [num_layers*ple_dim, hidden_size])
+        // context_proj = W @ embed * (1/sqrt(hidden_size))
+        let per_layer_model_proj_len = ple_total_dim * hidden_size;
+        let mut ple_context_proj = vec![0.0f32; ple_total_dim];
+        if self.per_layer_model_projection_weight.length() as usize >= per_layer_model_proj_len * 2 {
+            // Weight is stored as f16 on GPU, read it back for CPU computation
+            let proj_f16: &[u16] = unsafe {
+                std::slice::from_raw_parts(
+                    self.per_layer_model_projection_weight.contents() as *const u16,
+                    per_layer_model_proj_len,
+                )
+            };
+            // matvec: out[i] = sum_j(W[i,j] * embed[j]) * context_proj_scale
+            for i in 0..ple_total_dim {
+                let mut acc = 0.0f32;
+                let row_offset = i * hidden_size;
+                for j in 0..hidden_size {
+                    let w = half_to_f32(proj_f16[row_offset + j]);
+                    acc += w * embed_f32[j];
+                }
+                ple_context_proj[i] = acc * context_proj_scale;
+            }
+
+            // Step 2b: Apply per_layer_projection_norm (RMSNorm per layer slice)
+            let norm_weight: Vec<f32> = {
+                let ptr = self.per_layer_projection_norm_weight.contents() as *const f32;
+                let len = ple_dim;
+                unsafe { std::slice::from_raw_parts(ptr, len) }.to_vec()
+            };
+            for layer_idx in 0..num_layers {
+                let offset = layer_idx * ple_dim;
+                let slice = &mut ple_context_proj[offset..offset + ple_dim];
+                // RMSNorm: x / sqrt(mean(x^2) + eps) * weight
+                let mut sum_sq = 0.0f32;
+                for &v in slice.iter() {
+                    sum_sq += v * v;
+                }
+                let rms = (sum_sq / ple_dim as f32 + eps).sqrt();
+                for (i, v) in slice.iter_mut().enumerate() {
+                    *v = (*v / rms) * norm_weight[i];
+                }
+            }
+        }
+
+        // Step 3: Combine token identity + context projection, scaled by 1/sqrt(2)
+        let mut ple_combined_all = vec![0.0f32; ple_total_dim];
+        for i in 0..ple_total_dim {
+            ple_combined_all[i] = (ple_context_proj[i] + ple_token_identity[i]) * ple_input_scale;
+        }
+
         // Precompute all rotary cos/sin per layer (CPU, trivial)
         let pos = self.total_tokens as f32;
         let mut rotary_cos_per_layer: Vec<Vec<f32>> = Vec::with_capacity(self.layers.len());
         let mut rotary_sin_per_layer: Vec<Vec<f32>> = Vec::with_capacity(self.layers.len());
-        let mut rotary_dim_per_layer: Vec<usize> = Vec::with_capacity(self.layers.len());
 
         for layer_idx in 0..self.layers.len() {
             let layer = &self.layers[layer_idx];
@@ -462,37 +561,77 @@ impl Gemma4GpuModel {
                 self.config.sliding_rope_theta()
             };
 
+            let rope_factor = if is_full {
+                self.config.full_rope_factor()
+            } else {
+                self.config.sliding_rope_factor()
+            };
+
             let rotary_dim = if is_full {
                 (head_dim as f64 * self.config.full_partial_rotary_factor()) as usize
             } else {
                 head_dim
             };
 
-            let half_rot = rotary_dim / 2;
+            // Proportional RoPE: compute rope_angles frequencies using head_dim as denominator
+            // then pad with zeros for non-rotary dimensions.
+            // Reference: _compute_proportional_rope_parameters in modeling_rope_utils.py
+            let rope_angles = rotary_dim / 2; // = partial_rotary_factor * head_dim / 2
+            let half_dim = head_dim / 2;
             let mut cos_data = vec![0.0f32; head_dim];
             let mut sin_data = vec![0.0f32; head_dim];
-            for i in 0..half_rot {
-                let freq = 1.0 / (rope_theta.powf(i as f64 * 2.0 / rotary_dim as f64) as f32);
-                let angle = pos * freq;
+            for i in 0..rope_angles {
+                // inv_freq = 1 / (theta ^ (2i / head_dim)) / factor
+                let inv_freq = 1.0 / (rope_theta.powf(i as f64 * 2.0 / head_dim as f64) as f32) / rope_factor as f32;
+                let angle = pos * inv_freq;
                 cos_data[i] = angle.cos();
-                cos_data[i + half_rot] = angle.cos();
+                cos_data[i + half_dim] = angle.cos();
                 sin_data[i] = angle.sin();
-                sin_data[i + half_rot] = angle.sin();
+                sin_data[i + half_dim] = angle.sin();
             }
-            if rotary_dim < head_dim {
-                for i in rotary_dim..head_dim {
-                    cos_data[i] = 1.0;
-                }
+            // Non-rotary angles (nope_angles) remain 0 in inv_freq → cos=1, sin=0
+            // cos_data[rope_angles..half_dim] and cos_data[half_dim+rope_angles..head_dim] stay 0
+            // But for the rotary kernel, we need cos=1 for pass-through dimensions
+            for i in rope_angles..half_dim {
+                cos_data[i] = 1.0;
+                cos_data[i + half_dim] = 1.0;
+                // sin stays 0.0 (already initialized)
             }
 
             rotary_cos_per_layer.push(cos_data);
             rotary_sin_per_layer.push(sin_data);
-            rotary_dim_per_layer.push(rotary_dim);
         }
 
-        // ═══ ONE COMMAND BUFFER, ONE ENCODER PER LAYER ═══
-        let cmd = self.ctx.queue.new_command_buffer();
+        // ═══ ENCODE ALL LAYERS INTO A SINGLE COMMAND BUFFER ═══
+        // Pre-allocate per-layer GPU buffers for cos/sin/ple (small, ~2KB each)
         let actual_num_layers = self.layers.len();
+        let mut cos_bufs: Vec<Buffer> = Vec::with_capacity(actual_num_layers);
+        let mut sin_bufs: Vec<Buffer> = Vec::with_capacity(actual_num_layers);
+        let mut ple_bufs: Vec<Buffer> = Vec::with_capacity(actual_num_layers);
+        for layer_idx in 0..actual_num_layers {
+            let cos_buf = self.ctx.device.new_buffer_with_data(
+                rotary_cos_per_layer[layer_idx].as_ptr() as *const _,
+                (rotary_cos_per_layer[layer_idx].len() * 4) as u64,
+                MTLResourceOptions::StorageModeShared,
+            );
+            let sin_buf = self.ctx.device.new_buffer_with_data(
+                rotary_sin_per_layer[layer_idx].as_ptr() as *const _,
+                (rotary_sin_per_layer[layer_idx].len() * 4) as u64,
+                MTLResourceOptions::StorageModeShared,
+            );
+            let ple_layer_offset = layer_idx * ple_dim;
+            let ple_slice = &ple_combined_all[ple_layer_offset..ple_layer_offset + ple_dim];
+            let ple_buf = self.ctx.device.new_buffer_with_data(
+                ple_slice.as_ptr() as *const _,
+                (ple_dim * 4) as u64,
+                MTLResourceOptions::StorageModeShared,
+            );
+            cos_bufs.push(cos_buf);
+            sin_bufs.push(sin_buf);
+            ple_bufs.push(ple_buf);
+        }
+
+        let cmd = self.ctx.queue.new_command_buffer();
 
         for layer_idx in 0..actual_num_layers {
             let layer = &self.layers[layer_idx];
@@ -502,33 +641,10 @@ impl Gemma4GpuModel {
             let is_full = layer.is_full_attention;
             // Gemma4 uses attention_scale = 1.0 (QK norm handles scaling)
             let scale = 1.0f32;
-            let rotary_dim = rotary_dim_per_layer[layer_idx];
-
-            // Write rotary data before encoding this layer's GPU work
-            MetalContext::write_buffer(&self.cos_buf, &rotary_cos_per_layer[layer_idx]);
-            MetalContext::write_buffer(&self.sin_buf, &rotary_sin_per_layer[layer_idx]);
 
             let encoder = cmd.new_compute_command_encoder();
 
-            // Write PLE embedding for this layer (decode from f16 on CPU)
-            let ple_total_dim = num_layers * ple_dim;
-            let ple_token_offset = token_id * ple_total_dim + layer_idx * ple_dim;
-            let mut ple_f32 = vec![0.0f32; ple_dim];
-            if ple_token_offset + ple_dim <= self.embed_tokens_per_layer_f16.len() {
-                let ple_scale = (ple_dim as f32).sqrt(); // scaled embedding
-                for i in 0..ple_dim {
-                    ple_f32[i] = bf16_to_f32(self.embed_tokens_per_layer_f16[ple_token_offset + i]) * ple_scale;
-                }
-            }
-            MetalContext::write_buffer(&self.ple_embed_buf, &ple_f32);
-
             // ─── Attention Block ───
-            // Save residual
-            self.ctx.encode_copy(encoder, &self.hidden_buf, &self.residual_buf, hidden_size as u32);
-
-            // Pre-attention norm
-            self.ctx.encode_rmsnorm(encoder, &self.hidden_buf,
-                &layer.input_layernorm_weight, &self.normed_buf, hidden_size as u32, eps);
             // Save residual
             self.ctx.encode_copy(encoder, &self.hidden_buf, &self.residual_buf, hidden_size as u32);
 
@@ -544,15 +660,9 @@ impl Gemma4GpuModel {
             self.ctx.encode_rmsnorm_per_head(encoder, &self.q_buf, &layer.q_norm_weight,
                 &self.q_normed_buf, num_heads as u32, head_dim as u32, eps);
 
-            // Apply rotary to Q
-            if rotary_dim == head_dim {
-                self.ctx.encode_rotary(encoder, &self.q_normed_buf, &self.k_normed_buf,
-                    &self.cos_buf, &self.sin_buf, num_heads as u32, 0, head_dim as u32);
-            } else {
-                self.ctx.encode_rotary_partial(encoder, &self.q_normed_buf, &self.k_normed_buf,
-                    &self.cos_buf, &self.sin_buf, num_heads as u32, 0,
-                    head_dim as u32, rotary_dim as u32);
-            }
+            // Apply rotary to Q (full head_dim — non-rotary dims have cos=1, sin=0 for pass-through)
+            self.ctx.encode_rotary(encoder, &self.q_normed_buf, &self.k_normed_buf,
+                &cos_bufs[layer_idx], &sin_bufs[layer_idx], num_heads as u32, 0, head_dim as u32);
 
             // K, V only for non-shared layers
             if layer.has_kv {
@@ -561,17 +671,11 @@ impl Gemma4GpuModel {
                 self.ctx.encode_matvec_f16(encoder, &layer.v_proj, &self.normed_buf,
                     &self.v_buf, kv_out as u32, hidden_size as u32);
 
-                // K norm + rotary
+                // K norm + rotary (full head_dim — non-rotary dims pass through)
                 self.ctx.encode_rmsnorm_per_head(encoder, &self.k_buf, &layer.k_norm_weight,
                     &self.k_normed_buf, num_kv_heads as u32, head_dim as u32, eps);
-                if rotary_dim == head_dim {
-                    self.ctx.encode_rotary(encoder, &self.q_buf, &self.k_normed_buf,
-                        &self.cos_buf, &self.sin_buf, 0, num_kv_heads as u32, head_dim as u32);
-                } else {
-                    self.ctx.encode_rotary_partial(encoder, &self.q_buf, &self.k_normed_buf,
-                        &self.cos_buf, &self.sin_buf, 0, num_kv_heads as u32,
-                        head_dim as u32, rotary_dim as u32);
-                }
+                self.ctx.encode_rotary(encoder, &self.q_buf, &self.k_normed_buf,
+                    &cos_bufs[layer_idx], &sin_bufs[layer_idx], 0, num_kv_heads as u32, head_dim as u32);
 
                 // V norm (no weight)
                 self.ctx.encode_rmsnorm_per_head_noweight(encoder, &self.v_buf, &self.gate_buf,
@@ -657,7 +761,7 @@ impl Gemma4GpuModel {
             // GeLU activation (PLE uses GeLU, not the model's hidden_activation)
             // Reuse gelu_mul with up=ple_embed (element-wise multiply after gelu)
             // gelu_mul does: out = gelu(gate) * up
-            self.ctx.encode_gelu_mul(encoder, &self.ple_gated_buf, &self.ple_embed_buf,
+            self.ctx.encode_gelu_mul(encoder, &self.ple_gated_buf, &ple_bufs[layer_idx],
                 &self.ple_normed_buf, ple_dim as u32);
             // Project back: ple_projected = per_layer_projection(ple_normed) → [hidden]
             self.ctx.encode_matvec_f16(encoder, &layer.per_layer_projection_weight,
@@ -678,6 +782,10 @@ impl Gemma4GpuModel {
 
             encoder.end_encoding();
         }
+
+        // Commit all layer work
+        cmd.commit();
+        cmd.wait_until_completed();
 
         // Final norm
         let cmd = self.ctx.queue.new_command_buffer();
@@ -703,9 +811,11 @@ impl Gemma4GpuModel {
         let mut logits = MetalContext::read_buffer(&self.logits_buf, vocab_size);
 
         // Logit softcapping: logits = cap * tanh(logits / cap)
+        // Clamp input to tanh to prevent NaN from overflow (same issue as GeLU)
         let cap = self.config.final_logit_softcapping;
         for l in logits.iter_mut() {
-            *l = cap * (*l / cap).tanh();
+            let x = (*l / cap).clamp(-10.0, 10.0);
+            *l = cap * x.tanh();
         }
 
         // Update state
