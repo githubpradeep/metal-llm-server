@@ -47,12 +47,13 @@ pub struct Gemma4GpuModel {
     pub logits_buf: Buffer,
 
     // PLE scratch buffers
-    pub ple_embed_buf: Buffer,    // [ple_dim] = 256
+    pub ple_embed_buf: Buffer,    // [ple_dim] = 256 (unused now, kept for compat)
     pub ple_gated_buf: Buffer,    // [ple_dim]
     pub ple_normed_buf: Buffer,   // [ple_dim]
     pub ple_projected_buf: Buffer, // [hidden_size]
     pub ple_context_proj_buf: Buffer, // [num_layers * ple_dim] for context projection
-    pub ple_combined_buf: Buffer,     // [ple_dim] combined token + context
+    pub ple_token_id_buf: Buffer,     // [num_layers * ple_dim] token identity embedding
+    pub ple_combined_buf: Buffer,     // [num_layers * ple_dim] combined output
 
     // QK norm scratch
     pub q_normed_buf: Buffer,
@@ -386,7 +387,8 @@ impl Gemma4GpuModel {
         let ple_normed_buf = ctx.buffer_empty(ple_dim);
         let ple_projected_buf = ctx.buffer_empty(hidden_size);
         let ple_context_proj_buf = ctx.buffer_empty(num_layers * ple_dim);
-        let ple_combined_buf = ctx.buffer_empty(ple_dim);
+        let ple_token_id_buf = ctx.buffer_empty(num_layers * ple_dim);
+        let ple_combined_buf = ctx.buffer_empty(num_layers * ple_dim);
 
         // QK norm scratch (max head_dim per head)
         let q_normed_buf = ctx.buffer_empty(max_q_out);
@@ -436,6 +438,7 @@ impl Gemma4GpuModel {
             ple_normed_buf,
             ple_projected_buf,
             ple_context_proj_buf,
+            ple_token_id_buf,
             ple_combined_buf,
             q_normed_buf,
             k_normed_buf,
@@ -473,19 +476,18 @@ impl Gemma4GpuModel {
 
         let kv_seq = self.kv_seq_len;
 
-        // ─── PLE: Compute per-layer inputs (token identity + context projection) ───
+        // ─── PLE: Compute per-layer inputs on GPU ───
         // Reference: Gemma4TextModel.get_per_layer_inputs() + project_per_layer_inputs()
         //
         // 1. Token identity: embed_tokens_per_layer(token_id) * sqrt(ple_dim)
-        //    → [num_layers * ple_dim], then reshape to [num_layers, ple_dim]
         // 2. Context projection: per_layer_model_projection(embed) * (1/sqrt(hidden_size))
-        //    → [num_layers * ple_dim], then per_layer_projection_norm per layer
+        //    then per_layer_projection_norm (RMSNorm per layer)
         // 3. Combined: (context_proj + token_identity) * (1/sqrt(2))
         let ple_total_dim = num_layers * ple_dim;
-        let ple_input_scale = std::f32::consts::FRAC_1_SQRT_2; // 1/sqrt(2) = 2^(-0.5)
+        let ple_input_scale = std::f32::consts::FRAC_1_SQRT_2; // 1/sqrt(2)
         let context_proj_scale = 1.0 / (hidden_size as f32).sqrt();
 
-        // Step 1: Token identity from embed_tokens_per_layer (CPU, decode bf16)
+        // Step 1: Token identity from embed_tokens_per_layer (CPU decode bf16, write to GPU)
         let ple_token_offset = token_id * ple_total_dim;
         let ple_scale = (ple_dim as f32).sqrt();
         let mut ple_token_identity = vec![0.0f32; ple_total_dim];
@@ -494,56 +496,37 @@ impl Gemma4GpuModel {
                 ple_token_identity[i] = bf16_to_f32(self.embed_tokens_per_layer_f16[ple_token_offset + i]) * ple_scale;
             }
         }
+        MetalContext::write_buffer(&self.ple_token_id_buf, &ple_token_identity);
 
-        // Step 2: Context projection (CPU matvec: per_layer_model_projection is [num_layers*ple_dim, hidden_size])
-        // context_proj = W @ embed * (1/sqrt(hidden_size))
-        let per_layer_model_proj_len = ple_total_dim * hidden_size;
-        let mut ple_context_proj = vec![0.0f32; ple_total_dim];
-        if self.per_layer_model_projection_weight.length() as usize >= per_layer_model_proj_len * 2 {
-            // Weight is stored as f16 on GPU, read it back for CPU computation
-            let proj_f16: &[u16] = unsafe {
-                std::slice::from_raw_parts(
-                    self.per_layer_model_projection_weight.contents() as *const u16,
-                    per_layer_model_proj_len,
-                )
-            };
-            // matvec: out[i] = sum_j(W[i,j] * embed[j]) * context_proj_scale
-            for i in 0..ple_total_dim {
-                let mut acc = 0.0f32;
-                let row_offset = i * hidden_size;
-                for j in 0..hidden_size {
-                    let w = half_to_f32(proj_f16[row_offset + j]);
-                    acc += w * embed_f32[j];
-                }
-                ple_context_proj[i] = acc * context_proj_scale;
-            }
+        // Steps 2-3: GPU computation
+        let ple_cmd = self.ctx.queue.new_command_buffer();
+        let ple_enc = ple_cmd.new_compute_command_encoder();
 
-            // Step 2b: Apply per_layer_projection_norm (RMSNorm per layer slice)
-            let norm_weight: Vec<f32> = {
-                let ptr = self.per_layer_projection_norm_weight.contents() as *const f32;
-                let len = ple_dim;
-                unsafe { std::slice::from_raw_parts(ptr, len) }.to_vec()
-            };
-            for layer_idx in 0..num_layers {
-                let offset = layer_idx * ple_dim;
-                let slice = &mut ple_context_proj[offset..offset + ple_dim];
-                // RMSNorm: x / sqrt(mean(x^2) + eps) * weight
-                let mut sum_sq = 0.0f32;
-                for &v in slice.iter() {
-                    sum_sq += v * v;
-                }
-                let rms = (sum_sq / ple_dim as f32 + eps).sqrt();
-                for (i, v) in slice.iter_mut().enumerate() {
-                    *v = (*v / rms) * norm_weight[i];
-                }
-            }
-        }
+        // Step 2a: context_proj = per_layer_model_projection @ embed (GPU matvec)
+        self.ctx.encode_matvec_f16(ple_enc, &self.per_layer_model_projection_weight,
+            &self.hidden_buf, &self.ple_context_proj_buf,
+            ple_total_dim as u32, hidden_size as u32);
 
-        // Step 3: Combine token identity + context projection, scaled by 1/sqrt(2)
-        let mut ple_combined_all = vec![0.0f32; ple_total_dim];
-        for i in 0..ple_total_dim {
-            ple_combined_all[i] = (ple_context_proj[i] + ple_token_identity[i]) * ple_input_scale;
-        }
+        // Step 2b: context_proj *= 1/sqrt(hidden_size)
+        self.ctx.encode_vec_scale(ple_enc, &self.ple_context_proj_buf,
+            &self.ple_combined_buf, ple_total_dim as u32, context_proj_scale);
+
+        // Step 2c: RMSNorm per layer (42 chunks of 256) — use per-head norm
+        self.ctx.encode_rmsnorm_per_head(ple_enc, &self.ple_combined_buf,
+            &self.per_layer_projection_norm_weight, &self.ple_context_proj_buf,
+            num_layers as u32, ple_dim as u32, eps);
+
+        // Step 3: combined = (context_proj + token_identity) * 1/sqrt(2)
+        // First add: ple_combined = context_proj + token_identity
+        self.ctx.encode_vec_add(ple_enc, &self.ple_context_proj_buf,
+            &self.ple_token_id_buf, &self.ple_combined_buf, ple_total_dim as u32);
+        // Then scale: ple_context_proj = ple_combined * 1/sqrt(2)
+        self.ctx.encode_vec_scale(ple_enc, &self.ple_combined_buf,
+            &self.ple_context_proj_buf, ple_total_dim as u32, ple_input_scale);
+
+        ple_enc.end_encoding();
+        ple_cmd.commit();
+        ple_cmd.wait_until_completed();
 
         // Precompute all rotary cos/sin per layer (CPU, trivial)
         let pos = self.total_tokens as f32;
@@ -601,6 +584,9 @@ impl Gemma4GpuModel {
             rotary_cos_per_layer.push(cos_data);
             rotary_sin_per_layer.push(sin_data);
         }
+
+        // Read PLE result from GPU (42KB, trivial) for per-layer buffer creation
+        let ple_combined_all = MetalContext::read_buffer(&self.ple_context_proj_buf, ple_total_dim);
 
         // ═══ ENCODE ALL LAYERS INTO A SINGLE COMMAND BUFFER ═══
         // Pre-allocate per-layer GPU buffers for cos/sin/ple (small, ~2KB each)
