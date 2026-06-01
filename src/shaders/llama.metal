@@ -85,12 +85,13 @@ kernel void matvec_f16(
 // Each group: [f16 scale][16 bytes packed 4-bit pairs] = 18 bytes per 32 weights.
 // Values dequantized as: (nibble - 8) * scale
 //
-// Each SIMD group (32 threads) handles one row.
-// Each thread processes groups strided by SIMD_SIZE.
-// Inner loop unrolled 4 bytes at a time for better ILP.
+// Optimized: 2 SIMD groups per threadgroup, each handles 2 rows (4 rows total).
+// x-vector loaded into registers and reused across rows for better bandwidth.
 
 constant uint Q4_GROUP_SIZE = 32;
 constant uint Q4_BLOCK_BYTES = 18;
+constant uint N_ROWS_PER_TG = 4;  // rows per threadgroup
+constant uint N_SIMDGROUPS = 2;   // SIMD groups per threadgroup
 
 kernel void matvec_q4(
     device const uchar* W_q4 [[buffer(0)]],
@@ -99,51 +100,102 @@ kernel void matvec_q4(
     constant uint& M [[buffer(3)]],
     constant uint& K [[buffer(4)]],
     uint tgid [[threadgroup_position_in_grid]],
-    uint tid [[thread_index_in_threadgroup]]
+    uint tid [[thread_index_in_threadgroup]],
+    uint sgid [[simdgroup_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]]
 ) {
-    if (tgid >= M) return;
+    uint base_row = tgid * N_ROWS_PER_TG;
+    // Each SIMD group handles 2 rows
+    uint row0 = base_row + sgid * 2;
+    uint row1 = row0 + 1;
     
     uint num_groups = K / Q4_GROUP_SIZE;
-    uint row_byte_offset = tgid * num_groups * Q4_BLOCK_BYTES;
+    uint row_bytes = num_groups * Q4_BLOCK_BYTES;
     
-    float acc = 0.0f;
+    float acc0 = 0.0f;
+    float acc1 = 0.0f;
     
-    // Each thread handles groups strided by SIMD_SIZE
-    for (uint g = tid; g < num_groups; g += SIMD_SIZE) {
-        uint block_offset = row_byte_offset + g * Q4_BLOCK_BYTES;
-        
-        // Read scale
-        half scale_h = *reinterpret_cast<device const half*>(&W_q4[block_offset]);
-        float scale = float(scale_h);
-        
-        // Read packed quants
-        device const uchar* quants = &W_q4[block_offset + 2];
+    bool valid0 = row0 < M;
+    bool valid1 = row1 < M;
+    
+    device const uchar* row0_ptr = W_q4 + row0 * row_bytes;
+    device const uchar* row1_ptr = W_q4 + row1 * row_bytes;
+    
+    // Each lane processes groups strided by SIMD_SIZE
+    for (uint g = lane; g < num_groups; g += SIMD_SIZE) {
         uint x_offset = g * Q4_GROUP_SIZE;
         
-        // Unrolled: process 4 bytes (8 weights) per iteration
-        float local_acc = 0.0f;
-        for (uint i = 0; i < 16; i += 4) {
-            uchar p0 = quants[i];
-            uchar p1 = quants[i + 1];
-            uchar p2 = quants[i + 2];
-            uchar p3 = quants[i + 3];
+        // Load x-vector chunk into registers (shared across both rows)
+        float4 xv0 = *reinterpret_cast<device const float4*>(&x[x_offset]);
+        float4 xv1 = *reinterpret_cast<device const float4*>(&x[x_offset + 4]);
+        float4 xv2 = *reinterpret_cast<device const float4*>(&x[x_offset + 8]);
+        float4 xv3 = *reinterpret_cast<device const float4*>(&x[x_offset + 12]);
+        float4 xv4 = *reinterpret_cast<device const float4*>(&x[x_offset + 16]);
+        float4 xv5 = *reinterpret_cast<device const float4*>(&x[x_offset + 20]);
+        float4 xv6 = *reinterpret_cast<device const float4*>(&x[x_offset + 24]);
+        float4 xv7 = *reinterpret_cast<device const float4*>(&x[x_offset + 28]);
+        
+        // Process row0
+        if (valid0) {
+            uint block_offset = g * Q4_BLOCK_BYTES;
+            float scale = float(*reinterpret_cast<device const half*>(&row0_ptr[block_offset]));
+            device const uchar* q = &row0_ptr[block_offset + 2];
             
-            uint base = x_offset + i * 2;
-            local_acc += float(int(p0 & 0x0F) - 8) * x[base];
-            local_acc += float(int(p0 >> 4) - 8) * x[base + 1];
-            local_acc += float(int(p1 & 0x0F) - 8) * x[base + 2];
-            local_acc += float(int(p1 >> 4) - 8) * x[base + 3];
-            local_acc += float(int(p2 & 0x0F) - 8) * x[base + 4];
-            local_acc += float(int(p2 >> 4) - 8) * x[base + 5];
-            local_acc += float(int(p3 & 0x0F) - 8) * x[base + 6];
-            local_acc += float(int(p3 >> 4) - 8) * x[base + 7];
+            float local = 0.0f;
+            // Unroll all 16 bytes (32 weights)
+            local += float(int(q[0] & 0xF) - 8) * xv0[0] + float(int(q[0] >> 4) - 8) * xv0[1];
+            local += float(int(q[1] & 0xF) - 8) * xv0[2] + float(int(q[1] >> 4) - 8) * xv0[3];
+            local += float(int(q[2] & 0xF) - 8) * xv1[0] + float(int(q[2] >> 4) - 8) * xv1[1];
+            local += float(int(q[3] & 0xF) - 8) * xv1[2] + float(int(q[3] >> 4) - 8) * xv1[3];
+            local += float(int(q[4] & 0xF) - 8) * xv2[0] + float(int(q[4] >> 4) - 8) * xv2[1];
+            local += float(int(q[5] & 0xF) - 8) * xv2[2] + float(int(q[5] >> 4) - 8) * xv2[3];
+            local += float(int(q[6] & 0xF) - 8) * xv3[0] + float(int(q[6] >> 4) - 8) * xv3[1];
+            local += float(int(q[7] & 0xF) - 8) * xv3[2] + float(int(q[7] >> 4) - 8) * xv3[3];
+            local += float(int(q[8] & 0xF) - 8) * xv4[0] + float(int(q[8] >> 4) - 8) * xv4[1];
+            local += float(int(q[9] & 0xF) - 8) * xv4[2] + float(int(q[9] >> 4) - 8) * xv4[3];
+            local += float(int(q[10] & 0xF) - 8) * xv5[0] + float(int(q[10] >> 4) - 8) * xv5[1];
+            local += float(int(q[11] & 0xF) - 8) * xv5[2] + float(int(q[11] >> 4) - 8) * xv5[3];
+            local += float(int(q[12] & 0xF) - 8) * xv6[0] + float(int(q[12] >> 4) - 8) * xv6[1];
+            local += float(int(q[13] & 0xF) - 8) * xv6[2] + float(int(q[13] >> 4) - 8) * xv6[3];
+            local += float(int(q[14] & 0xF) - 8) * xv7[0] + float(int(q[14] >> 4) - 8) * xv7[1];
+            local += float(int(q[15] & 0xF) - 8) * xv7[2] + float(int(q[15] >> 4) - 8) * xv7[3];
+            acc0 += local * scale;
         }
-        acc += local_acc * scale;
+        
+        // Process row1 (reuses same x-vector registers)
+        if (valid1) {
+            uint block_offset = g * Q4_BLOCK_BYTES;
+            float scale = float(*reinterpret_cast<device const half*>(&row1_ptr[block_offset]));
+            device const uchar* q = &row1_ptr[block_offset + 2];
+            
+            float local = 0.0f;
+            local += float(int(q[0] & 0xF) - 8) * xv0[0] + float(int(q[0] >> 4) - 8) * xv0[1];
+            local += float(int(q[1] & 0xF) - 8) * xv0[2] + float(int(q[1] >> 4) - 8) * xv0[3];
+            local += float(int(q[2] & 0xF) - 8) * xv1[0] + float(int(q[2] >> 4) - 8) * xv1[1];
+            local += float(int(q[3] & 0xF) - 8) * xv1[2] + float(int(q[3] >> 4) - 8) * xv1[3];
+            local += float(int(q[4] & 0xF) - 8) * xv2[0] + float(int(q[4] >> 4) - 8) * xv2[1];
+            local += float(int(q[5] & 0xF) - 8) * xv2[2] + float(int(q[5] >> 4) - 8) * xv2[3];
+            local += float(int(q[6] & 0xF) - 8) * xv3[0] + float(int(q[6] >> 4) - 8) * xv3[1];
+            local += float(int(q[7] & 0xF) - 8) * xv3[2] + float(int(q[7] >> 4) - 8) * xv3[3];
+            local += float(int(q[8] & 0xF) - 8) * xv4[0] + float(int(q[8] >> 4) - 8) * xv4[1];
+            local += float(int(q[9] & 0xF) - 8) * xv4[2] + float(int(q[9] >> 4) - 8) * xv4[3];
+            local += float(int(q[10] & 0xF) - 8) * xv5[0] + float(int(q[10] >> 4) - 8) * xv5[1];
+            local += float(int(q[11] & 0xF) - 8) * xv5[2] + float(int(q[11] >> 4) - 8) * xv5[3];
+            local += float(int(q[12] & 0xF) - 8) * xv6[0] + float(int(q[12] >> 4) - 8) * xv6[1];
+            local += float(int(q[13] & 0xF) - 8) * xv6[2] + float(int(q[13] >> 4) - 8) * xv6[3];
+            local += float(int(q[14] & 0xF) - 8) * xv7[0] + float(int(q[14] >> 4) - 8) * xv7[1];
+            local += float(int(q[15] & 0xF) - 8) * xv7[2] + float(int(q[15] >> 4) - 8) * xv7[3];
+            acc1 += local * scale;
+        }
     }
     
-    acc = simd_sum(acc);
-    if (tid == 0) {
-        y[tgid] = acc;
+    // Reduce within SIMD group
+    acc0 = simd_sum(acc0);
+    acc1 = simd_sum(acc1);
+    
+    if (lane == 0) {
+        if (valid0) y[row0] = acc0;
+        if (valid1) y[row1] = acc1;
     }
 }
 

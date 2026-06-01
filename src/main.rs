@@ -178,8 +178,16 @@ fn generate_gemma4_gpu(
     let start_time = Instant::now();
     let mut tokens_generated = 0;
 
+    // Gemma4 stop tokens: <eos> (1), <end_of_turn> (107)
+    let eos_tokens: &[usize] = &[1, 107];
+
     for _ in 0..max_tokens {
         let next_token = sampling::min_p_sampling(&logits, 0.1);
+
+        // Stop at EOS or end-of-turn
+        if eos_tokens.contains(&next_token) {
+            break;
+        }
 
         let tok_str = tokenizer.decode(&[next_token as u32], false).unwrap_or_default();
         print!("{}", tok_str);

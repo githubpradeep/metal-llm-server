@@ -211,9 +211,10 @@ impl MetalContext {
         encoder.set_buffer(2, Some(y_buf), 0);
         encoder.set_bytes(3, 4, &m as *const u32 as *const _);
         encoder.set_bytes(4, 4, &k as *const u32 as *const _);
-        // One SIMD group (32 threads) per row
-        let num_tgs = MTLSize::new(m as u64, 1, 1);
-        let tg_size = MTLSize::new(32, 1, 1);
+        // 2 SIMD groups (64 threads) per TG, each TG handles 4 rows
+        let n_rows_per_tg = 4u64;
+        let num_tgs = MTLSize::new((m as u64 + n_rows_per_tg - 1) / n_rows_per_tg, 1, 1);
+        let tg_size = MTLSize::new(64, 1, 1);  // 2 SIMD groups × 32 threads
         encoder.dispatch_thread_groups(num_tgs, tg_size);
     }
 
