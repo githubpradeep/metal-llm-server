@@ -12,6 +12,7 @@ mod quantize;
 mod sampling;
 mod weights;
 mod generation;
+mod server;
 
 use std::io::{self, Write};
 use std::time::Instant;
@@ -43,7 +44,7 @@ fn main() {
             println!("Loading Gemma4 model (GPU/Metal) from: {}", model_dir);
             let start = Instant::now();
 
-            let mut gpu_model = gemma4_gpu_model::Gemma4GpuModel::new(&model_dir);
+            let gpu_model = gemma4_gpu_model::Gemma4GpuModel::new(&model_dir);
 
             let tokenizer_path = std::path::Path::new(&model_dir).join("tokenizer.json");
             let tokenizer = tokenizers::Tokenizer::from_file(&tokenizer_path)
@@ -51,6 +52,21 @@ fn main() {
 
             println!("Model loaded in {:.2}s", start.elapsed().as_secs_f64());
 
+            // Serve mode: start OpenAI-compatible HTTP server
+            if args.iter().any(|a| a == "--serve") {
+                let port: u16 = args.iter()
+                    .position(|a| a == "--port")
+                    .and_then(|i| args.get(i + 1))
+                    .and_then(|p| p.parse().ok())
+                    .unwrap_or(8080);
+
+                let rt = tokio::runtime::Runtime::new().unwrap();
+                rt.block_on(server::run_server(gpu_model, tokenizer, port));
+                return;
+            }
+
+            // Interactive generation mode
+            let mut gpu_model = gpu_model;
             println!("{}", "=".repeat(60));
             println!("GEMMA4 E4B GENERATION (Metal GPU, Q4_0)");
             println!("{}", "=".repeat(60));
