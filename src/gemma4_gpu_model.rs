@@ -109,6 +109,7 @@ pub struct Gemma4GpuLayer {
     pub head_dim: usize,
     pub q_out_dim: usize,
     pub kv_out_dim: usize,
+    pub use_f16: bool,          // true = f16 weights (sensitive layers), false = Q4
 }
 
 #[derive(Deserialize)]
@@ -328,14 +329,18 @@ impl Gemma4GpuModel {
             let q_norm_data = layer_tensors.remove("self_attn.q_norm.weight").expect("q_norm missing");
             let k_norm_data = layer_tensors.remove("self_attn.k_norm.weight").expect("k_norm missing");
 
+            // Mixed quantization: first 3 layers, last 3 layers, and attention o_proj use f16
+            // Everything else uses Q4_0. This preserves quality on edge cases.
+            let is_sensitive_layer = layer_idx < 3 || layer_idx >= (num_layers - 3);
+
             let layer = Gemma4GpuLayer {
-                q_proj: ctx.buffer_from_f32_as_q4(&q_proj_data, q_out, hidden_size),
-                k_proj: ctx.buffer_from_f32_as_q4(&k_proj_data, kv_out, hidden_size),
-                v_proj: ctx.buffer_from_f32_as_q4(&v_proj_data, kv_out, hidden_size),
-                o_proj: ctx.buffer_from_f32_as_q4(&o_proj_data, hidden_size, q_out),
-                gate_proj: ctx.buffer_from_f32_as_q4(&gate_proj_data, intermediate_size, hidden_size),
-                up_proj: ctx.buffer_from_f32_as_q4(&up_proj_data, intermediate_size, hidden_size),
-                down_proj: ctx.buffer_from_f32_as_q4(&down_proj_data, hidden_size, intermediate_size),
+                q_proj: if is_sensitive_layer { ctx.buffer_from_f32_as_f16(&q_proj_data) } else { ctx.buffer_from_f32_as_q4(&q_proj_data, q_out, hidden_size) },
+                k_proj: if is_sensitive_layer { ctx.buffer_from_f32_as_f16(&k_proj_data) } else { ctx.buffer_from_f32_as_q4(&k_proj_data, kv_out, hidden_size) },
+                v_proj: if is_sensitive_layer { ctx.buffer_from_f32_as_f16(&v_proj_data) } else { ctx.buffer_from_f32_as_q4(&v_proj_data, kv_out, hidden_size) },
+                o_proj: ctx.buffer_from_f32_as_f16(&o_proj_data), // always f16 (quality-critical)
+                gate_proj: if is_sensitive_layer { ctx.buffer_from_f32_as_f16(&gate_proj_data) } else { ctx.buffer_from_f32_as_q4(&gate_proj_data, intermediate_size, hidden_size) },
+                up_proj: if is_sensitive_layer { ctx.buffer_from_f32_as_f16(&up_proj_data) } else { ctx.buffer_from_f32_as_q4(&up_proj_data, intermediate_size, hidden_size) },
+                down_proj: if is_sensitive_layer { ctx.buffer_from_f32_as_f16(&down_proj_data) } else { ctx.buffer_from_f32_as_q4(&down_proj_data, hidden_size, intermediate_size) },
 
                 input_layernorm_weight: ctx.buffer_from_slice(&input_ln),
                 post_attention_layernorm_weight: ctx.buffer_from_slice(&post_attn_ln),
@@ -343,8 +348,8 @@ impl Gemma4GpuModel {
                 post_feedforward_layernorm_weight: ctx.buffer_from_slice(&post_ff_ln),
                 post_per_layer_input_norm_weight: ctx.buffer_from_slice(&post_ple_norm),
 
-                per_layer_input_gate_weight: ctx.buffer_from_f32_as_q4(&ple_gate_data, ple_dim, hidden_size),
-                per_layer_projection_weight: ctx.buffer_from_f32_as_q4(&ple_proj_data, hidden_size, ple_dim),
+                per_layer_input_gate_weight: ctx.buffer_from_f32_as_f16(&ple_gate_data), // always f16 (small, quality-critical)
+                per_layer_projection_weight: ctx.buffer_from_f32_as_f16(&ple_proj_data), // always f16
                 layer_scalar,
 
                 q_norm_weight: ctx.buffer_from_slice(&q_norm_data),
@@ -352,10 +357,11 @@ impl Gemma4GpuModel {
 
                 is_full_attention: is_full,
                 has_kv: layer_idx < (num_layers - config.num_kv_shared_layers),
-                kv_source_layer: 0, // will be computed below
+                kv_source_layer: 0,
                 head_dim,
                 q_out_dim: q_out,
                 kv_out_dim: kv_out,
+                use_f16: is_sensitive_layer,
             };
 
             layers.push(layer);
@@ -576,6 +582,7 @@ impl Gemma4GpuModel {
             file.write_all(&layer.layer_scalar.to_le_bytes()).unwrap();
             file.write_all(&(layer.is_full_attention as u8).to_le_bytes()).unwrap();
             file.write_all(&(layer.has_kv as u8).to_le_bytes()).unwrap();
+            file.write_all(&(layer.use_f16 as u8).to_le_bytes()).unwrap();
             file.write_all(&(layer.kv_source_layer as u32).to_le_bytes()).unwrap();
             file.write_all(&(layer.head_dim as u32).to_le_bytes()).unwrap();
             file.write_all(&(layer.q_out_dim as u32).to_le_bytes()).unwrap();
@@ -685,6 +692,8 @@ impl Gemma4GpuModel {
             let is_full_attention = meta[0] != 0;
             file.read_exact(&mut meta).unwrap();
             let has_kv = meta[0] != 0;
+            file.read_exact(&mut meta).unwrap();
+            let use_f16 = meta[0] != 0;
 
             let mut u32_buf = [0u8; 4];
             file.read_exact(&mut u32_buf).unwrap();
@@ -710,7 +719,7 @@ impl Gemma4GpuModel {
                 layer_scalar,
                 q_norm_weight, k_norm_weight,
                 is_full_attention, has_kv, kv_source_layer,
-                head_dim, q_out_dim, kv_out_dim,
+                head_dim, q_out_dim, kv_out_dim, use_f16,
             });
         }
 
@@ -959,8 +968,13 @@ impl Gemma4GpuModel {
                 &layer.input_layernorm_weight, &self.normed_buf, hidden_size as u32, eps);
 
             // Q projection (always computed)
-            self.ctx.encode_matvec_q4(encoder, &layer.q_proj, &self.normed_buf,
-                &self.q_buf, q_out as u32, hidden_size as u32);
+            if layer.use_f16 {
+                self.ctx.encode_matvec_f16(encoder, &layer.q_proj, &self.normed_buf,
+                    &self.q_buf, q_out as u32, hidden_size as u32);
+            } else {
+                self.ctx.encode_matvec_q4(encoder, &layer.q_proj, &self.normed_buf,
+                    &self.q_buf, q_out as u32, hidden_size as u32);
+            }
 
             // QK Norm on Q
             self.ctx.encode_rmsnorm_per_head(encoder, &self.q_buf, &layer.q_norm_weight,
@@ -972,10 +986,17 @@ impl Gemma4GpuModel {
 
             // K, V only for non-shared layers
             if layer.has_kv {
-                self.ctx.encode_matvec_q4(encoder, &layer.k_proj, &self.normed_buf,
-                    &self.k_buf, kv_out as u32, hidden_size as u32);
-                self.ctx.encode_matvec_q4(encoder, &layer.v_proj, &self.normed_buf,
-                    &self.v_buf, kv_out as u32, hidden_size as u32);
+                if layer.use_f16 {
+                    self.ctx.encode_matvec_f16(encoder, &layer.k_proj, &self.normed_buf,
+                        &self.k_buf, kv_out as u32, hidden_size as u32);
+                    self.ctx.encode_matvec_f16(encoder, &layer.v_proj, &self.normed_buf,
+                        &self.v_buf, kv_out as u32, hidden_size as u32);
+                } else {
+                    self.ctx.encode_matvec_q4(encoder, &layer.k_proj, &self.normed_buf,
+                        &self.k_buf, kv_out as u32, hidden_size as u32);
+                    self.ctx.encode_matvec_q4(encoder, &layer.v_proj, &self.normed_buf,
+                        &self.v_buf, kv_out as u32, hidden_size as u32);
+                }
 
                 // K norm + rotary (full head_dim — non-rotary dims pass through)
                 self.ctx.encode_rmsnorm_per_head(encoder, &self.k_buf, &layer.k_norm_weight,
@@ -1017,8 +1038,8 @@ impl Gemma4GpuModel {
                 num_heads as u32, num_kv_heads as u32, num_kv_groups,
                 head_dim as u32, effective_kv_seq, self.kv_capacity, scale, kv_start);
 
-            // O projection
-            self.ctx.encode_matvec_q4(encoder, &layer.o_proj, &self.attn_out_buf,
+            // O projection (always f16 for quality)
+            self.ctx.encode_matvec_f16(encoder, &layer.o_proj, &self.attn_out_buf,
                 &self.o_out_buf, hidden_size as u32, q_out as u32);
 
             // Post-attention norm (cannot be in-place, use normed_buf as temp)
@@ -1040,14 +1061,26 @@ impl Gemma4GpuModel {
                 hidden_size as u32, eps);
 
             // MLP: gate_proj, up_proj, GeLU activation, down_proj
-            self.ctx.encode_matvec_q4(encoder, &layer.gate_proj, &self.normed_buf,
-                &self.gate_buf, intermediate_size as u32, hidden_size as u32);
-            self.ctx.encode_matvec_q4(encoder, &layer.up_proj, &self.normed_buf,
-                &self.up_buf, intermediate_size as u32, hidden_size as u32);
+            if layer.use_f16 {
+                self.ctx.encode_matvec_f16(encoder, &layer.gate_proj, &self.normed_buf,
+                    &self.gate_buf, intermediate_size as u32, hidden_size as u32);
+                self.ctx.encode_matvec_f16(encoder, &layer.up_proj, &self.normed_buf,
+                    &self.up_buf, intermediate_size as u32, hidden_size as u32);
+            } else {
+                self.ctx.encode_matvec_q4(encoder, &layer.gate_proj, &self.normed_buf,
+                    &self.gate_buf, intermediate_size as u32, hidden_size as u32);
+                self.ctx.encode_matvec_q4(encoder, &layer.up_proj, &self.normed_buf,
+                    &self.up_buf, intermediate_size as u32, hidden_size as u32);
+            }
             self.ctx.encode_gelu_mul(encoder, &self.gate_buf, &self.up_buf,
                 &self.gelu_buf, intermediate_size as u32);
-            self.ctx.encode_matvec_q4(encoder, &layer.down_proj, &self.gelu_buf,
-                &self.down_buf, hidden_size as u32, intermediate_size as u32);
+            if layer.use_f16 {
+                self.ctx.encode_matvec_f16(encoder, &layer.down_proj, &self.gelu_buf,
+                    &self.down_buf, hidden_size as u32, intermediate_size as u32);
+            } else {
+                self.ctx.encode_matvec_q4(encoder, &layer.down_proj, &self.gelu_buf,
+                    &self.down_buf, hidden_size as u32, intermediate_size as u32);
+            }
 
             // Post-feedforward norm (cannot be in-place, use normed_buf as temp)
             self.ctx.encode_rmsnorm(encoder, &self.down_buf,
@@ -1062,7 +1095,7 @@ impl Gemma4GpuModel {
             // Save residual for PLE
             self.ctx.encode_copy(encoder, &self.hidden_buf, &self.residual_buf, hidden_size as u32);
             // Gate: ple_gated = per_layer_input_gate(hidden) → [ple_dim]
-            self.ctx.encode_matvec_q4(encoder, &layer.per_layer_input_gate_weight,
+            self.ctx.encode_matvec_f16(encoder, &layer.per_layer_input_gate_weight,
                 &self.hidden_buf, &self.ple_gated_buf, ple_dim as u32, hidden_size as u32);
             // GeLU activation (PLE uses GeLU, not the model's hidden_activation)
             // Reuse gelu_mul with up=ple_embed (element-wise multiply after gelu)
@@ -1070,7 +1103,7 @@ impl Gemma4GpuModel {
             self.ctx.encode_gelu_mul(encoder, &self.ple_gated_buf, &self.per_layer_ple_bufs[layer_idx],
                 &self.ple_normed_buf, ple_dim as u32);
             // Project back: ple_projected = per_layer_projection(ple_normed) → [hidden]
-            self.ctx.encode_matvec_q4(encoder, &layer.per_layer_projection_weight,
+            self.ctx.encode_matvec_f16(encoder, &layer.per_layer_projection_weight,
                 &self.ple_normed_buf, &self.ple_projected_buf, hidden_size as u32, ple_dim as u32);
             // Post-PLE norm
             self.ctx.encode_rmsnorm(encoder, &self.ple_projected_buf,
