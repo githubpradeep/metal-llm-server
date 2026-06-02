@@ -1,0 +1,12 @@
+[
+  {"id": "math_simple", "messages": [{"role": "user", "content": "What is 15 * 23? Show your work step by step."}]},
+  {"id": "code_python", "messages": [{"role": "user", "content": "Write a Python function that checks if a string is a palindrome."}]},
+  {"id": "code_sort", "messages": [{"role": "user", "content": "Implement quicksort in Python with comments."}]},
+  {"id": "reasoning", "messages": [{"role": "user", "content": "If all roses are flowers, and some flowers fade quickly, can we conclude that some roses fade quickly? Explain your reasoning."}]},
+  {"id": "creative", "messages": [{"role": "user", "content": "Write a haiku about a programmer debugging code at 3am."}]},
+  {"id": "knowledge", "messages": [{"role": "user", "content": "Explain how a transformer neural network works in 3 sentences."}]},
+  {"id": "instruction", "messages": [{"role": "user", "content": "List 5 tips for writing clean code. Be concise."}]},
+  {"id": "translation", "messages": [{"role": "user", "content": "Translate 'The quick brown fox jumps over the lazy dog' to French."}]},
+  {"id": "summarize", "messages": [{"role": "user", "content": "Summarize the concept of recursion in programming in one paragraph."}]},
+  {"id": "chat", "messages": [{"role": "user", "content": "Hello! What are you capable of?"}]}
+]
