@@ -168,21 +168,46 @@ async fn chat_completions_sync(
 
     // Decode
     let mut output_tokens = Vec::new();
-    let eos_tokens: &[usize] = &[1, 107];
+    let eos_tokens: &[usize] = &[1, 106];
 
     for _ in 0..req.max_tokens {
-        let next_token = sampling::argmax(&logits);
+        let next_token = sampling::sample(&logits, req.temperature, 0.05);
 
         if eos_tokens.contains(&next_token) {
             break;
         }
         output_tokens.push(next_token as u32);
+
+        // Check if decoded text contains end-of-turn marker
+        let decoded_so_far = state.tokenizer.decode(&output_tokens, false).unwrap_or_default();
+        if decoded_so_far.contains("<end_of_turn>") || decoded_so_far.contains("<eos>") {
+            // Trim the stop string from output
+            break;
+        }
+
         logits = model.forward_single_token(next_token);
     }
 
     drop(model);
 
-    let text = state.tokenizer.decode(&output_tokens, true).unwrap_or_default();
+    let mut text = state.tokenizer.decode(&output_tokens, true).unwrap_or_default();
+    // Remove any trailing stop sequences
+    if let Some(pos) = text.find("<end_of_turn>") {
+        text.truncate(pos);
+    }
+    if let Some(pos) = text.find("<eos>") {
+        text.truncate(pos);
+    }
+    // Strip thinking/reasoning content (Gemma4 thinking mode)
+    if text.starts_with("thought\n") {
+        // Find the end of thinking block - look for double newline or end
+        if let Some(end_pos) = text.find("\n...end_of_turn") {
+            text = text[end_pos..].trim_start_matches("\n...end_of_turn").to_string();
+        } else if let Some(end_pos) = text.rfind("\n\n") {
+            // Take only the last paragraph as the actual response
+            text = text[end_pos..].trim().to_string();
+        }
+    }
     let completion_tokens = output_tokens.len();
 
     let response = ChatCompletionResponse {
@@ -242,10 +267,10 @@ async fn chat_completions_stream(
         // Prefill
         let mut logits = model.forward_prefill(&input_ids);
 
-        let eos_tokens: &[usize] = &[1, 107];
+        let eos_tokens: &[usize] = &[1, 106];
 
         for _ in 0..req.max_tokens {
-            let next_token = sampling::argmax(&logits);
+            let next_token = sampling::sample(&logits, req.temperature, 0.05);
 
             if eos_tokens.contains(&next_token) {
                 break;
