@@ -18,9 +18,18 @@ Instructions:
 import torch
 from transformers import AutoTokenizer, AutoModelForCausalLM
 import json
+from transformers import AutoModelForCausalLM, BitsAndBytesConfig
+
+# 1. Define your 4-bit configuration
+bnb_config = BitsAndBytesConfig(
+    load_in_4bit=True,
+    bnb_4bit_compute_dtype="float16",  # or bfloat16, depending on your GPU
+    bnb_4bit_quant_type="nf4",         # Recommended 4-bit type
+    bnb_4bit_use_double_quant=True
+)
 import time
 
-model_id = "google/gemma-4-4b-it"
+model_id = "google/gemma-4-E4B-it"
 
 print("Loading tokenizer...")
 tokenizer = AutoTokenizer.from_pretrained(model_id)
@@ -28,7 +37,7 @@ tokenizer = AutoTokenizer.from_pretrained(model_id)
 print("Loading model (bf16)...")
 model = AutoModelForCausalLM.from_pretrained(
     model_id,
-    torch_dtype=torch.bfloat16,
+    quantization_config=bnb_config,
     device_map="auto",
 )
 print(f"Model loaded on: {model.device}")
