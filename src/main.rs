@@ -57,10 +57,10 @@ fn main() {
 
             let gen_start = Instant::now();
             generate_gemma4_gpu(
-                "<start_of_turn>user\nWrite a short story that begins with: Once upon a time<end_of_turn>\n<start_of_turn>model\n",
+                "<start_of_turn>user\n A train leaves at 8:15 AM and arrives at 11:47 AM. How long was the journey?<end_of_turn>\n<start_of_turn>model\n",
                 &tokenizer,
                 &mut gpu_model,
-                200,
+                1000,
             );
             println!("\nTotal time: {:.2}s", gen_start.elapsed().as_secs_f64());
         } else {
@@ -179,7 +179,7 @@ fn generate_gemma4_gpu(
     let mut tokens_generated = 0;
 
     // Gemma4 stop tokens: <eos> (1), <end_of_turn> (107)
-    let eos_tokens: &[usize] = &[1, 107];
+    let eos_tokens: &[usize] = &[1, 106];
 
     for _ in 0..max_tokens {
         let next_token = sampling::min_p_sampling(&logits, 0.1);
