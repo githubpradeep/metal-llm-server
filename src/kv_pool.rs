@@ -1,0 +1,189 @@
+use metal::{Buffer, MTLResourceOptions};
+use std::fmt;
+
+use crate::gemma4_config::Gemma4TextConfig;
+use crate::gpu::MetalContext;
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct KvSlot(usize);
+
+impl KvSlot {
+    pub fn index(self) -> usize {
+        self.0
+    }
+}
+
+#[derive(Debug)]
+pub enum KvPoolError {
+    InvalidSlot(usize),
+    SlotNotAllocated(usize),
+}
+
+impl fmt::Display for KvPoolError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            KvPoolError::InvalidSlot(slot) => write!(f, "invalid KV slot: {}", slot),
+            KvPoolError::SlotNotAllocated(slot) => write!(f, "KV slot is not allocated: {}", slot),
+        }
+    }
+}
+
+impl std::error::Error for KvPoolError {}
+
+pub struct KvCachePool {
+    slots: Vec<KvCacheSlot>,
+    free_slots: Vec<usize>,
+    max_seq_len: u32,
+    num_layers: usize,
+}
+
+pub struct KvCacheSlot {
+    pub k_cache: Vec<Buffer>,
+    pub v_cache: Vec<Buffer>,
+    pub seq_len: u32,
+    pub total_tokens: usize,
+    in_use: bool,
+}
+
+impl KvCachePool {
+    pub fn new(
+        ctx: &MetalContext,
+        config: &Gemma4TextConfig,
+        num_slots: usize,
+        max_seq_len: u32,
+    ) -> Self {
+        let num_layers = config.num_hidden_layers;
+        let num_kv_heads = config.num_key_value_heads;
+
+        let mut slots = Vec::with_capacity(num_slots);
+        for _ in 0..num_slots {
+            let mut k_cache = Vec::with_capacity(num_layers);
+            let mut v_cache = Vec::with_capacity(num_layers);
+
+            for layer_idx in 0..num_layers {
+                let head_dim = config.layer_head_dim(layer_idx);
+                let byte_len = (num_kv_heads * max_seq_len as usize * head_dim * 2) as u64;
+                k_cache.push(
+                    ctx.device
+                        .new_buffer(byte_len, MTLResourceOptions::StorageModeShared),
+                );
+                v_cache.push(
+                    ctx.device
+                        .new_buffer(byte_len, MTLResourceOptions::StorageModeShared),
+                );
+            }
+
+            slots.push(KvCacheSlot {
+                k_cache,
+                v_cache,
+                seq_len: 0,
+                total_tokens: 0,
+                in_use: false,
+            });
+        }
+
+        let free_slots = (0..num_slots).rev().collect();
+
+        Self {
+            slots,
+            free_slots,
+            max_seq_len,
+            num_layers,
+        }
+    }
+
+    pub fn allocate(&mut self) -> Option<KvSlot> {
+        let slot_idx = self.free_slots.pop()?;
+        let slot = &mut self.slots[slot_idx];
+        slot.in_use = true;
+        slot.seq_len = 0;
+        slot.total_tokens = 0;
+        Some(KvSlot(slot_idx))
+    }
+
+    pub fn release(&mut self, slot: KvSlot) -> Result<(), KvPoolError> {
+        let slot_idx = slot.index();
+        let slot = self
+            .slots
+            .get_mut(slot_idx)
+            .ok_or(KvPoolError::InvalidSlot(slot_idx))?;
+
+        if !slot.in_use {
+            return Err(KvPoolError::SlotNotAllocated(slot_idx));
+        }
+
+        slot.in_use = false;
+        slot.seq_len = 0;
+        slot.total_tokens = 0;
+        self.free_slots.push(slot_idx);
+        Ok(())
+    }
+
+    pub fn reset(&mut self, slot: KvSlot) -> Result<(), KvPoolError> {
+        let slot = self.slot_mut(slot)?;
+        slot.seq_len = 0;
+        slot.total_tokens = 0;
+        Ok(())
+    }
+
+    pub fn seq_len(&self, slot: KvSlot) -> Result<u32, KvPoolError> {
+        Ok(self.slot(slot)?.seq_len)
+    }
+
+    pub fn total_tokens(&self, slot: KvSlot) -> Result<usize, KvPoolError> {
+        Ok(self.slot(slot)?.total_tokens)
+    }
+
+    pub fn capacity(&self) -> u32 {
+        self.max_seq_len
+    }
+
+    pub fn num_slots(&self) -> usize {
+        self.slots.len()
+    }
+
+    pub fn available_slots(&self) -> usize {
+        self.free_slots.len()
+    }
+
+    pub fn num_layers(&self) -> usize {
+        self.num_layers
+    }
+
+    pub fn with_slot_mut<T>(
+        &mut self,
+        slot: KvSlot,
+        f: impl FnOnce(&mut KvCacheSlot) -> T,
+    ) -> Result<T, KvPoolError> {
+        let slot = self.slot_mut(slot)?;
+        Ok(f(slot))
+    }
+
+    fn slot(&self, slot: KvSlot) -> Result<&KvCacheSlot, KvPoolError> {
+        let slot_idx = slot.index();
+        let slot = self
+            .slots
+            .get(slot_idx)
+            .ok_or(KvPoolError::InvalidSlot(slot_idx))?;
+
+        if !slot.in_use {
+            return Err(KvPoolError::SlotNotAllocated(slot_idx));
+        }
+
+        Ok(slot)
+    }
+
+    fn slot_mut(&mut self, slot: KvSlot) -> Result<&mut KvCacheSlot, KvPoolError> {
+        let slot_idx = slot.index();
+        let slot = self
+            .slots
+            .get_mut(slot_idx)
+            .ok_or(KvPoolError::InvalidSlot(slot_idx))?;
+
+        if !slot.in_use {
+            return Err(KvPoolError::SlotNotAllocated(slot_idx));
+        }
+
+        Ok(slot)
+    }
+}

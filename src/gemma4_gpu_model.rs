@@ -8,6 +8,7 @@ use serde::Deserialize;
 
 use crate::gemma4_config::Gemma4TextConfig;
 use crate::gpu::MetalContext;
+use crate::kv_pool::{KvCachePool, KvPoolError, KvSlot};
 
 /// Gemma 4 E4B GPU-resident model with persistent KV cache on Metal.
 /// All operations for one token are encoded into a SINGLE command buffer.
@@ -1168,6 +1169,16 @@ impl Gemma4GpuModel {
         self.total_tokens
     }
 
+    pub fn reset_legacy_state(&mut self) {
+        self.kv_seq_len = 0;
+        self.total_tokens = 0;
+    }
+
+    pub fn create_kv_pool(&self, num_slots: usize, max_seq_len: u32) -> KvCachePool {
+        let max_seq_len = max_seq_len.min(self.config.max_position_embeddings as u32);
+        KvCachePool::new(&self.ctx, &self.config, num_slots, max_seq_len)
+    }
+
     /// Batched prefill: process all prompt tokens sequentially.
     pub fn forward_prefill(&mut self, token_ids: &[usize]) -> Vec<f32> {
         let mut logits = Vec::new();
@@ -1175,6 +1186,52 @@ impl Gemma4GpuModel {
             logits = self.forward_single_token(tid);
         }
         logits
+    }
+
+    pub fn forward_single_token_with_kv_slot(
+        &mut self,
+        token_id: usize,
+        kv_pool: &mut KvCachePool,
+        slot: KvSlot,
+    ) -> Result<Vec<f32>, KvPoolError> {
+        let pool_capacity = kv_pool.capacity();
+        kv_pool.with_slot_mut(slot, |slot_state| {
+            std::mem::swap(&mut self.k_cache, &mut slot_state.k_cache);
+            std::mem::swap(&mut self.v_cache, &mut slot_state.v_cache);
+
+            let legacy_kv_seq_len = self.kv_seq_len;
+            let legacy_total_tokens = self.total_tokens;
+            let legacy_kv_capacity = self.kv_capacity;
+            self.kv_seq_len = slot_state.seq_len;
+            self.total_tokens = slot_state.total_tokens;
+            self.kv_capacity = pool_capacity;
+
+            let logits = self.forward_single_token(token_id);
+
+            slot_state.seq_len = self.kv_seq_len;
+            slot_state.total_tokens = self.total_tokens;
+            self.kv_seq_len = legacy_kv_seq_len;
+            self.total_tokens = legacy_total_tokens;
+            self.kv_capacity = legacy_kv_capacity;
+
+            std::mem::swap(&mut self.v_cache, &mut slot_state.v_cache);
+            std::mem::swap(&mut self.k_cache, &mut slot_state.k_cache);
+
+            logits
+        })
+    }
+
+    pub fn forward_prefill_with_kv_slot(
+        &mut self,
+        token_ids: &[usize],
+        kv_pool: &mut KvCachePool,
+        slot: KvSlot,
+    ) -> Result<Vec<f32>, KvPoolError> {
+        let mut logits = Vec::new();
+        for &tid in token_ids {
+            logits = self.forward_single_token_with_kv_slot(tid, kv_pool, slot)?;
+        }
+        Ok(logits)
     }
 }
 
