@@ -515,6 +515,232 @@ impl TokenizerPool {
 
 ---
 
+## Module 12: `kv_persist.rs` — On-Disk KV Cache Persistence
+
+**Responsibility**: Save/load full KV cache state to SSD for instant session resume.
+
+```rust
+use std::path::{Path, PathBuf};
+use std::fs::File;
+use std::io::{Read, Write, BufWriter, BufReader};
+
+/// File format:
+/// [magic: 4 bytes "KVRS"]
+/// [version: u32]
+/// [model_id: 32 bytes SHA256 of model config]
+/// [quant_profile: u8 (0=q4, 1=f16, 2=fp8)]
+/// [num_layers: u32]
+/// [kv_seq_len: u32]
+/// [token_history_len: u32]
+/// [token_history: token_history_len × u32]
+/// [per-layer KV data: num_layers × (k_cache_bytes + v_cache_bytes)]
+
+pub struct KvPersistence {
+    cache_dir: PathBuf,           // ~/.cache/gemma4-server/sessions/
+    model_id: [u8; 32],          // SHA256 of config.json for compatibility check
+    quant_profile: u8,
+}
+
+pub struct SessionMetadata {
+    pub session_id: String,       // SHA1 of first user message
+    pub token_count: u32,
+    pub created_at: u64,
+    pub last_used: u64,
+    pub file_size: u64,
+}
+
+impl KvPersistence {
+    pub fn new(cache_dir: &Path, model_id: [u8; 32], quant_profile: u8) -> Self { ... }
+
+    /// Save current KV state to disk. ~88 MB writes at ~4 GB/s SSD = ~22ms.
+    pub fn save_session(
+        &self,
+        session_id: &str,
+        k_caches: &[Buffer],       // GPU buffers — read back to CPU then write
+        v_caches: &[Buffer],
+        kv_seq_len: u32,
+        token_history: &[u32],
+    ) -> Result<PathBuf, Error> { ... }
+
+    /// Load KV state from disk. Validates model_id + quant_profile match.
+    pub fn load_session(
+        &self,
+        session_id: &str,
+    ) -> Result<(Vec<Vec<u8>>, Vec<Vec<u8>>, u32, Vec<u32>), Error> { ... }
+
+    /// Find best matching session for a given prompt (longest prefix match).
+    pub fn find_prefix_match(
+        &self,
+        token_ids: &[u32],
+    ) -> Option<(SessionMetadata, u32)> { ... }  // returns (metadata, common_prefix_len)
+
+    /// List all saved sessions, sorted by last_used.
+    pub fn list_sessions(&self) -> Vec<SessionMetadata> { ... }
+
+    /// Evict sessions exceeding budget (LRU).
+    pub fn evict_to_budget(&self, budget_bytes: u64) { ... }
+}
+```
+
+**Integration with scheduler**:
+```rust
+// On request arrival:
+// 1. Tokenize prompt
+// 2. Check kv_persist.find_prefix_match(tokens)
+// 3. If match found and prefix_len > threshold:
+//    - Load session from disk (~20ms)
+//    - Write KV buffers to GPU
+//    - Only prefill the suffix tokens[prefix_len..]
+// 4. On conversation turn completion:
+//    - Background-save current KV state to disk
+```
+
+**Performance**: M1 Pro SSD writes 88 MB in ~22ms (4 GB/s). Reads same in ~18ms (5 GB/s sequential). Async I/O via `tokio::fs` so it doesn't block the scheduler.
+
+---
+
+## Module 13: `fp8_kv.rs` — FP8 KV Cache
+
+**Responsibility**: Pack/unpack KV values in 8-bit floating point to double context capacity.
+
+```rust
+/// FP8 E4M3 format: 1 sign + 4 exponent + 3 mantissa bits
+/// Range: ±448, precision: ~0.1% relative error
+/// Perfect for attention keys/values which are normalized by QK-norm
+
+pub struct Fp8KvCache {
+    k_caches: Vec<Buffer>,    // [layer][num_kv_heads × capacity × head_dim] in FP8
+    v_caches: Vec<Buffer>,    // same shape, FP8
+    capacity: u32,
+    seq_len: u32,
+}
+```
+
+**Metal kernels needed**:
+```metal
+// Quantize f32 → FP8 E4M3 during KV append
+kernel void kv_append_fp8(
+    device const float* new_kv,     // f32 input from projection
+    device uchar* cache,            // FP8 packed cache
+    constant uint& position,
+    constant uint& head_dim,
+    uint tid [[thread_position_in_grid]]
+) {
+    float val = new_kv[tid];
+    // Clamp to FP8 E4M3 range [-448, 448]
+    val = clamp(val, -448.0f, 448.0f);
+    // Pack: sign(1) | exponent(4) | mantissa(3)
+    cache[position * head_dim + tid] = float_to_fp8_e4m3(val);
+}
+
+// Dequantize FP8 → f32 during attention score computation
+// (integrated into attention kernel, not standalone)
+```
+
+**Memory savings**:
+| Context | f16 KV | FP8 KV | Savings |
+|---------|--------|--------|---------|
+| 1024 | 88 MB | 44 MB | 44 MB |
+| 4096 | 352 MB | 176 MB | 176 MB |
+| 8192 | 704 MB | 352 MB | 352 MB |
+
+**Quality validation**: Run full eval suite comparing f16 vs FP8 KV outputs. DeepSeek V4 (ds4) confirms FP8 KV works well in practice.
+
+---
+
+## Module 14: `fused_mlp.metal` — Fused Gate+Up+Activation Kernel
+
+**Responsibility**: Combine gate and up projections with GeLU activation into a single dispatch.
+
+```metal
+// Current: 3 dispatches per layer
+//   1. matvec_q4(gate_proj, x) → gate_buf
+//   2. matvec_q4(up_proj, x)   → up_buf
+//   3. gelu_mul(gate_buf, up_buf) → out_buf
+
+// Fused: 1 dispatch per layer
+//   matvec_q4_pair_gelu(gate_proj, up_proj, x) → out_buf
+kernel void matvec_q4_pair_gelu(
+    device const uchar* W_gate [[buffer(0)]],
+    device const uchar* W_up   [[buffer(1)]],
+    device const float* x      [[buffer(2)]],
+    device float* out          [[buffer(3)]],
+    constant uint& M           [[buffer(4)]],  // intermediate_size
+    constant uint& K           [[buffer(5)]],  // hidden_size
+    uint tgid [[threadgroup_position_in_grid]],
+    uint tid [[thread_index_in_threadgroup]]
+) {
+    uint row = tgid;
+
+    // Compute gate and up dot products cooperatively
+    float gate_acc = 0.0;
+    float up_acc = 0.0;
+
+    for (uint g = tid; g < num_groups; g += 32) {
+        // ... Q4 dequant for gate weights ...
+        gate_acc += local_gate * scale_gate;
+        // ... Q4 dequant for up weights ...
+        up_acc += local_up * scale_up;
+    }
+
+    gate_acc = simd_sum(gate_acc);
+    up_acc = simd_sum(up_acc);
+
+    if (tid == 0) {
+        // Fused GeLU(gate) * up
+        float gelu_gate = gate_acc * 0.5 * (1.0 + tanh(0.7978845608 * (gate_acc + 0.044715 * gate_acc * gate_acc * gate_acc)));
+        out[row] = gelu_gate * up_acc;
+    }
+}
+```
+
+**Benefits**:
+- Eliminates 2 intermediate buffer writes per layer (gate_buf, up_buf)
+- Saves ~84 kernel dispatches per token (42 layers × 2 eliminated)
+- Both matvecs read the same input `x` — shared in registers
+
+**Expected speedup**: 5–8% decode throughput.
+
+---
+
+## Module 15: Power Throttling
+
+**Responsibility**: Configurable GPU utilization cap for thermal/noise/battery management.
+
+```rust
+pub struct PowerThrottle {
+    target_percent: u32,        // 0-100, default 100
+    last_token_gpu_time: Duration,
+    sleep_per_token: Duration,  // computed from target and measured GPU time
+}
+
+impl PowerThrottle {
+    pub fn new(target_percent: u32) -> Self { ... }
+
+    /// Call after each decode token. Sleeps if needed to hit target utilization.
+    pub fn throttle_after_token(&mut self, gpu_time: Duration) {
+        if self.target_percent >= 100 { return; }
+
+        // target_pct = gpu_time / (gpu_time + sleep_time)
+        // sleep_time = gpu_time * (100 / target_pct - 1)
+        let ratio = (100.0 / self.target_percent as f64) - 1.0;
+        let sleep = Duration::from_secs_f64(gpu_time.as_secs_f64() * ratio);
+        std::thread::sleep(sleep);
+    }
+
+    /// Call between prefill chunks for chunk-level throttling.
+    pub fn throttle_after_chunk(&mut self, chunk_gpu_time: Duration) {
+        // Same logic, applied per-chunk during prefill
+        self.throttle_after_token(chunk_gpu_time);
+    }
+}
+```
+
+**API endpoint**: `POST /v1/power` with `{"percent": 50}` to adjust at runtime.
+**CLI**: `--power 70` flag.
+
+---
+
 ## Updated File Structure
 
 ```
@@ -530,13 +756,17 @@ src/
 ├── speculative.rs       (NEW: speculative decoding with draft model)
 ├── overlap.rs           (NEW: pipeline scheduling + Metal ICBs)
 ├── tokenizer_pool.rs    (NEW: parallel tokenization workers)
+├── kv_persist.rs        (NEW: on-disk KV cache save/load)
+├── fp8_kv.rs            (NEW: FP8 KV cache quantization)
+├── power.rs             (NEW: thermal/power throttling)
 ├── gemma4_gpu_model.rs  (existing model, add batch methods)
 ├── gemma4_config.rs     (existing config)
 ├── gpu.rs               (existing Metal context + kernels)
 ├── sampling.rs          (enhanced with rep penalty, top-k, stop seqs)
 ├── shaders/
 │   ├── llama.metal      (existing + new batch kernels)
-│   └── flash_attn.metal (NEW: tiled attention shader)
+│   ├── flash_attn.metal (NEW: tiled attention shader)
+│   └── fused_mlp.metal  (NEW: fused gate+up+gelu kernel)
 └── metrics.rs           (NEW: counters, /metrics endpoint)
 ```
 
@@ -560,6 +790,10 @@ src/
 | T12: Speculative decoding | `speculative.rs` | T1, T7 | Large |
 | T13: Overlap scheduling + Metal ICBs | `overlap.rs` | T7 | Medium |
 | T14: Tokenizer workers | `tokenizer_pool.rs` | T6 | Small |
+| T15: On-disk KV persistence | `kv_persist.rs` | T4 | Medium |
+| T16: FP8 KV cache | `fp8_kv.rs`, `shaders/llama.metal` | T4 | Medium |
+| T17: Fused MLP kernels | `shaders/fused_mlp.metal`, `gpu.rs` | — | Medium |
+| T18: Power throttling | `power.rs`, `server.rs` | — | Small |
 
 ---
 
@@ -576,3 +810,7 @@ src/
 9. **Speculative decoding as scheduler-transparent optimization** — the scheduler sees it as a single decode step that produces multiple tokens; no architectural coupling
 10. **Metal ICBs for decode only** — decode has fixed shapes (1 token per slot); prefill varies per request and can't be pre-captured
 11. **Tokenizer on rayon pool, not tokio** — CPU-bound BPE work should not compete with async I/O; spawn_blocking bridges the async/sync boundary
+12. **KV persistence uses raw GPU readback + sequential write** — mmap or async I/O adds complexity; at 88 MB the write completes in ~22ms which is fast enough to do synchronously between turns
+13. **FP8 E4M3 chosen over E5M2** — E4M3 has higher precision (3 mantissa bits vs 2) at the cost of smaller range (±448 vs ±57344); KV values are normalized by QK-norm so they stay well within ±448
+14. **Fused MLP only for Q4 layers initially** — f16 layers are already fast; the fusion benefit is largest for Q4 where the dequantization cost dominates and sharing the input vector across two matvecs saves register pressure
+15. **Power throttling at token granularity** — sleeping between layers would cause pipeline bubbles; sleeping between tokens is clean and predictable

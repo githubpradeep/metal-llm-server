@@ -93,6 +93,30 @@ The goal is to make this production-ready for real users.
 - **Acceptance**: Tokenization latency does not appear in GPU scheduler critical path; supports 50+ concurrent tokenization requests without blocking HTTP handlers
 - **Constraint**: Must handle tokenizer thread pool sizing; tokio::spawn_blocking or dedicated rayon pool
 
+### 14. On-Disk KV Cache Persistence
+- **What**: Serialize the full KV cache state + token history to SSD after each conversation turn; reload on session resume without re-prefilling
+- **Why**: Multi-turn chat re-prefills the entire conversation history on every new message. With M1 Pro SSD at ~5 GB/s, loading an 88 MB KV cache takes ~18ms vs re-prefilling 500 tokens at 14 tok/s = 36s. That's 2000x faster session resume
+- **Acceptance**: Saved session resumes in < 100ms regardless of conversation length; KV state is byte-identical to what prefill would have produced; sessions survive server restart
+- **Constraint**: File format must include model ID + quant profile to prevent loading incompatible states; must handle graceful invalidation when model weights change
+
+### 15. FP8 KV Cache
+- **What**: Store KV cache in 8-bit floating point (E4M3 or E5M2) instead of f16, with on-the-fly quantization during KV write and dequantization during attention read
+- **Why**: Halves KV cache memory from 2 bytes/value to 1 byte/value. Doubles effective context capacity: 1024→2048 context at same memory, or fit 8K context where 4K previously maxed out
+- **Acceptance**: Context capacity doubled at same memory budget; attention output within 0.5% cosine similarity of f16 KV baseline; no measurable quality degradation in eval scores
+- **Constraint**: Requires new Metal kernel for FP8 pack/unpack; must validate quality across all 10 eval categories before shipping
+
+### 16. Fused MLP Kernels
+- **What**: Combine gate_proj + up_proj + GeLU activation into a single GPU kernel dispatch, eliminating intermediate buffer writes between the three operations
+- **Why**: Currently 3 separate dispatches per layer for MLP front-half (gate matvec, up matvec, gelu_mul). Fusing eliminates 2 intermediate buffer writes per layer × 42 layers = 84 eliminated memory round-trips per token
+- **Acceptance**: Decode throughput improves 5–8%; identical output to unfused path (bitwise for Q4, within f16 tolerance for f16 layers)
+- **Constraint**: Fused kernel must handle both Q4 and f16 weight variants; threadgroup memory must fit gate+up intermediate values
+
+### 17. Power / Thermal Throttling
+- **What**: CLI flag `--power N` (0–100) that inserts configurable sleep between decode iterations to reduce sustained GPU load
+- **Why**: Continuous 100% GPU on a MacBook causes thermal throttling, fan noise, and battery drain. A power cap makes the engine usable as a quiet background service
+- **Acceptance**: `--power 50` reduces GPU utilization to ~50% with proportionally lower heat/fan noise; power setting adjustable at runtime via API endpoint
+- **Constraint**: Must not affect model output (same tokens produced, just slower); sleep granularity should be per-token or per-layer, not coarse
+
 ---
 
 ## Priority Order (implementation sequence)
@@ -100,11 +124,11 @@ The goal is to make this production-ready for real users.
 | Phase | Items | Milestone |
 |-------|-------|-----------|
 | **Phase 1** | #1 Parallel Prefill, #6 Sampling, #7 Robustness | Single-user production-ready |
-| **Phase 2** | #2 Request Queue, #3 KV Cache Pool | Multi-user capable |
+| **Phase 2** | #2 Request Queue, #3 KV Cache Pool, #14 KV Persistence | Multi-user capable + session resume |
 | **Phase 3** | #4 Continuous Batching, #5 Chunked Prefill | High-throughput serving |
-| **Phase 4** | #8 Observability | Operations-ready |
-| **Phase 5** | #9 FlashAttention, #10 Radix Cache | Long-context & memory-efficient |
-| **Phase 6** | #11 Speculative Decoding | Decode throughput 2–3x |
+| **Phase 4** | #8 Observability, #17 Power Throttling | Operations-ready |
+| **Phase 5** | #9 FlashAttention, #10 Radix Cache, #15 FP8 KV Cache | Long-context & memory-efficient |
+| **Phase 6** | #11 Speculative Decoding, #16 Fused MLP Kernels | Decode throughput 2–3x |
 | **Phase 7** | #12 Overlap Scheduling, #13 Tokenizer Workers | Final latency optimizations |
 
 ---
