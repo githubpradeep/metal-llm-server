@@ -42,10 +42,10 @@ This post walks through every layer of that stack, from math to metal.
 
 ## What This Engine Actually Does
 
-The engine takes Google's Gemma4 E4B model (a 4 billion parameter language model) and runs it on a MacBook Pro M1 with:
+The engine takes Google's Gemma4 E4B model (a 4.5 billion parameter dense language model optimized for edge/on-device deployment) and runs it on a MacBook Pro M1 with:
 
 - **~14 tokens/second** decode throughput
-- **~3 GB** total memory for model weights (Q4 quantized)
+- **~3 GB** total memory for model weights (Q4 quantized + f16 sensitive layers + PLE tables in bf16)
 - **~88 MB** for the KV cache (1024 context)
 - **OpenAI-compatible API** — drop-in replacement for any OpenAI client
 - **Streaming SSE** responses, just like ChatGPT
@@ -68,52 +68,65 @@ And you get back a streaming response, token by token, from a model running enti
 
 ## The Gemma4 Architecture
 
-Before we look at code, let's understand what Gemma4 E4B actually is. It's a **Mixture of Experts (MoE)** model, but with some unique twists compared to a standard transformer like Llama.
+Before we look at code, let's understand what Gemma4 E4B actually is. It's a **dense transformer** — not a Mixture of Experts (the larger 26B A4B variant is MoE, but E4B is fully dense). "E4B" stands for "Edge 4 Billion" — designed specifically for on-device deployment.
+
+Despite being dense, it has several architectural innovations that make it punch above its weight class.
 
 ### Model Specifications
 
 | Property | Value |
 |----------|-------|
-| Total parameters | ~5.1 billion |
-| Active parameters per token | ~2.3 billion |
+| Architecture | Dense transformer (not MoE) |
+| Total parameters | ~4.5B (effective), ~8B including PLE tables |
 | Hidden dimension | 2560 |
 | Layers | 42 |
 | Attention heads | 20 |
 | KV heads | 4 (GQA with 5 groups) |
+| KV-shared layers | Layers 24–41 share KV with earlier layers |
 | Intermediate (MLP) size | 10240 |
 | Vocabulary | 262,144 tokens |
 | Max context | 131,072 tokens (architecturally) |
 | Head dimensions | 128 (sliding) / 512 (global) |
+| PLE dimension | 256 per layer |
 
 ### What Makes Gemma4 Special
 
 **1. Mixed attention: Sliding window + Full attention**
 
 Not all layers are equal. Gemma4 alternates between two types:
-- **Sliding window layers** (majority): Attend only to the last 512 tokens. Head dim = 128.
-- **Full attention layers** (every ~6th layer): Attend to the entire context. Head dim = 512.
+- **Sliding window layers** (majority): Attend only to the last 512 tokens. Head dim = 128. Cheap and fast.
+- **Full attention layers** (every ~6th layer): Attend to the entire context. Head dim = 512. Expensive but gives long-range awareness.
 
-This hybrid approach gives you long-context awareness without the quadratic cost of full attention on every layer.
+This hybrid approach gives you long-context understanding without the quadratic cost of full attention on every layer.
 
-**2. Per-Layer Embeddings (PLE)**
+**2. KV Sharing**
 
-This is the weirdest part. In standard transformers, each layer receives the output of the previous layer. In Gemma4, each layer *also* receives a per-layer input that's a function of:
-- The raw token embedding (looked up separately in a per-layer embedding table)
+Layers 24–41 (roughly the second half) don't compute their own keys and values. Instead, they reuse the KV cache from an earlier layer. This halves the KV compute for those layers while maintaining quality — the model learns which layers can share representations.
+
+```rust
+pub has_kv: bool,           // false for shared KV layers (layers 24-41)
+pub kv_source_layer: usize, // which layer's KV cache to use
+```
+
+**3. Per-Layer Embeddings (PLE)**
+
+This is the most unusual part. In standard transformers, each layer receives only the output of the previous layer. In Gemma4, each layer *also* receives a per-layer input computed from:
+- The raw token embedding (looked up in a separate per-layer embedding table)
 - A learned projection of the main hidden state
 
-These are combined and fed as additional context to each layer. Think of it as giving each layer a direct "shortcut" to the original token meaning, not just the increasingly transformed hidden state.
+These are combined and gated before being added to the residual stream. Think of it as giving each layer a direct "shortcut" to the original token meaning, not just the increasingly transformed hidden state. This is what makes the PLE embedding tables ~3.5 GB — they store a unique 256-dim vector per token per layer.
 
-**3. QK-Norm**
+**4. QK-Norm**
 
-Before computing attention scores, both queries and keys are RMS-normalized per-head. This stabilizes training at scale and eliminates the need for the traditional `1/sqrt(d)` scaling.
+Before computing attention scores, both queries and keys are RMS-normalized per-head. This stabilizes training at scale and eliminates the need for the traditional `1/sqrt(d)` scaling — the model uses `attention_scale = 1.0`.
 
-**4. Post-norm architecture**
+**5. Post-norm architecture**
 
-Gemma4 applies RMSNorm *after* the attention/MLP output, not before the residual connection. Combined with a learnable `layer_scalar` that dampens signal growth across the 42 layers.
+Gemma4 applies RMSNorm *after* the attention/MLP output, not before the residual connection. Combined with a learnable `layer_scalar` per layer that dampens signal growth across the 42 layers.
 
-**5. Logit softcapping**
+**6. Logit softcapping**
 
-The final logits are passed through `cap * tanh(logits / cap)` to prevent extreme values from dominating sampling.
+The final logits are passed through `cap * tanh(logits / cap)` (cap=30) to prevent extreme values from dominating sampling.
 
 ---
 
@@ -123,9 +136,9 @@ The model comes as SafeTensors files — a simple binary format that stores name
 
 ### The Challenge
 
-Gemma4 E4B has ~5 billion parameters. In bf16 (the native training format), that's ~10 GB of raw weights. On a 16 GB MacBook, we can't fit that alongside the OS, the KV cache, and the app itself.
+Gemma4 E4B has ~4.5 billion dense parameters (plus ~3.5 GB of PLE embedding tables). In bf16 (the native training format), the core weights are ~9 GB. On a 16 GB MacBook, we can't fit that alongside the OS, the KV cache, and the app itself.
 
-Solution: **quantize to Q4_0 on load** — 4 bits per weight, reducing 10 GB to ~2.8 GB.
+Solution: **quantize to Q4_0 on load** — 4 bits per weight, reducing ~9 GB to ~2.5 GB for the main weights.
 
 ### The Loading Pipeline
 
@@ -187,9 +200,10 @@ Token ID (e.g., 42)
 │  Transformer Layer           │
 │  ┌───────────────────┐      │
 │  │ Attention Block    │      │
-│  │ Q/K/V projection  │      │
-│  │ QK-Norm + RoPE    │      │
-│  │ KV Cache Append   │      │
+│  │ Q projection       │      │  (always computed)
+│  │ K/V projection     │      │  (only layers 0-23; layers 24-41 reuse earlier KV)
+│  │ QK-Norm + RoPE     │      │
+│  │ KV Cache Append    │      │
 │  │ Attention Score    │      │
 │  │ Output Projection  │      │
 │  └───────────────────┘      │
@@ -222,16 +236,18 @@ Let's count the work for a single token:
 | Operation | Per Layer | Total (42 layers) |
 |-----------|-----------|-------------------|
 | RMSNorm | 5 | 210 |
-| Matrix-vector multiply (Q4) | 4-5 | ~180 |
+| Matrix-vector multiply (Q4) | 4-5 | ~150 (fewer for KV-shared layers) |
 | Matrix-vector multiply (f16) | 2-3 | ~100 |
-| Rotary embedding | 2 | 84 |
+| Rotary embedding | 1-2 | ~66 (Q always, K only for layers with own KV) |
 | Attention (dot product over KV) | 1 | 42 |
 | GeLU activation | 2 | 84 |
 | Vector add (residual) | 3 | 126 |
 | Vector scale | 1 | 42 |
 | Vector copy | 3 | 126 |
 
-**~1000 GPU kernel dispatches per token**, all encoded into a single Metal command buffer.
+Note: Layers 24–41 skip K/V projection and KV cache append (they reuse earlier layers' cache), reducing total compute by ~15%.
+
+**~800–1000 GPU kernel dispatches per token**, all encoded into a single Metal command buffer.
 
 ### The Single Command Buffer Pattern
 
@@ -408,7 +424,7 @@ kernel void attention_f16(
 }
 ```
 
-For GQA (Grouped Query Attention), multiple query heads share the same KV head. With 20 query heads and 4 KV heads, that's 5 queries per KV pair — a 5x saving in KV cache memory.
+For GQA (Grouped Query Attention), multiple query heads share the same KV head. With 20 query heads and 4 KV heads, that's 5 queries per KV pair — a 5x saving in KV cache memory and KV compute.
 
 ---
 
@@ -416,16 +432,16 @@ For GQA (Grouped Query Attention), multiple query heads share the same KV head. 
 
 ### Why Q4?
 
-Memory bandwidth on M1 Pro: ~200 GB/s. Model weights for Gemma4 E4B:
+Memory bandwidth on M1 Pro: ~200 GB/s. Model weights for Gemma4 E4B (dense, ~4.5B params):
 
 | Format | Size | Theoretical Max tok/s |
 |--------|------|----------------------|
-| f32 | ~20 GB | Doesn't fit |
-| bf16 | ~10 GB | ~20 tok/s |
-| f16 | ~10 GB | ~20 tok/s |
-| **Q4_0** | **~2.8 GB** | **~70 tok/s** |
+| f32 | ~18 GB | Doesn't fit |
+| bf16 | ~9 GB | ~22 tok/s |
+| f16 | ~9 GB | ~22 tok/s |
+| **Q4_0** | **~2.5 GB** | **~80 tok/s** |
 
-Q4 gives us the best throughput because we read the least data per token. The quality loss is minimal for a 4B model.
+Q4 gives us the best throughput because we read the least data per token. The quality loss is minimal for a dense 4B model — and we compensate by keeping quality-sensitive layers in f16.
 
 ### Q4_0 Format
 
@@ -796,7 +812,7 @@ RMSNorm + activations:             ~3ms (4%)
 CPU overhead (embed, rotary calc): ~2ms (3%)
 ```
 
-The overwhelming bottleneck is weight reads. 42 layers × 7 weight matrices × variable sizes = reading ~2.8 GB of Q4 data from memory per token.
+The overwhelming bottleneck is weight reads. 42 layers × 7 weight matrices × variable sizes = reading ~2.5 GB of Q4 data from memory per token.
 
 ### The Roofline
 
@@ -805,10 +821,10 @@ M1 Pro specs:
   Memory bandwidth: ~200 GB/s
   GPU compute (FP32): 4.1 TFLOPS
 
-Model weight reads per token: ~2.8 GB (Q4)
-Theoretical max throughput: 200 / 2.8 ≈ 71 tok/s
+Model weight reads per token: ~2.5 GB (Q4) + ~0.5 GB (f16 layers)
+Theoretical max throughput: 200 / 3.0 ≈ 67 tok/s
 
-Actual: ~14 tok/s = 20% of theoretical peak
+Actual: ~14 tok/s = 21% of theoretical peak
 ```
 
 Why only 20%? Several reasons:
