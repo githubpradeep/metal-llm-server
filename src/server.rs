@@ -8,7 +8,7 @@ use axum::{
 use futures::stream::Stream;
 use serde::{Deserialize, Serialize};
 use std::sync::{
-    atomic::{AtomicBool, Ordering},
+    atomic::{AtomicU8, Ordering},
     mpsc::SyncSender,
     Arc,
 };
@@ -17,7 +17,9 @@ use tokio_stream::wrappers::ReceiverStream;
 
 use crate::gemma4_gpu_model::Gemma4GpuModel;
 use crate::metrics::Metrics;
-use crate::scheduler::{self, GenerationParams, InferenceRequest, StreamEvent};
+use crate::scheduler::{
+    self, GenerationParams, InferenceRequest, StreamEvent, CANCEL_CLIENT, CANCEL_NONE, CANCEL_STOP,
+};
 
 // ─── OpenAI-compatible types ─────────────────────────────────────────────────
 
@@ -294,9 +296,9 @@ fn enqueue_request(
     state: &AppState,
     input_ids: Vec<usize>,
     params: GenerationParams,
-) -> Result<(tokio::sync::mpsc::Receiver<StreamEvent>, Arc<AtomicBool>), ApiError> {
+) -> Result<(tokio::sync::mpsc::Receiver<StreamEvent>, Arc<AtomicU8>), ApiError> {
     let (response_tx, response_rx) = tokio::sync::mpsc::channel(64);
-    let cancel = Arc::new(AtomicBool::new(false));
+    let cancel = Arc::new(AtomicU8::new(CANCEL_NONE));
     let prompt_tokens = input_ids.len();
     let request = InferenceRequest {
         id: format!("req-{}", uuid::Uuid::new_v4()),
@@ -444,7 +446,7 @@ async fn chat_completions_sync(
 
                 let decoded_so_far = state.tokenizer.decode(&output_tokens, false).unwrap_or_default();
                 if find_stop_position(&decoded_so_far, request_stop.as_deref()).is_some() {
-                    cancel.store(true, Ordering::Relaxed);
+                    cancel.store(CANCEL_STOP, Ordering::Relaxed);
                     break;
                 }
             }
@@ -552,13 +554,13 @@ async fn chat_completions_stream(
                         };
 
                         if tx.send(Ok(Event::default().data(serde_json::to_string(&chunk).unwrap()))).await.is_err() {
-                            cancel.store(true, Ordering::Relaxed);
+                            cancel.store(CANCEL_CLIENT, Ordering::Relaxed);
                             break;
                         }
                     }
 
                     if stopped {
-                        cancel.store(true, Ordering::Relaxed);
+                        cancel.store(CANCEL_STOP, Ordering::Relaxed);
                         break;
                     }
                 }

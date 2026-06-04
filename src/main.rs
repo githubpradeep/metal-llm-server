@@ -1,6 +1,7 @@
 #![allow(dead_code, unused_variables, unused_imports)]
 
 mod config;
+mod batch_engine;
 mod layers;
 mod cache;
 mod gpu;

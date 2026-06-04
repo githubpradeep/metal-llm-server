@@ -10,6 +10,8 @@ use crate::gemma4_config::Gemma4TextConfig;
 use crate::gpu::MetalContext;
 use crate::kv_pool::{KvCachePool, KvPoolError, KvSlot};
 
+const DEFAULT_MAX_PREFILL_SEQ: usize = 64;
+
 /// Gemma 4 E4B GPU-resident model with persistent KV cache on Metal.
 /// All operations for one token are encoded into a SINGLE command buffer.
 pub struct Gemma4GpuModel {
@@ -46,6 +48,7 @@ pub struct Gemma4GpuModel {
     pub gelu_buf: Buffer,
     pub down_buf: Buffer,
     pub logits_buf: Buffer,
+    pub prefill_scratch: PrefillScratch,
 
     // PLE scratch buffers
     pub ple_embed_buf: Buffer,    // [ple_dim] = 256 (unused now, kept for compat)
@@ -76,6 +79,64 @@ pub struct Gemma4GpuModel {
     pub per_layer_ple_bufs: Vec<Buffer>,
 
     pub total_tokens: usize,
+}
+
+pub struct PrefillScratch {
+    pub max_seq_len: usize,
+    pub hidden_buf: Buffer,
+    pub normed_buf: Buffer,
+    pub residual_buf: Buffer,
+    pub q_buf: Buffer,
+    pub k_buf: Buffer,
+    pub v_buf: Buffer,
+    pub attn_out_buf: Buffer,
+    pub o_out_buf: Buffer,
+    pub gate_buf: Buffer,
+    pub up_buf: Buffer,
+    pub gelu_buf: Buffer,
+    pub down_buf: Buffer,
+    pub logits_buf: Buffer,
+    pub ple_context_proj_buf: Buffer,
+    pub ple_token_id_buf: Buffer,
+    pub ple_combined_buf: Buffer,
+    pub q_normed_buf: Buffer,
+    pub k_normed_buf: Buffer,
+}
+
+impl PrefillScratch {
+    fn new(
+        ctx: &MetalContext,
+        max_seq_len: usize,
+        hidden_size: usize,
+        max_q_out: usize,
+        max_kv_out: usize,
+        intermediate_size: usize,
+        vocab_size: usize,
+        num_layers: usize,
+        ple_dim: usize,
+    ) -> Self {
+        Self {
+            max_seq_len,
+            hidden_buf: ctx.buffer_empty(max_seq_len * hidden_size),
+            normed_buf: ctx.buffer_empty(max_seq_len * hidden_size),
+            residual_buf: ctx.buffer_empty(max_seq_len * hidden_size),
+            q_buf: ctx.buffer_empty(max_seq_len * max_q_out),
+            k_buf: ctx.buffer_empty(max_seq_len * max_kv_out),
+            v_buf: ctx.buffer_empty(max_seq_len * max_kv_out),
+            attn_out_buf: ctx.buffer_empty(max_seq_len * max_q_out),
+            o_out_buf: ctx.buffer_empty(max_seq_len * hidden_size),
+            gate_buf: ctx.buffer_empty(max_seq_len * intermediate_size),
+            up_buf: ctx.buffer_empty(max_seq_len * intermediate_size),
+            gelu_buf: ctx.buffer_empty(max_seq_len * intermediate_size),
+            down_buf: ctx.buffer_empty(max_seq_len * hidden_size),
+            logits_buf: ctx.buffer_empty(vocab_size),
+            ple_context_proj_buf: ctx.buffer_empty(max_seq_len * num_layers * ple_dim),
+            ple_token_id_buf: ctx.buffer_empty(max_seq_len * num_layers * ple_dim),
+            ple_combined_buf: ctx.buffer_empty(max_seq_len * num_layers * ple_dim),
+            q_normed_buf: ctx.buffer_empty(max_seq_len * max_q_out),
+            k_normed_buf: ctx.buffer_empty(max_seq_len * max_kv_out),
+        }
+    }
 }
 
 pub struct Gemma4GpuLayer {
@@ -406,7 +467,6 @@ impl Gemma4GpuModel {
         let gelu_buf = ctx.buffer_empty(intermediate_size);
         let down_buf = ctx.buffer_empty(hidden_size);
         let logits_buf = ctx.buffer_empty(vocab_size);
-
         // PLE scratch
         let ple_embed_buf = ctx.buffer_empty(ple_dim);
         let ple_gated_buf = ctx.buffer_empty(ple_dim);
@@ -430,6 +490,17 @@ impl Gemma4GpuModel {
             k_cache.push(ctx.device.new_buffer(byte_len, MTLResourceOptions::StorageModeShared));
             v_cache.push(ctx.device.new_buffer(byte_len, MTLResourceOptions::StorageModeShared));
         }
+        let prefill_scratch = PrefillScratch::new(
+            &ctx,
+            DEFAULT_MAX_PREFILL_SEQ.min(kv_capacity as usize),
+            hidden_size,
+            max_q_out,
+            max_kv_out,
+            intermediate_size,
+            vocab_size,
+            num_layers,
+            ple_dim,
+        );
 
         // Rotary buffers (allocate for max head_dim)
         let cos_buf = ctx.buffer_empty(max_head_dim);
@@ -446,6 +517,7 @@ impl Gemma4GpuModel {
             per_layer_ple_bufs.push(ctx.buffer_empty(ple_dim));
         }
 
+        println!("  Parallel prefill scratch: max_seq={}", prefill_scratch.max_seq_len);
         println!("  Gemma4 model loaded successfully (Q4_0 quantized on Metal)");
 
         Gemma4GpuModel {
@@ -471,6 +543,7 @@ impl Gemma4GpuModel {
             gelu_buf,
             down_buf,
             logits_buf,
+            prefill_scratch,
             ple_embed_buf,
             ple_gated_buf,
             ple_normed_buf,
@@ -757,6 +830,17 @@ impl Gemma4GpuModel {
             k_cache.push(ctx.device.new_buffer(byte_len, MTLResourceOptions::StorageModeShared));
             v_cache.push(ctx.device.new_buffer(byte_len, MTLResourceOptions::StorageModeShared));
         }
+        let prefill_scratch = PrefillScratch::new(
+            &ctx,
+            DEFAULT_MAX_PREFILL_SEQ.min(kv_capacity as usize),
+            hidden_size,
+            max_q_out,
+            max_kv_out,
+            intermediate_size,
+            vocab_size,
+            num_layers,
+            ple_dim,
+        );
 
         let cos_buf = ctx.buffer_empty(max_head_dim);
         let sin_buf = ctx.buffer_empty(max_head_dim);
@@ -771,6 +855,7 @@ impl Gemma4GpuModel {
             per_layer_ple_bufs.push(ctx.buffer_empty(ple_dim));
         }
 
+        println!("  Parallel prefill scratch: max_seq={}", prefill_scratch.max_seq_len);
         println!("  Loaded from Q4 cache successfully");
 
         Gemma4GpuModel {
@@ -782,6 +867,7 @@ impl Gemma4GpuModel {
             hidden_buf, normed_buf, residual_buf,
             q_buf, k_buf, v_buf, attn_out_buf, o_out_buf,
             gate_buf, up_buf, gelu_buf, down_buf, logits_buf,
+            prefill_scratch,
             ple_embed_buf, ple_gated_buf, ple_normed_buf, ple_projected_buf,
             ple_context_proj_buf, ple_token_id_buf, ple_combined_buf,
             q_normed_buf, k_normed_buf,
@@ -1179,6 +1265,65 @@ impl Gemma4GpuModel {
         KvCachePool::new(&self.ctx, &self.config, num_slots, max_seq_len)
     }
 
+    pub fn max_parallel_prefill_seq(&self) -> usize {
+        self.prefill_scratch.max_seq_len
+    }
+
+    pub fn prepare_parallel_prefill_inputs(&mut self, token_ids: &[usize]) -> Result<(), String> {
+        if token_ids.is_empty() {
+            return Err("prefill token_ids must not be empty".to_string());
+        }
+        if token_ids.len() > self.prefill_scratch.max_seq_len {
+            return Err(format!(
+                "prefill chunk has {} tokens, max supported chunk is {}",
+                token_ids.len(),
+                self.prefill_scratch.max_seq_len
+            ));
+        }
+
+        let hidden_size = self.config.hidden_size;
+        let num_layers = self.config.num_hidden_layers;
+        let ple_dim = self.config.hidden_size_per_layer_input;
+        let ple_total_dim = num_layers * ple_dim;
+        let embed_scale = (hidden_size as f32).sqrt();
+        let ple_scale = (ple_dim as f32).sqrt();
+
+        let mut hidden = vec![0.0f32; token_ids.len() * hidden_size];
+        let mut ple_token_identity = vec![0.0f32; token_ids.len() * ple_total_dim];
+
+        for (pos, &token_id) in token_ids.iter().enumerate() {
+            let embed_offset = token_id
+                .checked_mul(hidden_size)
+                .ok_or_else(|| format!("token id {} overflowed embedding offset", token_id))?;
+            if embed_offset + hidden_size > self.embed_tokens_f16.len() {
+                return Err(format!("token id {} is outside embed_tokens", token_id));
+            }
+
+            let hidden_offset = pos * hidden_size;
+            for i in 0..hidden_size {
+                hidden[hidden_offset + i] =
+                    bf16_to_f32(self.embed_tokens_f16[embed_offset + i]) * embed_scale;
+            }
+
+            let ple_token_offset = token_id
+                .checked_mul(ple_total_dim)
+                .ok_or_else(|| format!("token id {} overflowed PLE offset", token_id))?;
+            if ple_token_offset + ple_total_dim > self.embed_tokens_per_layer_f16.len() {
+                return Err(format!("token id {} is outside embed_tokens_per_layer", token_id));
+            }
+
+            let ple_out_offset = pos * ple_total_dim;
+            for i in 0..ple_total_dim {
+                ple_token_identity[ple_out_offset + i] =
+                    bf16_to_f32(self.embed_tokens_per_layer_f16[ple_token_offset + i]) * ple_scale;
+            }
+        }
+
+        MetalContext::write_buffer(&self.prefill_scratch.hidden_buf, &hidden);
+        MetalContext::write_buffer(&self.prefill_scratch.ple_token_id_buf, &ple_token_identity);
+        Ok(())
+    }
+
     /// Batched prefill: process all prompt tokens sequentially.
     pub fn forward_prefill(&mut self, token_ids: &[usize]) -> Vec<f32> {
         let mut logits = Vec::new();
@@ -1230,6 +1375,46 @@ impl Gemma4GpuModel {
         let mut logits = Vec::new();
         for &tid in token_ids {
             logits = self.forward_single_token_with_kv_slot(tid, kv_pool, slot)?;
+        }
+        Ok(logits)
+    }
+
+    pub fn forward_prefill_chunked_with_kv_slot(
+        &mut self,
+        token_ids: &[usize],
+        kv_pool: &mut KvCachePool,
+        slot: KvSlot,
+    ) -> Result<Vec<f32>, String> {
+        if token_ids.is_empty() {
+            return Err("prefill token_ids must not be empty".to_string());
+        }
+
+        let mut logits = Vec::new();
+        let chunk_size = self.max_parallel_prefill_seq().max(1);
+
+        for chunk in token_ids.chunks(chunk_size) {
+            logits = self.forward_prefill_chunk_with_kv_slot(chunk, kv_pool, slot)?;
+        }
+
+        Ok(logits)
+    }
+
+    pub fn forward_prefill_chunk_with_kv_slot(
+        &mut self,
+        token_ids: &[usize],
+        kv_pool: &mut KvCachePool,
+        slot: KvSlot,
+    ) -> Result<Vec<f32>, String> {
+        self.prepare_parallel_prefill_inputs(token_ids)?;
+
+        // Correctness baseline: the prepared chunk is ready for the future
+        // batched layer path, but cache mutation still uses the proven
+        // single-token forward until the full parallel prefill kernels land.
+        let mut logits = Vec::new();
+        for &tid in token_ids {
+            logits = self
+                .forward_single_token_with_kv_slot(tid, kv_pool, slot)
+                .map_err(|err| err.to_string())?;
         }
         Ok(logits)
     }
