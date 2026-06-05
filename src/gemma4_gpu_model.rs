@@ -8,9 +8,10 @@ use serde::Deserialize;
 
 use crate::gemma4_config::Gemma4TextConfig;
 use crate::gpu::MetalContext;
-use crate::kv_pool::{KvCachePool, KvPoolError, KvSlot};
+use crate::kv_pool::{KvCachePool, KvPoolError, KvSlot, KvSlotView};
 
 const DEFAULT_MAX_PREFILL_SEQ: usize = 64;
+const DEFAULT_MAX_DECODE_BATCH: usize = 4;
 
 /// Gemma 4 E4B GPU-resident model with persistent KV cache on Metal.
 /// All operations for one token are encoded into a SINGLE command buffer.
@@ -49,6 +50,7 @@ pub struct Gemma4GpuModel {
     pub down_buf: Buffer,
     pub logits_buf: Buffer,
     pub prefill_scratch: PrefillScratch,
+    pub decode_batch_scratch: DecodeBatchScratch,
 
     // PLE scratch buffers
     pub ple_embed_buf: Buffer,    // [ple_dim] = 256 (unused now, kept for compat)
@@ -76,6 +78,11 @@ pub struct Gemma4GpuModel {
     // Per-layer persistent buffers (reused every token, contents overwritten)
     pub per_layer_cos_bufs: Vec<Buffer>,
     pub per_layer_sin_bufs: Vec<Buffer>,
+    pub per_layer_decode_batch_cos_bufs: Vec<Buffer>,
+    pub per_layer_decode_batch_sin_bufs: Vec<Buffer>,
+    pub per_layer_decode_batch_append_pos_bufs: Vec<Buffer>,
+    pub per_layer_decode_batch_kv_start_bufs: Vec<Buffer>,
+    pub per_layer_decode_batch_kv_len_bufs: Vec<Buffer>,
     pub per_layer_ple_bufs: Vec<Buffer>,
 
     pub total_tokens: usize,
@@ -101,6 +108,78 @@ pub struct PrefillScratch {
     pub ple_combined_buf: Buffer,
     pub q_normed_buf: Buffer,
     pub k_normed_buf: Buffer,
+}
+
+pub struct DecodeBatchScratch {
+    pub max_batch_size: usize,
+    pub hidden_buf: Buffer,
+    pub normed_buf: Buffer,
+    pub residual_buf: Buffer,
+    pub q_buf: Buffer,
+    pub k_buf: Buffer,
+    pub v_buf: Buffer,
+    pub attn_out_buf: Buffer,
+    pub o_out_buf: Buffer,
+    pub gate_buf: Buffer,
+    pub up_buf: Buffer,
+    pub gelu_buf: Buffer,
+    pub down_buf: Buffer,
+    pub logits_buf: Buffer,
+    pub ple_context_proj_buf: Buffer,
+    pub ple_token_id_buf: Buffer,
+    pub ple_combined_buf: Buffer,
+    pub q_normed_buf: Buffer,
+    pub k_normed_buf: Buffer,
+}
+
+struct BatchedTokenInputs {
+    batch_size: usize,
+    hidden: Vec<f32>,
+    ple_token_identity: Vec<f32>,
+}
+
+struct DecodeBatchRowOffsets {
+    hidden: u64,
+    q: u64,
+    kv: u64,
+    intermediate: u64,
+    ple_row: u64,
+}
+
+impl DecodeBatchScratch {
+    fn new(
+        ctx: &MetalContext,
+        max_batch_size: usize,
+        hidden_size: usize,
+        max_q_out: usize,
+        max_kv_out: usize,
+        intermediate_size: usize,
+        vocab_size: usize,
+        num_layers: usize,
+        ple_dim: usize,
+    ) -> Self {
+        Self {
+            max_batch_size,
+            hidden_buf: ctx.buffer_empty(max_batch_size * hidden_size),
+            normed_buf: ctx.buffer_empty(max_batch_size * hidden_size),
+            residual_buf: ctx.buffer_empty(max_batch_size * hidden_size),
+            q_buf: ctx.buffer_empty(max_batch_size * max_q_out),
+            k_buf: ctx.buffer_empty(max_batch_size * max_kv_out),
+            v_buf: ctx.buffer_empty(max_batch_size * max_kv_out),
+            attn_out_buf: ctx.buffer_empty(max_batch_size * max_q_out),
+            o_out_buf: ctx.buffer_empty(max_batch_size * hidden_size),
+            gate_buf: ctx.buffer_empty(max_batch_size * intermediate_size),
+            up_buf: ctx.buffer_empty(max_batch_size * intermediate_size),
+            gelu_buf: ctx.buffer_empty(max_batch_size * intermediate_size),
+            down_buf: ctx.buffer_empty(max_batch_size * hidden_size),
+            logits_buf: ctx.buffer_empty(max_batch_size * vocab_size),
+            ple_context_proj_buf: ctx.buffer_empty(max_batch_size * num_layers * ple_dim),
+            ple_token_id_buf: ctx.buffer_empty(max_batch_size * num_layers * ple_dim),
+            ple_combined_buf: ctx.buffer_empty(max_batch_size * num_layers * ple_dim),
+            q_normed_buf: ctx.buffer_empty(max_batch_size * max_q_out),
+            k_normed_buf: ctx.buffer_empty(max_batch_size * max_kv_out),
+        }
+    }
 }
 
 impl PrefillScratch {
@@ -501,7 +580,17 @@ impl Gemma4GpuModel {
             num_layers,
             ple_dim,
         );
-
+        let decode_batch_scratch = DecodeBatchScratch::new(
+            &ctx,
+            DEFAULT_MAX_DECODE_BATCH,
+            hidden_size,
+            max_q_out,
+            max_kv_out,
+            intermediate_size,
+            vocab_size,
+            num_layers,
+            ple_dim,
+        );
         // Rotary buffers (allocate for max head_dim)
         let cos_buf = ctx.buffer_empty(max_head_dim);
         let sin_buf = ctx.buffer_empty(max_head_dim);
@@ -509,15 +598,26 @@ impl Gemma4GpuModel {
         // Per-layer persistent buffers for cos/sin/ple (allocated once, overwritten each token)
         let mut per_layer_cos_bufs = Vec::with_capacity(num_layers);
         let mut per_layer_sin_bufs = Vec::with_capacity(num_layers);
+        let mut per_layer_decode_batch_cos_bufs = Vec::with_capacity(num_layers);
+        let mut per_layer_decode_batch_sin_bufs = Vec::with_capacity(num_layers);
+        let mut per_layer_decode_batch_append_pos_bufs = Vec::with_capacity(num_layers);
+        let mut per_layer_decode_batch_kv_start_bufs = Vec::with_capacity(num_layers);
+        let mut per_layer_decode_batch_kv_len_bufs = Vec::with_capacity(num_layers);
         let mut per_layer_ple_bufs = Vec::with_capacity(num_layers);
         for i in 0..num_layers {
             let hd = config.layer_head_dim(i);
             per_layer_cos_bufs.push(ctx.buffer_empty(hd));
             per_layer_sin_bufs.push(ctx.buffer_empty(hd));
+            per_layer_decode_batch_cos_bufs.push(ctx.buffer_empty(DEFAULT_MAX_DECODE_BATCH * hd));
+            per_layer_decode_batch_sin_bufs.push(ctx.buffer_empty(DEFAULT_MAX_DECODE_BATCH * hd));
+            per_layer_decode_batch_append_pos_bufs.push(ctx.buffer_empty_u32(DEFAULT_MAX_DECODE_BATCH));
+            per_layer_decode_batch_kv_start_bufs.push(ctx.buffer_empty_u32(DEFAULT_MAX_DECODE_BATCH));
+            per_layer_decode_batch_kv_len_bufs.push(ctx.buffer_empty_u32(DEFAULT_MAX_DECODE_BATCH));
             per_layer_ple_bufs.push(ctx.buffer_empty(ple_dim));
         }
 
         println!("  Parallel prefill scratch: max_seq={}", prefill_scratch.max_seq_len);
+        println!("  Decode batch scratch: max_batch={}", decode_batch_scratch.max_batch_size);
         println!("  Gemma4 model loaded successfully (Q4_0 quantized on Metal)");
 
         Gemma4GpuModel {
@@ -544,6 +644,7 @@ impl Gemma4GpuModel {
             down_buf,
             logits_buf,
             prefill_scratch,
+            decode_batch_scratch,
             ple_embed_buf,
             ple_gated_buf,
             ple_normed_buf,
@@ -561,6 +662,11 @@ impl Gemma4GpuModel {
             sin_buf,
             per_layer_cos_bufs,
             per_layer_sin_bufs,
+            per_layer_decode_batch_cos_bufs,
+            per_layer_decode_batch_sin_bufs,
+            per_layer_decode_batch_append_pos_bufs,
+            per_layer_decode_batch_kv_start_bufs,
+            per_layer_decode_batch_kv_len_bufs,
             per_layer_ple_bufs,
             total_tokens: 0,
         }
@@ -841,21 +947,43 @@ impl Gemma4GpuModel {
             num_layers,
             ple_dim,
         );
+        let decode_batch_scratch = DecodeBatchScratch::new(
+            &ctx,
+            DEFAULT_MAX_DECODE_BATCH,
+            hidden_size,
+            max_q_out,
+            max_kv_out,
+            intermediate_size,
+            vocab_size,
+            num_layers,
+            ple_dim,
+        );
 
         let cos_buf = ctx.buffer_empty(max_head_dim);
         let sin_buf = ctx.buffer_empty(max_head_dim);
 
         let mut per_layer_cos_bufs = Vec::with_capacity(num_layers);
         let mut per_layer_sin_bufs = Vec::with_capacity(num_layers);
+        let mut per_layer_decode_batch_cos_bufs = Vec::with_capacity(num_layers);
+        let mut per_layer_decode_batch_sin_bufs = Vec::with_capacity(num_layers);
+        let mut per_layer_decode_batch_append_pos_bufs = Vec::with_capacity(num_layers);
+        let mut per_layer_decode_batch_kv_start_bufs = Vec::with_capacity(num_layers);
+        let mut per_layer_decode_batch_kv_len_bufs = Vec::with_capacity(num_layers);
         let mut per_layer_ple_bufs = Vec::with_capacity(num_layers);
         for i in 0..num_layers {
             let hd = config.layer_head_dim(i);
             per_layer_cos_bufs.push(ctx.buffer_empty(hd));
             per_layer_sin_bufs.push(ctx.buffer_empty(hd));
+            per_layer_decode_batch_cos_bufs.push(ctx.buffer_empty(DEFAULT_MAX_DECODE_BATCH * hd));
+            per_layer_decode_batch_sin_bufs.push(ctx.buffer_empty(DEFAULT_MAX_DECODE_BATCH * hd));
+            per_layer_decode_batch_append_pos_bufs.push(ctx.buffer_empty_u32(DEFAULT_MAX_DECODE_BATCH));
+            per_layer_decode_batch_kv_start_bufs.push(ctx.buffer_empty_u32(DEFAULT_MAX_DECODE_BATCH));
+            per_layer_decode_batch_kv_len_bufs.push(ctx.buffer_empty_u32(DEFAULT_MAX_DECODE_BATCH));
             per_layer_ple_bufs.push(ctx.buffer_empty(ple_dim));
         }
 
         println!("  Parallel prefill scratch: max_seq={}", prefill_scratch.max_seq_len);
+        println!("  Decode batch scratch: max_batch={}", decode_batch_scratch.max_batch_size);
         println!("  Loaded from Q4 cache successfully");
 
         Gemma4GpuModel {
@@ -868,13 +996,19 @@ impl Gemma4GpuModel {
             q_buf, k_buf, v_buf, attn_out_buf, o_out_buf,
             gate_buf, up_buf, gelu_buf, down_buf, logits_buf,
             prefill_scratch,
+            decode_batch_scratch,
             ple_embed_buf, ple_gated_buf, ple_normed_buf, ple_projected_buf,
             ple_context_proj_buf, ple_token_id_buf, ple_combined_buf,
             q_normed_buf, k_normed_buf,
             k_cache, v_cache,
             kv_seq_len: 0, kv_capacity,
             cos_buf, sin_buf,
-            per_layer_cos_bufs, per_layer_sin_bufs, per_layer_ple_bufs,
+            per_layer_cos_bufs, per_layer_sin_bufs,
+            per_layer_decode_batch_cos_bufs, per_layer_decode_batch_sin_bufs,
+            per_layer_decode_batch_append_pos_bufs,
+            per_layer_decode_batch_kv_start_bufs,
+            per_layer_decode_batch_kv_len_bufs,
+            per_layer_ple_bufs,
             total_tokens: 0,
         }
     }
@@ -1269,6 +1403,10 @@ impl Gemma4GpuModel {
         self.prefill_scratch.max_seq_len
     }
 
+    pub fn max_decode_batch_size(&self) -> usize {
+        self.decode_batch_scratch.max_batch_size
+    }
+
     pub fn prepare_parallel_prefill_inputs(&mut self, token_ids: &[usize]) -> Result<(), String> {
         if token_ids.is_empty() {
             return Err("prefill token_ids must not be empty".to_string());
@@ -1281,6 +1419,137 @@ impl Gemma4GpuModel {
             ));
         }
 
+        let inputs = self.prepare_batched_token_inputs(token_ids)?;
+        MetalContext::write_buffer(&self.prefill_scratch.hidden_buf, &inputs.hidden);
+        MetalContext::write_buffer(
+            &self.prefill_scratch.ple_token_id_buf,
+            &inputs.ple_token_identity,
+        );
+        Ok(())
+    }
+
+    pub fn prepare_decode_batch_inputs(&mut self, token_ids: &[usize]) -> Result<(), String> {
+        if token_ids.is_empty() {
+            return Err("decode batch token_ids must not be empty".to_string());
+        }
+        if token_ids.len() > self.decode_batch_scratch.max_batch_size {
+            return Err(format!(
+                "decode batch has {} requests, max supported batch is {}",
+                token_ids.len(),
+                self.decode_batch_scratch.max_batch_size
+            ));
+        }
+
+        let inputs = self.prepare_batched_token_inputs(token_ids)?;
+        MetalContext::write_buffer(&self.decode_batch_scratch.hidden_buf, &inputs.hidden);
+        MetalContext::write_buffer(
+            &self.decode_batch_scratch.ple_token_id_buf,
+            &inputs.ple_token_identity,
+        );
+        Ok(())
+    }
+
+    fn prepare_decode_batch_rotary(
+        &mut self,
+        slot_views: &[KvSlotView],
+    ) -> Result<(), String> {
+        for layer_idx in 0..self.layers.len() {
+            let layer = &self.layers[layer_idx];
+            let head_dim = layer.head_dim;
+            let half_dim = head_dim / 2;
+            let is_full = layer.is_full_attention;
+            let rope_theta = if is_full {
+                self.config.full_rope_theta()
+            } else {
+                self.config.sliding_rope_theta()
+            };
+            let rope_factor = if is_full {
+                self.config.full_rope_factor()
+            } else {
+                self.config.sliding_rope_factor()
+            };
+            let rotary_dim = if is_full {
+                (head_dim as f64 * self.config.full_partial_rotary_factor()) as usize
+            } else {
+                head_dim
+            };
+            let rope_angles = rotary_dim / 2;
+
+            let mut cos_batch = vec![0.0f32; slot_views.len() * head_dim];
+            let mut sin_batch = vec![0.0f32; slot_views.len() * head_dim];
+
+            for (batch_idx, slot_view) in slot_views.iter().enumerate() {
+                let pos = slot_view.total_tokens as f32;
+                let batch_offset = batch_idx * head_dim;
+
+                for i in 0..rope_angles {
+                    let inv_freq = 1.0
+                        / (rope_theta.powf(i as f64 * 2.0 / head_dim as f64) as f32)
+                        / rope_factor as f32;
+                    let angle = pos * inv_freq;
+                    cos_batch[batch_offset + i] = angle.cos();
+                    cos_batch[batch_offset + i + half_dim] = angle.cos();
+                    sin_batch[batch_offset + i] = angle.sin();
+                    sin_batch[batch_offset + i + half_dim] = angle.sin();
+                }
+
+                for i in rope_angles..half_dim {
+                    cos_batch[batch_offset + i] = 1.0;
+                    cos_batch[batch_offset + i + half_dim] = 1.0;
+                }
+            }
+
+            MetalContext::write_buffer(&self.per_layer_decode_batch_cos_bufs[layer_idx], &cos_batch);
+            MetalContext::write_buffer(&self.per_layer_decode_batch_sin_bufs[layer_idx], &sin_batch);
+        }
+
+        Ok(())
+    }
+
+    fn prepare_decode_batch_attention_metadata(
+        &mut self,
+        slot_views: &[KvSlotView],
+    ) -> Result<(), String> {
+        let mut append_positions = vec![0u32; slot_views.len()];
+        for (batch_idx, slot_view) in slot_views.iter().enumerate() {
+            append_positions[batch_idx] = slot_view.seq_len;
+        }
+
+        for layer_idx in 0..self.layers.len() {
+            let layer = &self.layers[layer_idx];
+            let mut kv_starts = vec![0u32; slot_views.len()];
+            let mut kv_lens = vec![0u32; slot_views.len()];
+
+            for (batch_idx, &append_pos) in append_positions.iter().enumerate() {
+                let attn_kv_seq = append_pos + 1;
+                if layer.is_full_attention {
+                    kv_starts[batch_idx] = 0;
+                    kv_lens[batch_idx] = attn_kv_seq;
+                } else {
+                    let window = self.config.sliding_window as u32;
+                    kv_lens[batch_idx] = attn_kv_seq.min(window);
+                    kv_starts[batch_idx] = attn_kv_seq.saturating_sub(window);
+                }
+            }
+
+            MetalContext::write_u32_buffer(
+                &self.per_layer_decode_batch_append_pos_bufs[layer_idx],
+                &append_positions,
+            );
+            MetalContext::write_u32_buffer(
+                &self.per_layer_decode_batch_kv_start_bufs[layer_idx],
+                &kv_starts,
+            );
+            MetalContext::write_u32_buffer(
+                &self.per_layer_decode_batch_kv_len_bufs[layer_idx],
+                &kv_lens,
+            );
+        }
+
+        Ok(())
+    }
+
+    fn prepare_batched_token_inputs(&self, token_ids: &[usize]) -> Result<BatchedTokenInputs, String> {
         let hidden_size = self.config.hidden_size;
         let num_layers = self.config.num_hidden_layers;
         let ple_dim = self.config.hidden_size_per_layer_input;
@@ -1319,9 +1588,633 @@ impl Gemma4GpuModel {
             }
         }
 
-        MetalContext::write_buffer(&self.prefill_scratch.hidden_buf, &hidden);
-        MetalContext::write_buffer(&self.prefill_scratch.ple_token_id_buf, &ple_token_identity);
-        Ok(())
+        Ok(BatchedTokenInputs {
+            batch_size: token_ids.len(),
+            hidden,
+            ple_token_identity,
+        })
+    }
+
+    fn f32_byte_offset(elements: usize) -> u64 {
+        (elements * std::mem::size_of::<f32>()) as u64
+    }
+
+    fn decode_batch_row_offsets(&self, batch_idx: usize) -> DecodeBatchRowOffsets {
+        let hidden_size = self.config.hidden_size;
+        let intermediate_size = self.config.intermediate_size;
+        let ple_dim = self.config.hidden_size_per_layer_input;
+        let ple_total_dim = self.config.num_hidden_layers * ple_dim;
+        let max_q_out = self.layers.iter().map(|layer| layer.q_out_dim).max().unwrap_or(0);
+        let max_kv_out = self.layers.iter().map(|layer| layer.kv_out_dim).max().unwrap_or(0);
+
+        DecodeBatchRowOffsets {
+            hidden: Self::f32_byte_offset(batch_idx * hidden_size),
+            q: Self::f32_byte_offset(batch_idx * max_q_out),
+            kv: Self::f32_byte_offset(batch_idx * max_kv_out),
+            intermediate: Self::f32_byte_offset(batch_idx * intermediate_size),
+            ple_row: Self::f32_byte_offset(batch_idx * ple_total_dim),
+        }
+    }
+
+    fn decode_batch_layer_ple_offset(&self, batch_idx: usize, layer_idx: usize) -> u64 {
+        let ple_dim = self.config.hidden_size_per_layer_input;
+        let ple_total_dim = self.config.num_hidden_layers * ple_dim;
+        Self::f32_byte_offset(batch_idx * ple_total_dim + layer_idx * ple_dim)
+    }
+
+    fn forward_decode_batch_encoded_with_kv_slots(
+        &mut self,
+        inputs: &[(KvSlot, usize)],
+        slot_views: &[KvSlotView],
+        kv_pool: &mut KvCachePool,
+    ) -> Result<Vec<Vec<f32>>, String> {
+        let batch_size = inputs.len();
+        if batch_size == 0 {
+            return Ok(Vec::new());
+        }
+
+        let hidden_size = self.config.hidden_size;
+        let intermediate_size = self.config.intermediate_size;
+        let vocab_size = self.config.vocab_size;
+        let num_layers = self.config.num_hidden_layers;
+        let num_heads = self.config.num_attention_heads;
+        let num_kv_heads = self.config.num_key_value_heads;
+        let num_kv_groups = (num_heads / num_kv_heads) as u32;
+        let ple_dim = self.config.hidden_size_per_layer_input;
+        let ple_total_dim = num_layers * ple_dim;
+        let eps = self.config.rms_norm_eps as f32;
+        let context_proj_scale = 1.0f32 / (hidden_size as f32).sqrt();
+        let ple_input_scale = 1.0f32 / 2.0f32.sqrt();
+
+        let cmd = self.ctx.queue.new_command_buffer();
+
+        {
+            let encoder = cmd.new_compute_command_encoder();
+            for batch_idx in 0..batch_size {
+                let offsets = self.decode_batch_row_offsets(batch_idx);
+                self.ctx.encode_matvec_q4_at(
+                    encoder,
+                    &self.per_layer_model_projection_weight,
+                    &self.decode_batch_scratch.hidden_buf,
+                    offsets.hidden,
+                    &self.decode_batch_scratch.ple_context_proj_buf,
+                    offsets.ple_row,
+                    ple_total_dim as u32,
+                    hidden_size as u32,
+                );
+                self.ctx.encode_vec_scale_at(
+                    encoder,
+                    &self.decode_batch_scratch.ple_context_proj_buf,
+                    offsets.ple_row,
+                    &self.decode_batch_scratch.ple_combined_buf,
+                    offsets.ple_row,
+                    ple_total_dim as u32,
+                    context_proj_scale,
+                );
+                self.ctx.encode_rmsnorm_per_head_at(
+                    encoder,
+                    &self.decode_batch_scratch.ple_combined_buf,
+                    offsets.ple_row,
+                    &self.per_layer_projection_norm_weight,
+                    &self.decode_batch_scratch.ple_context_proj_buf,
+                    offsets.ple_row,
+                    num_layers as u32,
+                    ple_dim as u32,
+                    eps,
+                );
+                self.ctx.encode_vec_add_at(
+                    encoder,
+                    &self.decode_batch_scratch.ple_context_proj_buf,
+                    offsets.ple_row,
+                    &self.decode_batch_scratch.ple_token_id_buf,
+                    offsets.ple_row,
+                    &self.decode_batch_scratch.ple_combined_buf,
+                    offsets.ple_row,
+                    ple_total_dim as u32,
+                );
+                self.ctx.encode_vec_scale_at(
+                    encoder,
+                    &self.decode_batch_scratch.ple_combined_buf,
+                    offsets.ple_row,
+                    &self.decode_batch_scratch.ple_context_proj_buf,
+                    offsets.ple_row,
+                    ple_total_dim as u32,
+                    ple_input_scale,
+                );
+            }
+            encoder.end_encoding();
+        }
+
+        for layer_idx in 0..self.layers.len() {
+            let layer = &self.layers[layer_idx];
+            let head_dim = layer.head_dim;
+            let q_out = layer.q_out_dim;
+            let kv_out = layer.kv_out_dim;
+            let scale = 1.0f32;
+
+            let encoder = cmd.new_compute_command_encoder();
+
+            for (batch_idx, slot_view) in slot_views.iter().enumerate() {
+                let offsets = self.decode_batch_row_offsets(batch_idx);
+                let append_pos = slot_view.seq_len;
+                let attn_kv_seq = append_pos + 1;
+                let effective_kv_seq = if layer.is_full_attention {
+                    attn_kv_seq
+                } else {
+                    attn_kv_seq.min(self.config.sliding_window as u32)
+                };
+                let kv_start = if !layer.is_full_attention
+                    && attn_kv_seq > self.config.sliding_window as u32
+                {
+                    attn_kv_seq - self.config.sliding_window as u32
+                } else {
+                    0
+                };
+                let rotary_offset = Self::f32_byte_offset(batch_idx * head_dim);
+                let ple_layer_offset = self.decode_batch_layer_ple_offset(batch_idx, layer_idx);
+
+                self.ctx.encode_copy_at(
+                    encoder,
+                    &self.decode_batch_scratch.hidden_buf,
+                    offsets.hidden,
+                    &self.decode_batch_scratch.residual_buf,
+                    offsets.hidden,
+                    hidden_size as u32,
+                );
+                self.ctx.encode_rmsnorm_at(
+                    encoder,
+                    &self.decode_batch_scratch.hidden_buf,
+                    offsets.hidden,
+                    &layer.input_layernorm_weight,
+                    &self.decode_batch_scratch.normed_buf,
+                    offsets.hidden,
+                    hidden_size as u32,
+                    eps,
+                );
+
+                if layer.use_f16 {
+                    self.ctx.encode_matvec_f16_at(
+                        encoder,
+                        &layer.q_proj,
+                        &self.decode_batch_scratch.normed_buf,
+                        offsets.hidden,
+                        &self.decode_batch_scratch.q_buf,
+                        offsets.q,
+                        q_out as u32,
+                        hidden_size as u32,
+                    );
+                } else {
+                    self.ctx.encode_matvec_q4_at(
+                        encoder,
+                        &layer.q_proj,
+                        &self.decode_batch_scratch.normed_buf,
+                        offsets.hidden,
+                        &self.decode_batch_scratch.q_buf,
+                        offsets.q,
+                        q_out as u32,
+                        hidden_size as u32,
+                    );
+                }
+                self.ctx.encode_rmsnorm_per_head_at(
+                    encoder,
+                    &self.decode_batch_scratch.q_buf,
+                    offsets.q,
+                    &layer.q_norm_weight,
+                    &self.decode_batch_scratch.q_normed_buf,
+                    offsets.q,
+                    num_heads as u32,
+                    head_dim as u32,
+                    eps,
+                );
+                self.ctx.encode_rotary_at(
+                    encoder,
+                    &self.decode_batch_scratch.q_normed_buf,
+                    offsets.q,
+                    &self.decode_batch_scratch.k_normed_buf,
+                    offsets.kv,
+                    &self.per_layer_decode_batch_cos_bufs[layer_idx],
+                    rotary_offset,
+                    &self.per_layer_decode_batch_sin_bufs[layer_idx],
+                    rotary_offset,
+                    num_heads as u32,
+                    0,
+                    head_dim as u32,
+                );
+
+                if layer.has_kv {
+                    if layer.use_f16 {
+                        self.ctx.encode_matvec_f16_at(
+                            encoder,
+                            &layer.k_proj,
+                            &self.decode_batch_scratch.normed_buf,
+                            offsets.hidden,
+                            &self.decode_batch_scratch.k_buf,
+                            offsets.kv,
+                            kv_out as u32,
+                            hidden_size as u32,
+                        );
+                        self.ctx.encode_matvec_f16_at(
+                            encoder,
+                            &layer.v_proj,
+                            &self.decode_batch_scratch.normed_buf,
+                            offsets.hidden,
+                            &self.decode_batch_scratch.v_buf,
+                            offsets.kv,
+                            kv_out as u32,
+                            hidden_size as u32,
+                        );
+                    } else {
+                        self.ctx.encode_matvec_q4_at(
+                            encoder,
+                            &layer.k_proj,
+                            &self.decode_batch_scratch.normed_buf,
+                            offsets.hidden,
+                            &self.decode_batch_scratch.k_buf,
+                            offsets.kv,
+                            kv_out as u32,
+                            hidden_size as u32,
+                        );
+                        self.ctx.encode_matvec_q4_at(
+                            encoder,
+                            &layer.v_proj,
+                            &self.decode_batch_scratch.normed_buf,
+                            offsets.hidden,
+                            &self.decode_batch_scratch.v_buf,
+                            offsets.kv,
+                            kv_out as u32,
+                            hidden_size as u32,
+                        );
+                    }
+
+                    self.ctx.encode_rmsnorm_per_head_at(
+                        encoder,
+                        &self.decode_batch_scratch.k_buf,
+                        offsets.kv,
+                        &layer.k_norm_weight,
+                        &self.decode_batch_scratch.k_normed_buf,
+                        offsets.kv,
+                        num_kv_heads as u32,
+                        head_dim as u32,
+                        eps,
+                    );
+                    self.ctx.encode_rotary_at(
+                        encoder,
+                        &self.decode_batch_scratch.q_buf,
+                        offsets.q,
+                        &self.decode_batch_scratch.k_normed_buf,
+                        offsets.kv,
+                        &self.per_layer_decode_batch_cos_bufs[layer_idx],
+                        rotary_offset,
+                        &self.per_layer_decode_batch_sin_bufs[layer_idx],
+                        rotary_offset,
+                        0,
+                        num_kv_heads as u32,
+                        head_dim as u32,
+                    );
+                    self.ctx.encode_rmsnorm_per_head_noweight_at(
+                        encoder,
+                        &self.decode_batch_scratch.v_buf,
+                        offsets.kv,
+                        &self.decode_batch_scratch.gate_buf,
+                        offsets.intermediate,
+                        num_kv_heads as u32,
+                        head_dim as u32,
+                        eps,
+                    );
+
+                    let k_cache = kv_pool
+                        .layer_k_cache(slot_view.slot, layer_idx)
+                        .map_err(|err| err.to_string())?;
+                    let v_cache = kv_pool
+                        .layer_v_cache(slot_view.slot, layer_idx)
+                        .map_err(|err| err.to_string())?;
+                    self.ctx.encode_kv_append_f16_at(
+                        encoder,
+                        &self.decode_batch_scratch.k_normed_buf,
+                        offsets.kv,
+                        k_cache,
+                        num_kv_heads as u32,
+                        head_dim as u32,
+                        kv_pool.capacity(),
+                        append_pos,
+                    );
+                    self.ctx.encode_kv_append_f16_at(
+                        encoder,
+                        &self.decode_batch_scratch.gate_buf,
+                        offsets.intermediate,
+                        v_cache,
+                        num_kv_heads as u32,
+                        head_dim as u32,
+                        kv_pool.capacity(),
+                        append_pos,
+                    );
+                }
+
+                let k_cache = kv_pool
+                    .layer_k_cache(slot_view.slot, layer.kv_source_layer)
+                    .map_err(|err| err.to_string())?;
+                let v_cache = kv_pool
+                    .layer_v_cache(slot_view.slot, layer.kv_source_layer)
+                    .map_err(|err| err.to_string())?;
+                self.ctx.encode_attention_with_offset_f16_at(
+                    encoder,
+                    &self.decode_batch_scratch.q_normed_buf,
+                    offsets.q,
+                    k_cache,
+                    v_cache,
+                    &self.decode_batch_scratch.attn_out_buf,
+                    offsets.q,
+                    num_heads as u32,
+                    num_kv_heads as u32,
+                    num_kv_groups,
+                    head_dim as u32,
+                    effective_kv_seq,
+                    kv_pool.capacity(),
+                    scale,
+                    kv_start,
+                );
+
+                self.ctx.encode_matvec_f16_at(
+                    encoder,
+                    &layer.o_proj,
+                    &self.decode_batch_scratch.attn_out_buf,
+                    offsets.q,
+                    &self.decode_batch_scratch.o_out_buf,
+                    offsets.hidden,
+                    hidden_size as u32,
+                    q_out as u32,
+                );
+                self.ctx.encode_rmsnorm_at(
+                    encoder,
+                    &self.decode_batch_scratch.o_out_buf,
+                    offsets.hidden,
+                    &layer.post_attention_layernorm_weight,
+                    &self.decode_batch_scratch.normed_buf,
+                    offsets.hidden,
+                    hidden_size as u32,
+                    eps,
+                );
+                self.ctx.encode_vec_add_at(
+                    encoder,
+                    &self.decode_batch_scratch.residual_buf,
+                    offsets.hidden,
+                    &self.decode_batch_scratch.normed_buf,
+                    offsets.hidden,
+                    &self.decode_batch_scratch.hidden_buf,
+                    offsets.hidden,
+                    hidden_size as u32,
+                );
+
+                self.ctx.encode_copy_at(
+                    encoder,
+                    &self.decode_batch_scratch.hidden_buf,
+                    offsets.hidden,
+                    &self.decode_batch_scratch.residual_buf,
+                    offsets.hidden,
+                    hidden_size as u32,
+                );
+                self.ctx.encode_rmsnorm_at(
+                    encoder,
+                    &self.decode_batch_scratch.hidden_buf,
+                    offsets.hidden,
+                    &layer.pre_feedforward_layernorm_weight,
+                    &self.decode_batch_scratch.normed_buf,
+                    offsets.hidden,
+                    hidden_size as u32,
+                    eps,
+                );
+                if layer.use_f16 {
+                    self.ctx.encode_matvec_f16_at(
+                        encoder,
+                        &layer.gate_proj,
+                        &self.decode_batch_scratch.normed_buf,
+                        offsets.hidden,
+                        &self.decode_batch_scratch.gate_buf,
+                        offsets.intermediate,
+                        intermediate_size as u32,
+                        hidden_size as u32,
+                    );
+                    self.ctx.encode_matvec_f16_at(
+                        encoder,
+                        &layer.up_proj,
+                        &self.decode_batch_scratch.normed_buf,
+                        offsets.hidden,
+                        &self.decode_batch_scratch.up_buf,
+                        offsets.intermediate,
+                        intermediate_size as u32,
+                        hidden_size as u32,
+                    );
+                } else {
+                    self.ctx.encode_matvec_q4_at(
+                        encoder,
+                        &layer.gate_proj,
+                        &self.decode_batch_scratch.normed_buf,
+                        offsets.hidden,
+                        &self.decode_batch_scratch.gate_buf,
+                        offsets.intermediate,
+                        intermediate_size as u32,
+                        hidden_size as u32,
+                    );
+                    self.ctx.encode_matvec_q4_at(
+                        encoder,
+                        &layer.up_proj,
+                        &self.decode_batch_scratch.normed_buf,
+                        offsets.hidden,
+                        &self.decode_batch_scratch.up_buf,
+                        offsets.intermediate,
+                        intermediate_size as u32,
+                        hidden_size as u32,
+                    );
+                }
+                self.ctx.encode_gelu_mul_at(
+                    encoder,
+                    &self.decode_batch_scratch.gate_buf,
+                    offsets.intermediate,
+                    &self.decode_batch_scratch.up_buf,
+                    offsets.intermediate,
+                    &self.decode_batch_scratch.gelu_buf,
+                    offsets.intermediate,
+                    intermediate_size as u32,
+                );
+                if layer.use_f16 {
+                    self.ctx.encode_matvec_f16_at(
+                        encoder,
+                        &layer.down_proj,
+                        &self.decode_batch_scratch.gelu_buf,
+                        offsets.intermediate,
+                        &self.decode_batch_scratch.down_buf,
+                        offsets.hidden,
+                        hidden_size as u32,
+                        intermediate_size as u32,
+                    );
+                } else {
+                    self.ctx.encode_matvec_q4_at(
+                        encoder,
+                        &layer.down_proj,
+                        &self.decode_batch_scratch.gelu_buf,
+                        offsets.intermediate,
+                        &self.decode_batch_scratch.down_buf,
+                        offsets.hidden,
+                        hidden_size as u32,
+                        intermediate_size as u32,
+                    );
+                }
+                self.ctx.encode_rmsnorm_at(
+                    encoder,
+                    &self.decode_batch_scratch.down_buf,
+                    offsets.hidden,
+                    &layer.post_feedforward_layernorm_weight,
+                    &self.decode_batch_scratch.normed_buf,
+                    offsets.hidden,
+                    hidden_size as u32,
+                    eps,
+                );
+                self.ctx.encode_vec_add_at(
+                    encoder,
+                    &self.decode_batch_scratch.residual_buf,
+                    offsets.hidden,
+                    &self.decode_batch_scratch.normed_buf,
+                    offsets.hidden,
+                    &self.decode_batch_scratch.hidden_buf,
+                    offsets.hidden,
+                    hidden_size as u32,
+                );
+
+                self.ctx.encode_copy_at(
+                    encoder,
+                    &self.decode_batch_scratch.hidden_buf,
+                    offsets.hidden,
+                    &self.decode_batch_scratch.residual_buf,
+                    offsets.hidden,
+                    hidden_size as u32,
+                );
+                self.ctx.encode_matvec_f16_at(
+                    encoder,
+                    &layer.per_layer_input_gate_weight,
+                    &self.decode_batch_scratch.hidden_buf,
+                    offsets.hidden,
+                    &self.decode_batch_scratch.gate_buf,
+                    offsets.intermediate,
+                    ple_dim as u32,
+                    hidden_size as u32,
+                );
+                self.ctx.encode_gelu_mul_at(
+                    encoder,
+                    &self.decode_batch_scratch.gate_buf,
+                    offsets.intermediate,
+                    &self.decode_batch_scratch.ple_context_proj_buf,
+                    ple_layer_offset,
+                    &self.decode_batch_scratch.up_buf,
+                    offsets.intermediate,
+                    ple_dim as u32,
+                );
+                self.ctx.encode_matvec_f16_at(
+                    encoder,
+                    &layer.per_layer_projection_weight,
+                    &self.decode_batch_scratch.up_buf,
+                    offsets.intermediate,
+                    &self.decode_batch_scratch.o_out_buf,
+                    offsets.hidden,
+                    hidden_size as u32,
+                    ple_dim as u32,
+                );
+                self.ctx.encode_rmsnorm_at(
+                    encoder,
+                    &self.decode_batch_scratch.o_out_buf,
+                    offsets.hidden,
+                    &layer.post_per_layer_input_norm_weight,
+                    &self.decode_batch_scratch.normed_buf,
+                    offsets.hidden,
+                    hidden_size as u32,
+                    eps,
+                );
+                self.ctx.encode_vec_add_at(
+                    encoder,
+                    &self.decode_batch_scratch.residual_buf,
+                    offsets.hidden,
+                    &self.decode_batch_scratch.normed_buf,
+                    offsets.hidden,
+                    &self.decode_batch_scratch.hidden_buf,
+                    offsets.hidden,
+                    hidden_size as u32,
+                );
+                self.ctx.encode_vec_scale_at(
+                    encoder,
+                    &self.decode_batch_scratch.hidden_buf,
+                    offsets.hidden,
+                    &self.decode_batch_scratch.residual_buf,
+                    offsets.hidden,
+                    hidden_size as u32,
+                    layer.layer_scalar,
+                );
+                self.ctx.encode_copy_at(
+                    encoder,
+                    &self.decode_batch_scratch.residual_buf,
+                    offsets.hidden,
+                    &self.decode_batch_scratch.hidden_buf,
+                    offsets.hidden,
+                    hidden_size as u32,
+                );
+            }
+
+            encoder.end_encoding();
+        }
+
+        {
+            let encoder = cmd.new_compute_command_encoder();
+            self.ctx.encode_rmsnorm_batch(
+                encoder,
+                &self.decode_batch_scratch.hidden_buf,
+                &self.final_norm_weight,
+                &self.decode_batch_scratch.normed_buf,
+                hidden_size as u32,
+                eps,
+                batch_size as u32,
+            );
+            for batch_idx in 0..batch_size {
+                let offsets = self.decode_batch_row_offsets(batch_idx);
+                let logits_offset = Self::f32_byte_offset(batch_idx * vocab_size);
+                self.ctx.encode_matvec_q4_at(
+                    encoder,
+                    &self.lm_head_buf,
+                    &self.decode_batch_scratch.normed_buf,
+                    offsets.hidden,
+                    &self.decode_batch_scratch.logits_buf,
+                    logits_offset,
+                    vocab_size as u32,
+                    hidden_size as u32,
+                );
+            }
+            encoder.end_encoding();
+        }
+
+        cmd.commit();
+        cmd.wait_until_completed();
+
+        let mut logits_batch =
+            MetalContext::read_buffer(&self.decode_batch_scratch.logits_buf, batch_size * vocab_size);
+        let cap = self.config.final_logit_softcapping;
+        let mut outputs = Vec::with_capacity(batch_size);
+        for batch_idx in 0..batch_size {
+            let start = batch_idx * vocab_size;
+            let end = start + vocab_size;
+            for logit in &mut logits_batch[start..end] {
+                let x = (*logit / cap).clamp(-10.0, 10.0);
+                *logit = cap * x.tanh();
+            }
+            outputs.push(logits_batch[start..end].to_vec());
+        }
+
+        for slot_view in slot_views {
+            kv_pool
+                .with_slot_mut(slot_view.slot, |slot_state| {
+                    slot_state.seq_len += 1;
+                    slot_state.total_tokens += 1;
+                })
+                .map_err(|err| err.to_string())?;
+        }
+
+        Ok(outputs)
     }
 
     /// Batched prefill: process all prompt tokens sequentially.
@@ -1364,6 +2257,57 @@ impl Gemma4GpuModel {
 
             logits
         })
+    }
+
+    pub fn forward_decode_batch_with_kv_slots(
+        &mut self,
+        inputs: &[(KvSlot, usize)],
+        kv_pool: &mut KvCachePool,
+    ) -> Vec<Result<Vec<f32>, String>> {
+        if inputs.len() > self.max_decode_batch_size() {
+            return inputs
+                .iter()
+                .map(|_| {
+                    Err(format!(
+                        "decode batch has {} requests, max supported batch is {}",
+                        inputs.len(),
+                        self.max_decode_batch_size()
+                    ))
+                })
+                .collect();
+        }
+
+        let token_ids: Vec<usize> = inputs.iter().map(|&(_, token_id)| token_id).collect();
+        if let Err(message) = self.prepare_decode_batch_inputs(&token_ids) {
+            return inputs.iter().map(|_| Err(message.clone())).collect();
+        }
+
+        let slots: Vec<KvSlot> = inputs.iter().map(|&(slot, _)| slot).collect();
+        let slot_views = match kv_pool.slot_views(&slots) {
+            Ok(slot_views) => slot_views,
+            Err(err) => return inputs.iter().map(|_| Err(err.to_string())).collect(),
+        };
+        if let Err(message) = self.prepare_decode_batch_rotary(&slot_views) {
+            return inputs.iter().map(|_| Err(message.clone())).collect();
+        }
+        if let Err(message) = self.prepare_decode_batch_attention_metadata(&slot_views) {
+            return inputs.iter().map(|_| Err(message.clone())).collect();
+        }
+
+        if inputs.len() > 1 {
+            return match self.forward_decode_batch_encoded_with_kv_slots(inputs, &slot_views, kv_pool) {
+                Ok(outputs) => outputs.into_iter().map(Ok).collect(),
+                Err(message) => inputs.iter().map(|_| Err(message.clone())).collect(),
+            };
+        }
+
+        inputs
+            .iter()
+            .map(|&(slot, token_id)| {
+                self.forward_single_token_with_kv_slot(token_id, kv_pool, slot)
+                    .map_err(|err| err.to_string())
+            })
+            .collect()
     }
 
     pub fn forward_prefill_with_kv_slot(

@@ -162,6 +162,11 @@ impl MetalContext {
         self.device.new_buffer(byte_len, MTLResourceOptions::StorageModeShared)
     }
 
+    pub fn buffer_empty_u32(&self, count: usize) -> Buffer {
+        let byte_len = (count * std::mem::size_of::<u32>()) as u64;
+        self.device.new_buffer(byte_len, MTLResourceOptions::StorageModeShared)
+    }
+
     pub fn read_buffer(buf: &Buffer, count: usize) -> Vec<f32> {
         let ptr = buf.contents() as *const f32;
         unsafe { std::slice::from_raw_parts(ptr, count).to_vec() }
@@ -172,16 +177,29 @@ impl MetalContext {
         unsafe { std::ptr::copy_nonoverlapping(data.as_ptr(), ptr, data.len()); }
     }
 
+    pub fn write_u32_buffer(buf: &Buffer, data: &[u32]) {
+        let ptr = buf.contents() as *mut u32;
+        unsafe { std::ptr::copy_nonoverlapping(data.as_ptr(), ptr, data.len()); }
+    }
+
     // ─── Encoder-based methods (encode into existing encoder) ────────────────
 
     pub fn encode_matvec(
         &self, encoder: &ComputeCommandEncoderRef,
         w_buf: &Buffer, x_buf: &Buffer, y_buf: &Buffer, m: u32, k: u32,
     ) {
+        self.encode_matvec_at(encoder, w_buf, x_buf, 0, y_buf, 0, m, k);
+    }
+
+    pub fn encode_matvec_at(
+        &self, encoder: &ComputeCommandEncoderRef,
+        w_buf: &Buffer, x_buf: &Buffer, x_offset: u64,
+        y_buf: &Buffer, y_offset: u64, m: u32, k: u32,
+    ) {
         encoder.set_compute_pipeline_state(&self.matvec_pipeline);
         encoder.set_buffer(0, Some(w_buf), 0);
-        encoder.set_buffer(1, Some(x_buf), 0);
-        encoder.set_buffer(2, Some(y_buf), 0);
+        encoder.set_buffer(1, Some(x_buf), x_offset);
+        encoder.set_buffer(2, Some(y_buf), y_offset);
         encoder.set_bytes(3, 4, &m as *const u32 as *const _);
         encoder.set_bytes(4, 4, &k as *const u32 as *const _);
         // One threadgroup per row, 32 threads per group (SIMD group)
@@ -195,10 +213,18 @@ impl MetalContext {
         &self, encoder: &ComputeCommandEncoderRef,
         w_buf: &Buffer, x_buf: &Buffer, y_buf: &Buffer, m: u32, k: u32,
     ) {
+        self.encode_matvec_f16_at(encoder, w_buf, x_buf, 0, y_buf, 0, m, k);
+    }
+
+    pub fn encode_matvec_f16_at(
+        &self, encoder: &ComputeCommandEncoderRef,
+        w_buf: &Buffer, x_buf: &Buffer, x_offset: u64,
+        y_buf: &Buffer, y_offset: u64, m: u32, k: u32,
+    ) {
         encoder.set_compute_pipeline_state(&self.matvec_f16_pipeline);
         encoder.set_buffer(0, Some(w_buf), 0);
-        encoder.set_buffer(1, Some(x_buf), 0);
-        encoder.set_buffer(2, Some(y_buf), 0);
+        encoder.set_buffer(1, Some(x_buf), x_offset);
+        encoder.set_buffer(2, Some(y_buf), y_offset);
         encoder.set_bytes(3, 4, &m as *const u32 as *const _);
         encoder.set_bytes(4, 4, &k as *const u32 as *const _);
         let num_tgs = MTLSize::new(m as u64, 1, 1);
@@ -211,10 +237,18 @@ impl MetalContext {
         &self, encoder: &ComputeCommandEncoderRef,
         w_buf: &Buffer, x_buf: &Buffer, y_buf: &Buffer, m: u32, k: u32,
     ) {
+        self.encode_matvec_q4_at(encoder, w_buf, x_buf, 0, y_buf, 0, m, k);
+    }
+
+    pub fn encode_matvec_q4_at(
+        &self, encoder: &ComputeCommandEncoderRef,
+        w_buf: &Buffer, x_buf: &Buffer, x_offset: u64,
+        y_buf: &Buffer, y_offset: u64, m: u32, k: u32,
+    ) {
         encoder.set_compute_pipeline_state(&self.matvec_q4_pipeline);
         encoder.set_buffer(0, Some(w_buf), 0);
-        encoder.set_buffer(1, Some(x_buf), 0);
-        encoder.set_buffer(2, Some(y_buf), 0);
+        encoder.set_buffer(1, Some(x_buf), x_offset);
+        encoder.set_buffer(2, Some(y_buf), y_offset);
         encoder.set_bytes(3, 4, &m as *const u32 as *const _);
         encoder.set_bytes(4, 4, &k as *const u32 as *const _);
         // 2 SIMD groups (64 threads) per TG, each TG handles 4 rows
@@ -228,10 +262,18 @@ impl MetalContext {
         &self, encoder: &ComputeCommandEncoderRef,
         x_buf: &Buffer, weight_buf: &Buffer, out_buf: &Buffer, dim: u32, eps: f32,
     ) {
+        self.encode_rmsnorm_at(encoder, x_buf, 0, weight_buf, out_buf, 0, dim, eps);
+    }
+
+    pub fn encode_rmsnorm_at(
+        &self, encoder: &ComputeCommandEncoderRef,
+        x_buf: &Buffer, x_offset: u64, weight_buf: &Buffer,
+        out_buf: &Buffer, out_offset: u64, dim: u32, eps: f32,
+    ) {
         encoder.set_compute_pipeline_state(&self.rmsnorm_pipeline);
-        encoder.set_buffer(0, Some(x_buf), 0);
+        encoder.set_buffer(0, Some(x_buf), x_offset);
         encoder.set_buffer(1, Some(weight_buf), 0);
-        encoder.set_buffer(2, Some(out_buf), 0);
+        encoder.set_buffer(2, Some(out_buf), out_offset);
         encoder.set_bytes(3, 4, &dim as *const u32 as *const _);
         encoder.set_bytes(4, 4, &eps as *const f32 as *const _);
         let tg_size = MTLSize::new(256.min(dim as u64), 1, 1);
@@ -243,13 +285,25 @@ impl MetalContext {
         q_buf: &Buffer, k_buf: &Buffer, cos_buf: &Buffer, sin_buf: &Buffer,
         num_heads: u32, num_kv_heads: u32, head_dim: u32,
     ) {
+        self.encode_rotary_at(
+            encoder, q_buf, 0, k_buf, 0, cos_buf, 0, sin_buf, 0,
+            num_heads, num_kv_heads, head_dim,
+        );
+    }
+
+    pub fn encode_rotary_at(
+        &self, encoder: &ComputeCommandEncoderRef,
+        q_buf: &Buffer, q_offset: u64, k_buf: &Buffer, k_offset: u64,
+        cos_buf: &Buffer, cos_offset: u64, sin_buf: &Buffer, sin_offset: u64,
+        num_heads: u32, num_kv_heads: u32, head_dim: u32,
+    ) {
         let half_dim = head_dim / 2;
         let total_threads = num_heads * half_dim + num_kv_heads * half_dim;
         encoder.set_compute_pipeline_state(&self.rotary_pipeline);
-        encoder.set_buffer(0, Some(q_buf), 0);
-        encoder.set_buffer(1, Some(k_buf), 0);
-        encoder.set_buffer(2, Some(cos_buf), 0);
-        encoder.set_buffer(3, Some(sin_buf), 0);
+        encoder.set_buffer(0, Some(q_buf), q_offset);
+        encoder.set_buffer(1, Some(k_buf), k_offset);
+        encoder.set_buffer(2, Some(cos_buf), cos_offset);
+        encoder.set_buffer(3, Some(sin_buf), sin_offset);
         encoder.set_bytes(4, 4, &num_heads as *const u32 as *const _);
         encoder.set_bytes(5, 4, &num_kv_heads as *const u32 as *const _);
         encoder.set_bytes(6, 4, &head_dim as *const u32 as *const _);
@@ -279,9 +333,19 @@ impl MetalContext {
         new_data: &Buffer, cache: &Buffer,
         num_kv_heads: u32, head_dim: u32, capacity: u32, cur_seq: u32,
     ) {
+        self.encode_kv_append_f16_at(
+            encoder, new_data, 0, cache, num_kv_heads, head_dim, capacity, cur_seq,
+        );
+    }
+
+    pub fn encode_kv_append_f16_at(
+        &self, encoder: &ComputeCommandEncoderRef,
+        new_data: &Buffer, new_data_offset: u64, cache: &Buffer,
+        num_kv_heads: u32, head_dim: u32, capacity: u32, cur_seq: u32,
+    ) {
         let total = num_kv_heads * head_dim;
         encoder.set_compute_pipeline_state(&self.kv_append_f16_pipeline);
-        encoder.set_buffer(0, Some(new_data), 0);
+        encoder.set_buffer(0, Some(new_data), new_data_offset);
         encoder.set_buffer(1, Some(cache), 0);
         encoder.set_bytes(2, 4, &num_kv_heads as *const u32 as *const _);
         encoder.set_bytes(3, 4, &head_dim as *const u32 as *const _);
@@ -329,10 +393,18 @@ impl MetalContext {
         &self, encoder: &ComputeCommandEncoderRef,
         gate_buf: &Buffer, up_buf: &Buffer, out_buf: &Buffer, n: u32,
     ) {
+        self.encode_gelu_mul_at(encoder, gate_buf, 0, up_buf, 0, out_buf, 0, n);
+    }
+
+    pub fn encode_gelu_mul_at(
+        &self, encoder: &ComputeCommandEncoderRef,
+        gate_buf: &Buffer, gate_offset: u64, up_buf: &Buffer, up_offset: u64,
+        out_buf: &Buffer, out_offset: u64, n: u32,
+    ) {
         encoder.set_compute_pipeline_state(&self.gelu_mul_pipeline);
-        encoder.set_buffer(0, Some(gate_buf), 0);
-        encoder.set_buffer(1, Some(up_buf), 0);
-        encoder.set_buffer(2, Some(out_buf), 0);
+        encoder.set_buffer(0, Some(gate_buf), gate_offset);
+        encoder.set_buffer(1, Some(up_buf), up_offset);
+        encoder.set_buffer(2, Some(out_buf), out_offset);
         encoder.set_bytes(3, 4, &n as *const u32 as *const _);
         encoder.dispatch_threads(MTLSize::new(n as u64, 1, 1), MTLSize::new(256, 1, 1));
     }
@@ -366,9 +438,17 @@ impl MetalContext {
         &self, encoder: &ComputeCommandEncoderRef,
         src_buf: &Buffer, dst_buf: &Buffer, n: u32, scale: f32,
     ) {
+        self.encode_vec_scale_at(encoder, src_buf, 0, dst_buf, 0, n, scale);
+    }
+
+    pub fn encode_vec_scale_at(
+        &self, encoder: &ComputeCommandEncoderRef,
+        src_buf: &Buffer, src_offset: u64, dst_buf: &Buffer, dst_offset: u64,
+        n: u32, scale: f32,
+    ) {
         encoder.set_compute_pipeline_state(&self.vec_scale_pipeline);
-        encoder.set_buffer(0, Some(src_buf), 0);
-        encoder.set_buffer(1, Some(dst_buf), 0);
+        encoder.set_buffer(0, Some(src_buf), src_offset);
+        encoder.set_buffer(1, Some(dst_buf), dst_offset);
         encoder.set_bytes(2, 4, &n as *const u32 as *const _);
         encoder.set_bytes(3, 4, &scale as *const f32 as *const _);
         encoder.dispatch_threads(MTLSize::new(n as u64, 1, 1), MTLSize::new(256, 1, 1));
@@ -379,10 +459,20 @@ impl MetalContext {
         x_buf: &Buffer, weight_buf: &Buffer, out_buf: &Buffer,
         num_heads: u32, head_dim: u32, eps: f32,
     ) {
+        self.encode_rmsnorm_per_head_at(
+            encoder, x_buf, 0, weight_buf, out_buf, 0, num_heads, head_dim, eps,
+        );
+    }
+
+    pub fn encode_rmsnorm_per_head_at(
+        &self, encoder: &ComputeCommandEncoderRef,
+        x_buf: &Buffer, x_offset: u64, weight_buf: &Buffer, out_buf: &Buffer,
+        out_offset: u64, num_heads: u32, head_dim: u32, eps: f32,
+    ) {
         encoder.set_compute_pipeline_state(&self.rmsnorm_per_head_pipeline);
-        encoder.set_buffer(0, Some(x_buf), 0);
+        encoder.set_buffer(0, Some(x_buf), x_offset);
         encoder.set_buffer(1, Some(weight_buf), 0);
-        encoder.set_buffer(2, Some(out_buf), 0);
+        encoder.set_buffer(2, Some(out_buf), out_offset);
         encoder.set_bytes(3, 4, &num_heads as *const u32 as *const _);
         encoder.set_bytes(4, 4, &head_dim as *const u32 as *const _);
         encoder.set_bytes(5, 4, &eps as *const f32 as *const _);
@@ -395,9 +485,19 @@ impl MetalContext {
         x_buf: &Buffer, out_buf: &Buffer,
         num_heads: u32, head_dim: u32, eps: f32,
     ) {
+        self.encode_rmsnorm_per_head_noweight_at(
+            encoder, x_buf, 0, out_buf, 0, num_heads, head_dim, eps,
+        );
+    }
+
+    pub fn encode_rmsnorm_per_head_noweight_at(
+        &self, encoder: &ComputeCommandEncoderRef,
+        x_buf: &Buffer, x_offset: u64, out_buf: &Buffer, out_offset: u64,
+        num_heads: u32, head_dim: u32, eps: f32,
+    ) {
         encoder.set_compute_pipeline_state(&self.rmsnorm_per_head_noweight_pipeline);
-        encoder.set_buffer(0, Some(x_buf), 0);
-        encoder.set_buffer(1, Some(out_buf), 0);
+        encoder.set_buffer(0, Some(x_buf), x_offset);
+        encoder.set_buffer(1, Some(out_buf), out_offset);
         encoder.set_bytes(2, 4, &num_heads as *const u32 as *const _);
         encoder.set_bytes(3, 4, &head_dim as *const u32 as *const _);
         encoder.set_bytes(4, 4, &eps as *const f32 as *const _);
@@ -454,11 +554,24 @@ impl MetalContext {
         num_heads: u32, num_kv_heads: u32, num_kv_groups: u32,
         head_dim: u32, kv_seq: u32, k_cap: u32, scale: f32, kv_start: u32,
     ) {
+        self.encode_attention_with_offset_f16_at(
+            encoder, q_buf, 0, k_cache_buf, v_cache_buf, out_buf, 0,
+            num_heads, num_kv_heads, num_kv_groups, head_dim, kv_seq, k_cap, scale, kv_start,
+        );
+    }
+
+    pub fn encode_attention_with_offset_f16_at(
+        &self, encoder: &ComputeCommandEncoderRef,
+        q_buf: &Buffer, q_offset: u64, k_cache_buf: &Buffer, v_cache_buf: &Buffer,
+        out_buf: &Buffer, out_offset: u64,
+        num_heads: u32, num_kv_heads: u32, num_kv_groups: u32,
+        head_dim: u32, kv_seq: u32, k_cap: u32, scale: f32, kv_start: u32,
+    ) {
         encoder.set_compute_pipeline_state(&self.attention_offset_f16_pipeline);
-        encoder.set_buffer(0, Some(q_buf), 0);
+        encoder.set_buffer(0, Some(q_buf), q_offset);
         encoder.set_buffer(1, Some(k_cache_buf), 0);
         encoder.set_buffer(2, Some(v_cache_buf), 0);
-        encoder.set_buffer(3, Some(out_buf), 0);
+        encoder.set_buffer(3, Some(out_buf), out_offset);
         encoder.set_bytes(4, 4, &num_heads as *const u32 as *const _);
         encoder.set_bytes(5, 4, &num_kv_heads as *const u32 as *const _);
         encoder.set_bytes(6, 4, &num_kv_groups as *const u32 as *const _);
@@ -475,10 +588,18 @@ impl MetalContext {
         &self, encoder: &ComputeCommandEncoderRef,
         a_buf: &Buffer, b_buf: &Buffer, c_buf: &Buffer, n: u32,
     ) {
+        self.encode_vec_add_at(encoder, a_buf, 0, b_buf, 0, c_buf, 0, n);
+    }
+
+    pub fn encode_vec_add_at(
+        &self, encoder: &ComputeCommandEncoderRef,
+        a_buf: &Buffer, a_offset: u64, b_buf: &Buffer, b_offset: u64,
+        c_buf: &Buffer, c_offset: u64, n: u32,
+    ) {
         encoder.set_compute_pipeline_state(&self.vec_add_pipeline);
-        encoder.set_buffer(0, Some(a_buf), 0);
-        encoder.set_buffer(1, Some(b_buf), 0);
-        encoder.set_buffer(2, Some(c_buf), 0);
+        encoder.set_buffer(0, Some(a_buf), a_offset);
+        encoder.set_buffer(1, Some(b_buf), b_offset);
+        encoder.set_buffer(2, Some(c_buf), c_offset);
         encoder.set_bytes(3, 4, &n as *const u32 as *const _);
         encoder.dispatch_threads(MTLSize::new(n as u64, 1, 1), MTLSize::new(256, 1, 1));
     }
@@ -487,9 +608,16 @@ impl MetalContext {
         &self, encoder: &ComputeCommandEncoderRef,
         src: &Buffer, dst: &Buffer, n: u32,
     ) {
+        self.encode_copy_at(encoder, src, 0, dst, 0, n);
+    }
+
+    pub fn encode_copy_at(
+        &self, encoder: &ComputeCommandEncoderRef,
+        src: &Buffer, src_offset: u64, dst: &Buffer, dst_offset: u64, n: u32,
+    ) {
         encoder.set_compute_pipeline_state(&self.buf_copy_pipeline);
-        encoder.set_buffer(0, Some(src), 0);
-        encoder.set_buffer(1, Some(dst), 0);
+        encoder.set_buffer(0, Some(src), src_offset);
+        encoder.set_buffer(1, Some(dst), dst_offset);
         encoder.set_bytes(2, 4, &n as *const u32 as *const _);
         encoder.dispatch_threads(MTLSize::new(n as u64, 1, 1), MTLSize::new(256, 1, 1));
     }

@@ -16,6 +16,7 @@ impl KvSlot {
 #[derive(Debug)]
 pub enum KvPoolError {
     InvalidSlot(usize),
+    InvalidLayer { layer: usize, num_layers: usize },
     SlotNotAllocated(usize),
 }
 
@@ -23,6 +24,9 @@ impl fmt::Display for KvPoolError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             KvPoolError::InvalidSlot(slot) => write!(f, "invalid KV slot: {}", slot),
+            KvPoolError::InvalidLayer { layer, num_layers } => {
+                write!(f, "invalid KV layer: {} (num_layers={})", layer, num_layers)
+            }
             KvPoolError::SlotNotAllocated(slot) => write!(f, "KV slot is not allocated: {}", slot),
         }
     }
@@ -43,6 +47,14 @@ pub struct KvCacheSlot {
     pub seq_len: u32,
     pub total_tokens: usize,
     in_use: bool,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct KvSlotView {
+    pub slot: KvSlot,
+    pub slot_index: usize,
+    pub seq_len: u32,
+    pub total_tokens: usize,
 }
 
 impl KvCachePool {
@@ -134,6 +146,43 @@ impl KvCachePool {
         Ok(self.slot(slot)?.total_tokens)
     }
 
+    pub fn slot_view(&self, slot: KvSlot) -> Result<KvSlotView, KvPoolError> {
+        let slot_state = self.slot(slot)?;
+        Ok(KvSlotView {
+            slot,
+            slot_index: slot.index(),
+            seq_len: slot_state.seq_len,
+            total_tokens: slot_state.total_tokens,
+        })
+    }
+
+    pub fn slot_views(&self, slots: &[KvSlot]) -> Result<Vec<KvSlotView>, KvPoolError> {
+        slots.iter().map(|&slot| self.slot_view(slot)).collect()
+    }
+
+    pub fn slot_buffers(&self, slot: KvSlot) -> Result<(&[Buffer], &[Buffer]), KvPoolError> {
+        let slot_state = self.slot(slot)?;
+        Ok((&slot_state.k_cache, &slot_state.v_cache))
+    }
+
+    pub fn layer_k_cache(
+        &self,
+        slot: KvSlot,
+        layer_idx: usize,
+    ) -> Result<&Buffer, KvPoolError> {
+        let slot_state = self.slot(slot)?;
+        self.layer_buffer(&slot_state.k_cache, layer_idx)
+    }
+
+    pub fn layer_v_cache(
+        &self,
+        slot: KvSlot,
+        layer_idx: usize,
+    ) -> Result<&Buffer, KvPoolError> {
+        let slot_state = self.slot(slot)?;
+        self.layer_buffer(&slot_state.v_cache, layer_idx)
+    }
+
     pub fn capacity(&self) -> u32 {
         self.max_seq_len
     }
@@ -185,5 +234,18 @@ impl KvCachePool {
         }
 
         Ok(slot)
+    }
+
+    fn layer_buffer<'a>(
+        &self,
+        buffers: &'a [Buffer],
+        layer_idx: usize,
+    ) -> Result<&'a Buffer, KvPoolError> {
+        buffers
+            .get(layer_idx)
+            .ok_or(KvPoolError::InvalidLayer {
+                layer: layer_idx,
+                num_layers: self.num_layers,
+            })
     }
 }
