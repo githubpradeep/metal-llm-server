@@ -1,5 +1,23 @@
 # Gemma4 E4B Inference Quality Benchmark
 
+## Local server regression smoke test
+
+Start the server first:
+
+```bash
+cargo run --release -- --port 8080
+```
+
+Then run the regression suite:
+
+```bash
+python3 benchmarks/server_regression.py --port 8080 --requests 10 --max-tokens 32
+```
+
+This checks health/model listing, structured request errors, non-streaming chat,
+streaming chat, concurrent requests, stop-token trimming, and idle scheduler
+gauges.
+
 ## How to compare your local model against llama.cpp
 
 ### Step 1: Run the Colab script (llama.cpp reference on GPU)

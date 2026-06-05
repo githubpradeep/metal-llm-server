@@ -628,3 +628,100 @@ pub async fn run_server(model: Gemma4GpuModel, tokenizer: tokenizers::Tokenizer,
     let listener = tokio::net::TcpListener::bind(&addr).await.unwrap();
     axum::serve(listener, app).await.unwrap();
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn valid_request() -> ChatCompletionRequest {
+        ChatCompletionRequest {
+            model: Some("gemma-4-e4b-q4".to_string()),
+            messages: vec![Message {
+                role: "user".to_string(),
+                content: "hello".to_string(),
+            }],
+            max_tokens: 16,
+            temperature: 0.7,
+            stream: false,
+            stop: None,
+            min_p: 0.05,
+            top_k: 0,
+            repetition_penalty: 1.0,
+            frequency_penalty: 0.0,
+        }
+    }
+
+    #[test]
+    fn trim_stop_sequences_prefers_earliest_builtin_or_request_stop() {
+        let request_stop = vec!["CUSTOM_STOP".to_string()];
+        let mut text = "hello CUSTOM_STOP ignored <end_of_turn>".to_string();
+
+        assert!(trim_stop_sequences(&mut text, Some(&request_stop)));
+        assert_eq!(text, "hello ");
+
+        let mut built_in_first = "hello <end_of_turn> CUSTOM_STOP".to_string();
+        assert!(trim_stop_sequences(&mut built_in_first, Some(&request_stop)));
+        assert_eq!(built_in_first, "hello ");
+    }
+
+    #[test]
+    fn stream_trim_holds_back_partial_stop_prefixes() {
+        let request_stop = vec!["CUSTOM_STOP".to_string()];
+        let mut text = "hello <end".to_string();
+
+        assert!(!trim_stream_safe_text(&mut text, Some(&request_stop)));
+        assert_eq!(text, "hello ");
+
+        let mut custom = "hello CUSTOM_".to_string();
+        assert!(!trim_stream_safe_text(&mut custom, Some(&request_stop)));
+        assert_eq!(custom, "hello ");
+    }
+
+    #[test]
+    fn validate_request_rejects_common_bad_inputs() {
+        let mut req = valid_request();
+        req.messages.clear();
+        let err = validate_request(&req).unwrap_err();
+        assert_eq!(err.status, StatusCode::BAD_REQUEST);
+        assert_eq!(err.code, "empty_messages");
+
+        let mut req = valid_request();
+        req.max_tokens = 0;
+        assert_eq!(validate_request(&req).unwrap_err().code, "invalid_max_tokens");
+
+        let mut req = valid_request();
+        req.temperature = -0.1;
+        assert_eq!(validate_request(&req).unwrap_err().code, "invalid_temperature");
+
+        let mut req = valid_request();
+        req.min_p = 1.1;
+        assert_eq!(validate_request(&req).unwrap_err().code, "invalid_min_p");
+
+        let mut req = valid_request();
+        req.repetition_penalty = 0.0;
+        assert_eq!(
+            validate_request(&req).unwrap_err().code,
+            "invalid_repetition_penalty"
+        );
+
+        let mut req = valid_request();
+        req.frequency_penalty = 3.0;
+        assert_eq!(
+            validate_request(&req).unwrap_err().code,
+            "invalid_frequency_penalty"
+        );
+    }
+
+    #[test]
+    fn validate_context_len_rejects_over_limit_requests() {
+        assert!(validate_context_len(8, 8, 16).is_ok());
+        assert_eq!(
+            validate_context_len(16, 1, 16).unwrap_err().code,
+            "context_length_exceeded"
+        );
+        assert_eq!(
+            validate_context_len(15, 2, 16).unwrap_err().code,
+            "context_length_exceeded"
+        );
+    }
+}

@@ -164,3 +164,50 @@ pub fn argmax(values: &[f32]) -> usize {
     }
     max_idx
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn temperature_zero_uses_greedy_after_penalties() {
+        let logits = vec![0.0, 5.0, 4.0];
+        let params = SamplingParams {
+            temperature: 0.0,
+            min_p: 0.0,
+            top_k: 0,
+            repetition_penalty: 2.0,
+            frequency_penalty: 0.0,
+        };
+
+        assert_eq!(sample_with_params(&logits, &params, &[1]), 2);
+    }
+
+    #[test]
+    fn frequency_penalty_can_change_greedy_choice() {
+        let logits = vec![0.0, 5.0, 4.5];
+        let params = SamplingParams {
+            temperature: 0.0,
+            min_p: 0.0,
+            top_k: 0,
+            repetition_penalty: 1.0,
+            frequency_penalty: 1.0,
+        };
+
+        assert_eq!(sample_with_params(&logits, &params, &[1]), 2);
+    }
+
+    #[test]
+    fn top_k_filters_before_greedy_selection() {
+        let logits = vec![10.0, 9.0, 8.0];
+        let params = SamplingParams {
+            temperature: 0.0,
+            min_p: 0.0,
+            top_k: 2,
+            repetition_penalty: 10.0,
+            frequency_penalty: 0.0,
+        };
+
+        assert_eq!(sample_with_params(&logits, &params, &[0]), 1);
+    }
+}
