@@ -535,6 +535,35 @@ kernel void kv_cache_batch_append(
     cache[dst_offset] = new_data[src_offset];
 }
 
+// ─── KV Cache Batch Append (f16 cache) ───────────────────────────────────────
+// Append seq_len tokens of K or V into a half-precision cache.
+// new_data layout: (num_kv_heads, seq_len, head_dim) f32
+// cache layout: (num_kv_heads, capacity, head_dim) f16
+
+kernel void kv_cache_batch_append_f16(
+    device const float* new_data [[buffer(0)]],
+    device half* cache [[buffer(1)]],
+    constant uint& num_kv_heads [[buffer(2)]],
+    constant uint& head_dim [[buffer(3)]],
+    constant uint& capacity [[buffer(4)]],
+    constant uint& cur_seq [[buffer(5)]],
+    constant uint& seq_len [[buffer(6)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    uint total = num_kv_heads * seq_len * head_dim;
+    if (gid >= total) return;
+
+    uint h = gid / (seq_len * head_dim);
+    uint remainder = gid % (seq_len * head_dim);
+    uint s = remainder / head_dim;
+    uint d = remainder % head_dim;
+
+    uint src_offset = h * seq_len * head_dim + s * head_dim + d;
+    uint dst_offset = h * capacity * head_dim + (cur_seq + s) * head_dim + d;
+
+    cache[dst_offset] = half(new_data[src_offset]);
+}
+
 // ─── Batched RMS Norm ────────────────────────────────────────────────────────
 // Normalize each row of a (seq_len, dim) matrix independently.
 // One threadgroup per row.
@@ -692,62 +721,143 @@ kernel void attention_causal(
     // (since during prefill, kv_seq == q_len and positions are 0-indexed)
     uint attend_len = qi + 1;
     
-    threadgroup float scores[2560];
-    threadgroup float shared_max[256];
-    threadgroup float shared_sum[256];
-    
-    // Compute scores
-    float local_max = -INFINITY;
-    for (uint kv = tid; kv < attend_len; kv += tg_size) {
-        float dot = 0.0f;
-        uint k_offset = k_head_base + kv * head_dim;
-        for (uint d = 0; d < head_dim; d++) {
-            dot += Q[q_offset + d] * K_cache[k_offset + d];
-        }
-        float s = dot * scale;
-        scores[kv] = s;
-        local_max = max(local_max, s);
-    }
-    shared_max[tid] = local_max;
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    
-    for (uint stride = tg_size / 2; stride > 0; stride >>= 1) {
-        if (tid < stride) shared_max[tid] = max(shared_max[tid], shared_max[tid + stride]);
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-    }
-    float max_score = shared_max[0];
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    
-    // Softmax
-    float local_sum = 0.0f;
-    for (uint kv = tid; kv < attend_len; kv += tg_size) {
-        float e = exp(scores[kv] - max_score);
-        scores[kv] = e;
-        local_sum += e;
-    }
-    shared_sum[tid] = local_sum;
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    
-    for (uint stride = tg_size / 2; stride > 0; stride >>= 1) {
-        if (tid < stride) shared_sum[tid] += shared_sum[tid + stride];
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-    }
-    float inv_sum = 1.0f / shared_sum[0];
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    
-    for (uint kv = tid; kv < attend_len; kv += tg_size) {
-        scores[kv] *= inv_sum;
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    
-    // Weighted sum of V
+    threadgroup float shared_dot[256];
+    threadgroup float shared_update[4]; // m, l, old output factor, new value factor
+
     uint out_offset = (h * q_len + qi) * head_dim;
+    if (tid == 0) {
+        shared_update[0] = -INFINITY;
+        shared_update[1] = 0.0f;
+    }
     for (uint d = tid; d < head_dim; d += tg_size) {
-        float acc = 0.0f;
-        for (uint kv = 0; kv < attend_len; kv++) {
-            acc += scores[kv] * V_cache[v_head_base + kv * head_dim + d];
+        output[out_offset + d] = 0.0f;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint kv = 0; kv < attend_len; kv++) {
+        uint k_offset = k_head_base + kv * head_dim;
+        float partial_dot = 0.0f;
+        for (uint d = tid; d < head_dim; d += tg_size) {
+            partial_dot += Q[q_offset + d] * K_cache[k_offset + d];
         }
-        output[out_offset + d] = acc;
+        shared_dot[tid] = partial_dot;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        for (uint stride = tg_size / 2; stride > 0; stride >>= 1) {
+            if (tid < stride) {
+                shared_dot[tid] += shared_dot[tid + stride];
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+
+        if (tid == 0) {
+            float m = shared_update[0];
+            float l = shared_update[1];
+            float score = shared_dot[0] * scale;
+            float new_m = max(m, score);
+            float alpha = exp(m - new_m);
+            float beta = exp(score - new_m);
+            float new_l = l * alpha + beta;
+            shared_update[0] = new_m;
+            shared_update[1] = new_l;
+            shared_update[2] = new_l > 0.0f ? (l * alpha) / new_l : 0.0f;
+            shared_update[3] = new_l > 0.0f ? beta / new_l : 0.0f;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        float old_factor = shared_update[2];
+        float new_factor = shared_update[3];
+        for (uint d = tid; d < head_dim; d += tg_size) {
+            uint out_idx = out_offset + d;
+            output[out_idx] = output[out_idx] * old_factor
+                + new_factor * V_cache[v_head_base + kv * head_dim + d];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+}
+
+// ─── Causal Multi-Token Attention with f16 KV cache ─────────────────────────
+// Same as attention_causal but reads K/V from half-precision cache buffers.
+
+kernel void attention_causal_f16(
+    device const float* Q [[buffer(0)]],
+    device const half* K_cache [[buffer(1)]],
+    device const half* V_cache [[buffer(2)]],
+    device float* output [[buffer(3)]],
+    constant uint& num_heads [[buffer(4)]],
+    constant uint& num_kv_heads [[buffer(5)]],
+    constant uint& num_kv_groups [[buffer(6)]],
+    constant uint& head_dim [[buffer(7)]],
+    constant uint& kv_seq [[buffer(8)]],
+    constant uint& k_cap [[buffer(9)]],
+    constant float& scale [[buffer(10)]],
+    constant uint& q_len [[buffer(11)]],
+    uint tid [[thread_index_in_threadgroup]],
+    uint tg_size [[threads_per_threadgroup]],
+    uint tgid [[threadgroup_position_in_grid]]
+) {
+    uint h = tgid / q_len;
+    uint qi = tgid % q_len;
+    if (h >= num_heads) return;
+    
+    uint kv_h = h / num_kv_groups;
+    uint q_offset = (h * q_len + qi) * head_dim;
+    uint k_head_base = kv_h * k_cap * head_dim;
+    uint v_head_base = kv_h * k_cap * head_dim;
+    uint attend_len = qi + 1;
+    
+    threadgroup float shared_dot[256];
+    threadgroup float shared_update[4]; // m, l, old output factor, new value factor
+
+    uint out_offset = (h * q_len + qi) * head_dim;
+    if (tid == 0) {
+        shared_update[0] = -INFINITY;
+        shared_update[1] = 0.0f;
+    }
+    for (uint d = tid; d < head_dim; d += tg_size) {
+        output[out_offset + d] = 0.0f;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint kv = 0; kv < attend_len; kv++) {
+        uint k_offset = k_head_base + kv * head_dim;
+        float partial_dot = 0.0f;
+        for (uint d = tid; d < head_dim; d += tg_size) {
+            partial_dot += Q[q_offset + d] * float(K_cache[k_offset + d]);
+        }
+        shared_dot[tid] = partial_dot;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        for (uint stride = tg_size / 2; stride > 0; stride >>= 1) {
+            if (tid < stride) {
+                shared_dot[tid] += shared_dot[tid + stride];
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+
+        if (tid == 0) {
+            float m = shared_update[0];
+            float l = shared_update[1];
+            float score = shared_dot[0] * scale;
+            float new_m = max(m, score);
+            float alpha = exp(m - new_m);
+            float beta = exp(score - new_m);
+            float new_l = l * alpha + beta;
+            shared_update[0] = new_m;
+            shared_update[1] = new_l;
+            shared_update[2] = new_l > 0.0f ? (l * alpha) / new_l : 0.0f;
+            shared_update[3] = new_l > 0.0f ? beta / new_l : 0.0f;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        float old_factor = shared_update[2];
+        float new_factor = shared_update[3];
+        for (uint d = tid; d < head_dim; d += tg_size) {
+            uint out_idx = out_offset + d;
+            output[out_idx] = output[out_idx] * old_factor
+                + new_factor * float(V_cache[v_head_base + kv * head_dim + d]);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
     }
 }
 

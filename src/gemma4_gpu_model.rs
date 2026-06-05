@@ -78,6 +78,8 @@ pub struct Gemma4GpuModel {
     // Per-layer persistent buffers (reused every token, contents overwritten)
     pub per_layer_cos_bufs: Vec<Buffer>,
     pub per_layer_sin_bufs: Vec<Buffer>,
+    pub per_layer_prefill_cos_bufs: Vec<Buffer>,
+    pub per_layer_prefill_sin_bufs: Vec<Buffer>,
     pub per_layer_decode_batch_cos_bufs: Vec<Buffer>,
     pub per_layer_decode_batch_sin_bufs: Vec<Buffer>,
     pub per_layer_decode_batch_append_pos_bufs: Vec<Buffer>,
@@ -598,6 +600,8 @@ impl Gemma4GpuModel {
         // Per-layer persistent buffers for cos/sin/ple (allocated once, overwritten each token)
         let mut per_layer_cos_bufs = Vec::with_capacity(num_layers);
         let mut per_layer_sin_bufs = Vec::with_capacity(num_layers);
+        let mut per_layer_prefill_cos_bufs = Vec::with_capacity(num_layers);
+        let mut per_layer_prefill_sin_bufs = Vec::with_capacity(num_layers);
         let mut per_layer_decode_batch_cos_bufs = Vec::with_capacity(num_layers);
         let mut per_layer_decode_batch_sin_bufs = Vec::with_capacity(num_layers);
         let mut per_layer_decode_batch_append_pos_bufs = Vec::with_capacity(num_layers);
@@ -608,6 +612,8 @@ impl Gemma4GpuModel {
             let hd = config.layer_head_dim(i);
             per_layer_cos_bufs.push(ctx.buffer_empty(hd));
             per_layer_sin_bufs.push(ctx.buffer_empty(hd));
+            per_layer_prefill_cos_bufs.push(ctx.buffer_empty(DEFAULT_MAX_PREFILL_SEQ * hd));
+            per_layer_prefill_sin_bufs.push(ctx.buffer_empty(DEFAULT_MAX_PREFILL_SEQ * hd));
             per_layer_decode_batch_cos_bufs.push(ctx.buffer_empty(DEFAULT_MAX_DECODE_BATCH * hd));
             per_layer_decode_batch_sin_bufs.push(ctx.buffer_empty(DEFAULT_MAX_DECODE_BATCH * hd));
             per_layer_decode_batch_append_pos_bufs.push(ctx.buffer_empty_u32(DEFAULT_MAX_DECODE_BATCH));
@@ -662,6 +668,8 @@ impl Gemma4GpuModel {
             sin_buf,
             per_layer_cos_bufs,
             per_layer_sin_bufs,
+            per_layer_prefill_cos_bufs,
+            per_layer_prefill_sin_bufs,
             per_layer_decode_batch_cos_bufs,
             per_layer_decode_batch_sin_bufs,
             per_layer_decode_batch_append_pos_bufs,
@@ -964,6 +972,8 @@ impl Gemma4GpuModel {
 
         let mut per_layer_cos_bufs = Vec::with_capacity(num_layers);
         let mut per_layer_sin_bufs = Vec::with_capacity(num_layers);
+        let mut per_layer_prefill_cos_bufs = Vec::with_capacity(num_layers);
+        let mut per_layer_prefill_sin_bufs = Vec::with_capacity(num_layers);
         let mut per_layer_decode_batch_cos_bufs = Vec::with_capacity(num_layers);
         let mut per_layer_decode_batch_sin_bufs = Vec::with_capacity(num_layers);
         let mut per_layer_decode_batch_append_pos_bufs = Vec::with_capacity(num_layers);
@@ -974,6 +984,8 @@ impl Gemma4GpuModel {
             let hd = config.layer_head_dim(i);
             per_layer_cos_bufs.push(ctx.buffer_empty(hd));
             per_layer_sin_bufs.push(ctx.buffer_empty(hd));
+            per_layer_prefill_cos_bufs.push(ctx.buffer_empty(DEFAULT_MAX_PREFILL_SEQ * hd));
+            per_layer_prefill_sin_bufs.push(ctx.buffer_empty(DEFAULT_MAX_PREFILL_SEQ * hd));
             per_layer_decode_batch_cos_bufs.push(ctx.buffer_empty(DEFAULT_MAX_DECODE_BATCH * hd));
             per_layer_decode_batch_sin_bufs.push(ctx.buffer_empty(DEFAULT_MAX_DECODE_BATCH * hd));
             per_layer_decode_batch_append_pos_bufs.push(ctx.buffer_empty_u32(DEFAULT_MAX_DECODE_BATCH));
@@ -1004,6 +1016,7 @@ impl Gemma4GpuModel {
             kv_seq_len: 0, kv_capacity,
             cos_buf, sin_buf,
             per_layer_cos_bufs, per_layer_sin_bufs,
+            per_layer_prefill_cos_bufs, per_layer_prefill_sin_bufs,
             per_layer_decode_batch_cos_bufs, per_layer_decode_batch_sin_bufs,
             per_layer_decode_batch_append_pos_bufs,
             per_layer_decode_batch_kv_start_bufs,
@@ -1425,6 +1438,75 @@ impl Gemma4GpuModel {
             &self.prefill_scratch.ple_token_id_buf,
             &inputs.ple_token_identity,
         );
+        Ok(())
+    }
+
+    fn prepare_parallel_prefill_rotary(
+        &mut self,
+        start_pos: usize,
+        seq_len: usize,
+    ) -> Result<(), String> {
+        if seq_len == 0 {
+            return Err("prefill seq_len must not be empty".to_string());
+        }
+        if seq_len > self.prefill_scratch.max_seq_len {
+            return Err(format!(
+                "prefill chunk has {} tokens, max supported chunk is {}",
+                seq_len,
+                self.prefill_scratch.max_seq_len
+            ));
+        }
+
+        for layer_idx in 0..self.layers.len() {
+            let layer = &self.layers[layer_idx];
+            let head_dim = layer.head_dim;
+            let half_dim = head_dim / 2;
+            let is_full = layer.is_full_attention;
+            let rope_theta = if is_full {
+                self.config.full_rope_theta()
+            } else {
+                self.config.sliding_rope_theta()
+            };
+            let rope_factor = if is_full {
+                self.config.full_rope_factor()
+            } else {
+                self.config.sliding_rope_factor()
+            };
+            let rotary_dim = if is_full {
+                (head_dim as f64 * self.config.full_partial_rotary_factor()) as usize
+            } else {
+                head_dim
+            };
+            let rope_angles = rotary_dim / 2;
+
+            let mut cos_batch = vec![0.0f32; seq_len * head_dim];
+            let mut sin_batch = vec![0.0f32; seq_len * head_dim];
+
+            for token_idx in 0..seq_len {
+                let pos = (start_pos + token_idx) as f32;
+                let token_offset = token_idx * head_dim;
+
+                for i in 0..rope_angles {
+                    let inv_freq = 1.0
+                        / (rope_theta.powf(i as f64 * 2.0 / head_dim as f64) as f32)
+                        / rope_factor as f32;
+                    let angle = pos * inv_freq;
+                    cos_batch[token_offset + i] = angle.cos();
+                    cos_batch[token_offset + i + half_dim] = angle.cos();
+                    sin_batch[token_offset + i] = angle.sin();
+                    sin_batch[token_offset + i + half_dim] = angle.sin();
+                }
+
+                for i in rope_angles..half_dim {
+                    cos_batch[token_offset + i] = 1.0;
+                    cos_batch[token_offset + i + half_dim] = 1.0;
+                }
+            }
+
+            MetalContext::write_buffer(&self.per_layer_prefill_cos_bufs[layer_idx], &cos_batch);
+            MetalContext::write_buffer(&self.per_layer_prefill_sin_bufs[layer_idx], &sin_batch);
+        }
+
         Ok(())
     }
 
@@ -2350,6 +2432,8 @@ impl Gemma4GpuModel {
         slot: KvSlot,
     ) -> Result<Vec<f32>, String> {
         self.prepare_parallel_prefill_inputs(token_ids)?;
+        let start_pos = kv_pool.total_tokens(slot).map_err(|err| err.to_string())?;
+        self.prepare_parallel_prefill_rotary(start_pos, token_ids.len())?;
 
         // Correctness baseline: the prepared chunk is ready for the future
         // batched layer path, but cache mutation still uses the proven
