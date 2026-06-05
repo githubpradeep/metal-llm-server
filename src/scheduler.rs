@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 
 use tokio::sync::mpsc;
 
-use crate::batch_engine::BatchEngine;
+use crate::batch_engine::{BatchEngine, DecodeInput, PrefillInput};
 use crate::gemma4_gpu_model::Gemma4GpuModel;
 use crate::metrics::Metrics;
 use crate::sampling::{self, SamplingParams};
@@ -151,36 +151,76 @@ impl Scheduler {
         active: &mut Vec<ActiveRequest>,
     ) {
         let round_len = active.len();
-        let mut index = 0;
+        let mut decode_batch = Vec::new();
+        let mut finished = Vec::new();
 
+        let mut index = 0;
         while index < round_len && index < active.len() {
             if active[index].phase != ActivePhase::Decoding {
                 index += 1;
                 continue;
             }
 
-            let result = self.decode_one(&mut active[index]);
-            match result {
-                Ok(Some(finish)) => {
-                    let active_request = active.swap_remove(index);
-                    let _ = self.engine.release_slot(active_request.slot);
-                    self.finish_request(&active_request.request, finish);
-                }
-                Ok(None) => {
-                    index += 1;
-                }
-                Err(message) => {
-                    let active_request = active.swap_remove(index);
-                    let _ = active_request.request.response_tx.blocking_send(StreamEvent::Error {
-                        message: message.clone(),
+            match prepare_decode_token(&mut active[index]) {
+                DecodePreparation::Forward(next_token) => {
+                    decode_batch.push(PreparedDecode {
+                        active_index: index,
+                        input: DecodeInput {
+                            slot: active[index].slot,
+                            token_id: next_token,
+                        },
                     });
-                    let _ = self.engine.release_slot(active_request.slot);
-                    self.finish_request(
-                        &active_request.request,
-                        active_request.finish(&format!("error: {}", message)),
-                    );
+                }
+                DecodePreparation::Finish(finish) => {
+                    finished.push(FinishedRequest::done(index, finish));
                 }
             }
+
+            index += 1;
+        }
+
+        let inputs: Vec<DecodeInput> = decode_batch
+            .iter()
+            .map(|prepared| DecodeInput {
+                slot: prepared.input.slot,
+                token_id: prepared.input.token_id,
+            })
+            .collect();
+
+        for (prepared, output) in decode_batch.into_iter().zip(self.engine.decode_batch(&inputs)) {
+            match output {
+                Ok(forward) => {
+                    let active_request = &mut active[prepared.active_index];
+                    active_request.logits = forward.logits;
+                    active_request.decode_compute_latency += forward.latency;
+                    self.metrics.record_decode_compute(forward.latency);
+                }
+                Err(message) => {
+                    finished.push(FinishedRequest::error(
+                        prepared.active_index,
+                        message,
+                        active[prepared.active_index].finish("error"),
+                    ));
+                }
+            }
+        }
+
+        finished.sort_by_key(|finish| finish.active_index);
+        finished.dedup_by_key(|finish| finish.active_index);
+        for finish in finished.into_iter().rev() {
+            let active_request = active.swap_remove(finish.active_index);
+            if let Some(message) = finish.error_message {
+                let _ = active_request.request.response_tx.blocking_send(StreamEvent::Error {
+                    message: message.clone(),
+                });
+                self.finish_request(
+                    &active_request.request,
+                    active_request.finish(&format!("error: {}", message)),
+                );
+            } else {
+                self.finish_request(&active_request.request, finish.finish);
+            }
+            let _ = self.engine.release_slot(active_request.slot);
         }
     }
 
@@ -189,6 +229,9 @@ impl Scheduler {
         active: &mut Vec<ActiveRequest>,
     ) {
         let round_len = active.len();
+        let mut prefill_batch = Vec::new();
+        let mut finished = Vec::new();
+
         let mut index = 0;
 
         while index < round_len && index < active.len() {
@@ -197,147 +240,74 @@ impl Scheduler {
                 continue;
             }
 
-            let result = self.prefill_one_chunk(&mut active[index]);
-            match result {
-                Ok(Some(finish)) => {
-                    let active_request = active.swap_remove(index);
-                    let _ = self.engine.release_slot(active_request.slot);
-                    self.finish_request(&active_request.request, finish);
+            match prepare_prefill_chunk(&active[index], self.engine.max_prefill_chunk_tokens()) {
+                PrefillPreparation::Forward(input) => {
+                    prefill_batch.push(PreparedPrefill {
+                        active_index: index,
+                        token_count: input.token_ids.len(),
+                        input,
+                    });
                 }
-                Ok(None) => {
-                    index += 1;
+                PrefillPreparation::Finish(finish) => {
+                    finished.push(FinishedRequest::done(index, finish));
+                }
+            }
+
+            index += 1;
+        }
+
+        let inputs: Vec<PrefillInput> = prefill_batch
+            .iter()
+            .map(|prepared| PrefillInput {
+                slot: prepared.input.slot,
+                token_ids: prepared.input.token_ids.clone(),
+            })
+            .collect();
+
+        for (prepared, output) in prefill_batch.into_iter().zip(self.engine.prefill_batch(&inputs)) {
+            match output {
+                Ok(forward) => {
+                    let active_request = &mut active[prepared.active_index];
+                    active_request.logits = forward.logits;
+                    active_request.prefill_cursor += prepared.token_count;
+                    active_request.prefill_chunks_done += 1;
+                    active_request.prefill_latency += forward.latency;
+                    self.metrics
+                        .record_prefill_chunk(prepared.token_count, forward.latency);
+
+                    if active_request.prefill_cursor >= active_request.request.input_ids.len() {
+                        active_request.phase = ActivePhase::Decoding;
+                        active_request.decode_started_at = Some(Instant::now());
+                        self.metrics.record_prefill_to_decode();
+                    }
                 }
                 Err(message) => {
-                    let active_request = active.swap_remove(index);
-                    let _ = active_request.request.response_tx.blocking_send(StreamEvent::Error {
-                        message: message.clone(),
-                    });
-                    let _ = self.engine.release_slot(active_request.slot);
-                    self.finish_request(
-                        &active_request.request,
-                        active_request.finish(&format!("error: {}", message)),
-                    );
+                    finished.push(FinishedRequest::error(
+                        prepared.active_index,
+                        message,
+                        active[prepared.active_index].finish("error"),
+                    ));
                 }
             }
         }
-    }
 
-    fn prefill_one_chunk(
-        &mut self,
-        active: &mut ActiveRequest,
-    ) -> Result<Option<RequestFinish>, String> {
-        if active.request.created_at.elapsed() >= active.request.params.request_timeout {
-            let _ = active.request.response_tx.blocking_send(StreamEvent::Done {
-                finish_reason: "timeout".to_string(),
-            });
-            return Ok(Some(active.finish("timeout")));
+        finished.sort_by_key(|finish| finish.active_index);
+        finished.dedup_by_key(|finish| finish.active_index);
+        for finish in finished.into_iter().rev() {
+            let active_request = active.swap_remove(finish.active_index);
+            if let Some(message) = finish.error_message {
+                let _ = active_request.request.response_tx.blocking_send(StreamEvent::Error {
+                    message: message.clone(),
+                });
+                self.finish_request(
+                    &active_request.request,
+                    active_request.finish(&format!("error: {}", message)),
+                );
+            } else {
+                self.finish_request(&active_request.request, finish.finish);
+            }
+            let _ = self.engine.release_slot(active_request.slot);
         }
-
-        if let Some(reason) = cancellation_finish_reason(&active.request) {
-            let _ = active.request.response_tx.blocking_send(StreamEvent::Done {
-                finish_reason: reason.to_string(),
-            });
-            return Ok(Some(active.finish(reason)));
-        }
-
-        let chunk_size = self.engine.max_prefill_chunk_tokens();
-        let chunk_start = active.prefill_cursor;
-        let chunk_end = (chunk_start + chunk_size).min(active.request.input_ids.len());
-        let chunk = &active.request.input_ids[chunk_start..chunk_end];
-
-        let forward = self.engine.prefill_chunk(chunk, active.slot)?;
-        active.logits = forward.logits;
-
-        active.prefill_cursor = chunk_end;
-        active.prefill_chunks_done += 1;
-        active.prefill_latency += forward.latency;
-        self.metrics
-            .record_prefill_chunk(chunk.len(), forward.latency);
-
-        if active.prefill_cursor >= active.request.input_ids.len() {
-            active.phase = ActivePhase::Decoding;
-            active.decode_started_at = Some(Instant::now());
-            self.metrics.record_prefill_to_decode();
-        }
-
-        Ok(None)
-    }
-
-    fn decode_one(
-        &mut self,
-        active: &mut ActiveRequest,
-    ) -> Result<Option<RequestFinish>, String> {
-        if active.request.created_at.elapsed() >= active.request.params.request_timeout {
-            let _ = active.request.response_tx.blocking_send(StreamEvent::Done {
-                finish_reason: "timeout".to_string(),
-            });
-            return Ok(Some(active.finish("timeout")));
-        }
-
-        if let Some(reason) = cancellation_finish_reason(&active.request) {
-            let _ = active.request.response_tx.blocking_send(StreamEvent::Done {
-                finish_reason: reason.to_string(),
-            });
-            return Ok(Some(active.finish(reason)));
-        }
-
-        if active.completion_tokens >= active.request.params.max_tokens {
-            let _ = active.request.response_tx.blocking_send(StreamEvent::Done {
-                finish_reason: "stop".to_string(),
-            });
-            return Ok(Some(active.finish("stop")));
-        }
-
-        let next_token = sampling::sample_with_params(
-            &active.logits,
-            &SamplingParams {
-                temperature: active.request.params.temperature,
-                min_p: active.request.params.min_p,
-                top_k: active.request.params.top_k,
-                repetition_penalty: active.request.params.repetition_penalty,
-                frequency_penalty: active.request.params.frequency_penalty,
-            },
-            &active.generated_tokens,
-        );
-
-        if active.request.params.eos_token_ids.contains(&next_token) {
-            let _ = active.request.response_tx.blocking_send(StreamEvent::Done {
-                finish_reason: "stop".to_string(),
-            });
-            return Ok(Some(active.finish("stop")));
-        }
-
-        active.completion_tokens += 1;
-        active.generated_tokens.push(next_token);
-        if active
-            .request
-            .response_tx
-            .blocking_send(StreamEvent::Token { token_id: next_token })
-            .is_err()
-        {
-            return Ok(Some(active.finish("cancelled")));
-        }
-
-        if let Some(reason) = cancellation_finish_reason(&active.request) {
-            let _ = active.request.response_tx.blocking_send(StreamEvent::Done {
-                finish_reason: reason.to_string(),
-            });
-            return Ok(Some(active.finish(reason)));
-        }
-
-        if active.completion_tokens >= active.request.params.max_tokens {
-            let _ = active.request.response_tx.blocking_send(StreamEvent::Done {
-                finish_reason: "stop".to_string(),
-            });
-            return Ok(Some(active.finish("stop")));
-        }
-
-        let forward = self.engine.decode_one(next_token, active.slot)?;
-        active.logits = forward.logits;
-        active.decode_compute_latency += forward.latency;
-        self.metrics.record_decode_compute(forward.latency);
-
-        Ok(None)
     }
 
     fn finish_request(&self, request: &InferenceRequest, finish: RequestFinish) {
@@ -389,6 +359,41 @@ struct ActiveRequest {
     decode_compute_latency: Duration,
 }
 
+struct PreparedDecode {
+    active_index: usize,
+    input: DecodeInput,
+}
+
+struct PreparedPrefill {
+    active_index: usize,
+    token_count: usize,
+    input: PrefillInput,
+}
+
+struct FinishedRequest {
+    active_index: usize,
+    finish: RequestFinish,
+    error_message: Option<String>,
+}
+
+impl FinishedRequest {
+    fn done(active_index: usize, finish: RequestFinish) -> Self {
+        Self {
+            active_index,
+            finish,
+            error_message: None,
+        }
+    }
+
+    fn error(active_index: usize, message: String, finish: RequestFinish) -> Self {
+        Self {
+            active_index,
+            finish,
+            error_message: Some(message),
+        }
+    }
+}
+
 impl ActiveRequest {
     fn finish(&self, reason: &str) -> RequestFinish {
         RequestFinish::with_timings(
@@ -405,6 +410,108 @@ impl ActiveRequest {
             self.phase == ActivePhase::Decoding,
         )
     }
+}
+
+enum DecodePreparation {
+    Forward(usize),
+    Finish(RequestFinish),
+}
+
+enum PrefillPreparation {
+    Forward(PrefillInput),
+    Finish(RequestFinish),
+}
+
+fn prepare_prefill_chunk(active: &ActiveRequest, chunk_size: usize) -> PrefillPreparation {
+    if active.request.created_at.elapsed() >= active.request.params.request_timeout {
+        let _ = active.request.response_tx.blocking_send(StreamEvent::Done {
+            finish_reason: "timeout".to_string(),
+        });
+        return PrefillPreparation::Finish(active.finish("timeout"));
+    }
+
+    if let Some(reason) = cancellation_finish_reason(&active.request) {
+        let _ = active.request.response_tx.blocking_send(StreamEvent::Done {
+            finish_reason: reason.to_string(),
+        });
+        return PrefillPreparation::Finish(active.finish(reason));
+    }
+
+    let chunk_start = active.prefill_cursor;
+    let chunk_end = (chunk_start + chunk_size).min(active.request.input_ids.len());
+    PrefillPreparation::Forward(PrefillInput {
+        slot: active.slot,
+        token_ids: active.request.input_ids[chunk_start..chunk_end].to_vec(),
+    })
+}
+
+fn prepare_decode_token(active: &mut ActiveRequest) -> DecodePreparation {
+    if active.request.created_at.elapsed() >= active.request.params.request_timeout {
+        let _ = active.request.response_tx.blocking_send(StreamEvent::Done {
+            finish_reason: "timeout".to_string(),
+        });
+        return DecodePreparation::Finish(active.finish("timeout"));
+    }
+
+    if let Some(reason) = cancellation_finish_reason(&active.request) {
+        let _ = active.request.response_tx.blocking_send(StreamEvent::Done {
+            finish_reason: reason.to_string(),
+        });
+        return DecodePreparation::Finish(active.finish(reason));
+    }
+
+    if active.completion_tokens >= active.request.params.max_tokens {
+        let _ = active.request.response_tx.blocking_send(StreamEvent::Done {
+            finish_reason: "stop".to_string(),
+        });
+        return DecodePreparation::Finish(active.finish("stop"));
+    }
+
+    let next_token = sampling::sample_with_params(
+        &active.logits,
+        &SamplingParams {
+            temperature: active.request.params.temperature,
+            min_p: active.request.params.min_p,
+            top_k: active.request.params.top_k,
+            repetition_penalty: active.request.params.repetition_penalty,
+            frequency_penalty: active.request.params.frequency_penalty,
+        },
+        &active.generated_tokens,
+    );
+
+    if active.request.params.eos_token_ids.contains(&next_token) {
+        let _ = active.request.response_tx.blocking_send(StreamEvent::Done {
+            finish_reason: "stop".to_string(),
+        });
+        return DecodePreparation::Finish(active.finish("stop"));
+    }
+
+    active.completion_tokens += 1;
+    active.generated_tokens.push(next_token);
+    if active
+        .request
+        .response_tx
+        .blocking_send(StreamEvent::Token { token_id: next_token })
+        .is_err()
+    {
+        return DecodePreparation::Finish(active.finish("cancelled"));
+    }
+
+    if let Some(reason) = cancellation_finish_reason(&active.request) {
+        let _ = active.request.response_tx.blocking_send(StreamEvent::Done {
+            finish_reason: reason.to_string(),
+        });
+        return DecodePreparation::Finish(active.finish(reason));
+    }
+
+    if active.completion_tokens >= active.request.params.max_tokens {
+        let _ = active.request.response_tx.blocking_send(StreamEvent::Done {
+            finish_reason: "stop".to_string(),
+        });
+        return DecodePreparation::Finish(active.finish("stop"));
+    }
+
+    DecodePreparation::Forward(next_token)
 }
 
 fn cancellation_finish_reason(request: &InferenceRequest) -> Option<&'static str> {

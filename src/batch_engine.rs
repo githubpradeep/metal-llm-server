@@ -13,6 +13,16 @@ pub struct TimedForward {
     pub latency: Duration,
 }
 
+pub struct DecodeInput {
+    pub slot: KvSlot,
+    pub token_id: usize,
+}
+
+pub struct PrefillInput {
+    pub slot: KvSlot,
+    pub token_ids: Vec<usize>,
+}
+
 impl BatchEngine {
     pub fn new(model: Gemma4GpuModel, kv_pool_slots: usize) -> Self {
         let kv_pool = model.create_kv_pool(kv_pool_slots, model.kv_capacity);
@@ -46,6 +56,13 @@ impl BatchEngine {
         })
     }
 
+    pub fn prefill_batch(&mut self, inputs: &[PrefillInput]) -> Vec<Result<TimedForward, String>> {
+        inputs
+            .iter()
+            .map(|input| self.prefill_chunk(&input.token_ids, input.slot))
+            .collect()
+    }
+
     pub fn decode_one(&mut self, token_id: usize, slot: KvSlot) -> Result<TimedForward, String> {
         let started_at = Instant::now();
         let logits = self
@@ -56,5 +73,12 @@ impl BatchEngine {
             logits,
             latency: started_at.elapsed(),
         })
+    }
+
+    pub fn decode_batch(&mut self, inputs: &[DecodeInput]) -> Vec<Result<TimedForward, String>> {
+        inputs
+            .iter()
+            .map(|input| self.decode_one(input.token_id, input.slot))
+            .collect()
     }
 }
