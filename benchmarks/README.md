@@ -18,6 +18,19 @@ This checks health/model listing, structured request errors, non-streaming chat,
 streaming chat, concurrent requests, stop-token trimming, and idle scheduler
 gauges.
 
+## Prefill throughput benchmark
+
+Start the server first, then run:
+
+```bash
+python3 benchmarks/prefill_benchmark.py --port 8080 --sizes 32,64,128,256,512 --repeats 3
+```
+
+The benchmark uses `/metrics` deltas to report prompt prefill tokens/sec,
+prefill chunks, and end-to-end request latency for each prompt size.
+Set `LLAMA_MAX_PREFILL_SEQ=64` or `LLAMA_MAX_PREFILL_SEQ=128` before starting
+the server to compare prefill chunk sizes.
+
 ## How to compare your local model against llama.cpp
 
 ### Step 1: Run the Colab script (llama.cpp reference on GPU)

@@ -116,6 +116,31 @@ def check_sync_chat(base_url):
     print("ok sync chat")
 
 
+def check_chunked_prefill(base_url):
+    long_prompt = " ".join(
+        [
+            "This is a chunked prefill regression prompt.",
+            "Keep the reply short.",
+            "The following words intentionally make the prompt long enough",
+            "to cross the default prompt chunk boundary while still being simple.",
+        ]
+        + [f"marker{i}" for i in range(90)]
+    )
+    status, body = request_json(
+        "POST",
+        f"{base_url}/v1/chat/completions",
+        chat_payload(long_prompt, max_tokens=8, stream=False, temperature=0.0),
+        timeout=180,
+    )
+    assert status == 200
+    choice = body["choices"][0]
+    assert choice["finish_reason"] in {"stop", "length"}
+    assert "<end_of_turn>" not in choice["message"]["content"]
+    assert body["usage"]["prompt_tokens"] > 64
+    assert body["usage"]["completion_tokens"] > 0
+    print("ok chunked prefill")
+
+
 def parse_sse_events(resp):
     for raw_line in resp:
         line = raw_line.decode("utf-8").strip()
@@ -261,6 +286,7 @@ def main():
     check_health_and_models(base_url)
     check_structured_errors(base_url)
     check_sync_chat(base_url)
+    check_chunked_prefill(base_url)
     check_stream_chat(base_url)
     check_concurrency(base_url, args.requests, args.max_tokens, args.timeout)
     check_idle_metrics(base_url)

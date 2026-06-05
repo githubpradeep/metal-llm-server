@@ -199,6 +199,172 @@ kernel void matvec_q4(
     }
 }
 
+// ─── Batched f16 Projection for Prefill ─────────────────────────────────────
+// Computes Y = X * W^T where X is (S, K), W is (M, K), Y is (S, M).
+// Each threadgroup handles four output rows for one sequence position.
+
+kernel void projection_f16_batch(
+    device const half* W [[buffer(0)]],
+    device const float* X [[buffer(1)]],
+    device float* Y [[buffer(2)]],
+    constant uint& M [[buffer(3)]],
+    constant uint& K [[buffer(4)]],
+    constant uint& S [[buffer(5)]],
+    uint2 tgid [[threadgroup_position_in_grid]],
+    uint tid [[thread_index_in_threadgroup]],
+    uint sgid [[simdgroup_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]]
+) {
+    uint s = tgid.y;
+    if (s >= S) return;
+
+    uint base_row = tgid.x * N_ROWS_PER_TG;
+    uint row0 = base_row + sgid * 2;
+    uint row1 = row0 + 1;
+    bool valid0 = row0 < M;
+    bool valid1 = row1 < M;
+
+    uint x_base = s * K;
+    uint y_base = s * M;
+    uint row0_offset = row0 * K;
+    uint row1_offset = row1 * K;
+    float acc0 = 0.0f;
+    float acc1 = 0.0f;
+
+    uint k = lane * 4;
+    uint stride = SIMD_SIZE * 4;
+    for (; k + 3 < K; k += stride) {
+        float4 xv = *reinterpret_cast<device const float4*>(&X[x_base + k]);
+        if (valid0) {
+            half4 w = *reinterpret_cast<device const half4*>(&W[row0_offset + k]);
+            acc0 += dot(float4(w), xv);
+        }
+        if (valid1) {
+            half4 w = *reinterpret_cast<device const half4*>(&W[row1_offset + k]);
+            acc1 += dot(float4(w), xv);
+        }
+    }
+
+    for (uint kk = lane + (K / stride) * stride; kk < K; kk += SIMD_SIZE) {
+        float xv = X[x_base + kk];
+        if (valid0) acc0 += float(W[row0_offset + kk]) * xv;
+        if (valid1) acc1 += float(W[row1_offset + kk]) * xv;
+    }
+
+    acc0 = simd_sum(acc0);
+    acc1 = simd_sum(acc1);
+    if (lane == 0) {
+        if (valid0) Y[y_base + row0] = acc0;
+        if (valid1) Y[y_base + row1] = acc1;
+    }
+}
+
+// ─── Batched Q4_0 Projection for Prefill ────────────────────────────────────
+// Computes Y = X * W_q4^T where X is (S, K), W_q4 is (M, K), Y is (S, M).
+// Same Q4_0 layout as matvec_q4. Each threadgroup handles four output rows
+// for one sequence position.
+
+kernel void projection_q4_batch(
+    device const uchar* W_q4 [[buffer(0)]],
+    device const float* X [[buffer(1)]],
+    device float* Y [[buffer(2)]],
+    constant uint& M [[buffer(3)]],
+    constant uint& K [[buffer(4)]],
+    constant uint& S [[buffer(5)]],
+    uint2 tgid [[threadgroup_position_in_grid]],
+    uint tid [[thread_index_in_threadgroup]],
+    uint sgid [[simdgroup_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]]
+) {
+    uint s = tgid.y;
+    if (s >= S) return;
+
+    uint base_row = tgid.x * N_ROWS_PER_TG;
+    uint row0 = base_row + sgid * 2;
+    uint row1 = row0 + 1;
+    bool valid0 = row0 < M;
+    bool valid1 = row1 < M;
+
+    uint num_groups = K / Q4_GROUP_SIZE;
+    uint row_bytes = num_groups * Q4_BLOCK_BYTES;
+    uint x_base = s * K;
+    uint y_base = s * M;
+    device const uchar* row0_ptr = W_q4 + row0 * row_bytes;
+    device const uchar* row1_ptr = W_q4 + row1 * row_bytes;
+    float acc0 = 0.0f;
+    float acc1 = 0.0f;
+
+    for (uint g = lane; g < num_groups; g += SIMD_SIZE) {
+        uint x_offset = x_base + g * Q4_GROUP_SIZE;
+
+        float4 xv0 = *reinterpret_cast<device const float4*>(&X[x_offset]);
+        float4 xv1 = *reinterpret_cast<device const float4*>(&X[x_offset + 4]);
+        float4 xv2 = *reinterpret_cast<device const float4*>(&X[x_offset + 8]);
+        float4 xv3 = *reinterpret_cast<device const float4*>(&X[x_offset + 12]);
+        float4 xv4 = *reinterpret_cast<device const float4*>(&X[x_offset + 16]);
+        float4 xv5 = *reinterpret_cast<device const float4*>(&X[x_offset + 20]);
+        float4 xv6 = *reinterpret_cast<device const float4*>(&X[x_offset + 24]);
+        float4 xv7 = *reinterpret_cast<device const float4*>(&X[x_offset + 28]);
+
+        if (valid0) {
+            uint block_offset = g * Q4_BLOCK_BYTES;
+            float scale = float(*reinterpret_cast<device const half*>(&row0_ptr[block_offset]));
+            device const uchar* q = &row0_ptr[block_offset + 2];
+
+            float local = 0.0f;
+            local += float(int(q[0] & 0xF) - 8) * xv0[0] + float(int(q[0] >> 4) - 8) * xv0[1];
+            local += float(int(q[1] & 0xF) - 8) * xv0[2] + float(int(q[1] >> 4) - 8) * xv0[3];
+            local += float(int(q[2] & 0xF) - 8) * xv1[0] + float(int(q[2] >> 4) - 8) * xv1[1];
+            local += float(int(q[3] & 0xF) - 8) * xv1[2] + float(int(q[3] >> 4) - 8) * xv1[3];
+            local += float(int(q[4] & 0xF) - 8) * xv2[0] + float(int(q[4] >> 4) - 8) * xv2[1];
+            local += float(int(q[5] & 0xF) - 8) * xv2[2] + float(int(q[5] >> 4) - 8) * xv2[3];
+            local += float(int(q[6] & 0xF) - 8) * xv3[0] + float(int(q[6] >> 4) - 8) * xv3[1];
+            local += float(int(q[7] & 0xF) - 8) * xv3[2] + float(int(q[7] >> 4) - 8) * xv3[3];
+            local += float(int(q[8] & 0xF) - 8) * xv4[0] + float(int(q[8] >> 4) - 8) * xv4[1];
+            local += float(int(q[9] & 0xF) - 8) * xv4[2] + float(int(q[9] >> 4) - 8) * xv4[3];
+            local += float(int(q[10] & 0xF) - 8) * xv5[0] + float(int(q[10] >> 4) - 8) * xv5[1];
+            local += float(int(q[11] & 0xF) - 8) * xv5[2] + float(int(q[11] >> 4) - 8) * xv5[3];
+            local += float(int(q[12] & 0xF) - 8) * xv6[0] + float(int(q[12] >> 4) - 8) * xv6[1];
+            local += float(int(q[13] & 0xF) - 8) * xv6[2] + float(int(q[13] >> 4) - 8) * xv6[3];
+            local += float(int(q[14] & 0xF) - 8) * xv7[0] + float(int(q[14] >> 4) - 8) * xv7[1];
+            local += float(int(q[15] & 0xF) - 8) * xv7[2] + float(int(q[15] >> 4) - 8) * xv7[3];
+            acc0 += local * scale;
+        }
+
+        if (valid1) {
+            uint block_offset = g * Q4_BLOCK_BYTES;
+            float scale = float(*reinterpret_cast<device const half*>(&row1_ptr[block_offset]));
+            device const uchar* q = &row1_ptr[block_offset + 2];
+
+            float local = 0.0f;
+            local += float(int(q[0] & 0xF) - 8) * xv0[0] + float(int(q[0] >> 4) - 8) * xv0[1];
+            local += float(int(q[1] & 0xF) - 8) * xv0[2] + float(int(q[1] >> 4) - 8) * xv0[3];
+            local += float(int(q[2] & 0xF) - 8) * xv1[0] + float(int(q[2] >> 4) - 8) * xv1[1];
+            local += float(int(q[3] & 0xF) - 8) * xv1[2] + float(int(q[3] >> 4) - 8) * xv1[3];
+            local += float(int(q[4] & 0xF) - 8) * xv2[0] + float(int(q[4] >> 4) - 8) * xv2[1];
+            local += float(int(q[5] & 0xF) - 8) * xv2[2] + float(int(q[5] >> 4) - 8) * xv2[3];
+            local += float(int(q[6] & 0xF) - 8) * xv3[0] + float(int(q[6] >> 4) - 8) * xv3[1];
+            local += float(int(q[7] & 0xF) - 8) * xv3[2] + float(int(q[7] >> 4) - 8) * xv3[3];
+            local += float(int(q[8] & 0xF) - 8) * xv4[0] + float(int(q[8] >> 4) - 8) * xv4[1];
+            local += float(int(q[9] & 0xF) - 8) * xv4[2] + float(int(q[9] >> 4) - 8) * xv4[3];
+            local += float(int(q[10] & 0xF) - 8) * xv5[0] + float(int(q[10] >> 4) - 8) * xv5[1];
+            local += float(int(q[11] & 0xF) - 8) * xv5[2] + float(int(q[11] >> 4) - 8) * xv5[3];
+            local += float(int(q[12] & 0xF) - 8) * xv6[0] + float(int(q[12] >> 4) - 8) * xv6[1];
+            local += float(int(q[13] & 0xF) - 8) * xv6[2] + float(int(q[13] >> 4) - 8) * xv6[3];
+            local += float(int(q[14] & 0xF) - 8) * xv7[0] + float(int(q[14] >> 4) - 8) * xv7[1];
+            local += float(int(q[15] & 0xF) - 8) * xv7[2] + float(int(q[15] >> 4) - 8) * xv7[3];
+            acc1 += local * scale;
+        }
+    }
+
+    acc0 = simd_sum(acc0);
+    acc1 = simd_sum(acc1);
+    if (lane == 0) {
+        if (valid0) Y[y_base + row0] = acc0;
+        if (valid1) Y[y_base + row1] = acc1;
+    }
+}
+
 // ─── SIMD-Group Batched Matrix Multiply (for prefill) ────────────────────────
 // C = A * B^T where A is (M, K), B is (N, K), C is (M, N)
 // Each SIMD group computes one element of C (dot product of row A and row B).
@@ -604,6 +770,44 @@ kernel void rmsnorm_batch(
     }
 }
 
+// ─── Batched RMS Norm without Weight ────────────────────────────────────────
+// Normalize each row of a (num_rows, dim) matrix independently.
+
+kernel void rmsnorm_noweight_batch(
+    device const float* x [[buffer(0)]],
+    device float* out [[buffer(1)]],
+    constant uint& dim [[buffer(2)]],
+    constant float& eps [[buffer(3)]],
+    uint tid [[thread_index_in_threadgroup]],
+    uint tg_size [[threads_per_threadgroup]],
+    uint tgid [[threadgroup_position_in_grid]]
+) {
+    uint row = tgid;
+    uint row_offset = row * dim;
+
+    threadgroup float shared_sum[256];
+
+    float partial_sum = 0.0f;
+    for (uint i = tid; i < dim; i += tg_size) {
+        float val = x[row_offset + i];
+        partial_sum += val * val;
+    }
+    shared_sum[tid] = partial_sum;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint stride = tg_size / 2; stride > 0; stride >>= 1) {
+        if (tid < stride) shared_sum[tid] += shared_sum[tid + stride];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    float inv_rms = rsqrt(shared_sum[0] / float(dim) + eps);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint i = tid; i < dim; i += tg_size) {
+        out[row_offset + i] = x[row_offset + i] * inv_rms;
+    }
+}
+
 // ─── Batched SiLU * Up ──────────────────────────────────────────────────────
 
 kernel void silu_mul_batch(
@@ -792,6 +996,8 @@ kernel void attention_causal_f16(
     constant uint& k_cap [[buffer(9)]],
     constant float& scale [[buffer(10)]],
     constant uint& q_len [[buffer(11)]],
+    constant uint& q_start [[buffer(12)]],
+    constant uint& attention_window [[buffer(13)]],
     uint tid [[thread_index_in_threadgroup]],
     uint tg_size [[threads_per_threadgroup]],
     uint tgid [[threadgroup_position_in_grid]]
@@ -804,7 +1010,11 @@ kernel void attention_causal_f16(
     uint q_offset = (h * q_len + qi) * head_dim;
     uint k_head_base = kv_h * k_cap * head_dim;
     uint v_head_base = kv_h * k_cap * head_dim;
-    uint attend_len = qi + 1;
+    uint attend_len = min(q_start + qi + 1, kv_seq);
+    uint attend_start = 0;
+    if (attention_window > 0 && attend_len > attention_window) {
+        attend_start = attend_len - attention_window;
+    }
     
     threadgroup float shared_dot[256];
     threadgroup float shared_update[4]; // m, l, old output factor, new value factor
@@ -819,7 +1029,7 @@ kernel void attention_causal_f16(
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    for (uint kv = 0; kv < attend_len; kv++) {
+    for (uint kv = attend_start; kv < attend_len; kv++) {
         uint k_offset = k_head_base + kv * head_dim;
         float partial_dot = 0.0f;
         for (uint d = tid; d < head_dim; d += tg_size) {
@@ -880,6 +1090,33 @@ kernel void gelu_mul(
     inner = clamp(inner, -10.0f, 10.0f);
     float gelu = 0.5f * x * (1.0f + tanh(inner));
     out[gid] = gelu * up[gid];
+}
+
+// ─── Batched PLE GeLU * Context ─────────────────────────────────────────────
+// gate: (S, ple_dim), context: (S, num_layers, ple_dim), out: (S, ple_dim)
+
+kernel void ple_gelu_mul_batch(
+    device const float* gate [[buffer(0)]],
+    device const float* context [[buffer(1)]],
+    device float* out [[buffer(2)]],
+    constant uint& layer_idx [[buffer(3)]],
+    constant uint& num_layers [[buffer(4)]],
+    constant uint& ple_dim [[buffer(5)]],
+    constant uint& seq_len [[buffer(6)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    uint total = seq_len * ple_dim;
+    if (gid >= total) return;
+
+    uint s = gid / ple_dim;
+    uint d = gid % ple_dim;
+    uint context_offset = (s * num_layers + layer_idx) * ple_dim + d;
+
+    float x = gate[gid];
+    float inner = 0.7978845608f * (x + 0.044715f * x * x * x);
+    inner = clamp(inner, -10.0f, 10.0f);
+    float gelu = 0.5f * x * (1.0f + tanh(inner));
+    out[gid] = gelu * context[context_offset];
 }
 
 // ─── Element-wise Multiply ───────────────────────────────────────────────────

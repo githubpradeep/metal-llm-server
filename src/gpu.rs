@@ -8,9 +8,12 @@ pub struct MetalContext {
     pub matvec_pipeline: ComputePipelineState,
     pub matvec_f16_pipeline: ComputePipelineState,
     pub matvec_q4_pipeline: ComputePipelineState,
+    pub projection_f16_batch_pipeline: ComputePipelineState,
+    pub projection_q4_batch_pipeline: ComputePipelineState,
     pub matmul_pipeline: ComputePipelineState,
     pub rmsnorm_pipeline: ComputePipelineState,
     pub rmsnorm_batch_pipeline: ComputePipelineState,
+    pub rmsnorm_noweight_batch_pipeline: ComputePipelineState,
     pub silu_mul_pipeline: ComputePipelineState,
     pub silu_mul_batch_pipeline: ComputePipelineState,
     pub attention_pipeline: ComputePipelineState,
@@ -27,6 +30,7 @@ pub struct MetalContext {
     pub transpose_shd_pipeline: ComputePipelineState,
     pub transpose_hsd_pipeline: ComputePipelineState,
     pub gelu_mul_pipeline: ComputePipelineState,
+    pub ple_gelu_mul_batch_pipeline: ComputePipelineState,
     pub vec_mul_pipeline: ComputePipelineState,
     pub vec_add_scaled_pipeline: ComputePipelineState,
     pub rmsnorm_per_head_pipeline: ComputePipelineState,
@@ -64,9 +68,12 @@ impl MetalContext {
         let matvec_pipeline = get_fn("matvec");
         let matvec_f16_pipeline = get_fn("matvec_f16");
         let matvec_q4_pipeline = get_fn("matvec_q4");
+        let projection_f16_batch_pipeline = get_fn("projection_f16_batch");
+        let projection_q4_batch_pipeline = get_fn("projection_q4_batch");
         let matmul_pipeline = get_fn("matmul");
         let rmsnorm_pipeline = get_fn("rmsnorm");
         let rmsnorm_batch_pipeline = get_fn("rmsnorm_batch");
+        let rmsnorm_noweight_batch_pipeline = get_fn("rmsnorm_noweight_batch");
         let silu_mul_pipeline = get_fn("silu_mul");
         let silu_mul_batch_pipeline = get_fn("silu_mul_batch");
         let attention_pipeline = get_fn("attention_single_token");
@@ -83,6 +90,7 @@ impl MetalContext {
         let transpose_shd_pipeline = get_fn("transpose_shd_to_hsd");
         let transpose_hsd_pipeline = get_fn("transpose_hsd_to_shd");
         let gelu_mul_pipeline = get_fn("gelu_mul");
+        let ple_gelu_mul_batch_pipeline = get_fn("ple_gelu_mul_batch");
         let vec_mul_pipeline = get_fn("vec_mul");
         let vec_add_scaled_pipeline = get_fn("vec_add_scaled");
         let rmsnorm_per_head_pipeline = get_fn("rmsnorm_per_head");
@@ -99,9 +107,12 @@ impl MetalContext {
             matvec_pipeline,
             matvec_f16_pipeline,
             matvec_q4_pipeline,
+            projection_f16_batch_pipeline,
+            projection_q4_batch_pipeline,
             matmul_pipeline,
             rmsnorm_pipeline,
             rmsnorm_batch_pipeline,
+            rmsnorm_noweight_batch_pipeline,
             silu_mul_pipeline,
             silu_mul_batch_pipeline,
             attention_pipeline,
@@ -118,6 +129,7 @@ impl MetalContext {
             transpose_shd_pipeline,
             transpose_hsd_pipeline,
             gelu_mul_pipeline,
+            ple_gelu_mul_batch_pipeline,
             vec_mul_pipeline,
             vec_add_scaled_pipeline,
             rmsnorm_per_head_pipeline,
@@ -261,6 +273,40 @@ impl MetalContext {
         let n_rows_per_tg = 4u64;
         let num_tgs = MTLSize::new((m as u64 + n_rows_per_tg - 1) / n_rows_per_tg, 1, 1);
         let tg_size = MTLSize::new(64, 1, 1);  // 2 SIMD groups × 32 threads
+        encoder.dispatch_thread_groups(num_tgs, tg_size);
+    }
+
+    pub fn encode_projection_f16_batch(
+        &self, encoder: &ComputeCommandEncoderRef,
+        w_buf: &Buffer, x_buf: &Buffer, y_buf: &Buffer, m: u32, k: u32, seq_len: u32,
+    ) {
+        encoder.set_compute_pipeline_state(&self.projection_f16_batch_pipeline);
+        encoder.set_buffer(0, Some(w_buf), 0);
+        encoder.set_buffer(1, Some(x_buf), 0);
+        encoder.set_buffer(2, Some(y_buf), 0);
+        encoder.set_bytes(3, 4, &m as *const u32 as *const _);
+        encoder.set_bytes(4, 4, &k as *const u32 as *const _);
+        encoder.set_bytes(5, 4, &seq_len as *const u32 as *const _);
+        let n_rows_per_tg = 4u64;
+        let num_tgs = MTLSize::new((m as u64 + n_rows_per_tg - 1) / n_rows_per_tg, seq_len as u64, 1);
+        let tg_size = MTLSize::new(64, 1, 1);
+        encoder.dispatch_thread_groups(num_tgs, tg_size);
+    }
+
+    pub fn encode_projection_q4_batch(
+        &self, encoder: &ComputeCommandEncoderRef,
+        w_buf: &Buffer, x_buf: &Buffer, y_buf: &Buffer, m: u32, k: u32, seq_len: u32,
+    ) {
+        encoder.set_compute_pipeline_state(&self.projection_q4_batch_pipeline);
+        encoder.set_buffer(0, Some(w_buf), 0);
+        encoder.set_buffer(1, Some(x_buf), 0);
+        encoder.set_buffer(2, Some(y_buf), 0);
+        encoder.set_bytes(3, 4, &m as *const u32 as *const _);
+        encoder.set_bytes(4, 4, &k as *const u32 as *const _);
+        encoder.set_bytes(5, 4, &seq_len as *const u32 as *const _);
+        let n_rows_per_tg = 4u64;
+        let num_tgs = MTLSize::new((m as u64 + n_rows_per_tg - 1) / n_rows_per_tg, seq_len as u64, 1);
+        let tg_size = MTLSize::new(64, 1, 1);
         encoder.dispatch_thread_groups(num_tgs, tg_size);
     }
 
@@ -659,6 +705,19 @@ impl MetalContext {
         encoder.dispatch_thread_groups(MTLSize::new(seq_len as u64, 1, 1), tg_size);
     }
 
+    pub fn encode_rmsnorm_noweight_batch(
+        &self, encoder: &ComputeCommandEncoderRef,
+        x_buf: &Buffer, out_buf: &Buffer, dim: u32, eps: f32, num_rows: u32,
+    ) {
+        encoder.set_compute_pipeline_state(&self.rmsnorm_noweight_batch_pipeline);
+        encoder.set_buffer(0, Some(x_buf), 0);
+        encoder.set_buffer(1, Some(out_buf), 0);
+        encoder.set_bytes(2, 4, &dim as *const u32 as *const _);
+        encoder.set_bytes(3, 4, &eps as *const f32 as *const _);
+        let tg_size = MTLSize::new(256.min(dim as u64), 1, 1);
+        encoder.dispatch_thread_groups(MTLSize::new(num_rows as u64, 1, 1), tg_size);
+    }
+
     pub fn encode_silu_mul_batch(
         &self, encoder: &ComputeCommandEncoderRef,
         gate_buf: &Buffer, up_buf: &Buffer, out_buf: &Buffer, n: u32,
@@ -699,6 +758,23 @@ impl MetalContext {
         encoder.set_bytes(5, 4, &num_kv_heads as *const u32 as *const _);
         encoder.set_bytes(6, 4, &head_dim as *const u32 as *const _);
         encoder.set_bytes(7, 4, &seq_len as *const u32 as *const _);
+        encoder.dispatch_threads(MTLSize::new(total as u64, 1, 1), MTLSize::new(256, 1, 1));
+    }
+
+    pub fn encode_ple_gelu_mul_batch(
+        &self, encoder: &ComputeCommandEncoderRef,
+        gate_buf: &Buffer, context_buf: &Buffer, out_buf: &Buffer,
+        layer_idx: u32, num_layers: u32, ple_dim: u32, seq_len: u32,
+    ) {
+        let total = seq_len * ple_dim;
+        encoder.set_compute_pipeline_state(&self.ple_gelu_mul_batch_pipeline);
+        encoder.set_buffer(0, Some(gate_buf), 0);
+        encoder.set_buffer(1, Some(context_buf), 0);
+        encoder.set_buffer(2, Some(out_buf), 0);
+        encoder.set_bytes(3, 4, &layer_idx as *const u32 as *const _);
+        encoder.set_bytes(4, 4, &num_layers as *const u32 as *const _);
+        encoder.set_bytes(5, 4, &ple_dim as *const u32 as *const _);
+        encoder.set_bytes(6, 4, &seq_len as *const u32 as *const _);
         encoder.dispatch_threads(MTLSize::new(total as u64, 1, 1), MTLSize::new(256, 1, 1));
     }
 
@@ -764,7 +840,8 @@ impl MetalContext {
         &self, encoder: &ComputeCommandEncoderRef,
         q_buf: &Buffer, k_cache_buf: &Buffer, v_cache_buf: &Buffer, out_buf: &Buffer,
         num_heads: u32, num_kv_heads: u32, num_kv_groups: u32,
-        head_dim: u32, kv_seq: u32, k_cap: u32, scale: f32, q_len: u32,
+        head_dim: u32, kv_seq: u32, k_cap: u32, scale: f32, q_len: u32, q_start: u32,
+        attention_window: u32,
     ) {
         encoder.set_compute_pipeline_state(&self.attention_causal_f16_pipeline);
         encoder.set_buffer(0, Some(q_buf), 0);
@@ -779,6 +856,8 @@ impl MetalContext {
         encoder.set_bytes(9, 4, &k_cap as *const u32 as *const _);
         encoder.set_bytes(10, 4, &scale as *const f32 as *const _);
         encoder.set_bytes(11, 4, &q_len as *const u32 as *const _);
+        encoder.set_bytes(12, 4, &q_start as *const u32 as *const _);
+        encoder.set_bytes(13, 4, &attention_window as *const u32 as *const _);
         let tg_size = MTLSize::new(64, 1, 1);
         let num_tgs = num_heads * q_len;
         encoder.dispatch_thread_groups(MTLSize::new(num_tgs as u64, 1, 1), tg_size);

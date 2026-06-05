@@ -10,8 +10,17 @@ use crate::gemma4_config::Gemma4TextConfig;
 use crate::gpu::MetalContext;
 use crate::kv_pool::{KvCachePool, KvPoolError, KvSlot, KvSlotView};
 
-const DEFAULT_MAX_PREFILL_SEQ: usize = 64;
+const DEFAULT_MAX_PREFILL_SEQ: usize = 128;
 const DEFAULT_MAX_DECODE_BATCH: usize = 4;
+
+fn configured_max_prefill_seq(kv_capacity: u32) -> usize {
+    std::env::var("LLAMA_MAX_PREFILL_SEQ")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|&value| value > 0)
+        .unwrap_or(DEFAULT_MAX_PREFILL_SEQ)
+        .min(kv_capacity as usize)
+}
 
 /// Gemma 4 E4B GPU-resident model with persistent KV cache on Metal.
 /// All operations for one token are encoded into a SINGLE command buffer.
@@ -675,9 +684,10 @@ impl Gemma4GpuModel {
                     .new_buffer(byte_len, MTLResourceOptions::StorageModeShared),
             );
         }
+        let max_prefill_seq = configured_max_prefill_seq(kv_capacity);
         let prefill_scratch = PrefillScratch::new(
             &ctx,
-            DEFAULT_MAX_PREFILL_SEQ.min(kv_capacity as usize),
+            max_prefill_seq,
             hidden_size,
             max_q_out,
             max_kv_out,
@@ -716,8 +726,8 @@ impl Gemma4GpuModel {
             let hd = config.layer_head_dim(i);
             per_layer_cos_bufs.push(ctx.buffer_empty(hd));
             per_layer_sin_bufs.push(ctx.buffer_empty(hd));
-            per_layer_prefill_cos_bufs.push(ctx.buffer_empty(DEFAULT_MAX_PREFILL_SEQ * hd));
-            per_layer_prefill_sin_bufs.push(ctx.buffer_empty(DEFAULT_MAX_PREFILL_SEQ * hd));
+            per_layer_prefill_cos_bufs.push(ctx.buffer_empty(max_prefill_seq * hd));
+            per_layer_prefill_sin_bufs.push(ctx.buffer_empty(max_prefill_seq * hd));
             per_layer_decode_batch_cos_bufs.push(ctx.buffer_empty(DEFAULT_MAX_DECODE_BATCH * hd));
             per_layer_decode_batch_sin_bufs.push(ctx.buffer_empty(DEFAULT_MAX_DECODE_BATCH * hd));
             per_layer_decode_batch_append_pos_bufs
@@ -1112,9 +1122,10 @@ impl Gemma4GpuModel {
                     .new_buffer(byte_len, MTLResourceOptions::StorageModeShared),
             );
         }
+        let max_prefill_seq = configured_max_prefill_seq(kv_capacity);
         let prefill_scratch = PrefillScratch::new(
             &ctx,
-            DEFAULT_MAX_PREFILL_SEQ.min(kv_capacity as usize),
+            max_prefill_seq,
             hidden_size,
             max_q_out,
             max_kv_out,
@@ -1152,8 +1163,8 @@ impl Gemma4GpuModel {
             let hd = config.layer_head_dim(i);
             per_layer_cos_bufs.push(ctx.buffer_empty(hd));
             per_layer_sin_bufs.push(ctx.buffer_empty(hd));
-            per_layer_prefill_cos_bufs.push(ctx.buffer_empty(DEFAULT_MAX_PREFILL_SEQ * hd));
-            per_layer_prefill_sin_bufs.push(ctx.buffer_empty(DEFAULT_MAX_PREFILL_SEQ * hd));
+            per_layer_prefill_cos_bufs.push(ctx.buffer_empty(max_prefill_seq * hd));
+            per_layer_prefill_sin_bufs.push(ctx.buffer_empty(max_prefill_seq * hd));
             per_layer_decode_batch_cos_bufs.push(ctx.buffer_empty(DEFAULT_MAX_DECODE_BATCH * hd));
             per_layer_decode_batch_sin_bufs.push(ctx.buffer_empty(DEFAULT_MAX_DECODE_BATCH * hd));
             per_layer_decode_batch_append_pos_bufs
@@ -2225,12 +2236,6 @@ impl Gemma4GpuModel {
         }
     }
 
-    fn prefill_layer_ple_offset(&self, token_idx: usize, layer_idx: usize) -> u64 {
-        let ple_dim = self.config.hidden_size_per_layer_input;
-        let ple_total_dim = self.config.num_hidden_layers * ple_dim;
-        Self::f32_byte_offset(token_idx * ple_total_dim + layer_idx * ple_dim)
-    }
-
     fn encode_parallel_prefill_ple_context(&mut self, seq_len: usize) -> Result<(), String> {
         if seq_len == 0 {
             return Err("prefill seq_len must not be empty".to_string());
@@ -2252,59 +2257,47 @@ impl Gemma4GpuModel {
 
         let cmd = self.ctx.queue.new_command_buffer();
         let encoder = cmd.new_compute_command_encoder();
+        let total_ple = (seq_len * ple_total_dim) as u32;
 
-        for token_idx in 0..seq_len {
-            let offsets = self.prefill_row_offsets(token_idx);
-            self.ctx.encode_matvec_q4_at(
-                encoder,
-                &self.per_layer_model_projection_weight,
-                &self.prefill_scratch.hidden_buf,
-                offsets.hidden,
-                &self.prefill_scratch.ple_context_proj_buf,
-                offsets.ple_row,
-                ple_total_dim as u32,
-                hidden_size as u32,
-            );
-            self.ctx.encode_vec_scale_at(
-                encoder,
-                &self.prefill_scratch.ple_context_proj_buf,
-                offsets.ple_row,
-                &self.prefill_scratch.ple_combined_buf,
-                offsets.ple_row,
-                ple_total_dim as u32,
-                context_proj_scale,
-            );
-            self.ctx.encode_rmsnorm_per_head_at(
-                encoder,
-                &self.prefill_scratch.ple_combined_buf,
-                offsets.ple_row,
-                &self.per_layer_projection_norm_weight,
-                &self.prefill_scratch.ple_context_proj_buf,
-                offsets.ple_row,
-                num_layers as u32,
-                ple_dim as u32,
-                eps,
-            );
-            self.ctx.encode_vec_add_at(
-                encoder,
-                &self.prefill_scratch.ple_context_proj_buf,
-                offsets.ple_row,
-                &self.prefill_scratch.ple_token_id_buf,
-                offsets.ple_row,
-                &self.prefill_scratch.ple_combined_buf,
-                offsets.ple_row,
-                ple_total_dim as u32,
-            );
-            self.ctx.encode_vec_scale_at(
-                encoder,
-                &self.prefill_scratch.ple_combined_buf,
-                offsets.ple_row,
-                &self.prefill_scratch.ple_context_proj_buf,
-                offsets.ple_row,
-                ple_total_dim as u32,
-                ple_input_scale,
-            );
-        }
+        self.ctx.encode_projection_q4_batch(
+            encoder,
+            &self.per_layer_model_projection_weight,
+            &self.prefill_scratch.hidden_buf,
+            &self.prefill_scratch.ple_context_proj_buf,
+            ple_total_dim as u32,
+            hidden_size as u32,
+            seq_len as u32,
+        );
+        self.ctx.encode_vec_scale(
+            encoder,
+            &self.prefill_scratch.ple_context_proj_buf,
+            &self.prefill_scratch.ple_combined_buf,
+            total_ple,
+            context_proj_scale,
+        );
+        self.ctx.encode_rmsnorm_batch(
+            encoder,
+            &self.prefill_scratch.ple_combined_buf,
+            &self.per_layer_projection_norm_weight,
+            &self.prefill_scratch.ple_context_proj_buf,
+            ple_dim as u32,
+            eps,
+            (seq_len * num_layers) as u32,
+        );
+        self.ctx.encode_vec_add_batch(
+            encoder,
+            &self.prefill_scratch.ple_context_proj_buf,
+            &self.prefill_scratch.ple_token_id_buf,
+            &self.prefill_scratch.ple_combined_buf,
+            total_ple,
+        );
+        self.ctx.encode_vec_scale(
+            encoder,
+            &self.prefill_scratch.ple_combined_buf,
+            &self.prefill_scratch.ple_context_proj_buf,
+            total_ple,
+            ple_input_scale,
+        );
 
         encoder.end_encoding();
         cmd.commit();
@@ -2313,7 +2306,8 @@ impl Gemma4GpuModel {
     }
 
     fn encode_parallel_prefill_attention_inputs(
-        &mut self,
+        &self,
+        encoder: &ComputeCommandEncoderRef,
         layer_idx: usize,
         seq_len: usize,
     ) -> Result<(), String> {
@@ -2339,9 +2333,6 @@ impl Gemma4GpuModel {
         let kv_out = layer.kv_out_dim;
         let eps = self.config.rms_norm_eps as f32;
 
-        let cmd = self.ctx.queue.new_command_buffer();
-        let encoder = cmd.new_compute_command_encoder();
-
         self.ctx.encode_rmsnorm_batch(
             encoder,
             &self.prefill_scratch.hidden_buf,
@@ -2352,102 +2343,88 @@ impl Gemma4GpuModel {
             seq_len as u32,
         );
 
-        for token_idx in 0..seq_len {
-            let offsets = self.prefill_row_offsets(token_idx);
-            let q_offset = Self::f32_byte_offset(token_idx * q_out);
-            let kv_offset = Self::f32_byte_offset(token_idx * kv_out);
-            if layer.use_f16 {
-                self.ctx.encode_matvec_f16_at(
+        if layer.use_f16 {
+            self.ctx.encode_projection_f16_batch(
+                encoder,
+                &layer.q_proj,
+                &self.prefill_scratch.normed_buf,
+                &self.prefill_scratch.q_buf,
+                q_out as u32,
+                hidden_size as u32,
+                seq_len as u32,
+            );
+            if layer.has_kv {
+                self.ctx.encode_projection_f16_batch(
                     encoder,
-                    &layer.q_proj,
+                    &layer.k_proj,
                     &self.prefill_scratch.normed_buf,
-                    offsets.hidden,
-                    &self.prefill_scratch.q_buf,
-                    q_offset,
-                    q_out as u32,
+                    &self.prefill_scratch.k_buf,
+                    kv_out as u32,
                     hidden_size as u32,
+                    seq_len as u32,
                 );
-            } else {
-                self.ctx.encode_matvec_q4_at(
+                self.ctx.encode_projection_f16_batch(
                     encoder,
-                    &layer.q_proj,
+                    &layer.v_proj,
                     &self.prefill_scratch.normed_buf,
-                    offsets.hidden,
-                    &self.prefill_scratch.q_buf,
-                    q_offset,
-                    q_out as u32,
+                    &self.prefill_scratch.v_buf,
+                    kv_out as u32,
                     hidden_size as u32,
+                    seq_len as u32,
                 );
             }
-            self.ctx.encode_rmsnorm_per_head_at(
+        } else {
+            self.ctx.encode_projection_q4_batch(
                 encoder,
+                &layer.q_proj,
+                &self.prefill_scratch.normed_buf,
                 &self.prefill_scratch.q_buf,
-                q_offset,
-                &layer.q_norm_weight,
-                &self.prefill_scratch.q_normed_buf,
-                q_offset,
-                num_heads as u32,
+                q_out as u32,
+                hidden_size as u32,
+                seq_len as u32,
+            );
+            if layer.has_kv {
+                self.ctx.encode_projection_q4_batch(
+                    encoder,
+                    &layer.k_proj,
+                    &self.prefill_scratch.normed_buf,
+                    &self.prefill_scratch.k_buf,
+                    kv_out as u32,
+                    hidden_size as u32,
+                    seq_len as u32,
+                );
+                self.ctx.encode_projection_q4_batch(
+                    encoder,
+                    &layer.v_proj,
+                    &self.prefill_scratch.normed_buf,
+                    &self.prefill_scratch.v_buf,
+                    kv_out as u32,
+                    hidden_size as u32,
+                    seq_len as u32,
+                );
+            }
+        }
+
+        self.ctx.encode_rmsnorm_batch(
+            encoder,
+            &self.prefill_scratch.q_buf,
+            &layer.q_norm_weight,
+            &self.prefill_scratch.q_normed_buf,
+            head_dim as u32,
+            eps,
+            (seq_len * num_heads) as u32,
+        );
+
+        if layer.has_kv {
+            self.ctx.encode_rmsnorm_batch(
+                encoder,
+                &self.prefill_scratch.k_buf,
+                &layer.k_norm_weight,
+                &self.prefill_scratch.k_normed_buf,
                 head_dim as u32,
                 eps,
+                (seq_len * num_kv_heads) as u32,
             );
-
-            if layer.has_kv {
-                if layer.use_f16 {
-                    self.ctx.encode_matvec_f16_at(
-                        encoder,
-                        &layer.k_proj,
-                        &self.prefill_scratch.normed_buf,
-                        offsets.hidden,
-                        &self.prefill_scratch.k_buf,
-                        kv_offset,
-                        kv_out as u32,
-                        hidden_size as u32,
-                    );
-                    self.ctx.encode_matvec_f16_at(
-                        encoder,
-                        &layer.v_proj,
-                        &self.prefill_scratch.normed_buf,
-                        offsets.hidden,
-                        &self.prefill_scratch.v_buf,
-                        kv_offset,
-                        kv_out as u32,
-                        hidden_size as u32,
-                    );
-                } else {
-                    self.ctx.encode_matvec_q4_at(
-                        encoder,
-                        &layer.k_proj,
-                        &self.prefill_scratch.normed_buf,
-                        offsets.hidden,
-                        &self.prefill_scratch.k_buf,
-                        kv_offset,
-                        kv_out as u32,
-                        hidden_size as u32,
-                    );
-                    self.ctx.encode_matvec_q4_at(
-                        encoder,
-                        &layer.v_proj,
-                        &self.prefill_scratch.normed_buf,
-                        offsets.hidden,
-                        &self.prefill_scratch.v_buf,
-                        kv_offset,
-                        kv_out as u32,
-                        hidden_size as u32,
-                    );
-                }
-
-                self.ctx.encode_rmsnorm_per_head_at(
-                    encoder,
-                    &self.prefill_scratch.k_buf,
-                    kv_offset,
-                    &layer.k_norm_weight,
-                    &self.prefill_scratch.k_normed_buf,
-                    kv_offset,
-                    num_kv_heads as u32,
-                    head_dim as u32,
-                    eps,
-                );
-            }
         }
 
         self.ctx.encode_transpose_shd(
@@ -2469,19 +2446,14 @@ impl Gemma4GpuModel {
                 head_dim as u32,
             );
 
-            for token_idx in 0..seq_len {
-                let kv_offset = Self::f32_byte_offset(token_idx * kv_out);
-                self.ctx.encode_rmsnorm_per_head_noweight_at(
-                    encoder,
-                    &self.prefill_scratch.v_buf,
-                    kv_offset,
-                    &self.prefill_scratch.k_normed_buf,
-                    kv_offset,
-                    num_kv_heads as u32,
-                    head_dim as u32,
-                    eps,
-                );
-            }
+            self.ctx.encode_rmsnorm_noweight_batch(
+                encoder,
+                &self.prefill_scratch.v_buf,
+                &self.prefill_scratch.k_normed_buf,
+                head_dim as u32,
+                eps,
+                (seq_len * num_kv_heads) as u32,
+            );
 
             self.ctx.encode_transpose_shd(
                 encoder,
@@ -2505,9 +2477,6 @@ impl Gemma4GpuModel {
             seq_len as u32,
         );
 
-        encoder.end_encoding();
-        cmd.commit();
-        cmd.wait_until_completed();
         Ok(())
     }
 
@@ -2517,16 +2486,14 @@ impl Gemma4GpuModel {
         seq_len: usize,
         kv_pool: &KvCachePool,
     ) -> bool {
-        if start_pos != 0 || seq_len <= 1 || seq_len > self.prefill_scratch.max_seq_len {
+        if seq_len <= 1 || seq_len > self.prefill_scratch.max_seq_len {
             return false;
         }
-        if seq_len as u32 > kv_pool.capacity() {
+        if start_pos + seq_len > kv_pool.capacity() as usize {
             return false;
         }
 
-        self.layers
-            .iter()
-            .all(|layer| layer.is_full_attention || seq_len <= self.config.sliding_window)
+        true
     }
 
     fn encode_parallel_prefill_layer(
@@ -2537,7 +2504,9 @@ impl Gemma4GpuModel {
         slot: KvSlot,
         start_pos: usize,
     ) -> Result<(), String> {
-        self.encode_parallel_prefill_attention_inputs(layer_idx, seq_len)?;
+        let cmd = self.ctx.queue.new_command_buffer();
+        let encoder = cmd.new_compute_command_encoder();
+        self.encode_parallel_prefill_attention_inputs(encoder, layer_idx, seq_len)?;
 
         let layer = self
             .layers
@@ -2556,9 +2525,11 @@ impl Gemma4GpuModel {
         let total_hidden = (seq_len * hidden_size) as u32;
         let total_intermediate = (seq_len * intermediate_size) as u32;
         let scale = 1.0f32;
-
-        let cmd = self.ctx.queue.new_command_buffer();
-        let encoder = cmd.new_compute_command_encoder();
+        let attention_window = if layer.is_full_attention {
+            0
+        } else {
+            self.config.sliding_window as u32
+        };
 
         if layer.has_kv {
             let k_cache = kv_pool
@@ -2609,6 +2580,8 @@ impl Gemma4GpuModel {
             kv_pool.capacity(),
             scale,
             seq_len as u32,
+            start_pos as u32,
+            attention_window,
         );
 
         self.ctx.encode_copy(
@@ -2625,20 +2598,15 @@ impl Gemma4GpuModel {
             num_heads as u32,
             head_dim as u32,
         );
-        for token_idx in 0..seq_len {
-            let offsets = self.prefill_row_offsets(token_idx);
-            let q_offset = Self::f32_byte_offset(token_idx * q_out);
-            self.ctx.encode_matvec_f16_at(
-                encoder,
-                &layer.o_proj,
-                &self.prefill_scratch.q_normed_buf,
-                q_offset,
-                &self.prefill_scratch.o_out_buf,
-                offsets.hidden,
-                hidden_size as u32,
-                q_out as u32,
-            );
-        }
+        self.ctx.encode_projection_f16_batch(
+            encoder,
+            &layer.o_proj,
+            &self.prefill_scratch.q_normed_buf,
+            &self.prefill_scratch.o_out_buf,
+            hidden_size as u32,
+            q_out as u32,
+            seq_len as u32,
+        );
         self.ctx.encode_rmsnorm_batch(
             encoder,
             &self.prefill_scratch.o_out_buf,
@@ -2671,51 +2639,44 @@ impl Gemma4GpuModel {
             eps,
             seq_len as u32,
         );
-        for token_idx in 0..seq_len {
-            let offsets = self.prefill_row_offsets(token_idx);
-            if layer.use_f16 {
-                self.ctx.encode_matvec_f16_at(
-                    encoder,
-                    &layer.gate_proj,
-                    &self.prefill_scratch.normed_buf,
-                    offsets.hidden,
-                    &self.prefill_scratch.gate_buf,
-                    offsets.intermediate,
-                    intermediate_size as u32,
-                    hidden_size as u32,
-                );
-                self.ctx.encode_matvec_f16_at(
-                    encoder,
-                    &layer.up_proj,
-                    &self.prefill_scratch.normed_buf,
-                    offsets.hidden,
-                    &self.prefill_scratch.up_buf,
-                    offsets.intermediate,
-                    intermediate_size as u32,
-                    hidden_size as u32,
-                );
-            } else {
-                self.ctx.encode_matvec_q4_at(
-                    encoder,
-                    &layer.gate_proj,
-                    &self.prefill_scratch.normed_buf,
-                    offsets.hidden,
-                    &self.prefill_scratch.gate_buf,
-                    offsets.intermediate,
-                    intermediate_size as u32,
-                    hidden_size as u32,
-                );
-                self.ctx.encode_matvec_q4_at(
-                    encoder,
-                    &layer.up_proj,
-                    &self.prefill_scratch.normed_buf,
-                    offsets.hidden,
-                    &self.prefill_scratch.up_buf,
-                    offsets.intermediate,
-                    intermediate_size as u32,
-                    hidden_size as u32,
-                );
-            }
+        if layer.use_f16 {
+            self.ctx.encode_projection_f16_batch(
+                encoder,
+                &layer.gate_proj,
+                &self.prefill_scratch.normed_buf,
+                &self.prefill_scratch.gate_buf,
+                intermediate_size as u32,
+                hidden_size as u32,
+                seq_len as u32,
+            );
+            self.ctx.encode_projection_f16_batch(
+                encoder,
+                &layer.up_proj,
+                &self.prefill_scratch.normed_buf,
+                &self.prefill_scratch.up_buf,
+                intermediate_size as u32,
+                hidden_size as u32,
+                seq_len as u32,
+            );
+        } else {
+            self.ctx.encode_projection_q4_batch(
+                encoder,
+                &layer.gate_proj,
+                &self.prefill_scratch.normed_buf,
+                &self.prefill_scratch.gate_buf,
+                intermediate_size as u32,
+                hidden_size as u32,
+                seq_len as u32,
+            );
+            self.ctx.encode_projection_q4_batch(
+                encoder,
+                &layer.up_proj,
+                &self.prefill_scratch.normed_buf,
+                &self.prefill_scratch.up_buf,
+                intermediate_size as u32,
+                hidden_size as u32,
+                seq_len as u32,
+            );
         }
         self.ctx.encode_gelu_mul(
             encoder,
@@ -2724,31 +2685,26 @@ impl Gemma4GpuModel {
             &self.prefill_scratch.gelu_buf,
             total_intermediate,
         );
-        for token_idx in 0..seq_len {
-            let offsets = self.prefill_row_offsets(token_idx);
-            if layer.use_f16 {
-                self.ctx.encode_matvec_f16_at(
-                    encoder,
-                    &layer.down_proj,
-                    &self.prefill_scratch.gelu_buf,
-                    offsets.intermediate,
-                    &self.prefill_scratch.down_buf,
-                    offsets.hidden,
-                    hidden_size as u32,
-                    intermediate_size as u32,
-                );
-            } else {
-                self.ctx.encode_matvec_q4_at(
-                    encoder,
-                    &layer.down_proj,
-                    &self.prefill_scratch.gelu_buf,
-                    offsets.intermediate,
-                    &self.prefill_scratch.down_buf,
-                    offsets.hidden,
-                    hidden_size as u32,
-                    intermediate_size as u32,
-                );
-            }
+        if layer.use_f16 {
+            self.ctx.encode_projection_f16_batch(
+                encoder,
+                &layer.down_proj,
+                &self.prefill_scratch.gelu_buf,
+                &self.prefill_scratch.down_buf,
+                hidden_size as u32,
+                intermediate_size as u32,
+                seq_len as u32,
+            );
+        } else {
+            self.ctx.encode_projection_q4_batch(
+                encoder,
+                &layer.down_proj,
+                &self.prefill_scratch.gelu_buf,
+                &self.prefill_scratch.down_buf,
+                hidden_size as u32,
+                intermediate_size as u32,
+                seq_len as u32,
+            );
         }
         self.ctx.encode_rmsnorm_batch(
             encoder,
@@ -2773,40 +2729,34 @@ impl Gemma4GpuModel {
             &self.prefill_scratch.residual_buf,
             total_hidden,
         );
-        for token_idx in 0..seq_len {
-            let offsets = self.prefill_row_offsets(token_idx);
-            let ple_layer_offset = self.prefill_layer_ple_offset(token_idx, layer_idx);
-            self.ctx.encode_matvec_f16_at(
-                encoder,
-                &layer.per_layer_input_gate_weight,
-                &self.prefill_scratch.hidden_buf,
-                offsets.hidden,
-                &self.prefill_scratch.gate_buf,
-                offsets.intermediate,
-                ple_dim as u32,
-                hidden_size as u32,
-            );
-            self.ctx.encode_gelu_mul_at(
-                encoder,
-                &self.prefill_scratch.gate_buf,
-                offsets.intermediate,
-                &self.prefill_scratch.ple_context_proj_buf,
-                ple_layer_offset,
-                &self.prefill_scratch.up_buf,
-                offsets.intermediate,
-                ple_dim as u32,
-            );
-            self.ctx.encode_matvec_f16_at(
-                encoder,
-                &layer.per_layer_projection_weight,
-                &self.prefill_scratch.up_buf,
-                offsets.intermediate,
-                &self.prefill_scratch.o_out_buf,
-                offsets.hidden,
-                hidden_size as u32,
-                ple_dim as u32,
-            );
-        }
+        self.ctx.encode_projection_f16_batch(
+            encoder,
+            &layer.per_layer_input_gate_weight,
+            &self.prefill_scratch.hidden_buf,
+            &self.prefill_scratch.gate_buf,
+            ple_dim as u32,
+            hidden_size as u32,
+            seq_len as u32,
+        );
+        self.ctx.encode_ple_gelu_mul_batch(
+            encoder,
+            &self.prefill_scratch.gate_buf,
+            &self.prefill_scratch.ple_context_proj_buf,
+            &self.prefill_scratch.up_buf,
+            layer_idx as u32,
+            self.config.num_hidden_layers as u32,
+            ple_dim as u32,
+            seq_len as u32,
+        );
+        self.ctx.encode_projection_f16_batch(
+            encoder,
+            &layer.per_layer_projection_weight,
+            &self.prefill_scratch.up_buf,
+            &self.prefill_scratch.o_out_buf,
+            hidden_size as u32,
+            ple_dim as u32,
+            seq_len as u32,
+        );
         self.ctx.encode_rmsnorm_batch(
             encoder,
             &self.prefill_scratch.o_out_buf,
