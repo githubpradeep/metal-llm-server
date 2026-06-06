@@ -1,6 +1,13 @@
-# Building a Production LLM Inference Engine from Scratch in Rust + Metal
+# Building a Local LLM Inference Engine from Scratch in Rust + Metal
 
-**How I built a full Gemma4 E4B inference server — from raw transformer math to Metal GPU kernels to an OpenAI-compatible API — running at 14 tok/s on a MacBook Pro.**
+**How I built an alpha-stage Gemma4 E4B inference server — from raw transformer math to Metal GPU kernels to an OpenAI-compatible API with KV pooling, chunked prefill, continuous batching, and scheduler metrics.**
+
+> Current status: this is a working technical preview, not a production-ready
+> release. The engine now supports real multi-request prefill batching, real
+> decode batching, 4096-token server context, stress tests, correctness checks,
+> and Prometheus-style observability. The next major engineering work is
+> long-context performance: bringing the single-command-buffer optimization to
+> the multi-request batched prefill path, then improving attention.
 
 ---
 
@@ -42,27 +49,36 @@ This post walks through every layer of that stack, from math to metal.
 
 ## What This Engine Actually Does
 
-The engine takes Google's Gemma4 E4B model (a 4.5 billion parameter dense language model optimized for edge/on-device deployment) and runs it on a MacBook Pro M1 with:
+The engine takes Google's Gemma4 E4B model (a 4.5 billion parameter dense language model optimized for edge/on-device deployment) and runs it on Apple Silicon with:
 
-- **~14 tokens/second** decode throughput
+- **OpenAI-compatible API** — `/v1/chat/completions`, `/v1/models`, `/health`, `/metrics`
+- **Streaming SSE** responses, just like OpenAI-compatible chat APIs
+- **KV cache pooling** for multiple concurrent requests
+- **Real decode batching** across active requests
+- **Real multi-request prefill batching** across KV slots
+- **Chunked prefill** for long prompts
+- **4096-token server context cap** in the current build
+- **Scheduler metrics** for batch size and latency
 - **~3 GB** total memory for model weights (Q4 quantized + f16 sensitive layers + PLE tables in bf16)
-- **~88 MB** for the KV cache (1024 context)
-- **OpenAI-compatible API** — drop-in replacement for any OpenAI client
-- **Streaming SSE** responses, just like ChatGPT
 
 Here's what using it looks like:
 
 ```bash
 # Start the server
-cargo run --release -- --gpu --serve ~/models/gemma-4-e4b-it
+LLAMA_QUEUE_DEPTH=64 \
+LLAMA_KV_POOL_SLOTS=32 \
+LLAMA_PREFILL_TOKENS_PER_TICK=128 \
+LLAMA_REQUEST_TIMEOUT_SECS=300 \
+cargo run --release -- --gpu --serve ~/models/gemma-4-e4b-it --port 8080
 
 # Talk to it (any OpenAI client works)
 curl http://localhost:8080/v1/chat/completions \
   -H "Content-Type: application/json" \
-  -d '{"messages": [{"role": "user", "content": "Write a haiku about Rust"}]}'
+  -d '{"model":"gemma-4-e4b-q4","messages":[{"role":"user","content":"Write a haiku about Rust"}],"max_tokens":64}'
 ```
 
-And you get back a streaming response, token by token, from a model running entirely on your local GPU.
+And you get back a response from a model running locally on your GPU. Add
+`"stream": true` to receive SSE chunks.
 
 ---
 
@@ -535,7 +551,7 @@ Attention for token 5:
 
 ```rust
 // Pre-allocate at startup (fixed capacity)
-let kv_capacity = 1024;  // Max context length
+let kv_capacity = config.max_position_embeddings.min(4096) as u32;
 
 // Per layer: K and V buffers sized for max context
 // Shape: [num_kv_heads × kv_capacity × head_dim] in f16
@@ -574,10 +590,10 @@ Per token, per layer:
 Sliding layers (head_dim=128): 4 × 128 × 2 × 2 = 2,048 bytes/token/layer
 Full attention layers (head_dim=512): 4 × 512 × 2 × 2 = 8,192 bytes/token/layer
 
-For 1024 context:
-  ~34 sliding layers × 1024 × 2048 = 71 MB
-  ~8 full layers × 1024 × 8192 = 67 MB
-  Total: ~138 MB (but sliding layers only keep 512 tokens → actual ~88 MB)
+For 4096 context:
+  ~34 sliding layers × 4096 × 2048 = 285 MB allocated
+  ~8 full layers × 4096 × 8192 = 268 MB allocated
+  Total: ~553 MB per KV slot before accounting for shared-KV layers and exact layer mix
 ```
 
 ### Sliding Window Optimization
@@ -586,6 +602,7 @@ Sliding window layers only attend to the last 512 tokens. This means:
 - We still allocate the full capacity for simplicity
 - But attention only reads the relevant window
 - Long contexts don't slow down sliding layers
+- Full-attention layers still scale with the full active context
 
 ```rust
 // For sliding window layers:
@@ -670,16 +687,33 @@ Client (curl, Python, any OpenAI SDK)
 │  - Parse request JSON          │
 │  - Apply chat template         │
 │  - Tokenize prompt             │
+│  - Validate context length     │
 └───────────────┬───────────────┘
-                │ Mutex<Model>
+                │ bounded queue
                 ▼
 ┌───────────────────────────────┐
-│  GPU Inference Engine          │
-│  - Prefill (all prompt tokens) │
-│  - Decode loop (one at a time) │
-│  - Stream tokens back via SSE  │
+│  Scheduler Thread              │
+│  - Admit requests              │
+│  - Allocate KV slots           │
+│  - Batch decode tokens         │
+│  - Batch prefill chunks        │
+│  - Interleave prefill/decode   │
+└───────────────┬───────────────┘
+                │
+                ▼
+┌───────────────────────────────┐
+│  GPU Batch Engine              │
+│  - KV cache pool               │
+│  - Chunked prefill             │
+│  - Multi-request prefill       │
+│  - Batched decode              │
 └───────────────────────────────┘
 ```
+
+The early version used a single model lock and processed one request at a time.
+The current server has a dedicated scheduler thread and a pool of KV slots.
+Decode batching is real, and multi-request prefill is real when multiple
+requests overlap in the prefill phase.
 
 ### Chat Template
 
@@ -752,22 +786,56 @@ async fn chat_completions_stream(state: Arc<AppState>, request: ChatCompletionRe
 
 ## Part 8: Benchmarking
 
-### Performance Metrics
+### Current Validation Snapshot
 
-From our evaluation run (27 diverse prompts across 10 categories):
+The current server is tested more like a serving system than a single prompt
+demo. The strong regression suite checks:
 
-| Metric | Value |
-|--------|-------|
-| Decode throughput | ~11 tok/s (with overhead) |
-| Peak decode | ~14 tok/s (pure generation) |
-| Prefill throughput | ~14 tok/s (sequential, not yet parallel) |
-| Total tokens generated | 7,929 |
-| Total time | 732 seconds |
-| Errors | 0 |
+- health and model listing
+- structured API errors
+- synchronous chat
+- SSE streaming
+- chunked prefill
+- 10-way concurrency
+- sequential vs concurrent greedy correctness
+- reversed-order batched prefill correctness
+- mixed prefill/decode fairness
+- mixed-length stress with staggered arrivals
+- stream cancellation
+- client-side timeout pressure
+- final idle gauges
+
+Recent local validation:
+
+| Check | Result |
+|-------|--------|
+| Full strong regression | Passed |
+| Prefill correctness | Passed across tiny, short, medium, chunk-boundary, and long prompts |
+| Reversed-order correctness | Passed |
+| Stress mixed wave | 24/24 completed |
+| Stream cancellation | Passed |
+| Client timeout pressure | Passed |
+| Long context smoke | ~3528 prompt tokens accepted |
+| Over-limit request | ~4928 prompt tokens rejected cleanly against 4096 limit |
+
+Observed batching metrics from local runs:
+
+| Metric | Example Value |
+|--------|---------------|
+| Prefill batch average | ~1.35-1.45 requests/batch |
+| Prefill batch max | 3-4 requests |
+| Decode batch average | ~1.7-1.9 requests/batch |
+| Decode batch max | 4 requests |
+
+These are not final product benchmarks. They are validation signals for the
+current scheduler and batching behavior.
 
 ### Quality Evaluation (LLM-as-a-Judge)
 
-We ran the model through a comprehensive eval covering writing, reasoning, math, coding, extraction, STEM, humanities, instruction following, safety, and multi-turn conversation.
+Historical eval run: the model was run through a comprehensive eval covering
+writing, reasoning, math, coding, extraction, STEM, humanities, instruction
+following, safety, and multi-turn conversation. Treat this as an older quality
+snapshot, not a substitute for the current regression/stress suite.
 
 **Overall score: 8.0/10** (judged by Claude Opus 4.6)
 
@@ -784,17 +852,28 @@ We ran the model through a comprehensive eval covering writing, reasoning, math,
 | Reasoning | 6.8 | Struggles with multi-step logic |
 | Instruction Following | 6.8 | Usually great, occasionally total failure |
 
-### Comparison: Us vs llama.cpp
+### Performance Positioning
 
-| | This Engine | llama.cpp (Metal) |
-|---|---|---|
-| Decode speed | ~14 tok/s | ~18 tok/s |
-| Code size | ~3K lines Rust | ~150K lines C/C++ |
-| Models supported | Gemma4 only | 50+ architectures |
-| Dependencies | 0 (just Metal) | 0 (just Metal) |
-| Time to build | 2 weeks | 2+ years |
+The engine is now correctness- and scheduler-tested enough for an alpha
+technical preview, but the performance story is not finished.
 
-We're ~78% of llama.cpp's speed with 2% of the code. The remaining gap is largely kernel micro-optimization (tiled matmul, better memory access patterns) that takes months to tune.
+What is already meaningful:
+
+- Real multi-request prefill batching exists and is exercised by tests.
+- Real decode batching exists and is exercised by tests.
+- Single-request parallel prefill chunk execution now uses one Metal command
+  buffer across the layer stack.
+- 4096-token prompts are supported by the server context cap.
+
+What is still performance work:
+
+- The single-command-buffer optimization has not yet been applied to the
+  multi-request batched prefill path.
+- The newly added tiled projection kernels are registered but not used in the
+  hot path.
+- Prefill attention is straightforward causal attention, not FlashAttention-style.
+- Near-4096 prompts can run long enough to hit request timeouts unless the
+  timeout is raised.
 
 ---
 
@@ -802,17 +881,22 @@ We're ~78% of llama.cpp's speed with 2% of the code. The remaining gap is largel
 
 ### Where Does the Time Go?
 
-For a single token generation at ~14 tok/s (71ms per token):
+For decode, the bottleneck is still mostly weight bandwidth: 42 layers × many
+Q4/f16 projections means reading a large fraction of the model every generated
+token.
 
-```
-Matrix-vector multiplies (Q4):    ~50ms (70%)
-Matrix-vector multiplies (f16):   ~12ms (17%)
-Attention (over KV cache):         ~4ms (6%)
-RMSNorm + activations:             ~3ms (4%)
-CPU overhead (embed, rotary calc): ~2ms (3%)
-```
+For prefill, the bottlenecks shift:
 
-The overwhelming bottleneck is weight reads. 42 layers × 7 weight matrices × variable sizes = reading ~2.5 GB of Q4 data from memory per token.
+- projection throughput over `(sequence length × hidden size)`
+- causal attention over the prompt
+- KV append bandwidth
+- command-buffer and synchronization overhead
+- scheduler policy when short and long prompts overlap
+
+The current metrics expose request, prefill, decode, and decode-compute latency
+averages/maxima. The next level of observability should break prefill into
+stage-level timings: embeddings, Q/K/V projections, KV append, attention, MLP,
+final norm, and logits.
 
 ### The Roofline
 
@@ -824,7 +908,8 @@ M1 Pro specs:
 Model weight reads per token: ~2.5 GB (Q4) + ~0.5 GB (f16 layers)
 Theoretical max throughput: 200 / 3.0 ≈ 67 tok/s
 
-Actual: ~14 tok/s = 21% of theoretical peak
+Actual performance depends heavily on prompt shape, batch overlap, timeout
+settings, and hardware.
 ```
 
 Why only 20%? Several reasons:
@@ -833,7 +918,8 @@ Why only 20%? Several reasons:
 3. **SIMD divergence** — Q4 decode has branches that reduce occupancy
 4. **CPU→GPU sync** — embedding lookup + rotary computation on CPU before GPU starts
 
-The path to 40+ tok/s: parallel prefill (matmul for prompt), better kernel fusion, potentially int8 KV cache.
+The next speed path is no longer "add parallel prefill" — that exists now. The
+next path is: make the batched prefill path cheaper, then optimize attention.
 
 ---
 
@@ -905,7 +991,7 @@ cargo run --release -- --gpu ~/models/gemma-4-e4b-it
 cargo run --release -- --gpu --serve ~/models/gemma-4-e4b-it
 
 # Custom port
-cargo run --release -- --gpu --serve --port 9090 ~/models/gemma-4-e4b-it
+cargo run --release -- --gpu --serve ~/models/gemma-4-e4b-it --port 9090
 ```
 
 ### Use the API
@@ -945,6 +1031,10 @@ llama_sinks_rust/
 │   ├── gemma4_gpu_model.rs  The core: model loading, forward pass, KV cache
 │   ├── gpu.rs               Metal context: buffer management, kernel encoding
 │   ├── server.rs            Axum HTTP server (OpenAI API, SSE streaming)
+│   ├── scheduler.rs         Admission, prefill/decode interleaving, batching
+│   ├── batch_engine.rs      Batched model calls plus KV pool integration
+│   ├── kv_pool.rs           Per-request KV cache slots
+│   ├── metrics.rs           Prometheus-style counters and gauges
 │   ├── sampling.rs          Temperature, Min-P, multinomial sampling
 │   ├── shaders/
 │   │   └── llama.metal      All GPU compute kernels (matvec, attention, etc.)
@@ -952,7 +1042,11 @@ llama_sinks_rust/
 ├── benchmarks/
 │   ├── eval_prompts.json    27 evaluation prompts across 10 categories
 │   ├── eval_run.py          Evaluation harness (hits server, collects outputs)
-│   ├── eval_outputs.json    Results from latest eval run
+│   ├── server_regression.py Full server regression
+│   ├── prefill_correctness.py Sequential vs concurrent correctness
+│   ├── mixed_batching_fairness.py Mixed prefill/decode fairness
+│   ├── stress_scheduler.py  Mixed prompt, cancellation, timeout stress
+│   ├── eval_outputs.json    Historical eval run output
 │   └── EVAL_JUDGE_PROMPT.md Instructions for LLM-as-a-Judge scoring
 └── docs/
     ├── BLOG.md              Original Llama 3.2 blog post (73 tok/s journey)
@@ -963,17 +1057,28 @@ llama_sinks_rust/
 
 ## What's Next
 
-The engine currently handles single-user inference. The [production roadmap](../.kiro/specs/production-inference-server/design.md) adds:
+The engine is now past the single-user prototype stage. The next work is about
+long-context performance, configurability, and publish polish:
 
-1. **Parallel prefill** — process all prompt tokens in one matmul (10x prefill speedup)
-2. **Request queue + KV cache pool** — multiple concurrent users
-3. **Continuous batching** — batch decode tokens from different users into one GPU pass
-4. **FlashAttention** — tiled attention for 4K+ context without quadratic memory
-5. **Speculative decoding** — 2-3x decode speedup using a draft model
+1. **Apply the single-command-buffer optimization to multi-request batched prefill.**
+   The single-request chunked prefill path has it; the multi-request path still
+   has more command-buffer synchronization than it should.
+2. **Optimize attention.**
+   Current prefill attention is straightforward causal attention. The next
+   long-context speedup is tiled/FlashAttention-style prefill attention.
+3. **Make KV capacity configurable and memory-aware.**
+   The current server cap is 4096 tokens.
+4. **Benchmark or remove experimental tiled projection kernels.**
+   They are registered but not used in the hot path yet.
+5. **Add deeper debug correctness.**
+   The current checks compare generated text exactly. A debug endpoint for
+   logits/top-k would catch smaller numerical drift.
+6. **Publish as alpha.**
+   Add CI, exact hardware benchmark tables, known limits, and license clarity.
 
-But even today, it's a complete, working inference engine that you can use as:
-- A learning tool (understand every byte of LLM inference)
-- A local chat assistant (no internet, no API keys, full privacy)
-- A foundation for custom inference optimizations
+Even today, it is useful as:
+- A learning tool for understanding LLM inference end to end
+- A local OpenAI-compatible Gemma server for experiments
+- A foundation for continuous batching and Metal kernel optimization
 
 The full source is in this repository. Build it, break it, learn from it.

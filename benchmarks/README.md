@@ -1,84 +1,140 @@
-# Gemma4 E4B Inference Quality Benchmark
-
-## Local server regression smoke test
+# Gemma4 Server Benchmarks and Regression Checks
 
 Start the server first:
 
 ```bash
-cargo run --release -- --port 8080
+export MODEL_DIR=/path/to/gemma-model-dir
+
+MACOSX_DEPLOYMENT_TARGET=15.0 \
+LLAMA_QUEUE_DEPTH=64 \
+LLAMA_KV_POOL_SLOTS=32 \
+LLAMA_PREFILL_TOKENS_PER_TICK=128 \
+LLAMA_REQUEST_TIMEOUT_SECS=300 \
+cargo run --release -- --gpu --serve "$MODEL_DIR" --port 8080
 ```
 
-Then run the regression suite:
+## Full Strong Regression
 
 ```bash
-python3 benchmarks/server_regression.py --port 8080 --requests 10 --max-tokens 32
+python3 benchmarks/server_regression.py \
+  --port 8080 \
+  --requests 10 \
+  --max-tokens 32 \
+  --timeout 300 \
+  --prefill-correctness \
+  --mixed-fairness \
+  --stress
 ```
 
-This checks health/model listing, structured request errors, non-streaming chat,
-streaming chat, concurrent requests, stop-token trimming, and idle scheduler
-gauges.
+This checks:
 
-## Prefill throughput benchmark
+- health and model listing
+- structured request errors
+- sync chat
+- streaming chat
+- chunked prefill
+- concurrent requests
+- sequential vs concurrent prefill correctness
+- reversed-order batched prefill correctness
+- mixed prefill/decode fairness
+- scheduler stress
+- idle metrics
 
-Start the server first, then run:
+## Prefill Correctness
 
 ```bash
-python3 benchmarks/prefill_benchmark.py --port 8080 --sizes 32,64,128,256,512 --repeats 3
+python3 benchmarks/prefill_correctness.py \
+  --port 8080 \
+  --max-tokens 24 \
+  --timeout 300
 ```
 
-The benchmark uses `/metrics` deltas to report prompt prefill tokens/sec,
-prefill chunks, and end-to-end request latency for each prompt size.
-Set `LLAMA_MAX_PREFILL_SEQ=64` or `LLAMA_MAX_PREFILL_SEQ=128` before starting
-the server to compare prefill chunk sizes.
+This compares greedy sequential baseline outputs against concurrent requests
+across tiny, short, medium, chunk-boundary, and long prompts. It also verifies
+that prefill batch counters prove multi-request prefill batching happened.
 
-## Mixed prefill/decode fairness benchmark
-
-Start the server first, then run:
+## Scheduler Stress
 
 ```bash
-python3 benchmarks/mixed_batching_fairness.py --port 8080
+python3 benchmarks/stress_scheduler.py \
+  --port 8080 \
+  --requests 24 \
+  --timeout 300
 ```
 
-This keeps a streaming decode request active while a long prompt is prefilling,
-then reports the largest streaming-token gap. Use it to tune scheduler
-interleaving and catch regressions where long prefill monopolizes the GPU.
+This exercises mixed prompt lengths, staggered arrivals, stream cancellation,
+client timeout pressure, batching metrics, and final idle gauges.
 
-Relevant server runtime knobs:
+## Mixed Prefill/Decode Fairness
 
 ```bash
-LLAMA_QUEUE_DEPTH=32
-LLAMA_KV_POOL_SLOTS=4
-LLAMA_REQUEST_TIMEOUT_SECS=60
-LLAMA_PREFILL_TOKENS_PER_TICK=32
-LLAMA_MAX_PREFILL_SEQ=128
+python3 benchmarks/mixed_batching_fairness.py \
+  --port 8080 \
+  --stream-tokens 64 \
+  --prefill-words 180 \
+  --prefill-max-tokens 1 \
+  --timeout 300 \
+  --max-stream-gap 5.0
 ```
 
-`LLAMA_PREFILL_TOKENS_PER_TICK` caps scheduler prefill work per tick. If unset,
-the scheduler uses the model prefill chunk size.
+Long-context smoke around 3500 prompt tokens:
 
-## How to compare your local model against llama.cpp
-
-### Step 1: Run the Colab script (llama.cpp reference on GPU)
-Open `benchmark_llamacpp_colab.ipynb` in Google Colab with a T4/A100 GPU.
-It will:
-- Download Gemma4 E4B Q4 GGUF
-- Run greedy decode on 10 fixed prompts
-- Save the outputs to `reference_outputs.json`
-
-### Step 2: Run the local test against your server
 ```bash
-# Start your server first:
-# cargo run --release -- --gpu --serve ~/Downloads/models--google--gemma-4-E4B-it/...
-
-# Then run the comparison:
-python3 benchmarks/benchmark_local.py
+python3 benchmarks/mixed_batching_fairness.py \
+  --port 8080 \
+  --stream-tokens 32 \
+  --prefill-words 900 \
+  --prefill-max-tokens 1 \
+  --timeout 300 \
+  --max-stream-gap 8.0
 ```
 
-### Step 3: Compare
+Prompts above 4096 tokens should be rejected cleanly with
+`context_length_exceeded`.
+
+## Prefill Throughput Benchmark
+
 ```bash
-python3 benchmarks/compare_outputs.py
+python3 benchmarks/prefill_benchmark.py \
+  --port 8080 \
+  --sizes 32,64,128,256,512 \
+  --repeats 3
 ```
 
-This compares token-by-token at temperature=0 (greedy).
-Any differences indicate quantization divergence (expected for first few tokens)
-or implementation bugs (if outputs completely differ).
+This uses `/metrics` deltas to report prompt prefill tokens/sec, prefill
+chunks, and end-to-end request latency for each prompt size.
+
+## Metrics
+
+```bash
+curl -s http://127.0.0.1:8080/metrics \
+  | grep -E 'llama_(prefill|decode)_batch_items_(avg|max)|llama_.*latency_ms_(avg|max)'
+```
+
+Useful metrics:
+
+- `llama_prefill_batch_items_avg`
+- `llama_prefill_batch_items_max`
+- `llama_decode_batch_items_avg`
+- `llama_decode_batch_items_max`
+- `llama_request_latency_ms_avg`
+- `llama_request_latency_ms_max`
+- `llama_prefill_latency_ms_avg`
+- `llama_prefill_latency_ms_max`
+- `llama_decode_latency_ms_avg`
+- `llama_decode_latency_ms_max`
+- `llama_decode_compute_latency_ms_avg`
+- `llama_decode_compute_latency_ms_max`
+
+## Runtime Knobs
+
+```bash
+LLAMA_QUEUE_DEPTH=64
+LLAMA_KV_POOL_SLOTS=32
+LLAMA_REQUEST_TIMEOUT_SECS=300
+LLAMA_PREFILL_TOKENS_PER_TICK=128
+```
+
+`LLAMA_PREFILL_TOKENS_PER_TICK` caps scheduler prefill work per tick. Lower
+values improve decode interleaving under long prefill load; higher values may
+improve prompt throughput.
