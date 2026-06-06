@@ -57,7 +57,8 @@ Still pending:
 ## Build
 
 ```bash
-cd /Users/pradeep/projects/llm_np_cp/llama_sinks_rust
+git clone git@github.com:githubpradeep/metal-llm-server.git
+cd metal-llm-server
 export MACOSX_DEPLOYMENT_TARGET=15.0
 cargo build --release
 ```
