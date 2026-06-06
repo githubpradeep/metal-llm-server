@@ -292,7 +292,7 @@ def check_idle_metrics(base_url):
 
 
 def check_mixed_fairness(base_url, args):
-    first_token_seen = threading.Event()
+    stream_started = threading.Event()
     token_times = []
     errors = []
     stream_thread = threading.Thread(
@@ -300,7 +300,7 @@ def check_mixed_fairness(base_url, args):
         args=(
             base_url,
             args.mixed_stream_tokens,
-            first_token_seen,
+            stream_started,
             token_times,
             errors,
             args.timeout,
@@ -308,8 +308,10 @@ def check_mixed_fairness(base_url, args):
     )
 
     stream_thread.start()
-    if not first_token_seen.wait(timeout=args.timeout):
-        raise AssertionError("stream did not produce a first token before timeout")
+    if not stream_started.wait(timeout=args.timeout):
+        raise AssertionError("stream did not start before timeout")
+    if errors:
+        raise AssertionError(f"stream request failed before fairness load: {errors[0]}")
 
     prefill_elapsed, prefill_usage = mixed_batching_fairness.long_prefill(
         base_url,

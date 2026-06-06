@@ -5,7 +5,7 @@ Start the server first, then run:
     python3 benchmarks/mixed_batching_fairness.py --port 8080
 
 Useful scheduler tuning while testing:
-    LLAMA_PREFILL_TOKENS_PER_TICK=32 cargo run --release -- --gpu --serve --port 8080 <model_dir>
+    LLAMA_PREFILL_TOKENS_PER_TICK=32 cargo run --release -- --gpu --serve <model_dir> --port 8080
 """
 
 import argparse
@@ -52,7 +52,7 @@ def request_json(base_url, payload, timeout):
         return json.loads(resp.read().decode("utf-8"))
 
 
-def stream_decode(base_url, max_tokens, first_token_seen, token_times, errors, timeout):
+def stream_decode(base_url, max_tokens, stream_started, token_times, errors, timeout):
     payload = chat_payload(
         "Write a long comma-separated list of simple counting words. "
         "Do not stop early; continue until the token budget is exhausted.",
@@ -70,14 +70,14 @@ def stream_decode(base_url, max_tokens, first_token_seen, token_times, errors, t
             for event in parse_sse_events(resp):
                 if event == "[DONE]":
                     break
+                stream_started.set()
                 choice = event["choices"][0]
                 content = choice["delta"].get("content", "")
                 if content:
                     token_times.append(time.time())
-                    first_token_seen.set()
     except Exception as exc:
         errors.append(exc)
-        first_token_seen.set()
+        stream_started.set()
 
 
 def long_prefill(base_url, words, max_tokens, timeout):
@@ -128,7 +128,7 @@ def main():
     base_url = f"http://127.0.0.1:{args.port}"
     urllib.request.urlopen(f"{base_url}/health", timeout=5).read()
 
-    first_token_seen = threading.Event()
+    stream_started = threading.Event()
     token_times = []
     errors = []
     stream_thread = threading.Thread(
@@ -136,7 +136,7 @@ def main():
         args=(
             base_url,
             args.stream_tokens,
-            first_token_seen,
+            stream_started,
             token_times,
             errors,
             args.timeout,
@@ -145,8 +145,10 @@ def main():
 
     started_at = time.time()
     stream_thread.start()
-    if not first_token_seen.wait(timeout=args.timeout):
-        raise AssertionError("stream did not produce a first token before timeout")
+    if not stream_started.wait(timeout=args.timeout):
+        raise AssertionError("stream did not start before timeout")
+    if errors:
+        raise AssertionError(f"stream request failed before fairness load: {errors[0]}")
 
     prefill_elapsed, prefill_usage = long_prefill(
         base_url,
