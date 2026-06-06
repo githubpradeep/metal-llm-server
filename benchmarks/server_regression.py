@@ -13,6 +13,7 @@ import urllib.error
 import urllib.request
 
 import mixed_batching_fairness
+import prefill_correctness
 
 
 MODEL = "gemma-4-e4b-q4"
@@ -359,12 +360,62 @@ def check_mixed_fairness(base_url, args):
     print("ok mixed fairness")
 
 
+def check_prefill_correctness(base_url, args):
+    baseline = [
+        prefill_correctness.run_chat(
+            base_url,
+            name,
+            prompt,
+            args.prefill_correctness_max_tokens,
+            args.timeout,
+        )
+        for name, prompt in prefill_correctness.DEFAULT_CASES
+    ]
+
+    before = prefill_correctness.get_metrics(base_url)
+    concurrent = prefill_correctness.run_concurrent(
+        base_url,
+        prefill_correctness.DEFAULT_CASES,
+        args.prefill_correctness_max_tokens,
+        args.timeout,
+    )
+    after = prefill_correctness.get_metrics(base_url)
+
+    for expected, actual in zip(baseline, concurrent):
+        assert actual["content"] == expected["content"], (
+            f"prefill correctness mismatch for {expected['name']}\n"
+            f"baseline:   {expected['content']!r}\n"
+            f"concurrent: {actual['content']!r}"
+        )
+        assert (
+            actual["usage"]["prompt_tokens"] == expected["usage"]["prompt_tokens"]
+        ), f"prompt token mismatch for {expected['name']}"
+
+    prefill_batches = prefill_correctness.metric_delta(
+        after, before, "llama_prefill_batches_total"
+    )
+    prefill_items = prefill_correctness.metric_delta(
+        after, before, "llama_prefill_batch_items_total"
+    )
+    assert prefill_items > prefill_batches, (
+        "prefill correctness run did not prove multi-request prefill batching: "
+        f"items_delta={prefill_items:.0f}, batches_delta={prefill_batches:.0f}"
+    )
+    print(
+        "ok prefill correctness "
+        f"prefill_batches_delta={prefill_batches:.0f} "
+        f"prefill_items_delta={prefill_items:.0f}"
+    )
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--port", type=int, default=8080)
     parser.add_argument("--requests", type=int, default=10)
     parser.add_argument("--max-tokens", type=int, default=32)
     parser.add_argument("--timeout", type=float, default=180.0)
+    parser.add_argument("--prefill-correctness", action="store_true")
+    parser.add_argument("--prefill-correctness-max-tokens", type=int, default=24)
     parser.add_argument("--mixed-fairness", action="store_true")
     parser.add_argument("--mixed-stream-tokens", type=int, default=64)
     parser.add_argument(
@@ -384,6 +435,8 @@ def main():
     check_chunked_prefill(base_url)
     check_stream_chat(base_url)
     check_concurrency(base_url, args.requests, args.max_tokens, args.timeout)
+    if args.prefill_correctness:
+        check_prefill_correctness(base_url, args)
     if args.mixed_fairness:
         check_mixed_fairness(base_url, args)
     check_idle_metrics(base_url)
