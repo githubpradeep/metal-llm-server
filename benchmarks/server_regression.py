@@ -294,6 +294,15 @@ def check_idle_metrics(base_url):
 def check_mixed_fairness(base_url, args):
     stream_started = threading.Event()
     token_times = []
+    stream_stats = {
+        "events": 0,
+        "role_seen": False,
+        "content_chunks": 0,
+        "content_chars": 0,
+        "finish_reason": None,
+        "done_seen": False,
+        "text_sample": "",
+    }
     errors = []
     stream_thread = threading.Thread(
         target=mixed_batching_fairness.stream_decode,
@@ -302,8 +311,10 @@ def check_mixed_fairness(base_url, args):
             args.mixed_stream_tokens,
             stream_started,
             token_times,
+            stream_stats,
             errors,
             args.timeout,
+            args.mixed_stream_prompt,
         ),
     )
 
@@ -329,6 +340,8 @@ def check_mixed_fairness(base_url, args):
     print(
         "mixed fairness "
         f"stream_chunks={summary['count']} "
+        f"stream_events={stream_stats['events']} "
+        f"finish_reason={stream_stats['finish_reason']} "
         f"max_gap={summary['max_gap']:.3f}s "
         f"p95_gap={summary['p95_gap']:.3f}s "
         f"prefill_elapsed={prefill_elapsed:.3f}s "
@@ -354,6 +367,10 @@ def main():
     parser.add_argument("--timeout", type=float, default=180.0)
     parser.add_argument("--mixed-fairness", action="store_true")
     parser.add_argument("--mixed-stream-tokens", type=int, default=64)
+    parser.add_argument(
+        "--mixed-stream-prompt",
+        default=mixed_batching_fairness.DEFAULT_STREAM_PROMPT,
+    )
     parser.add_argument("--mixed-prefill-words", type=int, default=180)
     parser.add_argument("--mixed-prefill-max-tokens", type=int, default=1)
     parser.add_argument("--mixed-max-stream-gap", type=float, default=5.0)

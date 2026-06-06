@@ -57,13 +57,23 @@ def request_json(base_url, payload, timeout):
         raise AssertionError(f"HTTP {exc.code} from /v1/chat/completions: {body}") from exc
 
 
-def stream_decode(base_url, max_tokens, stream_started, token_times, errors, timeout):
-    payload = chat_payload(
-        "Write a long comma-separated list of simple counting words. "
-        "Do not stop early; continue until the token budget is exhausted.",
-        max_tokens=max_tokens,
-        stream=True,
-    )
+DEFAULT_STREAM_PROMPT = (
+    "Write twelve short sentences about building a reliable inference server. "
+    "Number each sentence and continue until you have written all twelve."
+)
+
+
+def stream_decode(
+    base_url,
+    max_tokens,
+    stream_started,
+    token_times,
+    stream_stats,
+    errors,
+    timeout,
+    prompt=DEFAULT_STREAM_PROMPT,
+):
+    payload = chat_payload(prompt, max_tokens=max_tokens, stream=True)
     req = urllib.request.Request(
         f"{base_url}/v1/chat/completions",
         data=json.dumps(payload).encode("utf-8"),
@@ -74,12 +84,26 @@ def stream_decode(base_url, max_tokens, stream_started, token_times, errors, tim
         with urllib.request.urlopen(req, timeout=timeout) as resp:
             for event in parse_sse_events(resp):
                 if event == "[DONE]":
+                    stream_stats["done_seen"] = True
                     break
                 stream_started.set()
+                stream_stats["events"] += 1
                 choice = event["choices"][0]
+                if choice.get("finish_reason"):
+                    stream_stats["finish_reason"] = choice["finish_reason"]
                 content = choice["delta"].get("content", "")
                 if content:
                     token_times.append(time.time())
+                    stream_stats["content_chunks"] += 1
+                    stream_stats["content_chars"] += len(content)
+                    if len(stream_stats["text_sample"]) < 200:
+                        stream_stats["text_sample"] += content
+                if choice["delta"].get("role"):
+                    stream_stats["role_seen"] = True
+    except urllib.error.HTTPError as exc:
+        body = exc.read().decode("utf-8", errors="replace")
+        errors.append(AssertionError(f"HTTP {exc.code} from streaming request: {body}"))
+        stream_started.set()
     except Exception as exc:
         errors.append(exc)
         stream_started.set()
@@ -123,6 +147,7 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--port", type=int, default=8080)
     parser.add_argument("--stream-tokens", type=int, default=64)
+    parser.add_argument("--stream-prompt", default=DEFAULT_STREAM_PROMPT)
     parser.add_argument("--prefill-words", type=int, default=180)
     parser.add_argument("--prefill-max-tokens", type=int, default=1)
     parser.add_argument("--timeout", type=float, default=240.0)
@@ -135,6 +160,15 @@ def main():
 
     stream_started = threading.Event()
     token_times = []
+    stream_stats = {
+        "events": 0,
+        "role_seen": False,
+        "content_chunks": 0,
+        "content_chars": 0,
+        "finish_reason": None,
+        "done_seen": False,
+        "text_sample": "",
+    }
     errors = []
     stream_thread = threading.Thread(
         target=stream_decode,
@@ -143,8 +177,10 @@ def main():
             args.stream_tokens,
             stream_started,
             token_times,
+            stream_stats,
             errors,
             args.timeout,
+            args.stream_prompt,
         ),
     )
 
@@ -171,6 +207,13 @@ def main():
     total_elapsed = time.time() - started_at
 
     print(f"stream_chunks={summary['count']}")
+    print(f"stream_events={stream_stats['events']}")
+    print(f"stream_role_seen={stream_stats['role_seen']}")
+    print(f"stream_finish_reason={stream_stats['finish_reason']}")
+    print(f"stream_done_seen={stream_stats['done_seen']}")
+    print(f"stream_content_chars={stream_stats['content_chars']}")
+    if stream_stats["text_sample"]:
+        print(f"stream_text_sample={stream_stats['text_sample'][:200]!r}")
     print(f"stream_max_gap_s={summary['max_gap']:.3f}")
     print(f"stream_p95_gap_s={summary['p95_gap']:.3f}")
     print(f"stream_mean_gap_s={summary['mean_gap']:.3f}")
