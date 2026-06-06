@@ -71,13 +71,13 @@ impl Scheduler {
                 }
             }
 
+            if receiver_open && self.engine.available_slots() > 0 {
+                receiver_open = self.try_admit_available(&request_rx, &mut active);
+            }
+
             if !active.is_empty() {
                 self.decode_active_round(&mut active);
                 self.prefill_active_round(&mut active);
-            }
-
-            if receiver_open && self.engine.available_slots() > 0 {
-                receiver_open = self.try_admit_one(&request_rx, &mut active);
             }
         }
     }
@@ -131,19 +131,20 @@ impl Scheduler {
         });
     }
 
-    fn try_admit_one(
+    fn try_admit_available(
         &mut self,
         request_rx: &Receiver<InferenceRequest>,
         active: &mut Vec<ActiveRequest>,
     ) -> bool {
-        match request_rx.try_recv() {
-            Ok(request) => {
-                self.admit_request(request, active);
-                true
+        while self.engine.available_slots() > 0 {
+            match request_rx.try_recv() {
+                Ok(request) => self.admit_request(request, active),
+                Err(TryRecvError::Empty) => return true,
+                Err(TryRecvError::Disconnected) => return false,
             }
-            Err(TryRecvError::Empty) => true,
-            Err(TryRecvError::Disconnected) => false,
         }
+
+        true
     }
 
     fn decode_active_round(
