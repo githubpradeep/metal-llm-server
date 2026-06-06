@@ -483,35 +483,84 @@ fn plan_prefill_round(
         return (Vec::new(), 0);
     }
 
-    let mut plan = Vec::new();
-    let mut remaining_budget = token_budget;
     let start_index = start_index % active_len;
-    let mut next_index = start_index;
+    let candidates: Vec<(usize, usize)> = (0..active_len)
+        .filter_map(|offset| {
+            let active_index = (start_index + offset) % active_len;
+            if !is_prefilling(active_index) {
+                return None;
+            }
 
-    for offset in 0..active_len {
-        let active_index = (start_index + offset) % active_len;
-        if !is_prefilling(active_index) {
-            continue;
+            let remaining = remaining_tokens(active_index).min(max_chunk_tokens);
+            if remaining == 0 {
+                None
+            } else {
+                Some((active_index, remaining))
+            }
+        })
+        .collect();
+
+    if candidates.is_empty() {
+        return (Vec::new(), start_index);
+    }
+
+    let mut allocations = vec![0usize; candidates.len()];
+    let mut remaining_budget = token_budget;
+
+    while remaining_budget > 0 {
+        let eligible_count = candidates
+            .iter()
+            .zip(&allocations)
+            .filter(|((_, remaining), allocated)| **allocated < *remaining)
+            .count();
+        if eligible_count == 0 {
+            break;
         }
 
-        let token_count = remaining_tokens(active_index)
-            .min(max_chunk_tokens)
-            .min(remaining_budget);
-        if token_count == 0 {
-            continue;
+        let quantum = (remaining_budget / eligible_count).max(1);
+        let mut made_progress = false;
+        for ((_, remaining), allocated) in candidates.iter().zip(&mut allocations) {
+            if *allocated >= *remaining {
+                continue;
+            }
+
+            let take = (*remaining - *allocated).min(quantum).min(remaining_budget);
+            if take == 0 {
+                continue;
+            }
+            *allocated += take;
+            remaining_budget -= take;
+            made_progress = true;
+
+            if remaining_budget == 0 {
+                break;
+            }
         }
 
-        plan.push(PrefillPlanItem {
-            active_index,
-            token_count,
-        });
-        remaining_budget -= token_count;
-        next_index = (active_index + 1) % active_len;
-
-        if remaining_budget == 0 {
+        if !made_progress {
             break;
         }
     }
+
+    let plan: Vec<PrefillPlanItem> = candidates
+        .iter()
+        .zip(allocations)
+        .filter_map(|(&(active_index, _), token_count)| {
+            if token_count == 0 {
+                None
+            } else {
+                Some(PrefillPlanItem {
+                    active_index,
+                    token_count,
+                })
+            }
+        })
+        .collect();
+
+    let next_index = plan
+        .last()
+        .map(|item| (item.active_index + 1) % active_len)
+        .unwrap_or(start_index);
 
     (plan, next_index)
 }
@@ -704,7 +753,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn prefill_plan_caps_total_tokens_per_tick() {
+    fn prefill_plan_spreads_total_tokens_per_tick() {
         let phases = [true, true, true];
         let remaining = [200, 200, 200];
 
@@ -719,16 +768,27 @@ mod tests {
 
         assert_eq!(
             plan,
-            vec![PrefillPlanItem {
-                active_index: 0,
-                token_count: 128,
-            }]
+            vec![
+                PrefillPlanItem {
+                    active_index: 0,
+                    token_count: 43,
+                },
+                PrefillPlanItem {
+                    active_index: 1,
+                    token_count: 43,
+                },
+                PrefillPlanItem {
+                    active_index: 2,
+                    token_count: 42,
+                },
+            ]
         );
-        assert_eq!(next_index, 1);
+        assert_eq!(next_index, 0);
+        assert_eq!(plan.iter().map(|item| item.token_count).sum::<usize>(), 128);
     }
 
     #[test]
-    fn prefill_plan_packs_short_chunks_until_budget_is_spent() {
+    fn prefill_plan_redistributes_short_chunks_until_budget_is_spent() {
         let phases = [true, true, true];
         let remaining = [8, 40, 120];
 
@@ -750,15 +810,16 @@ mod tests {
                 },
                 PrefillPlanItem {
                     active_index: 1,
-                    token_count: 40,
+                    token_count: 28,
                 },
                 PrefillPlanItem {
                     active_index: 2,
-                    token_count: 16,
+                    token_count: 28,
                 },
             ]
         );
         assert_eq!(next_index, 0);
+        assert_eq!(plan.iter().map(|item| item.token_count).sum::<usize>(), 64);
     }
 
     #[test]
@@ -777,11 +838,45 @@ mod tests {
 
         assert_eq!(
             plan,
+            vec![
+                PrefillPlanItem {
+                    active_index: 2,
+                    token_count: 43,
+                },
+                PrefillPlanItem {
+                    active_index: 3,
+                    token_count: 43,
+                },
+                PrefillPlanItem {
+                    active_index: 0,
+                    token_count: 42,
+                },
+            ]
+        );
+        assert_eq!(next_index, 1);
+    }
+
+    #[test]
+    fn prefill_plan_gives_single_prefill_request_full_budget() {
+        let phases = [false, true, false];
+        let remaining = [0, 200, 0];
+
+        let (plan, next_index) = plan_prefill_round(
+            phases.len(),
+            0,
+            128,
+            128,
+            |index| phases[index],
+            |index| remaining[index],
+        );
+
+        assert_eq!(
+            plan,
             vec![PrefillPlanItem {
-                active_index: 2,
+                active_index: 1,
                 token_count: 128,
             }]
         );
-        assert_eq!(next_index, 3);
+        assert_eq!(next_index, 2);
     }
 }
