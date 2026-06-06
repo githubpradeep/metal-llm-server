@@ -27,6 +27,10 @@ def marker_prompt(prefix, markers, suffix):
 
 DEFAULT_CASES = [
     (
+        "tiny",
+        "Reply with exactly three words about inference.",
+    ),
+    (
         "short",
         "Reply with exactly one concise sentence about deterministic inference.",
     ),
@@ -39,10 +43,26 @@ DEFAULT_CASES = [
         ),
     ),
     (
-        "long",
+        "chunk_boundary",
+        marker_prompt(
+            "Read these markers, then reply with exactly one concise sentence about chunk boundaries.",
+            110,
+            "Keep the answer stable.",
+        ),
+    ),
+    (
+        "long_kv",
         marker_prompt(
             "Read these markers, then reply with exactly one concise sentence about KV cache reuse.",
             170,
+            "Keep the answer stable.",
+        ),
+    ),
+    (
+        "long_scheduler",
+        marker_prompt(
+            "Read these markers, then reply with exactly one concise sentence about scheduler fairness.",
+            150,
             "Keep the answer stable.",
         ),
     ),
@@ -149,6 +169,40 @@ def metric_delta(after, before, name):
     return after.get(name, 0.0) - before.get(name, 0.0)
 
 
+def compare_outputs(label, baseline, concurrent):
+    expected_by_name = {result["name"]: result for result in baseline}
+    for actual in concurrent:
+        expected = expected_by_name[actual["name"]]
+        if actual["content"] != expected["content"]:
+            raise AssertionError(
+                f"content mismatch for {actual['name']} during {label}\n"
+                f"baseline:   {expected['content']!r}\n"
+                f"concurrent: {actual['content']!r}"
+            )
+        if actual["finish_reason"] != expected["finish_reason"]:
+            raise AssertionError(
+                f"finish reason mismatch for {actual['name']} during {label}: "
+                f"baseline={expected['finish_reason']} concurrent={actual['finish_reason']}"
+            )
+        if actual["usage"]["prompt_tokens"] != expected["usage"]["prompt_tokens"]:
+            raise AssertionError(
+                f"prompt token mismatch for {actual['name']} during {label}: "
+                f"baseline={expected['usage']['prompt_tokens']} "
+                f"concurrent={actual['usage']['prompt_tokens']}"
+            )
+        if actual["usage"]["completion_tokens"] != expected["usage"]["completion_tokens"]:
+            raise AssertionError(
+                f"completion token mismatch for {actual['name']} during {label}: "
+                f"baseline={expected['usage']['completion_tokens']} "
+                f"concurrent={actual['usage']['completion_tokens']}"
+            )
+        print(
+            f"ok match phase={label} name={actual['name']} "
+            f"completion_tokens={actual['usage']['completion_tokens']} "
+            f"elapsed={actual['elapsed']:.2f}s"
+        )
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--port", type=int, default=8080)
@@ -156,6 +210,11 @@ def main():
     parser.add_argument("--timeout", type=float, default=240.0)
     parser.add_argument(
         "--require-batched-prefill",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+    )
+    parser.add_argument(
+        "--reversed-order",
         action=argparse.BooleanOptionalAction,
         default=True,
     )
@@ -180,26 +239,16 @@ def main():
     before = get_metrics(base_url)
     print("running concurrent greedy comparison")
     concurrent = run_concurrent(base_url, DEFAULT_CASES, args.max_tokens, args.timeout)
-    after = get_metrics(base_url)
+    compare_outputs("normal", baseline, concurrent)
 
-    for expected, actual in zip(baseline, concurrent):
-        if actual["content"] != expected["content"]:
-            raise AssertionError(
-                f"content mismatch for {expected['name']}\n"
-                f"baseline:   {expected['content']!r}\n"
-                f"concurrent: {actual['content']!r}"
-            )
-        if actual["usage"]["prompt_tokens"] != expected["usage"]["prompt_tokens"]:
-            raise AssertionError(
-                f"prompt token mismatch for {expected['name']}: "
-                f"baseline={expected['usage']['prompt_tokens']} "
-                f"concurrent={actual['usage']['prompt_tokens']}"
-            )
-        print(
-            f"ok match name={actual['name']} "
-            f"completion_tokens={actual['usage']['completion_tokens']} "
-            f"elapsed={actual['elapsed']:.2f}s"
+    if args.reversed_order:
+        print("running reversed-order concurrent greedy comparison")
+        reversed_concurrent = run_concurrent(
+            base_url, list(reversed(DEFAULT_CASES)), args.max_tokens, args.timeout
         )
+        compare_outputs("reversed", baseline, reversed_concurrent)
+
+    after = get_metrics(base_url)
 
     prefill_batches = metric_delta(after, before, "llama_prefill_batches_total")
     prefill_items = metric_delta(after, before, "llama_prefill_batch_items_total")

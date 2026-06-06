@@ -14,6 +14,7 @@ import urllib.request
 
 import mixed_batching_fairness
 import prefill_correctness
+import stress_scheduler
 
 
 MODEL = "gemma-4-e4b-q4"
@@ -289,6 +290,21 @@ def check_idle_metrics(base_url):
         "llama_decode_batch_items_total",
     ):
         assert counter in metrics, f"{counter} missing from /metrics"
+    for gauge in (
+        "llama_prefill_batch_items_avg",
+        "llama_prefill_batch_items_max",
+        "llama_decode_batch_items_avg",
+        "llama_decode_batch_items_max",
+        "llama_request_latency_ms_avg",
+        "llama_request_latency_ms_max",
+        "llama_prefill_latency_ms_avg",
+        "llama_prefill_latency_ms_max",
+        "llama_decode_latency_ms_avg",
+        "llama_decode_latency_ms_max",
+        "llama_decode_compute_latency_ms_avg",
+        "llama_decode_compute_latency_ms_max",
+    ):
+        assert gauge in metrics, f"{gauge} missing from /metrics"
     print("ok idle metrics")
 
 
@@ -379,17 +395,18 @@ def check_prefill_correctness(base_url, args):
         args.prefill_correctness_max_tokens,
         args.timeout,
     )
-    after = prefill_correctness.get_metrics(base_url)
+    prefill_correctness.compare_outputs("normal", baseline, concurrent)
 
-    for expected, actual in zip(baseline, concurrent):
-        assert actual["content"] == expected["content"], (
-            f"prefill correctness mismatch for {expected['name']}\n"
-            f"baseline:   {expected['content']!r}\n"
-            f"concurrent: {actual['content']!r}"
+    if args.prefill_correctness_reversed_order:
+        reversed_concurrent = prefill_correctness.run_concurrent(
+            base_url,
+            list(reversed(prefill_correctness.DEFAULT_CASES)),
+            args.prefill_correctness_max_tokens,
+            args.timeout,
         )
-        assert (
-            actual["usage"]["prompt_tokens"] == expected["usage"]["prompt_tokens"]
-        ), f"prompt token mismatch for {expected['name']}"
+        prefill_correctness.compare_outputs("reversed", baseline, reversed_concurrent)
+
+    after = prefill_correctness.get_metrics(base_url)
 
     prefill_batches = prefill_correctness.metric_delta(
         after, before, "llama_prefill_batches_total"
@@ -408,6 +425,49 @@ def check_prefill_correctness(base_url, args):
     )
 
 
+def check_scheduler_stress(base_url, args):
+    marker_counts = [
+        int(value) for value in args.stress_marker_counts.split(",") if value.strip()
+    ]
+    before = stress_scheduler.get_metrics(base_url)
+    _, wave = stress_scheduler.run_mixed_wave(
+        base_url,
+        args.stress_requests,
+        args.stress_max_tokens,
+        args.timeout,
+        args.stress_stagger_sec,
+        marker_counts,
+    )
+    after_wave = stress_scheduler.get_metrics(base_url)
+
+    cancel_counts = stress_scheduler.run_cancellation_probe(
+        base_url,
+        args.stress_cancel_streams,
+        args.stress_cancel_after_chunks,
+        args.timeout,
+    )
+    client_timeouts = stress_scheduler.run_client_timeout_probe(
+        base_url,
+        args.stress_client_timeout_probes,
+        args.stress_client_timeout_secs,
+    )
+    final_metrics = stress_scheduler.wait_for_idle(base_url, args.timeout)
+
+    for gauge in PHASE_GAUGES:
+        assert final_metrics.get(gauge) == 0.0, f"{gauge} did not return to idle"
+
+    print(
+        "ok scheduler stress "
+        f"requests={args.stress_requests} "
+        f"elapsed={wave['elapsed']:.2f}s "
+        f"p95={wave['p95']:.2f}s "
+        f"prefill_items_delta={stress_scheduler.metric_delta(after_wave, before, 'llama_prefill_batch_items_total'):.0f} "
+        f"decode_items_delta={stress_scheduler.metric_delta(after_wave, before, 'llama_decode_batch_items_total'):.0f} "
+        f"cancel_chunks={cancel_counts} "
+        f"client_timeouts={client_timeouts}/{args.stress_client_timeout_probes}"
+    )
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--port", type=int, default=8080)
@@ -416,6 +476,11 @@ def main():
     parser.add_argument("--timeout", type=float, default=180.0)
     parser.add_argument("--prefill-correctness", action="store_true")
     parser.add_argument("--prefill-correctness-max-tokens", type=int, default=24)
+    parser.add_argument(
+        "--prefill-correctness-reversed-order",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+    )
     parser.add_argument("--mixed-fairness", action="store_true")
     parser.add_argument("--mixed-stream-tokens", type=int, default=64)
     parser.add_argument(
@@ -426,6 +491,15 @@ def main():
     parser.add_argument("--mixed-prefill-max-tokens", type=int, default=1)
     parser.add_argument("--mixed-max-stream-gap", type=float, default=5.0)
     parser.add_argument("--mixed-min-stream-chunks", type=int, default=4)
+    parser.add_argument("--stress", action="store_true")
+    parser.add_argument("--stress-requests", type=int, default=16)
+    parser.add_argument("--stress-max-tokens", type=int, default=20)
+    parser.add_argument("--stress-stagger-sec", type=float, default=0.03)
+    parser.add_argument("--stress-marker-counts", default="0,40,120,180")
+    parser.add_argument("--stress-cancel-streams", type=int, default=2)
+    parser.add_argument("--stress-cancel-after-chunks", type=int, default=2)
+    parser.add_argument("--stress-client-timeout-probes", type=int, default=1)
+    parser.add_argument("--stress-client-timeout-secs", type=float, default=0.5)
     args = parser.parse_args()
 
     base_url = f"http://127.0.0.1:{args.port}"
@@ -439,6 +513,8 @@ def main():
         check_prefill_correctness(base_url, args)
     if args.mixed_fairness:
         check_mixed_fairness(base_url, args)
+    if args.stress:
+        check_scheduler_stress(base_url, args)
     check_idle_metrics(base_url)
     print("all regression checks passed")
 
