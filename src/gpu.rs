@@ -10,6 +10,8 @@ pub struct MetalContext {
     pub matvec_q4_pipeline: ComputePipelineState,
     pub projection_f16_batch_pipeline: ComputePipelineState,
     pub projection_q4_batch_pipeline: ComputePipelineState,
+    pub projection_f16_batch_tiled_pipeline: ComputePipelineState,
+    pub projection_q4_batch_tiled_pipeline: ComputePipelineState,
     pub matmul_pipeline: ComputePipelineState,
     pub rmsnorm_pipeline: ComputePipelineState,
     pub rmsnorm_batch_pipeline: ComputePipelineState,
@@ -73,6 +75,8 @@ impl MetalContext {
         let matvec_q4_pipeline = get_fn("matvec_q4");
         let projection_f16_batch_pipeline = get_fn("projection_f16_batch");
         let projection_q4_batch_pipeline = get_fn("projection_q4_batch");
+        let projection_f16_batch_tiled_pipeline = get_fn("projection_f16_batch_tiled");
+        let projection_q4_batch_tiled_pipeline = get_fn("projection_q4_batch_tiled");
         let matmul_pipeline = get_fn("matmul");
         let rmsnorm_pipeline = get_fn("rmsnorm");
         let rmsnorm_batch_pipeline = get_fn("rmsnorm_batch");
@@ -114,6 +118,8 @@ impl MetalContext {
             matvec_q4_pipeline,
             projection_f16_batch_pipeline,
             projection_q4_batch_pipeline,
+            projection_f16_batch_tiled_pipeline,
+            projection_q4_batch_tiled_pipeline,
             matmul_pipeline,
             rmsnorm_pipeline,
             rmsnorm_batch_pipeline,

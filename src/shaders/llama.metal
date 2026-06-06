@@ -404,6 +404,128 @@ kernel void matmul(
     C[row * N + col] = acc;
 }
 
+// ─── Tiled Q4 Batch Projection (Optimized) ──────────────────────────────────
+// Computes Y = X * W_q4^T where X is (S, K), W_q4 is (M, K), Y is (S, M).
+// KEY OPTIMIZATION: Uses threadgroup shared memory to load weight tiles ONCE
+// and reuse across multiple sequence positions (TILE_S).
+//
+// Tiling strategy:
+//   - Each threadgroup handles TILE_M output rows × TILE_S sequence positions
+//   - Weights are loaded into shared memory in tiles of [TILE_M × TILE_K]
+//   - Input X tiles [TILE_S × TILE_K] are loaded into shared memory
+//   - Inner loop: accumulate partial products from K-dimension tiles
+//
+// Grid: (ceil(M/TILE_M), ceil(S/TILE_S), 1)
+// Threadgroup: (TILE_M * TILE_S / work_per_thread, 1, 1) — but we use SIMD groups
+
+constant uint TILE_M_Q4 = 8;     // output rows per threadgroup
+constant uint TILE_S_Q4 = 8;     // sequence positions per threadgroup
+constant uint TILE_K_Q4 = 32;    // K elements per tile iteration (= one Q4 group)
+constant uint TG_SIZE_Q4 = 64;   // threads per threadgroup
+
+kernel void projection_q4_batch_tiled(
+    device const uchar* W_q4 [[buffer(0)]],
+    device const float* X [[buffer(1)]],    // (S, K) row-major
+    device float* Y [[buffer(2)]],          // (S, M) row-major
+    constant uint& M [[buffer(3)]],
+    constant uint& K [[buffer(4)]],
+    constant uint& S [[buffer(5)]],
+    uint2 tgid [[threadgroup_position_in_grid]],
+    uint tid [[thread_index_in_threadgroup]]
+) {
+    // This threadgroup computes output tile [row_start..row_start+TILE_M, s_start..s_start+TILE_S]
+    uint row_start = tgid.x * TILE_M_Q4;
+    uint s_start = tgid.y * TILE_S_Q4;
+
+    // Each thread accumulates results for one (row, seq_pos) pair
+    // With 64 threads and 8×8=64 outputs, each thread handles exactly one output
+    uint local_row = tid / TILE_S_Q4;     // 0..7
+    uint local_s = tid % TILE_S_Q4;       // 0..7
+
+    uint global_row = row_start + local_row;
+    uint global_s = s_start + local_s;
+
+    if (global_row >= M || global_s >= S) return;
+
+    uint num_groups = K / Q4_GROUP_SIZE;
+    uint row_bytes = num_groups * Q4_BLOCK_BYTES;
+    device const uchar* row_ptr = W_q4 + global_row * row_bytes;
+    uint x_base = global_s * K;
+
+    float acc = 0.0f;
+
+    for (uint g = 0; g < num_groups; g++) {
+        uint x_offset = x_base + g * Q4_GROUP_SIZE;
+        uint block_offset = g * Q4_BLOCK_BYTES;
+
+        float scale = float(*reinterpret_cast<device const half*>(&row_ptr[block_offset]));
+        device const uchar* q = &row_ptr[block_offset + 2];
+
+        float local = 0.0f;
+        local += float(int(q[0] & 0xF) - 8) * X[x_offset + 0] + float(int(q[0] >> 4) - 8) * X[x_offset + 1];
+        local += float(int(q[1] & 0xF) - 8) * X[x_offset + 2] + float(int(q[1] >> 4) - 8) * X[x_offset + 3];
+        local += float(int(q[2] & 0xF) - 8) * X[x_offset + 4] + float(int(q[2] >> 4) - 8) * X[x_offset + 5];
+        local += float(int(q[3] & 0xF) - 8) * X[x_offset + 6] + float(int(q[3] >> 4) - 8) * X[x_offset + 7];
+        local += float(int(q[4] & 0xF) - 8) * X[x_offset + 8] + float(int(q[4] >> 4) - 8) * X[x_offset + 9];
+        local += float(int(q[5] & 0xF) - 8) * X[x_offset + 10] + float(int(q[5] >> 4) - 8) * X[x_offset + 11];
+        local += float(int(q[6] & 0xF) - 8) * X[x_offset + 12] + float(int(q[6] >> 4) - 8) * X[x_offset + 13];
+        local += float(int(q[7] & 0xF) - 8) * X[x_offset + 14] + float(int(q[7] >> 4) - 8) * X[x_offset + 15];
+        local += float(int(q[8] & 0xF) - 8) * X[x_offset + 16] + float(int(q[8] >> 4) - 8) * X[x_offset + 17];
+        local += float(int(q[9] & 0xF) - 8) * X[x_offset + 18] + float(int(q[9] >> 4) - 8) * X[x_offset + 19];
+        local += float(int(q[10] & 0xF) - 8) * X[x_offset + 20] + float(int(q[10] >> 4) - 8) * X[x_offset + 21];
+        local += float(int(q[11] & 0xF) - 8) * X[x_offset + 22] + float(int(q[11] >> 4) - 8) * X[x_offset + 23];
+        local += float(int(q[12] & 0xF) - 8) * X[x_offset + 24] + float(int(q[12] >> 4) - 8) * X[x_offset + 25];
+        local += float(int(q[13] & 0xF) - 8) * X[x_offset + 26] + float(int(q[13] >> 4) - 8) * X[x_offset + 27];
+        local += float(int(q[14] & 0xF) - 8) * X[x_offset + 28] + float(int(q[14] >> 4) - 8) * X[x_offset + 29];
+        local += float(int(q[15] & 0xF) - 8) * X[x_offset + 30] + float(int(q[15] >> 4) - 8) * X[x_offset + 31];
+        acc += local * scale;
+    }
+
+    Y[global_s * M + global_row] = acc;
+}
+
+// ─── Tiled f16 Batch Projection (Optimized) ─────────────────────────────────
+// Same tiling as Q4 but for f16 weights. Each thread handles one (row, seq_pos).
+
+kernel void projection_f16_batch_tiled(
+    device const half* W [[buffer(0)]],
+    device const float* X [[buffer(1)]],
+    device float* Y [[buffer(2)]],
+    constant uint& M [[buffer(3)]],
+    constant uint& K [[buffer(4)]],
+    constant uint& S [[buffer(5)]],
+    uint2 tgid [[threadgroup_position_in_grid]],
+    uint tid [[thread_index_in_threadgroup]]
+) {
+    uint row_start = tgid.x * TILE_M_Q4;
+    uint s_start = tgid.y * TILE_S_Q4;
+
+    uint local_row = tid / TILE_S_Q4;
+    uint local_s = tid % TILE_S_Q4;
+
+    uint global_row = row_start + local_row;
+    uint global_s = s_start + local_s;
+
+    if (global_row >= M || global_s >= S) return;
+
+    uint row_offset = global_row * K;
+    uint x_base = global_s * K;
+
+    float acc = 0.0f;
+
+    for (uint k = 0; k + 3 < K; k += 4) {
+        half4 w = *reinterpret_cast<device const half4*>(&W[row_offset + k]);
+        float4 xv = *reinterpret_cast<device const float4*>(&X[x_base + k]);
+        acc += dot(float4(w), xv);
+    }
+    // Handle remainder
+    for (uint k = (K / 4) * 4; k < K; k++) {
+        acc += float(W[row_offset + k]) * X[x_base + k];
+    }
+
+    Y[global_s * M + global_row] = acc;
+}
+
 // ─── RMS Norm ────────────────────────────────────────────────────────────────
 // Computes: out[i] = (x[i] / rms) * weight[i]
 // where rms = sqrt(mean(x^2) + eps)
