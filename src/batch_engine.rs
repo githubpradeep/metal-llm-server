@@ -49,11 +49,15 @@ impl BatchEngine {
         self.model.max_decode_batch_size().max(1)
     }
 
-    pub fn prefill_chunk(&mut self, token_ids: &[usize], slot: KvSlot) -> Result<TimedForward, String> {
+    pub fn prefill_chunk(
+        &mut self,
+        token_ids: &[usize],
+        slot: KvSlot,
+    ) -> Result<TimedForward, String> {
         let started_at = Instant::now();
-        let logits = self
-            .model
-            .forward_prefill_chunk_with_kv_slot(token_ids, &mut self.kv_pool, slot)?;
+        let logits =
+            self.model
+                .forward_prefill_chunk_with_kv_slot(token_ids, &mut self.kv_pool, slot)?;
         Ok(TimedForward {
             logits,
             latency: started_at.elapsed(),
@@ -61,9 +65,32 @@ impl BatchEngine {
     }
 
     pub fn prefill_batch(&mut self, inputs: &[PrefillInput]) -> Vec<Result<TimedForward, String>> {
-        inputs
+        if inputs.is_empty() {
+            return Vec::new();
+        }
+        if inputs.len() == 1 {
+            let input = &inputs[0];
+            return vec![self.prefill_chunk(&input.token_ids, input.slot)];
+        }
+
+        let started_at = Instant::now();
+        let model_inputs: Vec<(KvSlot, &[usize])> = inputs
             .iter()
-            .map(|input| self.prefill_chunk(&input.token_ids, input.slot))
+            .map(|input| (input.slot, input.token_ids.as_slice()))
+            .collect();
+        let outputs = self
+            .model
+            .forward_prefill_batch_with_kv_slots(&model_inputs, &mut self.kv_pool);
+        let per_item_latency = started_at.elapsed() / inputs.len() as u32;
+
+        outputs
+            .into_iter()
+            .map(|output| {
+                output.map(|logits| TimedForward {
+                    logits,
+                    latency: per_item_latency,
+                })
+            })
             .collect()
     }
 

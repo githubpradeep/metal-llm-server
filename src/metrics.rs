@@ -9,7 +9,11 @@ pub struct Metrics {
     prompt_tokens_total: AtomicU64,
     prefill_tokens_total: AtomicU64,
     prefill_chunks_total: AtomicU64,
+    prefill_batches_total: AtomicU64,
+    prefill_batch_items_total: AtomicU64,
     completion_tokens_total: AtomicU64,
+    decode_batches_total: AtomicU64,
+    decode_batch_items_total: AtomicU64,
     latency_ms_total: AtomicU64,
     prefill_latency_ms_total: AtomicU64,
     decode_latency_ms_total: AtomicU64,
@@ -30,7 +34,11 @@ impl Metrics {
             prompt_tokens_total: AtomicU64::new(0),
             prefill_tokens_total: AtomicU64::new(0),
             prefill_chunks_total: AtomicU64::new(0),
+            prefill_batches_total: AtomicU64::new(0),
+            prefill_batch_items_total: AtomicU64::new(0),
             completion_tokens_total: AtomicU64::new(0),
+            decode_batches_total: AtomicU64::new(0),
+            decode_batch_items_total: AtomicU64::new(0),
             latency_ms_total: AtomicU64::new(0),
             prefill_latency_ms_total: AtomicU64::new(0),
             decode_latency_ms_total: AtomicU64::new(0),
@@ -67,10 +75,15 @@ impl Metrics {
     pub fn record_prefill_chunk(&self, prefill_tokens: usize, prefill_latency: Duration) {
         self.prefill_tokens_total
             .fetch_add(prefill_tokens as u64, Ordering::Relaxed);
-        self.prefill_chunks_total
-            .fetch_add(1, Ordering::Relaxed);
+        self.prefill_chunks_total.fetch_add(1, Ordering::Relaxed);
         self.prefill_latency_ms_total
             .fetch_add(prefill_latency.as_millis() as u64, Ordering::Relaxed);
+    }
+
+    pub fn record_prefill_batch(&self, batch_items: usize) {
+        self.prefill_batches_total.fetch_add(1, Ordering::Relaxed);
+        self.prefill_batch_items_total
+            .fetch_add(batch_items as u64, Ordering::Relaxed);
     }
 
     pub fn record_prefill_to_decode(&self) {
@@ -81,6 +94,12 @@ impl Metrics {
     pub fn record_decode_compute(&self, decode_compute_latency: Duration) {
         self.decode_compute_latency_ms_total
             .fetch_add(decode_compute_latency.as_millis() as u64, Ordering::Relaxed);
+    }
+
+    pub fn record_decode_batch(&self, batch_items: usize) {
+        self.decode_batches_total.fetch_add(1, Ordering::Relaxed);
+        self.decode_batch_items_total
+            .fetch_add(batch_items as u64, Ordering::Relaxed);
     }
 
     pub fn record_finish(
@@ -121,13 +140,16 @@ impl Metrics {
         let prompt_tokens_total = self.prompt_tokens_total.load(Ordering::Relaxed);
         let prefill_tokens_total = self.prefill_tokens_total.load(Ordering::Relaxed);
         let prefill_chunks_total = self.prefill_chunks_total.load(Ordering::Relaxed);
+        let prefill_batches_total = self.prefill_batches_total.load(Ordering::Relaxed);
+        let prefill_batch_items_total = self.prefill_batch_items_total.load(Ordering::Relaxed);
         let completion_tokens_total = self.completion_tokens_total.load(Ordering::Relaxed);
+        let decode_batches_total = self.decode_batches_total.load(Ordering::Relaxed);
+        let decode_batch_items_total = self.decode_batch_items_total.load(Ordering::Relaxed);
         let latency_ms_total = self.latency_ms_total.load(Ordering::Relaxed);
         let prefill_latency_ms_total = self.prefill_latency_ms_total.load(Ordering::Relaxed);
         let decode_latency_ms_total = self.decode_latency_ms_total.load(Ordering::Relaxed);
-        let decode_compute_latency_ms_total = self
-            .decode_compute_latency_ms_total
-            .load(Ordering::Relaxed);
+        let decode_compute_latency_ms_total =
+            self.decode_compute_latency_ms_total.load(Ordering::Relaxed);
         let queued_requests = self.queued_requests.load(Ordering::Relaxed);
         let active_requests = self.active_requests.load(Ordering::Relaxed);
         let prefilling_requests = self.prefilling_requests.load(Ordering::Relaxed);
@@ -156,9 +178,21 @@ impl Metrics {
                 "# HELP llama_prefill_chunks_total Total prompt chunks processed by prefill.\n",
                 "# TYPE llama_prefill_chunks_total counter\n",
                 "llama_prefill_chunks_total {}\n",
+                "# HELP llama_prefill_batches_total Total scheduler prefill batches submitted.\n",
+                "# TYPE llama_prefill_batches_total counter\n",
+                "llama_prefill_batches_total {}\n",
+                "# HELP llama_prefill_batch_items_total Total prefill requests included in scheduler prefill batches.\n",
+                "# TYPE llama_prefill_batch_items_total counter\n",
+                "llama_prefill_batch_items_total {}\n",
                 "# HELP llama_completion_tokens_total Total completion tokens generated.\n",
                 "# TYPE llama_completion_tokens_total counter\n",
                 "llama_completion_tokens_total {}\n",
+                "# HELP llama_decode_batches_total Total scheduler decode batches submitted.\n",
+                "# TYPE llama_decode_batches_total counter\n",
+                "llama_decode_batches_total {}\n",
+                "# HELP llama_decode_batch_items_total Total decode requests included in scheduler decode batches.\n",
+                "# TYPE llama_decode_batch_items_total counter\n",
+                "llama_decode_batch_items_total {}\n",
                 "# HELP llama_request_latency_ms_total Sum of request latency in milliseconds.\n",
                 "# TYPE llama_request_latency_ms_total counter\n",
                 "llama_request_latency_ms_total {}\n",
@@ -191,7 +225,11 @@ impl Metrics {
             prompt_tokens_total,
             prefill_tokens_total,
             prefill_chunks_total,
+            prefill_batches_total,
+            prefill_batch_items_total,
             completion_tokens_total,
+            decode_batches_total,
+            decode_batch_items_total,
             latency_ms_total,
             prefill_latency_ms_total,
             decode_latency_ms_total,
@@ -204,26 +242,26 @@ impl Metrics {
     }
 
     fn decrement_queued(&self) {
-        let _ = self
-            .queued_requests
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
-                current.checked_sub(1)
-            });
+        let _ =
+            self.queued_requests
+                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+                    current.checked_sub(1)
+                });
     }
 
     fn decrement_prefilling(&self) {
-        let _ = self
-            .prefilling_requests
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
-                current.checked_sub(1)
-            });
+        let _ = self.prefilling_requests.fetch_update(
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+            |current| current.checked_sub(1),
+        );
     }
 
     fn decrement_decoding(&self) {
-        let _ = self
-            .decoding_requests
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
-                current.checked_sub(1)
-            });
+        let _ =
+            self.decoding_requests
+                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+                    current.checked_sub(1)
+                });
     }
 }

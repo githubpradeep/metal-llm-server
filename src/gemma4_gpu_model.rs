@@ -165,6 +165,14 @@ struct PrefillRowOffsets {
     ple_row: u64,
 }
 
+#[derive(Clone, Copy)]
+struct PrefillBatchSegment {
+    slot: KvSlot,
+    row_start: usize,
+    token_count: usize,
+    start_pos: usize,
+}
+
 impl DecodeBatchScratch {
     fn new(
         ctx: &MetalContext,
@@ -1933,13 +1941,21 @@ impl Gemma4GpuModel {
         start_pos: usize,
         seq_len: usize,
     ) -> Result<(), String> {
-        if seq_len == 0 {
+        self.prepare_parallel_prefill_rotary_segments(&[(start_pos, seq_len)])
+    }
+
+    fn prepare_parallel_prefill_rotary_segments(
+        &mut self,
+        segments: &[(usize, usize)],
+    ) -> Result<(), String> {
+        let total_seq_len: usize = segments.iter().map(|(_, seq_len)| *seq_len).sum();
+        if total_seq_len == 0 {
             return Err("prefill seq_len must not be empty".to_string());
         }
-        if seq_len > self.prefill_scratch.max_seq_len {
+        if total_seq_len > self.prefill_scratch.max_seq_len {
             return Err(format!(
                 "prefill chunk has {} tokens, max supported chunk is {}",
-                seq_len, self.prefill_scratch.max_seq_len
+                total_seq_len, self.prefill_scratch.max_seq_len
             ));
         }
 
@@ -1965,27 +1981,32 @@ impl Gemma4GpuModel {
             };
             let rope_angles = rotary_dim / 2;
 
-            let mut cos_batch = vec![0.0f32; seq_len * head_dim];
-            let mut sin_batch = vec![0.0f32; seq_len * head_dim];
+            let mut cos_batch = vec![0.0f32; total_seq_len * head_dim];
+            let mut sin_batch = vec![0.0f32; total_seq_len * head_dim];
 
-            for token_idx in 0..seq_len {
-                let pos = (start_pos + token_idx) as f32;
-                let token_offset = token_idx * head_dim;
+            let mut row_idx = 0;
+            for &(start_pos, seq_len) in segments {
+                for token_idx in 0..seq_len {
+                    let pos = (start_pos + token_idx) as f32;
+                    let token_offset = row_idx * head_dim;
 
-                for i in 0..rope_angles {
-                    let inv_freq = 1.0
-                        / (rope_theta.powf(i as f64 * 2.0 / head_dim as f64) as f32)
-                        / rope_factor as f32;
-                    let angle = pos * inv_freq;
-                    cos_batch[token_offset + i] = angle.cos();
-                    cos_batch[token_offset + i + half_dim] = angle.cos();
-                    sin_batch[token_offset + i] = angle.sin();
-                    sin_batch[token_offset + i + half_dim] = angle.sin();
-                }
+                    for i in 0..rope_angles {
+                        let inv_freq = 1.0
+                            / (rope_theta.powf(i as f64 * 2.0 / head_dim as f64) as f32)
+                            / rope_factor as f32;
+                        let angle = pos * inv_freq;
+                        cos_batch[token_offset + i] = angle.cos();
+                        cos_batch[token_offset + i + half_dim] = angle.cos();
+                        sin_batch[token_offset + i] = angle.sin();
+                        sin_batch[token_offset + i + half_dim] = angle.sin();
+                    }
 
-                for i in rope_angles..half_dim {
-                    cos_batch[token_offset + i] = 1.0;
-                    cos_batch[token_offset + i + half_dim] = 1.0;
+                    for i in rope_angles..half_dim {
+                        cos_batch[token_offset + i] = 1.0;
+                        cos_batch[token_offset + i + half_dim] = 1.0;
+                    }
+
+                    row_idx += 1;
                 }
             }
 
@@ -2793,6 +2814,311 @@ impl Gemma4GpuModel {
         Ok(())
     }
 
+    fn encode_parallel_prefill_layer_batched(
+        &mut self,
+        layer_idx: usize,
+        total_seq_len: usize,
+        segments: &[PrefillBatchSegment],
+        kv_pool: &mut KvCachePool,
+    ) -> Result<(), String> {
+        let cmd = self.ctx.queue.new_command_buffer();
+        let encoder = cmd.new_compute_command_encoder();
+        self.encode_parallel_prefill_attention_inputs(encoder, layer_idx, total_seq_len)?;
+
+        let layer = self
+            .layers
+            .get(layer_idx)
+            .ok_or_else(|| format!("invalid layer index {}", layer_idx))?;
+        let hidden_size = self.config.hidden_size;
+        let intermediate_size = self.config.intermediate_size;
+        let num_heads = self.config.num_attention_heads;
+        let num_kv_heads = self.config.num_key_value_heads;
+        let num_kv_groups = (num_heads / num_kv_heads) as u32;
+        let ple_dim = self.config.hidden_size_per_layer_input;
+        let eps = self.config.rms_norm_eps as f32;
+        let head_dim = layer.head_dim;
+        let q_out = layer.q_out_dim;
+        let total_hidden = (total_seq_len * hidden_size) as u32;
+        let total_intermediate = (total_seq_len * intermediate_size) as u32;
+        let scale = 1.0f32;
+        let attention_window = if layer.is_full_attention {
+            0
+        } else {
+            self.config.sliding_window as u32
+        };
+
+        if layer.has_kv {
+            for segment in segments {
+                let k_cache = kv_pool
+                    .layer_k_cache(segment.slot, layer_idx)
+                    .map_err(|err| err.to_string())?;
+                let v_cache = kv_pool
+                    .layer_v_cache(segment.slot, layer_idx)
+                    .map_err(|err| err.to_string())?;
+                self.ctx.encode_kv_batch_append_strided_f16(
+                    encoder,
+                    &self.prefill_scratch.k_buf,
+                    k_cache,
+                    num_kv_heads as u32,
+                    head_dim as u32,
+                    kv_pool.capacity(),
+                    segment.start_pos as u32,
+                    segment.token_count as u32,
+                    total_seq_len as u32,
+                    segment.row_start as u32,
+                );
+                self.ctx.encode_kv_batch_append_strided_f16(
+                    encoder,
+                    &self.prefill_scratch.v_buf,
+                    v_cache,
+                    num_kv_heads as u32,
+                    head_dim as u32,
+                    kv_pool.capacity(),
+                    segment.start_pos as u32,
+                    segment.token_count as u32,
+                    total_seq_len as u32,
+                    segment.row_start as u32,
+                );
+            }
+        }
+
+        for segment in segments {
+            let k_cache = kv_pool
+                .layer_k_cache(segment.slot, layer.kv_source_layer)
+                .map_err(|err| err.to_string())?;
+            let v_cache = kv_pool
+                .layer_v_cache(segment.slot, layer.kv_source_layer)
+                .map_err(|err| err.to_string())?;
+            self.ctx.encode_attention_causal_strided_f16(
+                encoder,
+                &self.prefill_scratch.q_buf,
+                k_cache,
+                v_cache,
+                &self.prefill_scratch.attn_out_buf,
+                num_heads as u32,
+                num_kv_heads as u32,
+                num_kv_groups,
+                head_dim as u32,
+                (segment.start_pos + segment.token_count) as u32,
+                kv_pool.capacity(),
+                scale,
+                segment.token_count as u32,
+                segment.start_pos as u32,
+                attention_window,
+                total_seq_len as u32,
+                segment.row_start as u32,
+            );
+        }
+
+        self.ctx.encode_copy(
+            encoder,
+            &self.prefill_scratch.hidden_buf,
+            &self.prefill_scratch.residual_buf,
+            total_hidden,
+        );
+        self.ctx.encode_transpose_hsd(
+            encoder,
+            &self.prefill_scratch.attn_out_buf,
+            &self.prefill_scratch.q_normed_buf,
+            total_seq_len as u32,
+            num_heads as u32,
+            head_dim as u32,
+        );
+        self.ctx.encode_projection_f16_batch(
+            encoder,
+            &layer.o_proj,
+            &self.prefill_scratch.q_normed_buf,
+            &self.prefill_scratch.o_out_buf,
+            hidden_size as u32,
+            q_out as u32,
+            total_seq_len as u32,
+        );
+        self.ctx.encode_rmsnorm_batch(
+            encoder,
+            &self.prefill_scratch.o_out_buf,
+            &layer.post_attention_layernorm_weight,
+            &self.prefill_scratch.normed_buf,
+            hidden_size as u32,
+            eps,
+            total_seq_len as u32,
+        );
+        self.ctx.encode_vec_add_batch(
+            encoder,
+            &self.prefill_scratch.residual_buf,
+            &self.prefill_scratch.normed_buf,
+            &self.prefill_scratch.hidden_buf,
+            total_hidden,
+        );
+
+        self.ctx.encode_copy(
+            encoder,
+            &self.prefill_scratch.hidden_buf,
+            &self.prefill_scratch.residual_buf,
+            total_hidden,
+        );
+        self.ctx.encode_rmsnorm_batch(
+            encoder,
+            &self.prefill_scratch.hidden_buf,
+            &layer.pre_feedforward_layernorm_weight,
+            &self.prefill_scratch.normed_buf,
+            hidden_size as u32,
+            eps,
+            total_seq_len as u32,
+        );
+        if layer.use_f16 {
+            self.ctx.encode_projection_f16_batch(
+                encoder,
+                &layer.gate_proj,
+                &self.prefill_scratch.normed_buf,
+                &self.prefill_scratch.gate_buf,
+                intermediate_size as u32,
+                hidden_size as u32,
+                total_seq_len as u32,
+            );
+            self.ctx.encode_projection_f16_batch(
+                encoder,
+                &layer.up_proj,
+                &self.prefill_scratch.normed_buf,
+                &self.prefill_scratch.up_buf,
+                intermediate_size as u32,
+                hidden_size as u32,
+                total_seq_len as u32,
+            );
+        } else {
+            self.ctx.encode_projection_q4_batch(
+                encoder,
+                &layer.gate_proj,
+                &self.prefill_scratch.normed_buf,
+                &self.prefill_scratch.gate_buf,
+                intermediate_size as u32,
+                hidden_size as u32,
+                total_seq_len as u32,
+            );
+            self.ctx.encode_projection_q4_batch(
+                encoder,
+                &layer.up_proj,
+                &self.prefill_scratch.normed_buf,
+                &self.prefill_scratch.up_buf,
+                intermediate_size as u32,
+                hidden_size as u32,
+                total_seq_len as u32,
+            );
+        }
+        self.ctx.encode_gelu_mul(
+            encoder,
+            &self.prefill_scratch.gate_buf,
+            &self.prefill_scratch.up_buf,
+            &self.prefill_scratch.gelu_buf,
+            total_intermediate,
+        );
+        if layer.use_f16 {
+            self.ctx.encode_projection_f16_batch(
+                encoder,
+                &layer.down_proj,
+                &self.prefill_scratch.gelu_buf,
+                &self.prefill_scratch.down_buf,
+                hidden_size as u32,
+                intermediate_size as u32,
+                total_seq_len as u32,
+            );
+        } else {
+            self.ctx.encode_projection_q4_batch(
+                encoder,
+                &layer.down_proj,
+                &self.prefill_scratch.gelu_buf,
+                &self.prefill_scratch.down_buf,
+                hidden_size as u32,
+                intermediate_size as u32,
+                total_seq_len as u32,
+            );
+        }
+        self.ctx.encode_rmsnorm_batch(
+            encoder,
+            &self.prefill_scratch.down_buf,
+            &layer.post_feedforward_layernorm_weight,
+            &self.prefill_scratch.normed_buf,
+            hidden_size as u32,
+            eps,
+            total_seq_len as u32,
+        );
+        self.ctx.encode_vec_add_batch(
+            encoder,
+            &self.prefill_scratch.residual_buf,
+            &self.prefill_scratch.normed_buf,
+            &self.prefill_scratch.hidden_buf,
+            total_hidden,
+        );
+
+        self.ctx.encode_copy(
+            encoder,
+            &self.prefill_scratch.hidden_buf,
+            &self.prefill_scratch.residual_buf,
+            total_hidden,
+        );
+        self.ctx.encode_projection_f16_batch(
+            encoder,
+            &layer.per_layer_input_gate_weight,
+            &self.prefill_scratch.hidden_buf,
+            &self.prefill_scratch.gate_buf,
+            ple_dim as u32,
+            hidden_size as u32,
+            total_seq_len as u32,
+        );
+        self.ctx.encode_ple_gelu_mul_batch(
+            encoder,
+            &self.prefill_scratch.gate_buf,
+            &self.prefill_scratch.ple_context_proj_buf,
+            &self.prefill_scratch.up_buf,
+            layer_idx as u32,
+            self.config.num_hidden_layers as u32,
+            ple_dim as u32,
+            total_seq_len as u32,
+        );
+        self.ctx.encode_projection_f16_batch(
+            encoder,
+            &layer.per_layer_projection_weight,
+            &self.prefill_scratch.up_buf,
+            &self.prefill_scratch.o_out_buf,
+            hidden_size as u32,
+            ple_dim as u32,
+            total_seq_len as u32,
+        );
+        self.ctx.encode_rmsnorm_batch(
+            encoder,
+            &self.prefill_scratch.o_out_buf,
+            &layer.post_per_layer_input_norm_weight,
+            &self.prefill_scratch.normed_buf,
+            hidden_size as u32,
+            eps,
+            total_seq_len as u32,
+        );
+        self.ctx.encode_vec_add_batch(
+            encoder,
+            &self.prefill_scratch.residual_buf,
+            &self.prefill_scratch.normed_buf,
+            &self.prefill_scratch.hidden_buf,
+            total_hidden,
+        );
+        self.ctx.encode_vec_scale(
+            encoder,
+            &self.prefill_scratch.hidden_buf,
+            &self.prefill_scratch.residual_buf,
+            total_hidden,
+            layer.layer_scalar,
+        );
+        self.ctx.encode_copy(
+            encoder,
+            &self.prefill_scratch.residual_buf,
+            &self.prefill_scratch.hidden_buf,
+            total_hidden,
+        );
+
+        encoder.end_encoding();
+        cmd.commit();
+        cmd.wait_until_completed();
+        Ok(())
+    }
+
     fn forward_prefill_chunk_parallel_with_kv_slot(
         &mut self,
         token_ids: &[usize],
@@ -3545,6 +3871,158 @@ impl Gemma4GpuModel {
                     .map_err(|err| err.to_string())
             })
             .collect()
+    }
+
+    pub fn forward_prefill_batch_with_kv_slots(
+        &mut self,
+        inputs: &[(KvSlot, &[usize])],
+        kv_pool: &mut KvCachePool,
+    ) -> Vec<Result<Vec<f32>, String>> {
+        if inputs.is_empty() {
+            return Vec::new();
+        }
+        if inputs.len() == 1 {
+            return inputs
+                .iter()
+                .map(|&(slot, token_ids)| {
+                    self.forward_prefill_chunk_with_kv_slot(token_ids, kv_pool, slot)
+                })
+                .collect();
+        }
+
+        let total_seq_len: usize = inputs.iter().map(|(_, token_ids)| token_ids.len()).sum();
+        if total_seq_len == 0 {
+            return inputs
+                .iter()
+                .map(|_| Err("prefill token_ids must not be empty".to_string()))
+                .collect();
+        }
+        if total_seq_len > self.max_parallel_prefill_seq() {
+            let message = format!(
+                "prefill batch has {} total tokens, max supported batch is {}",
+                total_seq_len,
+                self.max_parallel_prefill_seq()
+            );
+            return inputs.iter().map(|_| Err(message.clone())).collect();
+        }
+
+        let mut flat_tokens = Vec::with_capacity(total_seq_len);
+        let mut segments = Vec::with_capacity(inputs.len());
+        let mut rotary_segments = Vec::with_capacity(inputs.len());
+        let mut row_start = 0usize;
+
+        for &(slot, token_ids) in inputs {
+            if token_ids.is_empty() {
+                return inputs
+                    .iter()
+                    .map(|_| Err("prefill token_ids must not be empty".to_string()))
+                    .collect();
+            }
+
+            let start_pos = match kv_pool.total_tokens(slot) {
+                Ok(start_pos) => start_pos,
+                Err(err) => return inputs.iter().map(|_| Err(err.to_string())).collect(),
+            };
+            if start_pos + token_ids.len() > kv_pool.capacity() as usize {
+                let message = format!(
+                    "KV Cache overflow. Max length {}, current {}, new {}",
+                    kv_pool.capacity(),
+                    start_pos,
+                    token_ids.len()
+                );
+                return inputs.iter().map(|_| Err(message.clone())).collect();
+            }
+
+            flat_tokens.extend_from_slice(token_ids);
+            segments.push(PrefillBatchSegment {
+                slot,
+                row_start,
+                token_count: token_ids.len(),
+                start_pos,
+            });
+            rotary_segments.push((start_pos, token_ids.len()));
+            row_start += token_ids.len();
+        }
+
+        if let Err(message) = self.prepare_parallel_prefill_inputs(&flat_tokens) {
+            return inputs.iter().map(|_| Err(message.clone())).collect();
+        }
+        if let Err(message) = self.prepare_parallel_prefill_rotary_segments(&rotary_segments) {
+            return inputs.iter().map(|_| Err(message.clone())).collect();
+        }
+        if let Err(message) = self.encode_parallel_prefill_ple_context(total_seq_len) {
+            return inputs.iter().map(|_| Err(message.clone())).collect();
+        }
+
+        for layer_idx in 0..self.layers.len() {
+            if let Err(message) = self.encode_parallel_prefill_layer_batched(
+                layer_idx,
+                total_seq_len,
+                &segments,
+                kv_pool,
+            ) {
+                return inputs.iter().map(|_| Err(message.clone())).collect();
+            }
+        }
+
+        let hidden_size = self.config.hidden_size;
+        let vocab_size = self.config.vocab_size;
+        let eps = self.config.rms_norm_eps as f32;
+        let cmd = self.ctx.queue.new_command_buffer();
+        let encoder = cmd.new_compute_command_encoder();
+        self.ctx.encode_rmsnorm_batch(
+            encoder,
+            &self.prefill_scratch.hidden_buf,
+            &self.final_norm_weight,
+            &self.prefill_scratch.normed_buf,
+            hidden_size as u32,
+            eps,
+            total_seq_len as u32,
+        );
+        encoder.end_encoding();
+        cmd.commit();
+        cmd.wait_until_completed();
+
+        let mut outputs = Vec::with_capacity(segments.len());
+        for segment in &segments {
+            let last_offsets =
+                self.prefill_row_offsets(segment.row_start + segment.token_count - 1);
+            let cmd = self.ctx.queue.new_command_buffer();
+            let encoder = cmd.new_compute_command_encoder();
+            self.ctx.encode_matvec_q4_at(
+                encoder,
+                &self.lm_head_buf,
+                &self.prefill_scratch.normed_buf,
+                last_offsets.hidden,
+                &self.prefill_scratch.logits_buf,
+                0,
+                vocab_size as u32,
+                hidden_size as u32,
+            );
+            encoder.end_encoding();
+            cmd.commit();
+            cmd.wait_until_completed();
+
+            let mut logits =
+                MetalContext::read_buffer(&self.prefill_scratch.logits_buf, vocab_size);
+            let cap = self.config.final_logit_softcapping;
+            for logit in &mut logits {
+                let x = (*logit / cap).clamp(-10.0, 10.0);
+                *logit = cap * x.tanh();
+            }
+            outputs.push(Ok(logits));
+        }
+
+        for segment in &segments {
+            if let Err(err) = kv_pool.with_slot_mut(segment.slot, |slot_state| {
+                slot_state.seq_len += segment.token_count as u32;
+                slot_state.total_tokens += segment.token_count;
+            }) {
+                return inputs.iter().map(|_| Err(err.to_string())).collect();
+            }
+        }
+
+        outputs
     }
 
     pub fn forward_prefill_with_kv_slot(

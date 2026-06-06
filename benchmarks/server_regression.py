@@ -281,6 +281,13 @@ def check_idle_metrics(base_url):
 
     for gauge in PHASE_GAUGES:
         assert metrics.get(gauge) == 0.0, f"{gauge} did not return to idle: {metrics.get(gauge)}"
+    for counter in (
+        "llama_prefill_batches_total",
+        "llama_prefill_batch_items_total",
+        "llama_decode_batches_total",
+        "llama_decode_batch_items_total",
+    ):
+        assert counter in metrics, f"{counter} missing from /metrics"
     print("ok idle metrics")
 
 

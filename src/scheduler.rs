@@ -199,6 +199,9 @@ impl Scheduler {
             })
             .collect();
 
+        if !inputs.is_empty() {
+            self.metrics.record_decode_batch(inputs.len());
+        }
         for (prepared, output) in decode_batch
             .into_iter()
             .zip(self.engine.decode_batch(&inputs))
@@ -286,6 +289,9 @@ impl Scheduler {
             })
             .collect();
 
+        if !inputs.is_empty() {
+            self.metrics.record_prefill_batch(inputs.len());
+        }
         for (prepared, output) in prefill_batch
             .into_iter()
             .zip(self.engine.prefill_batch(&inputs))
@@ -339,9 +345,11 @@ impl Scheduler {
     }
 
     fn max_prefill_tokens_per_tick(&self) -> usize {
+        let max_chunk_tokens = self.engine.max_prefill_chunk_tokens();
         self.config
             .max_prefill_tokens_per_tick
-            .unwrap_or_else(|| self.engine.max_prefill_chunk_tokens())
+            .unwrap_or(max_chunk_tokens)
+            .min(max_chunk_tokens)
             .max(1)
     }
 
