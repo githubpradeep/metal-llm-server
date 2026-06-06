@@ -61,10 +61,18 @@ pub struct ChatCompletionRequest {
     pub frequency_penalty: f32,
 }
 
-fn default_max_tokens() -> usize { 1024 }
-fn default_temperature() -> f32 { 1.0 }
-fn default_min_p() -> f32 { 0.05 }
-fn default_repetition_penalty() -> f32 { 1.0 }
+fn default_max_tokens() -> usize {
+    1024
+}
+fn default_temperature() -> f32 {
+    1.0
+}
+fn default_min_p() -> f32 {
+    0.05
+}
+fn default_repetition_penalty() -> f32 {
+    1.0
+}
 
 #[derive(Deserialize, Serialize, Clone)]
 pub struct Message {
@@ -198,6 +206,84 @@ pub struct AppState {
     pub metrics: Arc<Metrics>,
     pub tokenizer: tokenizers::Tokenizer,
     pub max_context_len: usize,
+    pub runtime_config: ServerRuntimeConfig,
+}
+
+impl AppState {
+    fn request_timeout(&self) -> Duration {
+        self.runtime_config.request_timeout
+    }
+
+    fn render_metrics(&self) -> String {
+        let mut output = self.metrics.render_prometheus();
+        output.push_str(&self.runtime_config.render_prometheus());
+        output
+    }
+}
+
+#[derive(Clone)]
+pub struct ServerRuntimeConfig {
+    pub queue_depth: usize,
+    pub kv_pool_slots: usize,
+    pub request_timeout: Duration,
+    pub max_prefill_tokens_per_tick: Option<usize>,
+}
+
+impl ServerRuntimeConfig {
+    fn from_env() -> Self {
+        Self::from_lookup(|name| std::env::var(name).ok())
+    }
+
+    fn from_lookup(mut lookup: impl FnMut(&str) -> Option<String>) -> Self {
+        Self {
+            queue_depth: parse_usize(&mut lookup, "LLAMA_QUEUE_DEPTH")
+                .unwrap_or(32)
+                .max(1),
+            kv_pool_slots: parse_usize(&mut lookup, "LLAMA_KV_POOL_SLOTS")
+                .unwrap_or(4)
+                .max(1),
+            request_timeout: Duration::from_secs(
+                parse_u64(&mut lookup, "LLAMA_REQUEST_TIMEOUT_SECS")
+                    .unwrap_or(60)
+                    .max(1),
+            ),
+            max_prefill_tokens_per_tick: parse_usize(&mut lookup, "LLAMA_PREFILL_TOKENS_PER_TICK")
+                .filter(|tokens| *tokens > 0),
+        }
+    }
+
+    fn render_prometheus(&self) -> String {
+        let prefill_tokens_per_tick = self.max_prefill_tokens_per_tick.unwrap_or(0);
+
+        format!(
+            concat!(
+                "# HELP llama_config_queue_depth Configured scheduler queue depth.\n",
+                "# TYPE llama_config_queue_depth gauge\n",
+                "llama_config_queue_depth {}\n",
+                "# HELP llama_config_kv_pool_slots Configured KV cache pool slots.\n",
+                "# TYPE llama_config_kv_pool_slots gauge\n",
+                "llama_config_kv_pool_slots {}\n",
+                "# HELP llama_config_request_timeout_secs Configured request timeout in seconds.\n",
+                "# TYPE llama_config_request_timeout_secs gauge\n",
+                "llama_config_request_timeout_secs {}\n",
+                "# HELP llama_config_prefill_tokens_per_tick Configured prefill tokens per scheduler tick; 0 means model default.\n",
+                "# TYPE llama_config_prefill_tokens_per_tick gauge\n",
+                "llama_config_prefill_tokens_per_tick {}\n",
+            ),
+            self.queue_depth,
+            self.kv_pool_slots,
+            self.request_timeout.as_secs(),
+            prefill_tokens_per_tick,
+        )
+    }
+}
+
+fn parse_usize(lookup: &mut impl FnMut(&str) -> Option<String>, name: &str) -> Option<usize> {
+    lookup(name)?.parse().ok()
+}
+
+fn parse_u64(lookup: &mut impl FnMut(&str) -> Option<String>, name: &str) -> Option<u64> {
+    lookup(name)?.parse().ok()
 }
 
 // ─── Chat template ───────────────────────────────────────────────────────────
@@ -212,17 +298,24 @@ const BUILT_IN_STOP_SEQUENCES: &[&str] = &[
 fn apply_chat_template(messages: &[Message]) -> String {
     let mut prompt = String::new();
     for msg in messages {
-        prompt.push_str(&format!("<start_of_turn>{}\n{}<end_of_turn>\n", msg.role, msg.content));
+        prompt.push_str(&format!(
+            "<start_of_turn>{}\n{}<end_of_turn>\n",
+            msg.role, msg.content
+        ));
     }
     prompt.push_str("<start_of_turn>model\n");
     prompt
 }
 
 fn find_stop_position(text: &str, request_stop: Option<&[String]>) -> Option<usize> {
-    let mut earliest = BUILT_IN_STOP_SEQUENCES.iter().filter_map(|stop| text.find(stop)).min();
+    let mut earliest = BUILT_IN_STOP_SEQUENCES
+        .iter()
+        .filter_map(|stop| text.find(stop))
+        .min();
 
     if let Some(request_stop) = request_stop {
-        let request_earliest = request_stop.iter()
+        let request_earliest = request_stop
+            .iter()
             .filter(|stop| !stop.is_empty())
             .filter_map(|stop| text.find(stop))
             .min();
@@ -250,9 +343,15 @@ fn stop_prefix_holdback_len(text: &str, request_stop: Option<&[String]>) -> usiz
 
     for (start, _) in text.char_indices() {
         let suffix = &text[start..];
-        if BUILT_IN_STOP_SEQUENCES.iter().any(|stop| stop.starts_with(suffix))
+        if BUILT_IN_STOP_SEQUENCES
+            .iter()
+            .any(|stop| stop.starts_with(suffix))
             || request_stop
-                .map(|stops| stops.iter().any(|stop| !stop.is_empty() && stop.starts_with(suffix)))
+                .map(|stops| {
+                    stops
+                        .iter()
+                        .any(|stop| !stop.is_empty() && stop.starts_with(suffix))
+                })
                 .unwrap_or(false)
         {
             max_len = max_len.max(text.len() - start);
@@ -318,7 +417,10 @@ fn enqueue_request(
     Ok((response_rx, cancel))
 }
 
-fn generation_params_from_request(req: &ChatCompletionRequest) -> Result<GenerationParams, ApiError> {
+fn generation_params_from_request(
+    req: &ChatCompletionRequest,
+    request_timeout: Duration,
+) -> Result<GenerationParams, ApiError> {
     validate_request(req)?;
 
     Ok(GenerationParams {
@@ -329,35 +431,53 @@ fn generation_params_from_request(req: &ChatCompletionRequest) -> Result<Generat
         repetition_penalty: req.repetition_penalty,
         frequency_penalty: req.frequency_penalty,
         eos_token_ids: vec![1, 106],
-        request_timeout: Duration::from_secs(60),
+        request_timeout,
     })
 }
 
 fn validate_request(req: &ChatCompletionRequest) -> Result<(), ApiError> {
     if req.messages.is_empty() {
-        return Err(ApiError::bad_request("empty_messages", "messages must not be empty"));
+        return Err(ApiError::bad_request(
+            "empty_messages",
+            "messages must not be empty",
+        ));
     }
 
     if req.max_tokens == 0 {
-        return Err(ApiError::bad_request("invalid_max_tokens", "max_tokens must be greater than 0"));
+        return Err(ApiError::bad_request(
+            "invalid_max_tokens",
+            "max_tokens must be greater than 0",
+        ));
     }
 
     if !req.temperature.is_finite() || req.temperature < 0.0 || req.temperature > 5.0 {
-        return Err(ApiError::bad_request("invalid_temperature", "temperature must be between 0 and 5"));
+        return Err(ApiError::bad_request(
+            "invalid_temperature",
+            "temperature must be between 0 and 5",
+        ));
     }
 
     if !req.min_p.is_finite() || req.min_p < 0.0 || req.min_p > 1.0 {
-        return Err(ApiError::bad_request("invalid_min_p", "min_p must be between 0 and 1"));
+        return Err(ApiError::bad_request(
+            "invalid_min_p",
+            "min_p must be between 0 and 1",
+        ));
     }
 
-    if !req.repetition_penalty.is_finite() || req.repetition_penalty <= 0.0 || req.repetition_penalty > 10.0 {
+    if !req.repetition_penalty.is_finite()
+        || req.repetition_penalty <= 0.0
+        || req.repetition_penalty > 10.0
+    {
         return Err(ApiError::bad_request(
             "invalid_repetition_penalty",
             "repetition_penalty must be greater than 0 and at most 10",
         ));
     }
 
-    if !req.frequency_penalty.is_finite() || req.frequency_penalty < -2.0 || req.frequency_penalty > 2.0 {
+    if !req.frequency_penalty.is_finite()
+        || req.frequency_penalty < -2.0
+        || req.frequency_penalty > 2.0
+    {
         return Err(ApiError::bad_request(
             "invalid_frequency_penalty",
             "frequency_penalty must be between -2 and 2",
@@ -372,7 +492,12 @@ fn encode_prompt(state: &AppState, messages: &[Message]) -> Result<Vec<usize>, A
     let encoding = state
         .tokenizer
         .encode(prompt.as_str(), true)
-        .map_err(|err| ApiError::bad_request("tokenizer_error", format!("failed to tokenize prompt: {}", err)))?;
+        .map_err(|err| {
+            ApiError::bad_request(
+                "tokenizer_error",
+                format!("failed to tokenize prompt: {}", err),
+            )
+        })?;
     Ok(encoding.get_ids().iter().map(|&t| t as usize).collect())
 }
 
@@ -407,7 +532,7 @@ fn validate_context_len(
 async fn metrics(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     (
         [(header::CONTENT_TYPE, "text/plain; version=0.0.4")],
-        state.metrics.render_prometheus(),
+        state.render_metrics(),
     )
 }
 
@@ -428,14 +553,17 @@ async fn chat_completions_sync(
     state: Arc<AppState>,
     req: ChatCompletionRequest,
 ) -> Result<Json<ChatCompletionResponse>, ApiError> {
-    let generation_params = generation_params_from_request(&req)?;
+    let generation_params = generation_params_from_request(&req, state.request_timeout())?;
     let input_ids = encode_prompt(&state, &req.messages)?;
     let prompt_tokens = input_ids.len();
-    validate_context_len(prompt_tokens, generation_params.max_tokens, state.max_context_len)?;
+    validate_context_len(
+        prompt_tokens,
+        generation_params.max_tokens,
+        state.max_context_len,
+    )?;
     let request_stop = req.stop.map(StopSequences::into_vec);
 
-    let (mut response_rx, cancel) =
-        enqueue_request(&state, input_ids, generation_params)?;
+    let (mut response_rx, cancel) = enqueue_request(&state, input_ids, generation_params)?;
     let mut output_tokens = Vec::new();
     let mut finish_reason = "stop".to_string();
 
@@ -444,13 +572,18 @@ async fn chat_completions_sync(
             StreamEvent::Token { token_id } => {
                 output_tokens.push(token_id as u32);
 
-                let decoded_so_far = state.tokenizer.decode(&output_tokens, false).unwrap_or_default();
+                let decoded_so_far = state
+                    .tokenizer
+                    .decode(&output_tokens, false)
+                    .unwrap_or_default();
                 if find_stop_position(&decoded_so_far, request_stop.as_deref()).is_some() {
                     cancel.store(CANCEL_STOP, Ordering::Relaxed);
                     break;
                 }
             }
-            StreamEvent::Done { finish_reason: reason } => {
+            StreamEvent::Done {
+                finish_reason: reason,
+            } => {
                 finish_reason = reason;
                 break;
             }
@@ -458,13 +591,18 @@ async fn chat_completions_sync(
         }
     }
 
-    let mut text = state.tokenizer.decode(&output_tokens, true).unwrap_or_default();
+    let mut text = state
+        .tokenizer
+        .decode(&output_tokens, true)
+        .unwrap_or_default();
     trim_stop_sequences(&mut text, request_stop.as_deref());
     // Strip thinking/reasoning content (Gemma4 thinking mode)
     if text.starts_with("thought\n") {
         // Find the end of thinking block - look for double newline or end
         if let Some(end_pos) = text.find("\n...end_of_turn") {
-            text = text[end_pos..].trim_start_matches("\n...end_of_turn").to_string();
+            text = text[end_pos..]
+                .trim_start_matches("\n...end_of_turn")
+                .to_string();
         } else if let Some(end_pos) = text.rfind("\n\n") {
             // Take only the last paragraph as the actual response
             text = text[end_pos..].trim().to_string();
@@ -479,7 +617,10 @@ async fn chat_completions_sync(
         model: "gemma-4-e4b-q4".to_string(),
         choices: vec![Choice {
             index: 0,
-            message: Message { role: "assistant".to_string(), content: text },
+            message: Message {
+                role: "assistant".to_string(),
+                content: text,
+            },
             finish_reason,
         }],
         usage: Usage {
@@ -500,9 +641,13 @@ async fn chat_completions_stream(
 
     let chat_id = format!("chatcmpl-{}", uuid::Uuid::new_v4());
     let created = chrono::Utc::now().timestamp();
-    let generation_params = generation_params_from_request(&req)?;
+    let generation_params = generation_params_from_request(&req, state.request_timeout())?;
     let input_ids = encode_prompt(&state, &req.messages)?;
-    validate_context_len(input_ids.len(), generation_params.max_tokens, state.max_context_len)?;
+    validate_context_len(
+        input_ids.len(),
+        generation_params.max_tokens,
+        state.max_context_len,
+    )?;
     let request_stop = req.stop.map(StopSequences::into_vec);
     let request_result = enqueue_request(&state, input_ids, generation_params)?;
 
@@ -515,11 +660,18 @@ async fn chat_completions_stream(
             model: "gemma-4-e4b-q4".to_string(),
             choices: vec![ChunkChoice {
                 index: 0,
-                delta: Delta { role: Some("assistant".to_string()), content: None },
+                delta: Delta {
+                    role: Some("assistant".to_string()),
+                    content: None,
+                },
                 finish_reason: None,
             }],
         };
-        let _ = tx.send(Ok(Event::default().data(serde_json::to_string(&role_chunk).unwrap()))).await;
+        let _ = tx
+            .send(Ok(
+                Event::default().data(serde_json::to_string(&role_chunk).unwrap())
+            ))
+            .await;
 
         let mut output_tokens = Vec::new();
         let mut emitted_text = String::new();
@@ -531,7 +683,10 @@ async fn chat_completions_stream(
             match event {
                 StreamEvent::Token { token_id } => {
                     output_tokens.push(token_id as u32);
-                    let mut visible_text = state.tokenizer.decode(&output_tokens, false).unwrap_or_default();
+                    let mut visible_text = state
+                        .tokenizer
+                        .decode(&output_tokens, false)
+                        .unwrap_or_default();
                     let stopped = trim_stream_safe_text(&mut visible_text, request_stop.as_deref());
                     let tok_str = if visible_text.starts_with(&emitted_text) {
                         visible_text[emitted_text.len()..].to_string()
@@ -548,12 +703,21 @@ async fn chat_completions_stream(
                             model: "gemma-4-e4b-q4".to_string(),
                             choices: vec![ChunkChoice {
                                 index: 0,
-                                delta: Delta { role: None, content: Some(tok_str) },
+                                delta: Delta {
+                                    role: None,
+                                    content: Some(tok_str),
+                                },
                                 finish_reason: None,
                             }],
                         };
 
-                        if tx.send(Ok(Event::default().data(serde_json::to_string(&chunk).unwrap()))).await.is_err() {
+                        if tx
+                            .send(Ok(
+                                Event::default().data(serde_json::to_string(&chunk).unwrap())
+                            ))
+                            .await
+                            .is_err()
+                        {
                             cancel.store(CANCEL_CLIENT, Ordering::Relaxed);
                             break;
                         }
@@ -564,7 +728,9 @@ async fn chat_completions_stream(
                         break;
                     }
                 }
-                StreamEvent::Done { finish_reason: reason } => {
+                StreamEvent::Done {
+                    finish_reason: reason,
+                } => {
                     finish_reason = reason;
                     break;
                 }
@@ -583,12 +749,21 @@ async fn chat_completions_stream(
             model: "gemma-4-e4b-q4".to_string(),
             choices: vec![ChunkChoice {
                 index: 0,
-                delta: Delta { role: None, content: None },
+                delta: Delta {
+                    role: None,
+                    content: None,
+                },
                 finish_reason: Some(finish_reason),
             }],
         };
-        let _ = tx.send(Ok(Event::default().data(serde_json::to_string(&done_chunk).unwrap()))).await;
-        let _ = tx.send(Ok(Event::default().data("[DONE]".to_string()))).await;
+        let _ = tx
+            .send(Ok(
+                Event::default().data(serde_json::to_string(&done_chunk).unwrap())
+            ))
+            .await;
+        let _ = tx
+            .send(Ok(Event::default().data("[DONE]".to_string())))
+            .await;
     });
 
     Ok(Sse::new(ReceiverStream::new(rx)))
@@ -607,13 +782,24 @@ pub fn create_router(state: Arc<AppState>) -> Router {
 
 pub async fn run_server(model: Gemma4GpuModel, tokenizer: tokenizers::Tokenizer, port: u16) {
     let max_context_len = model.kv_capacity as usize;
+    let runtime_config = ServerRuntimeConfig::from_env();
     let metrics = Arc::new(Metrics::new());
-    let request_tx = scheduler::spawn_scheduler(model, 32, 4, metrics.clone());
+    let scheduler_config = scheduler::SchedulerConfig {
+        max_prefill_tokens_per_tick: runtime_config.max_prefill_tokens_per_tick,
+    };
+    let request_tx = scheduler::spawn_scheduler_with_config(
+        model,
+        runtime_config.queue_depth,
+        runtime_config.kv_pool_slots,
+        metrics.clone(),
+        scheduler_config,
+    );
     let state = Arc::new(AppState {
         request_tx,
         metrics,
         tokenizer,
         max_context_len,
+        runtime_config: runtime_config.clone(),
     });
 
     let app = create_router(state);
@@ -624,6 +810,16 @@ pub async fn run_server(model: Gemma4GpuModel, tokenizer: tokenizers::Tokenizer,
     println!("   Models: /v1/models");
     println!("   Health: /health");
     println!("   Metrics: /metrics");
+    println!(
+        "   Runtime: queue_depth={}, kv_pool_slots={}, request_timeout_secs={}, prefill_tokens_per_tick={}",
+        runtime_config.queue_depth,
+        runtime_config.kv_pool_slots,
+        runtime_config.request_timeout.as_secs(),
+        runtime_config
+            .max_prefill_tokens_per_tick
+            .map(|tokens| tokens.to_string())
+            .unwrap_or_else(|| "model_default".to_string()),
+    );
 
     let listener = tokio::net::TcpListener::bind(&addr).await.unwrap();
     axum::serve(listener, app).await.unwrap();
@@ -660,7 +856,10 @@ mod tests {
         assert_eq!(text, "hello ");
 
         let mut built_in_first = "hello <end_of_turn> CUSTOM_STOP".to_string();
-        assert!(trim_stop_sequences(&mut built_in_first, Some(&request_stop)));
+        assert!(trim_stop_sequences(
+            &mut built_in_first,
+            Some(&request_stop)
+        ));
         assert_eq!(built_in_first, "hello ");
     }
 
@@ -687,11 +886,17 @@ mod tests {
 
         let mut req = valid_request();
         req.max_tokens = 0;
-        assert_eq!(validate_request(&req).unwrap_err().code, "invalid_max_tokens");
+        assert_eq!(
+            validate_request(&req).unwrap_err().code,
+            "invalid_max_tokens"
+        );
 
         let mut req = valid_request();
         req.temperature = -0.1;
-        assert_eq!(validate_request(&req).unwrap_err().code, "invalid_temperature");
+        assert_eq!(
+            validate_request(&req).unwrap_err().code,
+            "invalid_temperature"
+        );
 
         let mut req = valid_request();
         req.min_p = 1.1;
@@ -723,5 +928,47 @@ mod tests {
             validate_context_len(15, 2, 16).unwrap_err().code,
             "context_length_exceeded"
         );
+    }
+
+    #[test]
+    fn runtime_config_defaults_are_production_safe() {
+        let config = ServerRuntimeConfig::from_lookup(|_| None);
+
+        assert_eq!(config.queue_depth, 32);
+        assert_eq!(config.kv_pool_slots, 4);
+        assert_eq!(config.request_timeout, Duration::from_secs(60));
+        assert_eq!(config.max_prefill_tokens_per_tick, None);
+    }
+
+    #[test]
+    fn runtime_config_applies_env_overrides_and_clamps_zeroes() {
+        let config = ServerRuntimeConfig::from_lookup(|name| match name {
+            "LLAMA_QUEUE_DEPTH" => Some("0".to_string()),
+            "LLAMA_KV_POOL_SLOTS" => Some("8".to_string()),
+            "LLAMA_REQUEST_TIMEOUT_SECS" => Some("0".to_string()),
+            "LLAMA_PREFILL_TOKENS_PER_TICK" => Some("32".to_string()),
+            _ => None,
+        });
+
+        assert_eq!(config.queue_depth, 1);
+        assert_eq!(config.kv_pool_slots, 8);
+        assert_eq!(config.request_timeout, Duration::from_secs(1));
+        assert_eq!(config.max_prefill_tokens_per_tick, Some(32));
+    }
+
+    #[test]
+    fn runtime_config_metrics_expose_static_scheduler_knobs() {
+        let config = ServerRuntimeConfig {
+            queue_depth: 16,
+            kv_pool_slots: 2,
+            request_timeout: Duration::from_secs(30),
+            max_prefill_tokens_per_tick: Some(64),
+        };
+        let metrics = config.render_prometheus();
+
+        assert!(metrics.contains("llama_config_queue_depth 16"));
+        assert!(metrics.contains("llama_config_kv_pool_slots 2"));
+        assert!(metrics.contains("llama_config_request_timeout_secs 30"));
+        assert!(metrics.contains("llama_config_prefill_tokens_per_tick 64"));
     }
 }

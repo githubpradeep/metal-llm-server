@@ -31,6 +31,31 @@ prefill chunks, and end-to-end request latency for each prompt size.
 Set `LLAMA_MAX_PREFILL_SEQ=64` or `LLAMA_MAX_PREFILL_SEQ=128` before starting
 the server to compare prefill chunk sizes.
 
+## Mixed prefill/decode fairness benchmark
+
+Start the server first, then run:
+
+```bash
+python3 benchmarks/mixed_batching_fairness.py --port 8080
+```
+
+This keeps a streaming decode request active while a long prompt is prefilling,
+then reports the largest streaming-token gap. Use it to tune scheduler
+interleaving and catch regressions where long prefill monopolizes the GPU.
+
+Relevant server runtime knobs:
+
+```bash
+LLAMA_QUEUE_DEPTH=32
+LLAMA_KV_POOL_SLOTS=4
+LLAMA_REQUEST_TIMEOUT_SECS=60
+LLAMA_PREFILL_TOKENS_PER_TICK=32
+LLAMA_MAX_PREFILL_SEQ=128
+```
+
+`LLAMA_PREFILL_TOKENS_PER_TICK` caps scheduler prefill work per tick. If unset,
+the scheduler uses the model prefill chunk size.
+
 ## How to compare your local model against llama.cpp
 
 ### Step 1: Run the Colab script (llama.cpp reference on GPU)

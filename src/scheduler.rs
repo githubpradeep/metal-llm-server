@@ -46,14 +46,30 @@ pub enum StreamEvent {
 pub struct Scheduler {
     engine: BatchEngine,
     metrics: Arc<Metrics>,
+    config: SchedulerConfig,
     next_prefill_index: usize,
+}
+
+#[derive(Clone, Default)]
+pub struct SchedulerConfig {
+    pub max_prefill_tokens_per_tick: Option<usize>,
 }
 
 impl Scheduler {
     pub fn new(model: Gemma4GpuModel, kv_pool_slots: usize, metrics: Arc<Metrics>) -> Self {
+        Self::new_with_config(model, kv_pool_slots, metrics, SchedulerConfig::default())
+    }
+
+    pub fn new_with_config(
+        model: Gemma4GpuModel,
+        kv_pool_slots: usize,
+        metrics: Arc<Metrics>,
+        config: SchedulerConfig,
+    ) -> Self {
         Self {
             engine: BatchEngine::new(model, kv_pool_slots),
             metrics,
+            config,
             next_prefill_index: 0,
         }
     }
@@ -84,11 +100,7 @@ impl Scheduler {
         }
     }
 
-    fn admit_request(
-        &mut self,
-        request: InferenceRequest,
-        active: &mut Vec<ActiveRequest>,
-    ) {
+    fn admit_request(&mut self, request: InferenceRequest, active: &mut Vec<ActiveRequest>) {
         self.metrics.record_dequeue();
 
         let Some(slot) = self.engine.allocate_slot() else {
@@ -149,10 +161,7 @@ impl Scheduler {
         true
     }
 
-    fn decode_active_round(
-        &mut self,
-        active: &mut Vec<ActiveRequest>,
-    ) {
+    fn decode_active_round(&mut self, active: &mut Vec<ActiveRequest>) {
         let round_len = active.len();
         let mut decode_batch = Vec::new();
         let mut finished = Vec::new();
@@ -190,7 +199,10 @@ impl Scheduler {
             })
             .collect();
 
-        for (prepared, output) in decode_batch.into_iter().zip(self.engine.decode_batch(&inputs)) {
+        for (prepared, output) in decode_batch
+            .into_iter()
+            .zip(self.engine.decode_batch(&inputs))
+        {
             match output {
                 Ok(forward) => {
                     let active_request = &mut active[prepared.active_index];
@@ -213,9 +225,12 @@ impl Scheduler {
         for finish in finished.into_iter().rev() {
             let active_request = active.swap_remove(finish.active_index);
             if let Some(message) = finish.error_message {
-                let _ = active_request.request.response_tx.blocking_send(StreamEvent::Error {
-                    message: message.clone(),
-                });
+                let _ = active_request
+                    .request
+                    .response_tx
+                    .blocking_send(StreamEvent::Error {
+                        message: message.clone(),
+                    });
                 self.finish_request(
                     &active_request.request,
                     active_request.finish(&format!("error: {}", message)),
@@ -227,10 +242,7 @@ impl Scheduler {
         }
     }
 
-    fn prefill_active_round(
-        &mut self,
-        active: &mut Vec<ActiveRequest>,
-    ) {
+    fn prefill_active_round(&mut self, active: &mut Vec<ActiveRequest>) {
         let mut prefill_batch = Vec::new();
         let mut finished = Vec::new();
         let max_chunk_tokens = self.engine.max_prefill_chunk_tokens();
@@ -274,7 +286,10 @@ impl Scheduler {
             })
             .collect();
 
-        for (prepared, output) in prefill_batch.into_iter().zip(self.engine.prefill_batch(&inputs)) {
+        for (prepared, output) in prefill_batch
+            .into_iter()
+            .zip(self.engine.prefill_batch(&inputs))
+        {
             match output {
                 Ok(forward) => {
                     let active_request = &mut active[prepared.active_index];
@@ -306,9 +321,12 @@ impl Scheduler {
         for finish in finished.into_iter().rev() {
             let active_request = active.swap_remove(finish.active_index);
             if let Some(message) = finish.error_message {
-                let _ = active_request.request.response_tx.blocking_send(StreamEvent::Error {
-                    message: message.clone(),
-                });
+                let _ = active_request
+                    .request
+                    .response_tx
+                    .blocking_send(StreamEvent::Error {
+                        message: message.clone(),
+                    });
                 self.finish_request(
                     &active_request.request,
                     active_request.finish(&format!("error: {}", message)),
@@ -321,7 +339,10 @@ impl Scheduler {
     }
 
     fn max_prefill_tokens_per_tick(&self) -> usize {
-        self.engine.max_prefill_chunk_tokens()
+        self.config
+            .max_prefill_tokens_per_tick
+            .unwrap_or_else(|| self.engine.max_prefill_chunk_tokens())
+            .max(1)
     }
 
     fn finish_request(&self, request: &InferenceRequest, finish: RequestFinish) {
@@ -556,7 +577,9 @@ fn prepare_decode_token(active: &mut ActiveRequest) -> DecodePreparation {
     if active
         .request
         .response_tx
-        .blocking_send(StreamEvent::Token { token_id: next_token })
+        .blocking_send(StreamEvent::Token {
+            token_id: next_token,
+        })
         .is_err()
     {
         return DecodePreparation::Finish(active.finish("cancelled"));
@@ -645,8 +668,26 @@ pub fn spawn_scheduler(
     kv_pool_slots: usize,
     metrics: Arc<Metrics>,
 ) -> SyncSender<InferenceRequest> {
+    spawn_scheduler_with_config(
+        model,
+        queue_depth,
+        kv_pool_slots,
+        metrics,
+        SchedulerConfig::default(),
+    )
+}
+
+pub fn spawn_scheduler_with_config(
+    model: Gemma4GpuModel,
+    queue_depth: usize,
+    kv_pool_slots: usize,
+    metrics: Arc<Metrics>,
+    config: SchedulerConfig,
+) -> SyncSender<InferenceRequest> {
     let (request_tx, request_rx) = std::sync::mpsc::sync_channel(queue_depth);
-    std::thread::spawn(move || Scheduler::new(model, kv_pool_slots, metrics).run(request_rx));
+    std::thread::spawn(move || {
+        Scheduler::new_with_config(model, kv_pool_slots, metrics, config).run(request_rx)
+    });
     request_tx
 }
 

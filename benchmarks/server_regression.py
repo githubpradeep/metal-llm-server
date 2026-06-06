@@ -12,6 +12,8 @@ import time
 import urllib.error
 import urllib.request
 
+import mixed_batching_fairness
+
 
 MODEL = "gemma-4-e4b-q4"
 PHASE_GAUGES = (
@@ -269,9 +271,70 @@ def check_idle_metrics(base_url):
         assert resp.status == 200
         metrics = parse_metrics(resp.read().decode("utf-8"))
 
+    for gauge in (
+        "llama_config_queue_depth",
+        "llama_config_kv_pool_slots",
+        "llama_config_request_timeout_secs",
+        "llama_config_prefill_tokens_per_tick",
+    ):
+        assert gauge in metrics, f"{gauge} missing from /metrics"
+
     for gauge in PHASE_GAUGES:
         assert metrics.get(gauge) == 0.0, f"{gauge} did not return to idle: {metrics.get(gauge)}"
     print("ok idle metrics")
+
+
+def check_mixed_fairness(base_url, args):
+    first_token_seen = threading.Event()
+    token_times = []
+    errors = []
+    stream_thread = threading.Thread(
+        target=mixed_batching_fairness.stream_decode,
+        args=(
+            base_url,
+            args.mixed_stream_tokens,
+            first_token_seen,
+            token_times,
+            errors,
+            args.timeout,
+        ),
+    )
+
+    stream_thread.start()
+    if not first_token_seen.wait(timeout=args.timeout):
+        raise AssertionError("stream did not produce a first token before timeout")
+
+    prefill_elapsed, prefill_usage = mixed_batching_fairness.long_prefill(
+        base_url,
+        args.mixed_prefill_words,
+        args.mixed_prefill_max_tokens,
+        args.timeout,
+    )
+    stream_thread.join(timeout=args.timeout)
+    if stream_thread.is_alive():
+        raise AssertionError("stream request did not finish before timeout")
+    if errors:
+        raise AssertionError(f"stream request failed: {errors[0]}")
+
+    summary = mixed_batching_fairness.summarize_gaps(token_times)
+    print(
+        "mixed fairness "
+        f"stream_chunks={summary['count']} "
+        f"max_gap={summary['max_gap']:.3f}s "
+        f"p95_gap={summary['p95_gap']:.3f}s "
+        f"prefill_elapsed={prefill_elapsed:.3f}s "
+        f"prefill_prompt_tokens={prefill_usage['prompt_tokens']}"
+    )
+
+    assert summary["count"] >= args.mixed_min_stream_chunks, (
+        f"stream produced only {summary['count']} chunks; "
+        f"expected at least {args.mixed_min_stream_chunks}"
+    )
+    assert summary["max_gap"] <= args.mixed_max_stream_gap, (
+        f"stream max token gap {summary['max_gap']:.3f}s exceeded "
+        f"{args.mixed_max_stream_gap:.3f}s while long prefill was active"
+    )
+    print("ok mixed fairness")
 
 
 def main():
@@ -280,6 +343,12 @@ def main():
     parser.add_argument("--requests", type=int, default=10)
     parser.add_argument("--max-tokens", type=int, default=32)
     parser.add_argument("--timeout", type=float, default=180.0)
+    parser.add_argument("--mixed-fairness", action="store_true")
+    parser.add_argument("--mixed-stream-tokens", type=int, default=64)
+    parser.add_argument("--mixed-prefill-words", type=int, default=400)
+    parser.add_argument("--mixed-prefill-max-tokens", type=int, default=1)
+    parser.add_argument("--mixed-max-stream-gap", type=float, default=5.0)
+    parser.add_argument("--mixed-min-stream-chunks", type=int, default=4)
     args = parser.parse_args()
 
     base_url = f"http://127.0.0.1:{args.port}"
@@ -289,6 +358,8 @@ def main():
     check_chunked_prefill(base_url)
     check_stream_chat(base_url)
     check_concurrency(base_url, args.requests, args.max_tokens, args.timeout)
+    if args.mixed_fairness:
+        check_mixed_fairness(base_url, args)
     check_idle_metrics(base_url)
     print("all regression checks passed")
 
