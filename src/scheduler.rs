@@ -46,6 +46,7 @@ pub enum StreamEvent {
 pub struct Scheduler {
     engine: BatchEngine,
     metrics: Arc<Metrics>,
+    next_prefill_index: usize,
 }
 
 impl Scheduler {
@@ -53,6 +54,7 @@ impl Scheduler {
         Self {
             engine: BatchEngine::new(model, kv_pool_slots),
             metrics,
+            next_prefill_index: 0,
         }
     }
 
@@ -229,32 +231,39 @@ impl Scheduler {
         &mut self,
         active: &mut Vec<ActiveRequest>,
     ) {
-        let round_len = active.len();
         let mut prefill_batch = Vec::new();
         let mut finished = Vec::new();
+        let max_chunk_tokens = self.engine.max_prefill_chunk_tokens();
+        let token_budget = self.max_prefill_tokens_per_tick();
+        let (prefill_plan, next_prefill_index) = plan_prefill_round(
+            active.len(),
+            self.next_prefill_index,
+            max_chunk_tokens,
+            token_budget,
+            |index| active[index].phase == ActivePhase::Prefilling,
+            |index| {
+                active[index]
+                    .request
+                    .input_ids
+                    .len()
+                    .saturating_sub(active[index].prefill_cursor)
+            },
+        );
+        self.next_prefill_index = next_prefill_index;
 
-        let mut index = 0;
-
-        while index < round_len && index < active.len() {
-            if active[index].phase != ActivePhase::Prefilling {
-                index += 1;
-                continue;
-            }
-
-            match prepare_prefill_chunk(&active[index], self.engine.max_prefill_chunk_tokens()) {
+        for plan in prefill_plan {
+            match prepare_prefill_chunk(&active[plan.active_index], plan.token_count) {
                 PrefillPreparation::Forward(input) => {
                     prefill_batch.push(PreparedPrefill {
-                        active_index: index,
+                        active_index: plan.active_index,
                         token_count: input.token_ids.len(),
                         input,
                     });
                 }
                 PrefillPreparation::Finish(finish) => {
-                    finished.push(FinishedRequest::done(index, finish));
+                    finished.push(FinishedRequest::done(plan.active_index, finish));
                 }
             }
-
-            index += 1;
         }
 
         let inputs: Vec<PrefillInput> = prefill_batch
@@ -309,6 +318,10 @@ impl Scheduler {
             }
             let _ = self.engine.release_slot(active_request.slot);
         }
+    }
+
+    fn max_prefill_tokens_per_tick(&self) -> usize {
+        self.engine.max_prefill_chunk_tokens()
     }
 
     fn finish_request(&self, request: &InferenceRequest, finish: RequestFinish) {
@@ -371,6 +384,12 @@ struct PreparedPrefill {
     input: PrefillInput,
 }
 
+#[derive(Debug, Eq, PartialEq)]
+struct PrefillPlanItem {
+    active_index: usize,
+    token_count: usize,
+}
+
 struct FinishedRequest {
     active_index: usize,
     finish: RequestFinish,
@@ -421,6 +440,51 @@ enum DecodePreparation {
 enum PrefillPreparation {
     Forward(PrefillInput),
     Finish(RequestFinish),
+}
+
+fn plan_prefill_round(
+    active_len: usize,
+    start_index: usize,
+    max_chunk_tokens: usize,
+    token_budget: usize,
+    mut is_prefilling: impl FnMut(usize) -> bool,
+    mut remaining_tokens: impl FnMut(usize) -> usize,
+) -> (Vec<PrefillPlanItem>, usize) {
+    if active_len == 0 || max_chunk_tokens == 0 || token_budget == 0 {
+        return (Vec::new(), 0);
+    }
+
+    let mut plan = Vec::new();
+    let mut remaining_budget = token_budget;
+    let start_index = start_index % active_len;
+    let mut next_index = start_index;
+
+    for offset in 0..active_len {
+        let active_index = (start_index + offset) % active_len;
+        if !is_prefilling(active_index) {
+            continue;
+        }
+
+        let token_count = remaining_tokens(active_index)
+            .min(max_chunk_tokens)
+            .min(remaining_budget);
+        if token_count == 0 {
+            continue;
+        }
+
+        plan.push(PrefillPlanItem {
+            active_index,
+            token_count,
+        });
+        remaining_budget -= token_count;
+        next_index = (active_index + 1) % active_len;
+
+        if remaining_budget == 0 {
+            break;
+        }
+    }
+
+    (plan, next_index)
 }
 
 fn prepare_prefill_chunk(active: &ActiveRequest, chunk_size: usize) -> PrefillPreparation {
@@ -584,4 +648,91 @@ pub fn spawn_scheduler(
     let (request_tx, request_rx) = std::sync::mpsc::sync_channel(queue_depth);
     std::thread::spawn(move || Scheduler::new(model, kv_pool_slots, metrics).run(request_rx));
     request_tx
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn prefill_plan_caps_total_tokens_per_tick() {
+        let phases = [true, true, true];
+        let remaining = [200, 200, 200];
+
+        let (plan, next_index) = plan_prefill_round(
+            phases.len(),
+            0,
+            128,
+            128,
+            |index| phases[index],
+            |index| remaining[index],
+        );
+
+        assert_eq!(
+            plan,
+            vec![PrefillPlanItem {
+                active_index: 0,
+                token_count: 128,
+            }]
+        );
+        assert_eq!(next_index, 1);
+    }
+
+    #[test]
+    fn prefill_plan_packs_short_chunks_until_budget_is_spent() {
+        let phases = [true, true, true];
+        let remaining = [8, 40, 120];
+
+        let (plan, next_index) = plan_prefill_round(
+            phases.len(),
+            0,
+            128,
+            64,
+            |index| phases[index],
+            |index| remaining[index],
+        );
+
+        assert_eq!(
+            plan,
+            vec![
+                PrefillPlanItem {
+                    active_index: 0,
+                    token_count: 8,
+                },
+                PrefillPlanItem {
+                    active_index: 1,
+                    token_count: 40,
+                },
+                PrefillPlanItem {
+                    active_index: 2,
+                    token_count: 16,
+                },
+            ]
+        );
+        assert_eq!(next_index, 0);
+    }
+
+    #[test]
+    fn prefill_plan_round_robins_from_previous_cursor() {
+        let phases = [true, false, true, true];
+        let remaining = [200, 0, 200, 200];
+
+        let (plan, next_index) = plan_prefill_round(
+            phases.len(),
+            2,
+            128,
+            128,
+            |index| phases[index],
+            |index| remaining[index],
+        );
+
+        assert_eq!(
+            plan,
+            vec![PrefillPlanItem {
+                active_index: 2,
+                token_count: 128,
+            }]
+        );
+        assert_eq!(next_index, 3);
+    }
 }
