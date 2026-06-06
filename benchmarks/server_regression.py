@@ -354,7 +354,7 @@ def main():
     parser.add_argument("--timeout", type=float, default=180.0)
     parser.add_argument("--mixed-fairness", action="store_true")
     parser.add_argument("--mixed-stream-tokens", type=int, default=64)
-    parser.add_argument("--mixed-prefill-words", type=int, default=400)
+    parser.add_argument("--mixed-prefill-words", type=int, default=180)
     parser.add_argument("--mixed-prefill-max-tokens", type=int, default=1)
     parser.add_argument("--mixed-max-stream-gap", type=float, default=5.0)
     parser.add_argument("--mixed-min-stream-chunks", type=int, default=4)

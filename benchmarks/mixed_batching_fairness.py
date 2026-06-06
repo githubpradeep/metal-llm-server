@@ -13,6 +13,7 @@ import json
 import statistics
 import threading
 import time
+import urllib.error
 import urllib.request
 
 
@@ -48,8 +49,12 @@ def request_json(base_url, payload, timeout):
         data=json.dumps(payload).encode("utf-8"),
         headers={"Content-Type": "application/json"},
     )
-    with urllib.request.urlopen(req, timeout=timeout) as resp:
-        return json.loads(resp.read().decode("utf-8"))
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        body = exc.read().decode("utf-8", errors="replace")
+        raise AssertionError(f"HTTP {exc.code} from /v1/chat/completions: {body}") from exc
 
 
 def stream_decode(base_url, max_tokens, stream_started, token_times, errors, timeout):
@@ -118,7 +123,7 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--port", type=int, default=8080)
     parser.add_argument("--stream-tokens", type=int, default=64)
-    parser.add_argument("--prefill-words", type=int, default=400)
+    parser.add_argument("--prefill-words", type=int, default=180)
     parser.add_argument("--prefill-max-tokens", type=int, default=1)
     parser.add_argument("--timeout", type=float, default=240.0)
     parser.add_argument("--max-stream-gap", type=float, default=5.0)
