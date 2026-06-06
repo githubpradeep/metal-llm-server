@@ -68,6 +68,40 @@ The model directory should contain:
 - `tokenizer.json`
 - `model.safetensors` or sharded safetensors with `model.safetensors.index.json`
 
+## Download Model From Hugging Face
+
+Install the Hugging Face CLI:
+
+```bash
+python3 -m pip install -U huggingface_hub
+```
+
+If the model is gated, log in first and make sure you have accepted the model
+license on Hugging Face:
+
+```bash
+hf auth login
+```
+
+Download the model to a local directory:
+
+```bash
+mkdir -p ~/models
+
+hf download google/gemma-4-e4b-it \
+  --local-dir ~/models/gemma-4-e4b-it
+```
+
+Then point the server at that directory:
+
+```bash
+export MODEL_DIR=~/models/gemma-4-e4b-it
+```
+
+If you use a different Gemma4 E4B checkpoint or an already-downloaded local
+snapshot, set `MODEL_DIR` to the folder containing `config.json`,
+`tokenizer.json`, and the safetensors files.
+
 ## Run Server
 
 ```bash
