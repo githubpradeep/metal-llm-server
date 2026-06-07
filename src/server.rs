@@ -21,6 +21,8 @@ use crate::scheduler::{
     self, GenerationParams, InferenceRequest, StreamEvent, CANCEL_CLIENT, CANCEL_NONE, CANCEL_STOP,
 };
 
+const DEFAULT_MODEL_ID: &str = "gemma-4-q4";
+
 // ─── OpenAI-compatible types ─────────────────────────────────────────────────
 
 #[derive(Deserialize)]
@@ -289,6 +291,8 @@ fn parse_u64(lookup: &mut impl FnMut(&str) -> Option<String>, name: &str) -> Opt
 // ─── Chat template ───────────────────────────────────────────────────────────
 
 const BUILT_IN_STOP_SEQUENCES: &[&str] = &[
+    "<turn|>",
+    "<|turn>",
     "<end_of_turn>",
     "<eos>",
     "<start_of_turn>",
@@ -296,14 +300,16 @@ const BUILT_IN_STOP_SEQUENCES: &[&str] = &[
 ];
 
 fn apply_chat_template(messages: &[Message]) -> String {
-    let mut prompt = String::new();
+    let mut prompt = "<bos>".to_string();
     for msg in messages {
-        prompt.push_str(&format!(
-            "<start_of_turn>{}\n{}<end_of_turn>\n",
-            msg.role, msg.content
-        ));
+        let role = if msg.role == "assistant" {
+            "model"
+        } else {
+            msg.role.as_str()
+        };
+        prompt.push_str(&format!("<|turn>{}\n{}<turn|>\n", role, msg.content.trim()));
     }
-    prompt.push_str("<start_of_turn>model\n");
+    prompt.push_str("<|turn>model\n<|channel>thought\n<channel|>");
     prompt
 }
 
@@ -383,11 +389,18 @@ async fn health() -> &'static str {
 async fn list_models() -> Json<ModelList> {
     Json(ModelList {
         object: "list".to_string(),
-        data: vec![ModelInfo {
-            id: "gemma-4-e4b-q4".to_string(),
-            object: "model".to_string(),
-            owned_by: "local".to_string(),
-        }],
+        data: vec![
+            ModelInfo {
+                id: "gemma-4-e4b-q4".to_string(),
+                object: "model".to_string(),
+                owned_by: "local".to_string(),
+            },
+            ModelInfo {
+                id: "gemma-4-12b-q4".to_string(),
+                object: "model".to_string(),
+                owned_by: "local".to_string(),
+            },
+        ],
     })
 }
 
@@ -554,6 +567,10 @@ async fn chat_completions_sync(
     req: ChatCompletionRequest,
 ) -> Result<Json<ChatCompletionResponse>, ApiError> {
     let generation_params = generation_params_from_request(&req, state.request_timeout())?;
+    let response_model = req
+        .model
+        .clone()
+        .unwrap_or_else(|| DEFAULT_MODEL_ID.to_string());
     let input_ids = encode_prompt(&state, &req.messages)?;
     let prompt_tokens = input_ids.len();
     validate_context_len(
@@ -614,7 +631,7 @@ async fn chat_completions_sync(
         id: format!("chatcmpl-{}", uuid::Uuid::new_v4()),
         object: "chat.completion".to_string(),
         created: chrono::Utc::now().timestamp(),
-        model: "gemma-4-e4b-q4".to_string(),
+        model: response_model,
         choices: vec![Choice {
             index: 0,
             message: Message {
@@ -642,6 +659,10 @@ async fn chat_completions_stream(
     let chat_id = format!("chatcmpl-{}", uuid::Uuid::new_v4());
     let created = chrono::Utc::now().timestamp();
     let generation_params = generation_params_from_request(&req, state.request_timeout())?;
+    let response_model = req
+        .model
+        .clone()
+        .unwrap_or_else(|| DEFAULT_MODEL_ID.to_string());
     let input_ids = encode_prompt(&state, &req.messages)?;
     validate_context_len(
         input_ids.len(),
@@ -657,7 +678,7 @@ async fn chat_completions_stream(
             id: chat_id.clone(),
             object: "chat.completion.chunk".to_string(),
             created,
-            model: "gemma-4-e4b-q4".to_string(),
+            model: response_model.clone(),
             choices: vec![ChunkChoice {
                 index: 0,
                 delta: Delta {
@@ -700,7 +721,7 @@ async fn chat_completions_stream(
                             id: chat_id.clone(),
                             object: "chat.completion.chunk".to_string(),
                             created,
-                            model: "gemma-4-e4b-q4".to_string(),
+                            model: response_model.clone(),
                             choices: vec![ChunkChoice {
                                 index: 0,
                                 delta: Delta {
@@ -746,7 +767,7 @@ async fn chat_completions_stream(
             id: chat_id,
             object: "chat.completion.chunk".to_string(),
             created,
-            model: "gemma-4-e4b-q4".to_string(),
+            model: response_model,
             choices: vec![ChunkChoice {
                 index: 0,
                 delta: Delta {
@@ -831,7 +852,7 @@ mod tests {
 
     fn valid_request() -> ChatCompletionRequest {
         ChatCompletionRequest {
-            model: Some("gemma-4-e4b-q4".to_string()),
+            model: Some("gemma-4-12b-q4".to_string()),
             messages: vec![Message {
                 role: "user".to_string(),
                 content: "hello".to_string(),
@@ -861,6 +882,21 @@ mod tests {
             Some(&request_stop)
         ));
         assert_eq!(built_in_first, "hello ");
+    }
+
+    #[test]
+    fn apply_chat_template_uses_gemma4_turn_tokens() {
+        let prompt = apply_chat_template(&[Message {
+            role: "user".to_string(),
+            content: "List places to visit in india".to_string(),
+        }]);
+
+        assert_eq!(
+            prompt,
+            "<bos><|turn>user\nList places to visit in india<turn|>\n<|turn>model\n<|channel>thought\n<channel|>"
+        );
+        assert!(!prompt.contains("<start_of_turn>"));
+        assert!(!prompt.contains("<end_of_turn>"));
     }
 
     #[test]

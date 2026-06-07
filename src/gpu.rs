@@ -156,6 +156,9 @@ impl MetalContext {
     }
 
     pub fn buffer_from_slice(&self, data: &[f32]) -> Buffer {
+        if data.is_empty() {
+            return self.buffer_empty(1);
+        }
         let byte_len = (data.len() * std::mem::size_of::<f32>()) as u64;
         self.device.new_buffer_with_data(
             data.as_ptr() as *const _,
@@ -166,6 +169,9 @@ impl MetalContext {
 
     /// Create a Metal buffer with f16 data converted from f32.
     pub fn buffer_from_f32_as_f16(&self, data: &[f32]) -> Buffer {
+        if data.is_empty() {
+            return self.buffer_empty(1);
+        }
         let f16_data: Vec<u16> = data.iter().map(|&v| f32_to_f16(v)).collect();
         let byte_len = (f16_data.len() * 2) as u64;
         self.device.new_buffer_with_data(
@@ -189,13 +195,13 @@ impl MetalContext {
     }
 
     pub fn buffer_empty(&self, count: usize) -> Buffer {
-        let byte_len = (count * std::mem::size_of::<f32>()) as u64;
+        let byte_len = (count.max(1) * std::mem::size_of::<f32>()) as u64;
         self.device
             .new_buffer(byte_len, MTLResourceOptions::StorageModeShared)
     }
 
     pub fn buffer_empty_u32(&self, count: usize) -> Buffer {
-        let byte_len = (count * std::mem::size_of::<u32>()) as u64;
+        let byte_len = (count.max(1) * std::mem::size_of::<u32>()) as u64;
         self.device
             .new_buffer(byte_len, MTLResourceOptions::StorageModeShared)
     }

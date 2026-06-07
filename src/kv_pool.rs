@@ -65,7 +65,6 @@ impl KvCachePool {
         max_seq_len: u32,
     ) -> Self {
         let num_layers = config.num_hidden_layers;
-        let num_kv_heads = config.num_key_value_heads;
 
         let mut slots = Vec::with_capacity(num_slots);
         for _ in 0..num_slots {
@@ -74,6 +73,7 @@ impl KvCachePool {
 
             for layer_idx in 0..num_layers {
                 let head_dim = config.layer_head_dim(layer_idx);
+                let num_kv_heads = config.layer_num_kv_heads(layer_idx);
                 let byte_len = (num_kv_heads * max_seq_len as usize * head_dim * 2) as u64;
                 k_cache.push(
                     ctx.device

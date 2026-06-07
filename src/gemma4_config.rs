@@ -11,6 +11,8 @@ pub struct Gemma4TextConfig {
     pub num_hidden_layers: usize,
     pub num_attention_heads: usize,
     pub num_key_value_heads: usize,
+    #[serde(default)]
+    pub num_global_key_value_heads: Option<usize>,
     pub head_dim: usize,
     #[serde(default = "default_global_head_dim")]
     pub global_head_dim: usize,
@@ -64,6 +66,15 @@ fn default_partial_rotary() -> f64 { 1.0 }
 impl Gemma4TextConfig {
     pub fn num_kv_groups(&self) -> usize {
         self.num_attention_heads / self.num_key_value_heads
+    }
+
+    pub fn layer_num_kv_heads(&self, layer_idx: usize) -> usize {
+        if self.is_full_attention(layer_idx) {
+            self.num_global_key_value_heads
+                .unwrap_or(self.num_key_value_heads)
+        } else {
+            self.num_key_value_heads
+        }
     }
 
     pub fn is_full_attention(&self, layer_idx: usize) -> bool {
