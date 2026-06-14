@@ -1,7 +1,7 @@
 use metal::{Buffer, MTLResourceOptions};
 use std::fmt;
 
-use crate::gemma4_config::Gemma4TextConfig;
+use crate::gemma4_config::{Gemma4TextConfig, KvCacheType};
 use crate::gpu::MetalContext;
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -39,6 +39,7 @@ pub struct KvCachePool {
     free_slots: Vec<usize>,
     max_seq_len: u32,
     num_layers: usize,
+    pub kv_cache_type: KvCacheType,
 }
 
 pub struct KvCacheSlot {
@@ -63,6 +64,7 @@ impl KvCachePool {
         config: &Gemma4TextConfig,
         num_slots: usize,
         max_seq_len: u32,
+        kv_cache_type: KvCacheType,
     ) -> Self {
         let num_layers = config.num_hidden_layers;
         let num_kv_heads = config.num_key_value_heads;
@@ -74,7 +76,9 @@ impl KvCachePool {
 
             for layer_idx in 0..num_layers {
                 let head_dim = config.layer_head_dim(layer_idx);
-                let byte_len = (num_kv_heads * max_seq_len as usize * head_dim * 2) as u64;
+                assert!(head_dim % 32 == 0, "head_dim must be multiple of 32 for quantized KV cache");
+                let bytes_per_row = kv_cache_type.bytes_per_row(head_dim);
+                let byte_len = (num_kv_heads * max_seq_len as usize * bytes_per_row) as u64;
                 k_cache.push(
                     ctx.device
                         .new_buffer(byte_len, MTLResourceOptions::StorageModeShared),
@@ -101,6 +105,7 @@ impl KvCachePool {
             free_slots,
             max_seq_len,
             num_layers,
+            kv_cache_type,
         }
     }
 

@@ -1700,6 +1700,845 @@ kernel void attention_single_token_offset_f16(
     }
 }
 
+// ─── Q8_0 KV Cache Append ────────────────────────────────────────────────────
+// Quantizes f32 K/V data to Q8_0 format and appends to quantized cache.
+// Q8_0 layout per group of 32: [2-byte f16 scale][32 int8 values] = 34 bytes per group
+// Cache layout: (num_kv_heads, capacity, groups_per_row * 34)
+
+kernel void kv_cache_append_q8_0(
+    device const float* new_data [[buffer(0)]],
+    device uchar* cache [[buffer(1)]],
+    constant uint& num_kv_heads [[buffer(2)]],
+    constant uint& head_dim [[buffer(3)]],
+    constant uint& capacity [[buffer(4)]],
+    constant uint& cur_seq [[buffer(5)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    uint groups_per_row = head_dim / 32;
+    uint total_groups = num_kv_heads * groups_per_row;
+    if (gid >= total_groups) return;
+
+    uint h = gid / groups_per_row;
+    uint g = gid % groups_per_row;
+    uint row_bytes = groups_per_row * 34;
+
+    // Find max abs value in this group
+    float max_abs = 0.0f;
+    for (uint d = 0; d < 32; d++) {
+        float val = new_data[h * head_dim + g * 32 + d];
+        float a = fabs(val);
+        if (a > max_abs) max_abs = a;
+    }
+
+    float scale = max_abs / 127.0f;
+    if (max_abs == 0.0f) scale = 1.0f;
+    float inv_scale = 1.0f / scale;
+
+    // Store scale as f16
+    half scale_h = half(scale);
+    uint base_offset = h * capacity * row_bytes + cur_seq * row_bytes + g * 34;
+    *reinterpret_cast<device half*>(&cache[base_offset]) = scale_h;
+
+    // Store int8 quantized values (as unsigned bytes with two's complement)
+    for (uint d = 0; d < 32; d++) {
+        float val = new_data[h * head_dim + g * 32 + d];
+        int q = clamp(int(round(val * inv_scale)), -128, 127);
+        cache[base_offset + 2 + d] = uchar(q);
+    }
+}
+
+// ─── Q4_0 KV Cache Append ────────────────────────────────────────────────────
+// Quantizes f32 K/V data to Q4_0 format and appends to quantized cache.
+// Q4_0 layout per group of 32: [2-byte f16 scale][16 packed bytes] = 18 bytes per group
+// Cache layout: (num_kv_heads, capacity, groups_per_row * 18)
+
+kernel void kv_cache_append_q4_0(
+    device const float* new_data [[buffer(0)]],
+    device uchar* cache [[buffer(1)]],
+    constant uint& num_kv_heads [[buffer(2)]],
+    constant uint& head_dim [[buffer(3)]],
+    constant uint& capacity [[buffer(4)]],
+    constant uint& cur_seq [[buffer(5)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    uint groups_per_row = head_dim / 32;
+    uint total_groups = num_kv_heads * groups_per_row;
+    if (gid >= total_groups) return;
+
+    uint h = gid / groups_per_row;
+    uint g = gid % groups_per_row;
+    uint row_bytes = groups_per_row * 18;
+
+    float max_abs = 0.0f;
+    for (uint d = 0; d < 32; d++) {
+        float val = new_data[h * head_dim + g * 32 + d];
+        float a = fabs(val);
+        if (a > max_abs) max_abs = a;
+    }
+
+    float scale = max_abs / 7.0f;
+    if (max_abs == 0.0f) scale = 1.0f;
+    float inv_scale = 1.0f / scale;
+
+    half scale_h = half(scale);
+    uint base_offset = h * capacity * row_bytes + cur_seq * row_bytes + g * 18;
+    *reinterpret_cast<device half*>(&cache[base_offset]) = scale_h;
+
+    for (uint i = 0; i < 16; i++) {
+        float v0 = new_data[h * head_dim + g * 32 + i * 2];
+        float v1 = new_data[h * head_dim + g * 32 + i * 2 + 1];
+        int q0 = clamp(int(round(v0 * inv_scale)) + 8, 0, 15);
+        int q1 = clamp(int(round(v1 * inv_scale)) + 8, 0, 15);
+        cache[base_offset + 2 + i] = uchar(q0 | (q1 << 4));
+    }
+}
+
+// ─── Q8_0 KV Cache Batch Append ──────────────────────────────────────────────
+
+kernel void kv_cache_batch_append_q8_0(
+    device const float* new_data [[buffer(0)]],
+    device uchar* cache [[buffer(1)]],
+    constant uint& num_kv_heads [[buffer(2)]],
+    constant uint& head_dim [[buffer(3)]],
+    constant uint& capacity [[buffer(4)]],
+    constant uint& cur_seq [[buffer(5)]],
+    constant uint& seq_len [[buffer(6)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    uint groups_per_row = head_dim / 32;
+    uint total = num_kv_heads * seq_len * groups_per_row;
+    if (gid >= total) return;
+
+    uint h = gid / (seq_len * groups_per_row);
+    uint remainder = gid % (seq_len * groups_per_row);
+    uint s = remainder / groups_per_row;
+    uint g = remainder % groups_per_row;
+    uint row_bytes = groups_per_row * 34;
+
+    float max_abs = 0.0f;
+    for (uint d = 0; d < 32; d++) {
+        float val = new_data[h * seq_len * head_dim + s * head_dim + g * 32 + d];
+        float a = fabs(val);
+        if (a > max_abs) max_abs = a;
+    }
+
+    float scale = max_abs / 127.0f;
+    if (max_abs == 0.0f) scale = 1.0f;
+    float inv_scale = 1.0f / scale;
+
+    half scale_h = half(scale);
+    uint base_offset = h * capacity * row_bytes + (cur_seq + s) * row_bytes + g * 34;
+    *reinterpret_cast<device half*>(&cache[base_offset]) = scale_h;
+
+    for (uint d = 0; d < 32; d++) {
+        float val = new_data[h * seq_len * head_dim + s * head_dim + g * 32 + d];
+        int q = clamp(int(round(val * inv_scale)), -128, 127);
+        cache[base_offset + 2 + d] = uchar(q);
+    }
+}
+
+// ─── Q8_0 KV Cache Batch Append Strided ──────────────────────────────────────
+
+kernel void kv_cache_batch_append_strided_q8_0(
+    device const float* new_data [[buffer(0)]],
+    device uchar* cache [[buffer(1)]],
+    constant uint& num_kv_heads [[buffer(2)]],
+    constant uint& head_dim [[buffer(3)]],
+    constant uint& capacity [[buffer(4)]],
+    constant uint& cur_seq [[buffer(5)]],
+    constant uint& seq_len [[buffer(6)]],
+    constant uint& source_seq_stride [[buffer(7)]],
+    constant uint& source_start [[buffer(8)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    uint groups_per_row = head_dim / 32;
+    uint total = num_kv_heads * seq_len * groups_per_row;
+    if (gid >= total) return;
+
+    uint h = gid / (seq_len * groups_per_row);
+    uint remainder = gid % (seq_len * groups_per_row);
+    uint s = remainder / groups_per_row;
+    uint g = remainder % groups_per_row;
+    uint row_bytes = groups_per_row * 34;
+
+    float max_abs = 0.0f;
+    for (uint d = 0; d < 32; d++) {
+        float val = new_data[h * source_seq_stride * head_dim + (source_start + s) * head_dim + g * 32 + d];
+        float a = fabs(val);
+        if (a > max_abs) max_abs = a;
+    }
+
+    float scale = max_abs / 127.0f;
+    if (max_abs == 0.0f) scale = 1.0f;
+    float inv_scale = 1.0f / scale;
+
+    half scale_h = half(scale);
+    uint base_offset = h * capacity * row_bytes + (cur_seq + s) * row_bytes + g * 34;
+    *reinterpret_cast<device half*>(&cache[base_offset]) = scale_h;
+
+    for (uint d = 0; d < 32; d++) {
+        float val = new_data[h * source_seq_stride * head_dim + (source_start + s) * head_dim + g * 32 + d];
+        int q = clamp(int(round(val * inv_scale)), -128, 127);
+        cache[base_offset + 2 + d] = uchar(q);
+    }
+}
+
+// ─── Q4_0 KV Cache Batch Append ──────────────────────────────────────────────
+
+kernel void kv_cache_batch_append_q4_0(
+    device const float* new_data [[buffer(0)]],
+    device uchar* cache [[buffer(1)]],
+    constant uint& num_kv_heads [[buffer(2)]],
+    constant uint& head_dim [[buffer(3)]],
+    constant uint& capacity [[buffer(4)]],
+    constant uint& cur_seq [[buffer(5)]],
+    constant uint& seq_len [[buffer(6)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    uint groups_per_row = head_dim / 32;
+    uint total = num_kv_heads * seq_len * groups_per_row;
+    if (gid >= total) return;
+
+    uint h = gid / (seq_len * groups_per_row);
+    uint remainder = gid % (seq_len * groups_per_row);
+    uint s = remainder / groups_per_row;
+    uint g = remainder % groups_per_row;
+    uint row_bytes = groups_per_row * 18;
+
+    float max_abs = 0.0f;
+    for (uint d = 0; d < 32; d++) {
+        float val = new_data[h * seq_len * head_dim + s * head_dim + g * 32 + d];
+        float a = fabs(val);
+        if (a > max_abs) max_abs = a;
+    }
+
+    float scale = max_abs / 7.0f;
+    if (max_abs == 0.0f) scale = 1.0f;
+    float inv_scale = 1.0f / scale;
+
+    half scale_h = half(scale);
+    uint base_offset = h * capacity * row_bytes + (cur_seq + s) * row_bytes + g * 18;
+    *reinterpret_cast<device half*>(&cache[base_offset]) = scale_h;
+
+    for (uint i = 0; i < 16; i++) {
+        float v0 = new_data[h * seq_len * head_dim + s * head_dim + g * 32 + i * 2];
+        float v1 = new_data[h * seq_len * head_dim + s * head_dim + g * 32 + i * 2 + 1];
+        int q0 = clamp(int(round(v0 * inv_scale)) + 8, 0, 15);
+        int q1 = clamp(int(round(v1 * inv_scale)) + 8, 0, 15);
+        cache[base_offset + 2 + i] = uchar(q0 | (q1 << 4));
+    }
+}
+
+// ─── Q4_0 KV Cache Batch Append Strided ──────────────────────────────────────
+
+kernel void kv_cache_batch_append_strided_q4_0(
+    device const float* new_data [[buffer(0)]],
+    device uchar* cache [[buffer(1)]],
+    constant uint& num_kv_heads [[buffer(2)]],
+    constant uint& head_dim [[buffer(3)]],
+    constant uint& capacity [[buffer(4)]],
+    constant uint& cur_seq [[buffer(5)]],
+    constant uint& seq_len [[buffer(6)]],
+    constant uint& source_seq_stride [[buffer(7)]],
+    constant uint& source_start [[buffer(8)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    uint groups_per_row = head_dim / 32;
+    uint total = num_kv_heads * seq_len * groups_per_row;
+    if (gid >= total) return;
+
+    uint h = gid / (seq_len * groups_per_row);
+    uint remainder = gid % (seq_len * groups_per_row);
+    uint s = remainder / groups_per_row;
+    uint g = remainder % groups_per_row;
+    uint row_bytes = groups_per_row * 18;
+
+    float max_abs = 0.0f;
+    for (uint d = 0; d < 32; d++) {
+        float val = new_data[h * source_seq_stride * head_dim + (source_start + s) * head_dim + g * 32 + d];
+        float a = fabs(val);
+        if (a > max_abs) max_abs = a;
+    }
+
+    float scale = max_abs / 7.0f;
+    if (max_abs == 0.0f) scale = 1.0f;
+    float inv_scale = 1.0f / scale;
+
+    half scale_h = half(scale);
+    uint base_offset = h * capacity * row_bytes + (cur_seq + s) * row_bytes + g * 18;
+    *reinterpret_cast<device half*>(&cache[base_offset]) = scale_h;
+
+    for (uint i = 0; i < 16; i++) {
+        float v0 = new_data[h * source_seq_stride * head_dim + (source_start + s) * head_dim + g * 32 + i * 2];
+        float v1 = new_data[h * source_seq_stride * head_dim + (source_start + s) * head_dim + g * 32 + i * 2 + 1];
+        int q0 = clamp(int(round(v0 * inv_scale)) + 8, 0, 15);
+        int q1 = clamp(int(round(v1 * inv_scale)) + 8, 0, 15);
+        cache[base_offset + 2 + i] = uchar(q0 | (q1 << 4));
+    }
+}
+
+// ─── Q8_0 Dequantization Helper ──────────────────────────────────────────────
+
+inline float q8_0_read(device const uchar* cache, uint head_base, uint pos, uint row_bytes, uint d) {
+    uint g = d / 32;
+    uint d_in_group = d % 32;
+    uint offset = head_base + pos * row_bytes + g * 34;
+    float scale = float(*reinterpret_cast<device const half*>(&cache[offset]));
+    return float(reinterpret_cast<device const int8_t*>(&cache[offset + 2])[d_in_group]) * scale;
+}
+
+// ─── Q4_0 Dequantization Helper ──────────────────────────────────────────────
+
+inline float q4_0_read(device const uchar* cache, uint head_base, uint pos, uint row_bytes, uint d) {
+    uint g = d / 32;
+    uint d_in_group = d % 32;
+    uint offset = head_base + pos * row_bytes + g * 18;
+    float scale = float(*reinterpret_cast<device const half*>(&cache[offset]));
+    uint byte_idx = d_in_group / 2;
+    uchar packed = cache[offset + 2 + byte_idx];
+    if (d_in_group & 1) {
+        return float(int(packed >> 4) - 8) * scale;
+    } else {
+        return float(int(packed & 0xF) - 8) * scale;
+    }
+}
+
+// ─── Attention with Q8_0 KV cache (single token offset) ──────────────────────
+
+kernel void attention_single_token_offset_q8_0(
+    device const float* Q [[buffer(0)]],
+    device const uchar* K_cache [[buffer(1)]],
+    device const uchar* V_cache [[buffer(2)]],
+    device float* output [[buffer(3)]],
+    constant uint& num_heads [[buffer(4)]],
+    constant uint& num_kv_heads [[buffer(5)]],
+    constant uint& num_kv_groups [[buffer(6)]],
+    constant uint& head_dim [[buffer(7)]],
+    constant uint& kv_seq [[buffer(8)]],
+    constant uint& capacity [[buffer(9)]],
+    constant float& scale [[buffer(10)]],
+    constant uint& kv_start [[buffer(11)]],
+    constant uint& groups_per_row [[buffer(12)]],
+    constant uint& row_bytes [[buffer(13)]],
+    uint tid [[thread_index_in_threadgroup]],
+    uint tg_size [[threads_per_threadgroup]],
+    uint tgid [[threadgroup_position_in_grid]]
+) {
+    uint h = tgid;
+    if (h >= num_heads) return;
+
+    uint kv_h = h / num_kv_groups;
+    uint q_offset = h * head_dim;
+    uint k_head_base = kv_h * capacity * row_bytes;
+    uint v_head_base = kv_h * capacity * row_bytes;
+
+    threadgroup float shared_dot[256];
+    threadgroup float shared_update[4];
+
+    if (tid == 0) {
+        shared_update[0] = -INFINITY;
+        shared_update[1] = 0.0f;
+    }
+    for (uint d = tid; d < head_dim; d += tg_size) {
+        output[q_offset + d] = 0.0f;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint kv = 0; kv < kv_seq; kv++) {
+        uint actual_pos = kv_start + kv;
+        float partial_dot = 0.0f;
+        for (uint d = tid; d < head_dim; d += tg_size) {
+            partial_dot += Q[q_offset + d] * q8_0_read(K_cache, k_head_base, actual_pos, row_bytes, d);
+        }
+        shared_dot[tid] = partial_dot;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        for (uint stride = tg_size / 2; stride > 0; stride >>= 1) {
+            if (tid < stride) {
+                shared_dot[tid] += shared_dot[tid + stride];
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+
+        if (tid == 0) {
+            float m = shared_update[0];
+            float l = shared_update[1];
+            float score = shared_dot[0] * scale;
+            float new_m = max(m, score);
+            float alpha = exp(m - new_m);
+            float beta = exp(score - new_m);
+            float new_l = l * alpha + beta;
+            shared_update[0] = new_m;
+            shared_update[1] = new_l;
+            shared_update[2] = new_l > 0.0f ? (l * alpha) / new_l : 0.0f;
+            shared_update[3] = new_l > 0.0f ? beta / new_l : 0.0f;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        float old_factor = shared_update[2];
+        float new_factor = shared_update[3];
+        for (uint d = tid; d < head_dim; d += tg_size) {
+            uint out_idx = q_offset + d;
+            output[out_idx] = output[out_idx] * old_factor
+                + new_factor * q8_0_read(V_cache, v_head_base, actual_pos, row_bytes, d);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+}
+
+// ─── Causal Multi-Token Attention with Q8_0 KV cache ─────────────────────────
+
+kernel void attention_causal_q8_0(
+    device const float* Q [[buffer(0)]],
+    device const uchar* K_cache [[buffer(1)]],
+    device const uchar* V_cache [[buffer(2)]],
+    device float* output [[buffer(3)]],
+    constant uint& num_heads [[buffer(4)]],
+    constant uint& num_kv_heads [[buffer(5)]],
+    constant uint& num_kv_groups [[buffer(6)]],
+    constant uint& head_dim [[buffer(7)]],
+    constant uint& kv_seq [[buffer(8)]],
+    constant uint& capacity [[buffer(9)]],
+    constant float& scale [[buffer(10)]],
+    constant uint& q_len [[buffer(11)]],
+    constant uint& q_start [[buffer(12)]],
+    constant uint& attention_window [[buffer(13)]],
+    constant uint& groups_per_row [[buffer(14)]],
+    constant uint& row_bytes [[buffer(15)]],
+    uint tid [[thread_index_in_threadgroup]],
+    uint tg_size [[threads_per_threadgroup]],
+    uint tgid [[threadgroup_position_in_grid]]
+) {
+    uint h = tgid / q_len;
+    uint qi = tgid % q_len;
+    if (h >= num_heads) return;
+
+    uint kv_h = h / num_kv_groups;
+    uint q_offset = (h * q_len + qi) * head_dim;
+    uint k_head_base = kv_h * capacity * row_bytes;
+    uint v_head_base = kv_h * capacity * row_bytes;
+    uint attend_len = min(q_start + qi + 1, kv_seq);
+    uint attend_start = 0;
+    if (attention_window > 0 && attend_len > attention_window) {
+        attend_start = attend_len - attention_window;
+    }
+
+    threadgroup float shared_dot[256];
+    threadgroup float shared_update[4];
+
+    uint out_offset = (h * q_len + qi) * head_dim;
+    if (tid == 0) {
+        shared_update[0] = -INFINITY;
+        shared_update[1] = 0.0f;
+    }
+    for (uint d = tid; d < head_dim; d += tg_size) {
+        output[out_offset + d] = 0.0f;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint kv = attend_start; kv < attend_len; kv++) {
+        float partial_dot = 0.0f;
+        for (uint d = tid; d < head_dim; d += tg_size) {
+            partial_dot += Q[q_offset + d] * q8_0_read(K_cache, k_head_base, kv, row_bytes, d);
+        }
+        shared_dot[tid] = partial_dot;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        for (uint stride = tg_size / 2; stride > 0; stride >>= 1) {
+            if (tid < stride) {
+                shared_dot[tid] += shared_dot[tid + stride];
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+
+        if (tid == 0) {
+            float m = shared_update[0];
+            float l = shared_update[1];
+            float score = shared_dot[0] * scale;
+            float new_m = max(m, score);
+            float alpha = exp(m - new_m);
+            float beta = exp(score - new_m);
+            float new_l = l * alpha + beta;
+            shared_update[0] = new_m;
+            shared_update[1] = new_l;
+            shared_update[2] = new_l > 0.0f ? (l * alpha) / new_l : 0.0f;
+            shared_update[3] = new_l > 0.0f ? beta / new_l : 0.0f;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        float old_factor = shared_update[2];
+        float new_factor = shared_update[3];
+        for (uint d = tid; d < head_dim; d += tg_size) {
+            uint out_idx = out_offset + d;
+            output[out_idx] = output[out_idx] * old_factor
+                + new_factor * q8_0_read(V_cache, v_head_base, kv, row_bytes, d);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+}
+
+// ─── Strided Causal Attention with Q8_0 KV cache ────────────────────────────
+
+kernel void attention_causal_strided_q8_0(
+    device const float* Q [[buffer(0)]],
+    device const uchar* K_cache [[buffer(1)]],
+    device const uchar* V_cache [[buffer(2)]],
+    device float* output [[buffer(3)]],
+    constant uint& num_heads [[buffer(4)]],
+    constant uint& num_kv_heads [[buffer(5)]],
+    constant uint& num_kv_groups [[buffer(6)]],
+    constant uint& head_dim [[buffer(7)]],
+    constant uint& kv_seq [[buffer(8)]],
+    constant uint& capacity [[buffer(9)]],
+    constant float& scale [[buffer(10)]],
+    constant uint& q_len [[buffer(11)]],
+    constant uint& q_pos_start [[buffer(12)]],
+    constant uint& attention_window [[buffer(13)]],
+    constant uint& q_stride [[buffer(14)]],
+    constant uint& q_start_row [[buffer(15)]],
+    constant uint& groups_per_row [[buffer(16)]],
+    constant uint& row_bytes [[buffer(17)]],
+    uint tid [[thread_index_in_threadgroup]],
+    uint tg_size [[threads_per_threadgroup]],
+    uint tgid [[threadgroup_position_in_grid]]
+) {
+    uint h = tgid / q_len;
+    uint qi = tgid % q_len;
+    if (h >= num_heads) return;
+
+    uint kv_h = h / num_kv_groups;
+    uint q_row = q_start_row + qi;
+    uint q_offset = (h * q_stride + q_row) * head_dim;
+    uint k_head_base = kv_h * capacity * row_bytes;
+    uint v_head_base = kv_h * capacity * row_bytes;
+    uint attend_len = min(q_pos_start + qi + 1, kv_seq);
+    uint attend_start = 0;
+    if (attention_window > 0 && attend_len > attention_window) {
+        attend_start = attend_len - attention_window;
+    }
+
+    threadgroup float shared_dot[256];
+    threadgroup float shared_update[4];
+
+    uint out_offset = (h * q_stride + q_row) * head_dim;
+    if (tid == 0) {
+        shared_update[0] = -INFINITY;
+        shared_update[1] = 0.0f;
+    }
+    for (uint d = tid; d < head_dim; d += tg_size) {
+        output[out_offset + d] = 0.0f;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint kv = attend_start; kv < attend_len; kv++) {
+        float partial_dot = 0.0f;
+        for (uint d = tid; d < head_dim; d += tg_size) {
+            partial_dot += Q[q_offset + d] * q8_0_read(K_cache, k_head_base, kv, row_bytes, d);
+        }
+        shared_dot[tid] = partial_dot;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        for (uint stride = tg_size / 2; stride > 0; stride >>= 1) {
+            if (tid < stride) {
+                shared_dot[tid] += shared_dot[tid + stride];
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+
+        if (tid == 0) {
+            float m = shared_update[0];
+            float l = shared_update[1];
+            float score = shared_dot[0] * scale;
+            float new_m = max(m, score);
+            float alpha = exp(m - new_m);
+            float beta = exp(score - new_m);
+            float new_l = l * alpha + beta;
+            shared_update[0] = new_m;
+            shared_update[1] = new_l;
+            shared_update[2] = new_l > 0.0f ? (l * alpha) / new_l : 0.0f;
+            shared_update[3] = new_l > 0.0f ? beta / new_l : 0.0f;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        float old_factor = shared_update[2];
+        float new_factor = shared_update[3];
+        for (uint d = tid; d < head_dim; d += tg_size) {
+            uint out_idx = out_offset + d;
+            output[out_idx] = output[out_idx] * old_factor
+                + new_factor * q8_0_read(V_cache, v_head_base, kv, row_bytes, d);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+}
+
+// ─── Attention with Q4_0 KV cache (single token offset) ──────────────────────
+
+kernel void attention_single_token_offset_q4_0(
+    device const float* Q [[buffer(0)]],
+    device const uchar* K_cache [[buffer(1)]],
+    device const uchar* V_cache [[buffer(2)]],
+    device float* output [[buffer(3)]],
+    constant uint& num_heads [[buffer(4)]],
+    constant uint& num_kv_heads [[buffer(5)]],
+    constant uint& num_kv_groups [[buffer(6)]],
+    constant uint& head_dim [[buffer(7)]],
+    constant uint& kv_seq [[buffer(8)]],
+    constant uint& capacity [[buffer(9)]],
+    constant float& scale [[buffer(10)]],
+    constant uint& kv_start [[buffer(11)]],
+    constant uint& groups_per_row [[buffer(12)]],
+    constant uint& row_bytes [[buffer(13)]],
+    uint tid [[thread_index_in_threadgroup]],
+    uint tg_size [[threads_per_threadgroup]],
+    uint tgid [[threadgroup_position_in_grid]]
+) {
+    uint h = tgid;
+    if (h >= num_heads) return;
+
+    uint kv_h = h / num_kv_groups;
+    uint q_offset = h * head_dim;
+    uint k_head_base = kv_h * capacity * row_bytes;
+    uint v_head_base = kv_h * capacity * row_bytes;
+
+    threadgroup float shared_dot[256];
+    threadgroup float shared_update[4];
+
+    if (tid == 0) {
+        shared_update[0] = -INFINITY;
+        shared_update[1] = 0.0f;
+    }
+    for (uint d = tid; d < head_dim; d += tg_size) {
+        output[q_offset + d] = 0.0f;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint kv = 0; kv < kv_seq; kv++) {
+        uint actual_pos = kv_start + kv;
+        float partial_dot = 0.0f;
+        for (uint d = tid; d < head_dim; d += tg_size) {
+            partial_dot += Q[q_offset + d] * q4_0_read(K_cache, k_head_base, actual_pos, row_bytes, d);
+        }
+        shared_dot[tid] = partial_dot;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        for (uint stride = tg_size / 2; stride > 0; stride >>= 1) {
+            if (tid < stride) {
+                shared_dot[tid] += shared_dot[tid + stride];
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+
+        if (tid == 0) {
+            float m = shared_update[0];
+            float l = shared_update[1];
+            float score = shared_dot[0] * scale;
+            float new_m = max(m, score);
+            float alpha = exp(m - new_m);
+            float beta = exp(score - new_m);
+            float new_l = l * alpha + beta;
+            shared_update[0] = new_m;
+            shared_update[1] = new_l;
+            shared_update[2] = new_l > 0.0f ? (l * alpha) / new_l : 0.0f;
+            shared_update[3] = new_l > 0.0f ? beta / new_l : 0.0f;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        float old_factor = shared_update[2];
+        float new_factor = shared_update[3];
+        for (uint d = tid; d < head_dim; d += tg_size) {
+            uint out_idx = q_offset + d;
+            output[out_idx] = output[out_idx] * old_factor
+                + new_factor * q4_0_read(V_cache, v_head_base, actual_pos, row_bytes, d);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+}
+
+// ─── Causal Multi-Token Attention with Q4_0 KV cache ─────────────────────────
+
+kernel void attention_causal_q4_0(
+    device const float* Q [[buffer(0)]],
+    device const uchar* K_cache [[buffer(1)]],
+    device const uchar* V_cache [[buffer(2)]],
+    device float* output [[buffer(3)]],
+    constant uint& num_heads [[buffer(4)]],
+    constant uint& num_kv_heads [[buffer(5)]],
+    constant uint& num_kv_groups [[buffer(6)]],
+    constant uint& head_dim [[buffer(7)]],
+    constant uint& kv_seq [[buffer(8)]],
+    constant uint& capacity [[buffer(9)]],
+    constant float& scale [[buffer(10)]],
+    constant uint& q_len [[buffer(11)]],
+    constant uint& q_start [[buffer(12)]],
+    constant uint& attention_window [[buffer(13)]],
+    constant uint& groups_per_row [[buffer(14)]],
+    constant uint& row_bytes [[buffer(15)]],
+    uint tid [[thread_index_in_threadgroup]],
+    uint tg_size [[threads_per_threadgroup]],
+    uint tgid [[threadgroup_position_in_grid]]
+) {
+    uint h = tgid / q_len;
+    uint qi = tgid % q_len;
+    if (h >= num_heads) return;
+
+    uint kv_h = h / num_kv_groups;
+    uint q_offset = (h * q_len + qi) * head_dim;
+    uint k_head_base = kv_h * capacity * row_bytes;
+    uint v_head_base = kv_h * capacity * row_bytes;
+    uint attend_len = min(q_start + qi + 1, kv_seq);
+    uint attend_start = 0;
+    if (attention_window > 0 && attend_len > attention_window) {
+        attend_start = attend_len - attention_window;
+    }
+
+    threadgroup float shared_dot[256];
+    threadgroup float shared_update[4];
+
+    uint out_offset = (h * q_len + qi) * head_dim;
+    if (tid == 0) {
+        shared_update[0] = -INFINITY;
+        shared_update[1] = 0.0f;
+    }
+    for (uint d = tid; d < head_dim; d += tg_size) {
+        output[out_offset + d] = 0.0f;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint kv = attend_start; kv < attend_len; kv++) {
+        float partial_dot = 0.0f;
+        for (uint d = tid; d < head_dim; d += tg_size) {
+            partial_dot += Q[q_offset + d] * q4_0_read(K_cache, k_head_base, kv, row_bytes, d);
+        }
+        shared_dot[tid] = partial_dot;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        for (uint stride = tg_size / 2; stride > 0; stride >>= 1) {
+            if (tid < stride) {
+                shared_dot[tid] += shared_dot[tid + stride];
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+
+        if (tid == 0) {
+            float m = shared_update[0];
+            float l = shared_update[1];
+            float score = shared_dot[0] * scale;
+            float new_m = max(m, score);
+            float alpha = exp(m - new_m);
+            float beta = exp(score - new_m);
+            float new_l = l * alpha + beta;
+            shared_update[0] = new_m;
+            shared_update[1] = new_l;
+            shared_update[2] = new_l > 0.0f ? (l * alpha) / new_l : 0.0f;
+            shared_update[3] = new_l > 0.0f ? beta / new_l : 0.0f;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        float old_factor = shared_update[2];
+        float new_factor = shared_update[3];
+        for (uint d = tid; d < head_dim; d += tg_size) {
+            uint out_idx = out_offset + d;
+            output[out_idx] = output[out_idx] * old_factor
+                + new_factor * q4_0_read(V_cache, v_head_base, kv, row_bytes, d);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+}
+
+// ─── Strided Causal Attention with Q4_0 KV cache ─────────────────────────────
+
+kernel void attention_causal_strided_q4_0(
+    device const float* Q [[buffer(0)]],
+    device const uchar* K_cache [[buffer(1)]],
+    device const uchar* V_cache [[buffer(2)]],
+    device float* output [[buffer(3)]],
+    constant uint& num_heads [[buffer(4)]],
+    constant uint& num_kv_heads [[buffer(5)]],
+    constant uint& num_kv_groups [[buffer(6)]],
+    constant uint& head_dim [[buffer(7)]],
+    constant uint& kv_seq [[buffer(8)]],
+    constant uint& capacity [[buffer(9)]],
+    constant float& scale [[buffer(10)]],
+    constant uint& q_len [[buffer(11)]],
+    constant uint& q_pos_start [[buffer(12)]],
+    constant uint& attention_window [[buffer(13)]],
+    constant uint& q_stride [[buffer(14)]],
+    constant uint& q_start_row [[buffer(15)]],
+    constant uint& groups_per_row [[buffer(16)]],
+    constant uint& row_bytes [[buffer(17)]],
+    uint tid [[thread_index_in_threadgroup]],
+    uint tg_size [[threads_per_threadgroup]],
+    uint tgid [[threadgroup_position_in_grid]]
+) {
+    uint h = tgid / q_len;
+    uint qi = tgid % q_len;
+    if (h >= num_heads) return;
+
+    uint kv_h = h / num_kv_groups;
+    uint q_row = q_start_row + qi;
+    uint q_offset = (h * q_stride + q_row) * head_dim;
+    uint k_head_base = kv_h * capacity * row_bytes;
+    uint v_head_base = kv_h * capacity * row_bytes;
+    uint attend_len = min(q_pos_start + qi + 1, kv_seq);
+    uint attend_start = 0;
+    if (attention_window > 0 && attend_len > attention_window) {
+        attend_start = attend_len - attention_window;
+    }
+
+    threadgroup float shared_dot[256];
+    threadgroup float shared_update[4];
+
+    uint out_offset = (h * q_stride + q_row) * head_dim;
+    if (tid == 0) {
+        shared_update[0] = -INFINITY;
+        shared_update[1] = 0.0f;
+    }
+    for (uint d = tid; d < head_dim; d += tg_size) {
+        output[out_offset + d] = 0.0f;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint kv = attend_start; kv < attend_len; kv++) {
+        float partial_dot = 0.0f;
+        for (uint d = tid; d < head_dim; d += tg_size) {
+            partial_dot += Q[q_offset + d] * q4_0_read(K_cache, k_head_base, kv, row_bytes, d);
+        }
+        shared_dot[tid] = partial_dot;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        for (uint stride = tg_size / 2; stride > 0; stride >>= 1) {
+            if (tid < stride) {
+                shared_dot[tid] += shared_dot[tid + stride];
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+
+        if (tid == 0) {
+            float m = shared_update[0];
+            float l = shared_update[1];
+            float score = shared_dot[0] * scale;
+            float new_m = max(m, score);
+            float alpha = exp(m - new_m);
+            float beta = exp(score - new_m);
+            float new_l = l * alpha + beta;
+            shared_update[0] = new_m;
+            shared_update[1] = new_l;
+            shared_update[2] = new_l > 0.0f ? (l * alpha) / new_l : 0.0f;
+            shared_update[3] = new_l > 0.0f ? beta / new_l : 0.0f;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        float old_factor = shared_update[2];
+        float new_factor = shared_update[3];
+        for (uint d = tid; d < head_dim; d += tg_size) {
+            uint out_idx = out_offset + d;
+            output[out_idx] = output[out_idx] * old_factor
+                + new_factor * q4_0_read(V_cache, v_head_base, kv, row_bytes, d);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+}
+
 // ─── Transpose: (seq, heads, head_dim) → (heads, seq, head_dim) ─────────────
 
 kernel void transpose_shd_to_hsd(

@@ -6,7 +6,7 @@ use std::path::Path;
 use safetensors::SafeTensors;
 use serde::Deserialize;
 
-use crate::gemma4_config::Gemma4TextConfig;
+use crate::gemma4_config::{Gemma4TextConfig, KvCacheType};
 use crate::gpu::MetalContext;
 use crate::kv_pool::{KvCachePool, KvPoolError, KvSlot, KvSlotView};
 
@@ -79,6 +79,7 @@ pub struct Gemma4GpuModel {
     pub v_cache: Vec<Buffer>,
     pub kv_seq_len: u32,
     pub kv_capacity: u32,
+    pub kv_cache_type: KvCacheType,
 
     // Rotary precomputed buffers (per-layer since sliding/full differ)
     pub cos_buf: Buffer,
@@ -677,12 +678,15 @@ impl Gemma4GpuModel {
         let k_normed_buf = ctx.buffer_empty(max_kv_out);
 
         // KV cache: f16 precision to halve memory bandwidth
+        let kv_cache_type = KvCacheType::from_env();
         let kv_capacity = config.max_position_embeddings.min(4096) as u32;
         let mut k_cache = Vec::with_capacity(num_layers);
         let mut v_cache = Vec::with_capacity(num_layers);
         for i in 0..num_layers {
             let hd = config.layer_head_dim(i);
-            let byte_len = (num_kv_heads * kv_capacity as usize * hd * 2) as u64; // f16 = 2 bytes
+            assert!(hd % 32 == 0, "head_dim must be a multiple of 32 for quantized KV cache");
+            let bytes_per_row = kv_cache_type.bytes_per_row(hd);
+            let byte_len = (num_kv_heads * kv_capacity as usize * bytes_per_row) as u64;
             k_cache.push(
                 ctx.device
                     .new_buffer(byte_len, MTLResourceOptions::StorageModeShared),
@@ -692,6 +696,14 @@ impl Gemma4GpuModel {
                     .new_buffer(byte_len, MTLResourceOptions::StorageModeShared),
             );
         }
+        let f16_bytes = num_kv_heads * kv_capacity as usize * config.head_dim * 2 + num_kv_heads * kv_capacity as usize * config.global_head_dim * 2;
+        let quant_bytes = num_kv_heads * kv_capacity as usize * kv_cache_type.bytes_per_row(config.head_dim) + num_kv_heads * kv_capacity as usize * kv_cache_type.bytes_per_row(config.global_head_dim);
+        println!("  KV cache type: {}, est. memory per layer: {:.1} MB (vs f16: {:.1} MB, {:.0}% savings)",
+            kv_cache_type,
+            quant_bytes as f64 / num_layers as f64 / 1024.0 / 1024.0,
+            f16_bytes as f64 / num_layers as f64 / 1024.0 / 1024.0,
+            (1.0 - quant_bytes as f64 / f16_bytes as f64) * 100.0,
+        );
         let max_prefill_seq = configured_max_prefill_seq(kv_capacity);
         let prefill_scratch = PrefillScratch::new(
             &ctx,
@@ -794,6 +806,7 @@ impl Gemma4GpuModel {
             v_cache,
             kv_seq_len: 0,
             kv_capacity,
+            kv_cache_type,
             cos_buf,
             sin_buf,
             per_layer_cos_bufs,
@@ -1115,12 +1128,15 @@ impl Gemma4GpuModel {
         let q_normed_buf = ctx.buffer_empty(max_q_out);
         let k_normed_buf = ctx.buffer_empty(max_kv_out);
 
+        let kv_cache_type = KvCacheType::from_env();
         let kv_capacity = config.max_position_embeddings.min(4096) as u32;
         let mut k_cache = Vec::with_capacity(num_layers);
         let mut v_cache = Vec::with_capacity(num_layers);
         for i in 0..num_layers {
             let hd = config.layer_head_dim(i);
-            let byte_len = (num_kv_heads * kv_capacity as usize * hd * 2) as u64;
+            assert!(hd % 32 == 0, "head_dim must be a multiple of 32 for quantized KV cache");
+            let bytes_per_row = kv_cache_type.bytes_per_row(hd);
+            let byte_len = (num_kv_heads * kv_capacity as usize * bytes_per_row) as u64;
             k_cache.push(
                 ctx.device
                     .new_buffer(byte_len, MTLResourceOptions::StorageModeShared),
@@ -1130,6 +1146,14 @@ impl Gemma4GpuModel {
                     .new_buffer(byte_len, MTLResourceOptions::StorageModeShared),
             );
         }
+        let f16_bytes = num_kv_heads * kv_capacity as usize * config.head_dim * 2 + num_kv_heads * kv_capacity as usize * config.global_head_dim * 2;
+        let quant_bytes = num_kv_heads * kv_capacity as usize * kv_cache_type.bytes_per_row(config.head_dim) + num_kv_heads * kv_capacity as usize * kv_cache_type.bytes_per_row(config.global_head_dim);
+        println!("  KV cache type: {}, est. memory per layer: {:.1} MB (vs f16: {:.1} MB, {:.0}% savings)",
+            kv_cache_type,
+            quant_bytes as f64 / num_layers as f64 / 1024.0 / 1024.0,
+            f16_bytes as f64 / num_layers as f64 / 1024.0 / 1024.0,
+            (1.0 - quant_bytes as f64 / f16_bytes as f64) * 100.0,
+        );
         let max_prefill_seq = configured_max_prefill_seq(kv_capacity);
         let prefill_scratch = PrefillScratch::new(
             &ctx,
@@ -1231,6 +1255,7 @@ impl Gemma4GpuModel {
             v_cache,
             kv_seq_len: 0,
             kv_capacity,
+            kv_cache_type,
             cos_buf,
             sin_buf,
             per_layer_cos_bufs,
@@ -1582,25 +1607,69 @@ impl Gemma4GpuModel {
                     eps,
                 );
 
-                // Append to this layer's cache (f16)
-                self.ctx.encode_kv_append_f16(
-                    encoder,
-                    &self.k_normed_buf,
-                    &self.k_cache[layer_idx],
-                    num_kv_heads as u32,
-                    head_dim as u32,
-                    self.kv_capacity,
-                    kv_seq,
-                );
-                self.ctx.encode_kv_append_f16(
-                    encoder,
-                    &self.gate_buf,
-                    &self.v_cache[layer_idx],
-                    num_kv_heads as u32,
-                    head_dim as u32,
-                    self.kv_capacity,
-                    kv_seq,
-                );
+                // Append to this layer's cache
+                match self.kv_cache_type {
+                    KvCacheType::F16 => {
+                        self.ctx.encode_kv_append_f16(
+                            encoder,
+                            &self.k_normed_buf,
+                            &self.k_cache[layer_idx],
+                            num_kv_heads as u32,
+                            head_dim as u32,
+                            self.kv_capacity,
+                            kv_seq,
+                        );
+                        self.ctx.encode_kv_append_f16(
+                            encoder,
+                            &self.gate_buf,
+                            &self.v_cache[layer_idx],
+                            num_kv_heads as u32,
+                            head_dim as u32,
+                            self.kv_capacity,
+                            kv_seq,
+                        );
+                    }
+                    KvCacheType::Q8_0 => {
+                        self.ctx.encode_kv_append_q8_0(
+                            encoder,
+                            &self.k_normed_buf,
+                            &self.k_cache[layer_idx],
+                            num_kv_heads as u32,
+                            head_dim as u32,
+                            self.kv_capacity,
+                            kv_seq,
+                        );
+                        self.ctx.encode_kv_append_q8_0(
+                            encoder,
+                            &self.gate_buf,
+                            &self.v_cache[layer_idx],
+                            num_kv_heads as u32,
+                            head_dim as u32,
+                            self.kv_capacity,
+                            kv_seq,
+                        );
+                    }
+                    KvCacheType::Q4_0 => {
+                        self.ctx.encode_kv_append_q4_0(
+                            encoder,
+                            &self.k_normed_buf,
+                            &self.k_cache[layer_idx],
+                            num_kv_heads as u32,
+                            head_dim as u32,
+                            self.kv_capacity,
+                            kv_seq,
+                        );
+                        self.ctx.encode_kv_append_q4_0(
+                            encoder,
+                            &self.gate_buf,
+                            &self.v_cache[layer_idx],
+                            num_kv_heads as u32,
+                            head_dim as u32,
+                            self.kv_capacity,
+                            kv_seq,
+                        );
+                    }
+                }
             }
 
             // Attention
@@ -1620,21 +1689,67 @@ impl Gemma4GpuModel {
                 0u32
             };
 
-            self.ctx.encode_attention_with_offset_f16(
-                encoder,
-                &self.q_normed_buf,
-                &self.k_cache[layer.kv_source_layer],
-                &self.v_cache[layer.kv_source_layer],
-                &self.attn_out_buf,
-                num_heads as u32,
-                num_kv_heads as u32,
-                num_kv_groups,
-                head_dim as u32,
-                effective_kv_seq,
-                self.kv_capacity,
-                scale,
-                kv_start,
-            );
+            match self.kv_cache_type {
+                KvCacheType::F16 => {
+                    self.ctx.encode_attention_with_offset_f16(
+                        encoder,
+                        &self.q_normed_buf,
+                        &self.k_cache[layer.kv_source_layer],
+                        &self.v_cache[layer.kv_source_layer],
+                        &self.attn_out_buf,
+                        num_heads as u32,
+                        num_kv_heads as u32,
+                        num_kv_groups,
+                        head_dim as u32,
+                        effective_kv_seq,
+                        self.kv_capacity,
+                        scale,
+                        kv_start,
+                    );
+                }
+                KvCacheType::Q8_0 => {
+                    let groups_per_row = (head_dim / 32) as u32;
+                    let row_bytes = groups_per_row * 34;
+                    self.ctx.encode_attention_with_offset_q8_0(
+                        encoder,
+                        &self.q_normed_buf,
+                        &self.k_cache[layer.kv_source_layer],
+                        &self.v_cache[layer.kv_source_layer],
+                        &self.attn_out_buf,
+                        num_heads as u32,
+                        num_kv_heads as u32,
+                        num_kv_groups,
+                        head_dim as u32,
+                        effective_kv_seq,
+                        self.kv_capacity,
+                        scale,
+                        kv_start,
+                        groups_per_row,
+                        row_bytes,
+                    );
+                }
+                KvCacheType::Q4_0 => {
+                    let groups_per_row = (head_dim / 32) as u32;
+                    let row_bytes = groups_per_row * 18;
+                    self.ctx.encode_attention_with_offset_q4_0(
+                        encoder,
+                        &self.q_normed_buf,
+                        &self.k_cache[layer.kv_source_layer],
+                        &self.v_cache[layer.kv_source_layer],
+                        &self.attn_out_buf,
+                        num_heads as u32,
+                        num_kv_heads as u32,
+                        num_kv_groups,
+                        head_dim as u32,
+                        effective_kv_seq,
+                        self.kv_capacity,
+                        scale,
+                        kv_start,
+                        groups_per_row,
+                        row_bytes,
+                    );
+                }
+            }
 
             // O projection (always f16 for quality)
             self.ctx.encode_matvec_f16(
@@ -1904,7 +2019,7 @@ impl Gemma4GpuModel {
 
     pub fn create_kv_pool(&self, num_slots: usize, max_seq_len: u32) -> KvCachePool {
         let max_seq_len = max_seq_len.min(self.config.max_position_embeddings as u32);
-        KvCachePool::new(&self.ctx, &self.config, num_slots, max_seq_len)
+        KvCachePool::new(&self.ctx, &self.config, num_slots, max_seq_len, self.kv_cache_type)
     }
 
     pub fn max_parallel_prefill_seq(&self) -> usize {
@@ -2559,26 +2674,74 @@ impl Gemma4GpuModel {
             let v_cache = kv_pool
                 .layer_v_cache(slot, layer_idx)
                 .map_err(|err| err.to_string())?;
-            self.ctx.encode_kv_batch_append_f16(
-                encoder,
-                &self.prefill_scratch.k_buf,
-                k_cache,
-                num_kv_heads as u32,
-                head_dim as u32,
-                kv_pool.capacity(),
-                start_pos as u32,
-                seq_len as u32,
-            );
-            self.ctx.encode_kv_batch_append_f16(
-                encoder,
-                &self.prefill_scratch.v_buf,
-                v_cache,
-                num_kv_heads as u32,
-                head_dim as u32,
-                kv_pool.capacity(),
-                start_pos as u32,
-                seq_len as u32,
-            );
+            match self.kv_cache_type {
+                KvCacheType::F16 => {
+                    self.ctx.encode_kv_batch_append_f16(
+                        encoder,
+                        &self.prefill_scratch.k_buf,
+                        k_cache,
+                        num_kv_heads as u32,
+                        head_dim as u32,
+                        kv_pool.capacity(),
+                        start_pos as u32,
+                        seq_len as u32,
+                    );
+                    self.ctx.encode_kv_batch_append_f16(
+                        encoder,
+                        &self.prefill_scratch.v_buf,
+                        v_cache,
+                        num_kv_heads as u32,
+                        head_dim as u32,
+                        kv_pool.capacity(),
+                        start_pos as u32,
+                        seq_len as u32,
+                    );
+                }
+                KvCacheType::Q8_0 => {
+                    self.ctx.encode_kv_batch_append_q8_0(
+                        encoder,
+                        &self.prefill_scratch.k_buf,
+                        k_cache,
+                        num_kv_heads as u32,
+                        head_dim as u32,
+                        kv_pool.capacity(),
+                        start_pos as u32,
+                        seq_len as u32,
+                    );
+                    self.ctx.encode_kv_batch_append_q8_0(
+                        encoder,
+                        &self.prefill_scratch.v_buf,
+                        v_cache,
+                        num_kv_heads as u32,
+                        head_dim as u32,
+                        kv_pool.capacity(),
+                        start_pos as u32,
+                        seq_len as u32,
+                    );
+                }
+                KvCacheType::Q4_0 => {
+                    self.ctx.encode_kv_batch_append_q4_0(
+                        encoder,
+                        &self.prefill_scratch.k_buf,
+                        k_cache,
+                        num_kv_heads as u32,
+                        head_dim as u32,
+                        kv_pool.capacity(),
+                        start_pos as u32,
+                        seq_len as u32,
+                    );
+                    self.ctx.encode_kv_batch_append_q4_0(
+                        encoder,
+                        &self.prefill_scratch.v_buf,
+                        v_cache,
+                        num_kv_heads as u32,
+                        head_dim as u32,
+                        kv_pool.capacity(),
+                        start_pos as u32,
+                        seq_len as u32,
+                    );
+                }
+            }
         }
 
         let k_cache = kv_pool
@@ -2587,23 +2750,73 @@ impl Gemma4GpuModel {
         let v_cache = kv_pool
             .layer_v_cache(slot, layer.kv_source_layer)
             .map_err(|err| err.to_string())?;
-        self.ctx.encode_attention_causal_f16(
-            encoder,
-            &self.prefill_scratch.q_buf,
-            k_cache,
-            v_cache,
-            &self.prefill_scratch.attn_out_buf,
-            num_heads as u32,
-            num_kv_heads as u32,
-            num_kv_groups,
-            head_dim as u32,
-            (start_pos + seq_len) as u32,
-            kv_pool.capacity(),
-            scale,
-            seq_len as u32,
-            start_pos as u32,
-            attention_window,
-        );
+        match self.kv_cache_type {
+            KvCacheType::F16 => {
+                self.ctx.encode_attention_causal_f16(
+                    encoder,
+                    &self.prefill_scratch.q_buf,
+                    k_cache,
+                    v_cache,
+                    &self.prefill_scratch.attn_out_buf,
+                    num_heads as u32,
+                    num_kv_heads as u32,
+                    num_kv_groups,
+                    head_dim as u32,
+                    (start_pos + seq_len) as u32,
+                    kv_pool.capacity(),
+                    scale,
+                    seq_len as u32,
+                    start_pos as u32,
+                    attention_window,
+                );
+            }
+            KvCacheType::Q8_0 => {
+                let groups_per_row = (head_dim / 32) as u32;
+                let row_bytes = groups_per_row * 34;
+                self.ctx.encode_attention_causal_q8_0(
+                    encoder,
+                    &self.prefill_scratch.q_buf,
+                    k_cache,
+                    v_cache,
+                    &self.prefill_scratch.attn_out_buf,
+                    num_heads as u32,
+                    num_kv_heads as u32,
+                    num_kv_groups,
+                    head_dim as u32,
+                    (start_pos + seq_len) as u32,
+                    kv_pool.capacity(),
+                    scale,
+                    seq_len as u32,
+                    start_pos as u32,
+                    attention_window,
+                    groups_per_row,
+                    row_bytes,
+                );
+            }
+            KvCacheType::Q4_0 => {
+                let groups_per_row = (head_dim / 32) as u32;
+                let row_bytes = groups_per_row * 18;
+                self.ctx.encode_attention_causal_q4_0(
+                    encoder,
+                    &self.prefill_scratch.q_buf,
+                    k_cache,
+                    v_cache,
+                    &self.prefill_scratch.attn_out_buf,
+                    num_heads as u32,
+                    num_kv_heads as u32,
+                    num_kv_groups,
+                    head_dim as u32,
+                    (start_pos + seq_len) as u32,
+                    kv_pool.capacity(),
+                    scale,
+                    seq_len as u32,
+                    start_pos as u32,
+                    attention_window,
+                    groups_per_row,
+                    row_bytes,
+                );
+            }
+        }
 
         self.ctx.encode_copy(
             encoder,
@@ -2855,30 +3068,86 @@ impl Gemma4GpuModel {
                 let v_cache = kv_pool
                     .layer_v_cache(segment.slot, layer_idx)
                     .map_err(|err| err.to_string())?;
-                self.ctx.encode_kv_batch_append_strided_f16(
-                    encoder,
-                    &self.prefill_scratch.k_buf,
-                    k_cache,
-                    num_kv_heads as u32,
-                    head_dim as u32,
-                    kv_pool.capacity(),
-                    segment.start_pos as u32,
-                    segment.token_count as u32,
-                    total_seq_len as u32,
-                    segment.row_start as u32,
-                );
-                self.ctx.encode_kv_batch_append_strided_f16(
-                    encoder,
-                    &self.prefill_scratch.v_buf,
-                    v_cache,
-                    num_kv_heads as u32,
-                    head_dim as u32,
-                    kv_pool.capacity(),
-                    segment.start_pos as u32,
-                    segment.token_count as u32,
-                    total_seq_len as u32,
-                    segment.row_start as u32,
-                );
+                match self.kv_cache_type {
+                    KvCacheType::F16 => {
+                        self.ctx.encode_kv_batch_append_strided_f16(
+                            encoder,
+                            &self.prefill_scratch.k_buf,
+                            k_cache,
+                            num_kv_heads as u32,
+                            head_dim as u32,
+                            kv_pool.capacity(),
+                            segment.start_pos as u32,
+                            segment.token_count as u32,
+                            total_seq_len as u32,
+                            segment.row_start as u32,
+                        );
+                        self.ctx.encode_kv_batch_append_strided_f16(
+                            encoder,
+                            &self.prefill_scratch.v_buf,
+                            v_cache,
+                            num_kv_heads as u32,
+                            head_dim as u32,
+                            kv_pool.capacity(),
+                            segment.start_pos as u32,
+                            segment.token_count as u32,
+                            total_seq_len as u32,
+                            segment.row_start as u32,
+                        );
+                    }
+                    KvCacheType::Q8_0 => {
+                        self.ctx.encode_kv_batch_append_strided_q8_0(
+                            encoder,
+                            &self.prefill_scratch.k_buf,
+                            k_cache,
+                            num_kv_heads as u32,
+                            head_dim as u32,
+                            kv_pool.capacity(),
+                            segment.start_pos as u32,
+                            segment.token_count as u32,
+                            total_seq_len as u32,
+                            segment.row_start as u32,
+                        );
+                        self.ctx.encode_kv_batch_append_strided_q8_0(
+                            encoder,
+                            &self.prefill_scratch.v_buf,
+                            v_cache,
+                            num_kv_heads as u32,
+                            head_dim as u32,
+                            kv_pool.capacity(),
+                            segment.start_pos as u32,
+                            segment.token_count as u32,
+                            total_seq_len as u32,
+                            segment.row_start as u32,
+                        );
+                    }
+                    KvCacheType::Q4_0 => {
+                        self.ctx.encode_kv_batch_append_strided_q4_0(
+                            encoder,
+                            &self.prefill_scratch.k_buf,
+                            k_cache,
+                            num_kv_heads as u32,
+                            head_dim as u32,
+                            kv_pool.capacity(),
+                            segment.start_pos as u32,
+                            segment.token_count as u32,
+                            total_seq_len as u32,
+                            segment.row_start as u32,
+                        );
+                        self.ctx.encode_kv_batch_append_strided_q4_0(
+                            encoder,
+                            &self.prefill_scratch.v_buf,
+                            v_cache,
+                            num_kv_heads as u32,
+                            head_dim as u32,
+                            kv_pool.capacity(),
+                            segment.start_pos as u32,
+                            segment.token_count as u32,
+                            total_seq_len as u32,
+                            segment.row_start as u32,
+                        );
+                    }
+                }
             }
         }
 
@@ -2889,25 +3158,79 @@ impl Gemma4GpuModel {
             let v_cache = kv_pool
                 .layer_v_cache(segment.slot, layer.kv_source_layer)
                 .map_err(|err| err.to_string())?;
-            self.ctx.encode_attention_causal_strided_f16(
-                encoder,
-                &self.prefill_scratch.q_buf,
-                k_cache,
-                v_cache,
-                &self.prefill_scratch.attn_out_buf,
-                num_heads as u32,
-                num_kv_heads as u32,
-                num_kv_groups,
-                head_dim as u32,
-                (segment.start_pos + segment.token_count) as u32,
-                kv_pool.capacity(),
-                scale,
-                segment.token_count as u32,
-                segment.start_pos as u32,
-                attention_window,
-                total_seq_len as u32,
-                segment.row_start as u32,
-            );
+            match self.kv_cache_type {
+                KvCacheType::F16 => {
+                    self.ctx.encode_attention_causal_strided_f16(
+                        encoder,
+                        &self.prefill_scratch.q_buf,
+                        k_cache,
+                        v_cache,
+                        &self.prefill_scratch.attn_out_buf,
+                        num_heads as u32,
+                        num_kv_heads as u32,
+                        num_kv_groups,
+                        head_dim as u32,
+                        (segment.start_pos + segment.token_count) as u32,
+                        kv_pool.capacity(),
+                        scale,
+                        segment.token_count as u32,
+                        segment.start_pos as u32,
+                        attention_window,
+                        total_seq_len as u32,
+                        segment.row_start as u32,
+                    );
+                }
+                KvCacheType::Q8_0 => {
+                    let groups_per_row = (head_dim / 32) as u32;
+                    let row_bytes = groups_per_row * 34;
+                    self.ctx.encode_attention_causal_strided_q8_0(
+                        encoder,
+                        &self.prefill_scratch.q_buf,
+                        k_cache,
+                        v_cache,
+                        &self.prefill_scratch.attn_out_buf,
+                        num_heads as u32,
+                        num_kv_heads as u32,
+                        num_kv_groups,
+                        head_dim as u32,
+                        (segment.start_pos + segment.token_count) as u32,
+                        kv_pool.capacity(),
+                        scale,
+                        segment.token_count as u32,
+                        segment.start_pos as u32,
+                        attention_window,
+                        total_seq_len as u32,
+                        segment.row_start as u32,
+                        groups_per_row,
+                        row_bytes,
+                    );
+                }
+                KvCacheType::Q4_0 => {
+                    let groups_per_row = (head_dim / 32) as u32;
+                    let row_bytes = groups_per_row * 18;
+                    self.ctx.encode_attention_causal_strided_q4_0(
+                        encoder,
+                        &self.prefill_scratch.q_buf,
+                        k_cache,
+                        v_cache,
+                        &self.prefill_scratch.attn_out_buf,
+                        num_heads as u32,
+                        num_kv_heads as u32,
+                        num_kv_groups,
+                        head_dim as u32,
+                        (segment.start_pos + segment.token_count) as u32,
+                        kv_pool.capacity(),
+                        scale,
+                        segment.token_count as u32,
+                        segment.start_pos as u32,
+                        attention_window,
+                        total_seq_len as u32,
+                        segment.row_start as u32,
+                        groups_per_row,
+                        row_bytes,
+                    );
+                }
+            }
         }
 
         self.ctx.encode_copy(
@@ -3169,26 +3492,74 @@ impl Gemma4GpuModel {
                 let v_cache = kv_pool
                     .layer_v_cache(slot, layer_idx)
                     .map_err(|err| err.to_string())?;
-                self.ctx.encode_kv_batch_append_f16(
-                    encoder,
-                    &self.prefill_scratch.k_buf,
-                    k_cache,
-                    num_kv_heads as u32,
-                    head_dim as u32,
-                    kv_pool.capacity(),
-                    start_pos as u32,
-                    seq_len as u32,
-                );
-                self.ctx.encode_kv_batch_append_f16(
-                    encoder,
-                    &self.prefill_scratch.v_buf,
-                    v_cache,
-                    num_kv_heads as u32,
-                    head_dim as u32,
-                    kv_pool.capacity(),
-                    start_pos as u32,
-                    seq_len as u32,
-                );
+                match self.kv_cache_type {
+                    KvCacheType::F16 => {
+                        self.ctx.encode_kv_batch_append_f16(
+                            encoder,
+                            &self.prefill_scratch.k_buf,
+                            k_cache,
+                            num_kv_heads as u32,
+                            head_dim as u32,
+                            kv_pool.capacity(),
+                            start_pos as u32,
+                            seq_len as u32,
+                        );
+                        self.ctx.encode_kv_batch_append_f16(
+                            encoder,
+                            &self.prefill_scratch.v_buf,
+                            v_cache,
+                            num_kv_heads as u32,
+                            head_dim as u32,
+                            kv_pool.capacity(),
+                            start_pos as u32,
+                            seq_len as u32,
+                        );
+                    }
+                    KvCacheType::Q8_0 => {
+                        self.ctx.encode_kv_batch_append_q8_0(
+                            encoder,
+                            &self.prefill_scratch.k_buf,
+                            k_cache,
+                            num_kv_heads as u32,
+                            head_dim as u32,
+                            kv_pool.capacity(),
+                            start_pos as u32,
+                            seq_len as u32,
+                        );
+                        self.ctx.encode_kv_batch_append_q8_0(
+                            encoder,
+                            &self.prefill_scratch.v_buf,
+                            v_cache,
+                            num_kv_heads as u32,
+                            head_dim as u32,
+                            kv_pool.capacity(),
+                            start_pos as u32,
+                            seq_len as u32,
+                        );
+                    }
+                    KvCacheType::Q4_0 => {
+                        self.ctx.encode_kv_batch_append_q4_0(
+                            encoder,
+                            &self.prefill_scratch.k_buf,
+                            k_cache,
+                            num_kv_heads as u32,
+                            head_dim as u32,
+                            kv_pool.capacity(),
+                            start_pos as u32,
+                            seq_len as u32,
+                        );
+                        self.ctx.encode_kv_batch_append_q4_0(
+                            encoder,
+                            &self.prefill_scratch.v_buf,
+                            v_cache,
+                            num_kv_heads as u32,
+                            head_dim as u32,
+                            kv_pool.capacity(),
+                            start_pos as u32,
+                            seq_len as u32,
+                        );
+                    }
+                }
             }
 
             let k_cache = kv_pool
@@ -3197,23 +3568,73 @@ impl Gemma4GpuModel {
             let v_cache = kv_pool
                 .layer_v_cache(slot, layer.kv_source_layer)
                 .map_err(|err| err.to_string())?;
-            self.ctx.encode_attention_causal_f16(
-                encoder,
-                &self.prefill_scratch.q_buf,
-                k_cache,
-                v_cache,
-                &self.prefill_scratch.attn_out_buf,
-                num_heads as u32,
-                num_kv_heads as u32,
-                num_kv_groups,
-                head_dim as u32,
-                (start_pos + seq_len) as u32,
-                kv_pool.capacity(),
-                scale,
-                seq_len as u32,
-                start_pos as u32,
-                attention_window,
-            );
+            match self.kv_cache_type {
+                KvCacheType::F16 => {
+                    self.ctx.encode_attention_causal_f16(
+                        encoder,
+                        &self.prefill_scratch.q_buf,
+                        k_cache,
+                        v_cache,
+                        &self.prefill_scratch.attn_out_buf,
+                        num_heads as u32,
+                        num_kv_heads as u32,
+                        num_kv_groups,
+                        head_dim as u32,
+                        (start_pos + seq_len) as u32,
+                        kv_pool.capacity(),
+                        scale,
+                        seq_len as u32,
+                        start_pos as u32,
+                        attention_window,
+                    );
+                }
+                KvCacheType::Q8_0 => {
+                    let groups_per_row = (head_dim / 32) as u32;
+                    let row_bytes = groups_per_row * 34;
+                    self.ctx.encode_attention_causal_q8_0(
+                        encoder,
+                        &self.prefill_scratch.q_buf,
+                        k_cache,
+                        v_cache,
+                        &self.prefill_scratch.attn_out_buf,
+                        num_heads as u32,
+                        num_kv_heads as u32,
+                        num_kv_groups,
+                        head_dim as u32,
+                        (start_pos + seq_len) as u32,
+                        kv_pool.capacity(),
+                        scale,
+                        seq_len as u32,
+                        start_pos as u32,
+                        attention_window,
+                        groups_per_row,
+                        row_bytes,
+                    );
+                }
+                KvCacheType::Q4_0 => {
+                    let groups_per_row = (head_dim / 32) as u32;
+                    let row_bytes = groups_per_row * 18;
+                    self.ctx.encode_attention_causal_q4_0(
+                        encoder,
+                        &self.prefill_scratch.q_buf,
+                        k_cache,
+                        v_cache,
+                        &self.prefill_scratch.attn_out_buf,
+                        num_heads as u32,
+                        num_kv_heads as u32,
+                        num_kv_groups,
+                        head_dim as u32,
+                        (start_pos + seq_len) as u32,
+                        kv_pool.capacity(),
+                        scale,
+                        seq_len as u32,
+                        start_pos as u32,
+                        attention_window,
+                        groups_per_row,
+                        row_bytes,
+                    );
+                }
+            }
 
             self.ctx.encode_copy(
                 encoder,
@@ -3732,26 +4153,74 @@ impl Gemma4GpuModel {
                     let v_cache = kv_pool
                         .layer_v_cache(slot_view.slot, layer_idx)
                         .map_err(|err| err.to_string())?;
-                    self.ctx.encode_kv_append_f16_at(
-                        encoder,
-                        &self.decode_batch_scratch.k_normed_buf,
-                        offsets.kv,
-                        k_cache,
-                        num_kv_heads as u32,
-                        head_dim as u32,
-                        kv_pool.capacity(),
-                        append_pos,
-                    );
-                    self.ctx.encode_kv_append_f16_at(
-                        encoder,
-                        &self.decode_batch_scratch.gate_buf,
-                        offsets.intermediate,
-                        v_cache,
-                        num_kv_heads as u32,
-                        head_dim as u32,
-                        kv_pool.capacity(),
-                        append_pos,
-                    );
+                    match self.kv_cache_type {
+                        KvCacheType::F16 => {
+                            self.ctx.encode_kv_append_f16_at(
+                                encoder,
+                                &self.decode_batch_scratch.k_normed_buf,
+                                offsets.kv,
+                                k_cache,
+                                num_kv_heads as u32,
+                                head_dim as u32,
+                                kv_pool.capacity(),
+                                append_pos,
+                            );
+                            self.ctx.encode_kv_append_f16_at(
+                                encoder,
+                                &self.decode_batch_scratch.gate_buf,
+                                offsets.intermediate,
+                                v_cache,
+                                num_kv_heads as u32,
+                                head_dim as u32,
+                                kv_pool.capacity(),
+                                append_pos,
+                            );
+                        }
+                        KvCacheType::Q8_0 => {
+                            self.ctx.encode_kv_append_q8_0_at(
+                                encoder,
+                                &self.decode_batch_scratch.k_normed_buf,
+                                offsets.kv,
+                                k_cache,
+                                num_kv_heads as u32,
+                                head_dim as u32,
+                                kv_pool.capacity(),
+                                append_pos,
+                            );
+                            self.ctx.encode_kv_append_q8_0_at(
+                                encoder,
+                                &self.decode_batch_scratch.gate_buf,
+                                offsets.intermediate,
+                                v_cache,
+                                num_kv_heads as u32,
+                                head_dim as u32,
+                                kv_pool.capacity(),
+                                append_pos,
+                            );
+                        }
+                        KvCacheType::Q4_0 => {
+                            self.ctx.encode_kv_append_q4_0_at(
+                                encoder,
+                                &self.decode_batch_scratch.k_normed_buf,
+                                offsets.kv,
+                                k_cache,
+                                num_kv_heads as u32,
+                                head_dim as u32,
+                                kv_pool.capacity(),
+                                append_pos,
+                            );
+                            self.ctx.encode_kv_append_q4_0_at(
+                                encoder,
+                                &self.decode_batch_scratch.gate_buf,
+                                offsets.intermediate,
+                                v_cache,
+                                num_kv_heads as u32,
+                                head_dim as u32,
+                                kv_pool.capacity(),
+                                append_pos,
+                            );
+                        }
+                    }
                 }
 
                 let k_cache = kv_pool
@@ -3760,23 +4229,73 @@ impl Gemma4GpuModel {
                 let v_cache = kv_pool
                     .layer_v_cache(slot_view.slot, layer.kv_source_layer)
                     .map_err(|err| err.to_string())?;
-                self.ctx.encode_attention_with_offset_f16_at(
-                    encoder,
-                    &self.decode_batch_scratch.q_normed_buf,
-                    offsets.q,
-                    k_cache,
-                    v_cache,
-                    &self.decode_batch_scratch.attn_out_buf,
-                    offsets.q,
-                    num_heads as u32,
-                    num_kv_heads as u32,
-                    num_kv_groups,
-                    head_dim as u32,
-                    effective_kv_seq,
-                    kv_pool.capacity(),
-                    scale,
-                    kv_start,
-                );
+                match self.kv_cache_type {
+                    KvCacheType::F16 => {
+                        self.ctx.encode_attention_with_offset_f16_at(
+                            encoder,
+                            &self.decode_batch_scratch.q_normed_buf,
+                            offsets.q,
+                            k_cache,
+                            v_cache,
+                            &self.decode_batch_scratch.attn_out_buf,
+                            offsets.q,
+                            num_heads as u32,
+                            num_kv_heads as u32,
+                            num_kv_groups,
+                            head_dim as u32,
+                            effective_kv_seq,
+                            kv_pool.capacity(),
+                            scale,
+                            kv_start,
+                        );
+                    }
+                    KvCacheType::Q8_0 => {
+                        let groups_per_row = (head_dim / 32) as u32;
+                        let row_bytes = groups_per_row * 34;
+                        self.ctx.encode_attention_with_offset_q8_0_at(
+                            encoder,
+                            &self.decode_batch_scratch.q_normed_buf,
+                            offsets.q,
+                            k_cache,
+                            v_cache,
+                            &self.decode_batch_scratch.attn_out_buf,
+                            offsets.q,
+                            num_heads as u32,
+                            num_kv_heads as u32,
+                            num_kv_groups,
+                            head_dim as u32,
+                            effective_kv_seq,
+                            kv_pool.capacity(),
+                            scale,
+                            kv_start,
+                            groups_per_row,
+                            row_bytes,
+                        );
+                    }
+                    KvCacheType::Q4_0 => {
+                        let groups_per_row = (head_dim / 32) as u32;
+                        let row_bytes = groups_per_row * 18;
+                        self.ctx.encode_attention_with_offset_q4_0_at(
+                            encoder,
+                            &self.decode_batch_scratch.q_normed_buf,
+                            offsets.q,
+                            k_cache,
+                            v_cache,
+                            &self.decode_batch_scratch.attn_out_buf,
+                            offsets.q,
+                            num_heads as u32,
+                            num_kv_heads as u32,
+                            num_kv_groups,
+                            head_dim as u32,
+                            effective_kv_seq,
+                            kv_pool.capacity(),
+                            scale,
+                            kv_start,
+                            groups_per_row,
+                            row_bytes,
+                        );
+                    }
+                }
 
                 self.ctx.encode_matvec_f16_at(
                     encoder,

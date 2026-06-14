@@ -61,6 +61,42 @@ fn default_final_logit_softcapping() -> f32 { 30.0 }
 fn default_rope_theta() -> f64 { 10000.0 }
 fn default_partial_rotary() -> f64 { 1.0 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KvCacheType {
+    F16,
+    Q8_0,
+    Q4_0,
+}
+
+impl KvCacheType {
+    pub fn from_env() -> Self {
+        match std::env::var("LLAMA_KV_CACHE_TYPE").as_deref() {
+            Ok("q8_0") | Ok("Q8_0") => KvCacheType::Q8_0,
+            Ok("q4_0") | Ok("Q4_0") => KvCacheType::Q4_0,
+            _ => KvCacheType::F16,
+        }
+    }
+
+    pub fn bytes_per_row(&self, head_dim: usize) -> usize {
+        assert!(head_dim % 32 == 0, "head_dim must be a multiple of 32 for quantized KV cache");
+        match self {
+            KvCacheType::F16 => head_dim * 2,
+            KvCacheType::Q8_0 => (head_dim / 32) * 34,
+            KvCacheType::Q4_0 => (head_dim / 32) * 18,
+        }
+    }
+}
+
+impl std::fmt::Display for KvCacheType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            KvCacheType::F16 => write!(f, "f16"),
+            KvCacheType::Q8_0 => write!(f, "q8_0"),
+            KvCacheType::Q4_0 => write!(f, "q4_0"),
+        }
+    }
+}
+
 impl Gemma4TextConfig {
     pub fn num_kv_groups(&self) -> usize {
         self.num_attention_heads / self.num_key_value_heads

@@ -44,6 +44,18 @@ pub struct MetalContext {
     pub attention_causal_f16_pipeline: ComputePipelineState,
     pub attention_causal_strided_f16_pipeline: ComputePipelineState,
     pub vec_scale_pipeline: ComputePipelineState,
+    pub kv_append_q8_0_pipeline: ComputePipelineState,
+    pub kv_batch_append_q8_0_pipeline: ComputePipelineState,
+    pub kv_batch_append_strided_q8_0_pipeline: ComputePipelineState,
+    pub kv_append_q4_0_pipeline: ComputePipelineState,
+    pub kv_batch_append_q4_0_pipeline: ComputePipelineState,
+    pub kv_batch_append_strided_q4_0_pipeline: ComputePipelineState,
+    pub attention_offset_q8_0_pipeline: ComputePipelineState,
+    pub attention_causal_q8_0_pipeline: ComputePipelineState,
+    pub attention_causal_strided_q8_0_pipeline: ComputePipelineState,
+    pub attention_offset_q4_0_pipeline: ComputePipelineState,
+    pub attention_causal_q4_0_pipeline: ComputePipelineState,
+    pub attention_causal_strided_q4_0_pipeline: ComputePipelineState,
 }
 
 impl MetalContext {
@@ -110,6 +122,19 @@ impl MetalContext {
         let attention_causal_strided_f16_pipeline = get_fn("attention_causal_strided_f16");
         let vec_scale_pipeline = get_fn("vec_scale");
 
+        let kv_append_q8_0_pipeline = get_fn("kv_cache_append_q8_0");
+        let kv_batch_append_q8_0_pipeline = get_fn("kv_cache_batch_append_q8_0");
+        let kv_batch_append_strided_q8_0_pipeline = get_fn("kv_cache_batch_append_strided_q8_0");
+        let kv_append_q4_0_pipeline = get_fn("kv_cache_append_q4_0");
+        let kv_batch_append_q4_0_pipeline = get_fn("kv_cache_batch_append_q4_0");
+        let kv_batch_append_strided_q4_0_pipeline = get_fn("kv_cache_batch_append_strided_q4_0");
+        let attention_offset_q8_0_pipeline = get_fn("attention_single_token_offset_q8_0");
+        let attention_causal_q8_0_pipeline = get_fn("attention_causal_q8_0");
+        let attention_causal_strided_q8_0_pipeline = get_fn("attention_causal_strided_q8_0");
+        let attention_offset_q4_0_pipeline = get_fn("attention_single_token_offset_q4_0");
+        let attention_causal_q4_0_pipeline = get_fn("attention_causal_q4_0");
+        let attention_causal_strided_q4_0_pipeline = get_fn("attention_causal_strided_q4_0");
+
         MetalContext {
             device,
             queue,
@@ -152,6 +177,18 @@ impl MetalContext {
             attention_causal_f16_pipeline,
             attention_causal_strided_f16_pipeline,
             vec_scale_pipeline,
+            kv_append_q8_0_pipeline,
+            kv_batch_append_q8_0_pipeline,
+            kv_batch_append_strided_q8_0_pipeline,
+            kv_append_q4_0_pipeline,
+            kv_batch_append_q4_0_pipeline,
+            kv_batch_append_strided_q4_0_pipeline,
+            attention_offset_q8_0_pipeline,
+            attention_causal_q8_0_pipeline,
+            attention_causal_strided_q8_0_pipeline,
+            attention_offset_q4_0_pipeline,
+            attention_causal_q4_0_pipeline,
+            attention_causal_strided_q4_0_pipeline,
         }
     }
 
@@ -1302,6 +1339,502 @@ impl MetalContext {
         encoder.set_bytes(3, 4, &num_heads as *const u32 as *const _);
         encoder.set_bytes(4, 4, &head_dim as *const u32 as *const _);
         encoder.dispatch_threads(MTLSize::new(total as u64, 1, 1), MTLSize::new(256, 1, 1));
+    }
+
+    pub fn encode_kv_append_q8_0(
+        &self,
+        encoder: &ComputeCommandEncoderRef,
+        new_data: &Buffer,
+        cache: &Buffer,
+        num_kv_heads: u32,
+        head_dim: u32,
+        capacity: u32,
+        cur_seq: u32,
+    ) {
+        let groups_per_row = head_dim / 32;
+        let total = num_kv_heads * groups_per_row;
+        encoder.set_compute_pipeline_state(&self.kv_append_q8_0_pipeline);
+        encoder.set_buffer(0, Some(new_data), 0);
+        encoder.set_buffer(1, Some(cache), 0);
+        encoder.set_bytes(2, 4, &num_kv_heads as *const u32 as *const _);
+        encoder.set_bytes(3, 4, &head_dim as *const u32 as *const _);
+        encoder.set_bytes(4, 4, &capacity as *const u32 as *const _);
+        encoder.set_bytes(5, 4, &cur_seq as *const u32 as *const _);
+        encoder.dispatch_threads(MTLSize::new(total as u64, 1, 1), MTLSize::new(256, 1, 1));
+    }
+
+    pub fn encode_kv_append_q8_0_at(
+        &self,
+        encoder: &ComputeCommandEncoderRef,
+        new_data: &Buffer,
+        new_data_offset: u64,
+        cache: &Buffer,
+        num_kv_heads: u32,
+        head_dim: u32,
+        capacity: u32,
+        cur_seq: u32,
+    ) {
+        let groups_per_row = head_dim / 32;
+        let total = num_kv_heads * groups_per_row;
+        encoder.set_compute_pipeline_state(&self.kv_append_q8_0_pipeline);
+        encoder.set_buffer(0, Some(new_data), new_data_offset);
+        encoder.set_buffer(1, Some(cache), 0);
+        encoder.set_bytes(2, 4, &num_kv_heads as *const u32 as *const _);
+        encoder.set_bytes(3, 4, &head_dim as *const u32 as *const _);
+        encoder.set_bytes(4, 4, &capacity as *const u32 as *const _);
+        encoder.set_bytes(5, 4, &cur_seq as *const u32 as *const _);
+        encoder.dispatch_threads(MTLSize::new(total as u64, 1, 1), MTLSize::new(256, 1, 1));
+    }
+
+    pub fn encode_kv_append_q4_0(
+        &self,
+        encoder: &ComputeCommandEncoderRef,
+        new_data: &Buffer,
+        cache: &Buffer,
+        num_kv_heads: u32,
+        head_dim: u32,
+        capacity: u32,
+        cur_seq: u32,
+    ) {
+        let groups_per_row = head_dim / 32;
+        let total = num_kv_heads * groups_per_row;
+        encoder.set_compute_pipeline_state(&self.kv_append_q4_0_pipeline);
+        encoder.set_buffer(0, Some(new_data), 0);
+        encoder.set_buffer(1, Some(cache), 0);
+        encoder.set_bytes(2, 4, &num_kv_heads as *const u32 as *const _);
+        encoder.set_bytes(3, 4, &head_dim as *const u32 as *const _);
+        encoder.set_bytes(4, 4, &capacity as *const u32 as *const _);
+        encoder.set_bytes(5, 4, &cur_seq as *const u32 as *const _);
+        encoder.dispatch_threads(MTLSize::new(total as u64, 1, 1), MTLSize::new(256, 1, 1));
+    }
+
+    pub fn encode_kv_append_q4_0_at(
+        &self,
+        encoder: &ComputeCommandEncoderRef,
+        new_data: &Buffer,
+        new_data_offset: u64,
+        cache: &Buffer,
+        num_kv_heads: u32,
+        head_dim: u32,
+        capacity: u32,
+        cur_seq: u32,
+    ) {
+        let groups_per_row = head_dim / 32;
+        let total = num_kv_heads * groups_per_row;
+        encoder.set_compute_pipeline_state(&self.kv_append_q4_0_pipeline);
+        encoder.set_buffer(0, Some(new_data), new_data_offset);
+        encoder.set_buffer(1, Some(cache), 0);
+        encoder.set_bytes(2, 4, &num_kv_heads as *const u32 as *const _);
+        encoder.set_bytes(3, 4, &head_dim as *const u32 as *const _);
+        encoder.set_bytes(4, 4, &capacity as *const u32 as *const _);
+        encoder.set_bytes(5, 4, &cur_seq as *const u32 as *const _);
+        encoder.dispatch_threads(MTLSize::new(total as u64, 1, 1), MTLSize::new(256, 1, 1));
+    }
+
+    pub fn encode_kv_batch_append_q8_0(
+        &self,
+        encoder: &ComputeCommandEncoderRef,
+        new_data: &Buffer,
+        cache: &Buffer,
+        num_kv_heads: u32,
+        head_dim: u32,
+        capacity: u32,
+        cur_seq: u32,
+        seq_len: u32,
+    ) {
+        let groups_per_row = head_dim / 32;
+        let total = num_kv_heads * seq_len * groups_per_row;
+        encoder.set_compute_pipeline_state(&self.kv_batch_append_q8_0_pipeline);
+        encoder.set_buffer(0, Some(new_data), 0);
+        encoder.set_buffer(1, Some(cache), 0);
+        encoder.set_bytes(2, 4, &num_kv_heads as *const u32 as *const _);
+        encoder.set_bytes(3, 4, &head_dim as *const u32 as *const _);
+        encoder.set_bytes(4, 4, &capacity as *const u32 as *const _);
+        encoder.set_bytes(5, 4, &cur_seq as *const u32 as *const _);
+        encoder.set_bytes(6, 4, &seq_len as *const u32 as *const _);
+        encoder.dispatch_threads(MTLSize::new(total as u64, 1, 1), MTLSize::new(256, 1, 1));
+    }
+
+    pub fn encode_kv_batch_append_strided_q8_0(
+        &self,
+        encoder: &ComputeCommandEncoderRef,
+        new_data: &Buffer,
+        cache: &Buffer,
+        num_kv_heads: u32,
+        head_dim: u32,
+        capacity: u32,
+        cur_seq: u32,
+        seq_len: u32,
+        source_seq_stride: u32,
+        source_start: u32,
+    ) {
+        let groups_per_row = head_dim / 32;
+        let total = num_kv_heads * seq_len * groups_per_row;
+        encoder.set_compute_pipeline_state(&self.kv_batch_append_strided_q8_0_pipeline);
+        encoder.set_buffer(0, Some(new_data), 0);
+        encoder.set_buffer(1, Some(cache), 0);
+        encoder.set_bytes(2, 4, &num_kv_heads as *const u32 as *const _);
+        encoder.set_bytes(3, 4, &head_dim as *const u32 as *const _);
+        encoder.set_bytes(4, 4, &capacity as *const u32 as *const _);
+        encoder.set_bytes(5, 4, &cur_seq as *const u32 as *const _);
+        encoder.set_bytes(6, 4, &seq_len as *const u32 as *const _);
+        encoder.set_bytes(7, 4, &source_seq_stride as *const u32 as *const _);
+        encoder.set_bytes(8, 4, &source_start as *const u32 as *const _);
+        encoder.dispatch_threads(MTLSize::new(total as u64, 1, 1), MTLSize::new(256, 1, 1));
+    }
+
+    pub fn encode_kv_batch_append_q4_0(
+        &self,
+        encoder: &ComputeCommandEncoderRef,
+        new_data: &Buffer,
+        cache: &Buffer,
+        num_kv_heads: u32,
+        head_dim: u32,
+        capacity: u32,
+        cur_seq: u32,
+        seq_len: u32,
+    ) {
+        let groups_per_row = head_dim / 32;
+        let total = num_kv_heads * seq_len * groups_per_row;
+        encoder.set_compute_pipeline_state(&self.kv_batch_append_q4_0_pipeline);
+        encoder.set_buffer(0, Some(new_data), 0);
+        encoder.set_buffer(1, Some(cache), 0);
+        encoder.set_bytes(2, 4, &num_kv_heads as *const u32 as *const _);
+        encoder.set_bytes(3, 4, &head_dim as *const u32 as *const _);
+        encoder.set_bytes(4, 4, &capacity as *const u32 as *const _);
+        encoder.set_bytes(5, 4, &cur_seq as *const u32 as *const _);
+        encoder.set_bytes(6, 4, &seq_len as *const u32 as *const _);
+        encoder.dispatch_threads(MTLSize::new(total as u64, 1, 1), MTLSize::new(256, 1, 1));
+    }
+
+    pub fn encode_kv_batch_append_strided_q4_0(
+        &self,
+        encoder: &ComputeCommandEncoderRef,
+        new_data: &Buffer,
+        cache: &Buffer,
+        num_kv_heads: u32,
+        head_dim: u32,
+        capacity: u32,
+        cur_seq: u32,
+        seq_len: u32,
+        source_seq_stride: u32,
+        source_start: u32,
+    ) {
+        let groups_per_row = head_dim / 32;
+        let total = num_kv_heads * seq_len * groups_per_row;
+        encoder.set_compute_pipeline_state(&self.kv_batch_append_strided_q4_0_pipeline);
+        encoder.set_buffer(0, Some(new_data), 0);
+        encoder.set_buffer(1, Some(cache), 0);
+        encoder.set_bytes(2, 4, &num_kv_heads as *const u32 as *const _);
+        encoder.set_bytes(3, 4, &head_dim as *const u32 as *const _);
+        encoder.set_bytes(4, 4, &capacity as *const u32 as *const _);
+        encoder.set_bytes(5, 4, &cur_seq as *const u32 as *const _);
+        encoder.set_bytes(6, 4, &seq_len as *const u32 as *const _);
+        encoder.set_bytes(7, 4, &source_seq_stride as *const u32 as *const _);
+        encoder.set_bytes(8, 4, &source_start as *const u32 as *const _);
+        encoder.dispatch_threads(MTLSize::new(total as u64, 1, 1), MTLSize::new(256, 1, 1));
+    }
+
+    pub fn encode_attention_with_offset_q8_0(
+        &self,
+        encoder: &ComputeCommandEncoderRef,
+        q_buf: &Buffer,
+        k_cache_buf: &Buffer,
+        v_cache_buf: &Buffer,
+        out_buf: &Buffer,
+        num_heads: u32,
+        num_kv_heads: u32,
+        num_kv_groups: u32,
+        head_dim: u32,
+        kv_seq: u32,
+        capacity: u32,
+        scale: f32,
+        kv_start: u32,
+        groups_per_row: u32,
+        row_bytes: u32,
+    ) {
+        self.encode_attention_with_offset_q8_0_at(
+            encoder, q_buf, 0, k_cache_buf, v_cache_buf, out_buf, 0,
+            num_heads, num_kv_heads, num_kv_groups, head_dim, kv_seq, capacity, scale, kv_start, groups_per_row, row_bytes,
+        );
+    }
+
+    pub fn encode_attention_with_offset_q8_0_at(
+        &self,
+        encoder: &ComputeCommandEncoderRef,
+        q_buf: &Buffer,
+        q_offset: u64,
+        k_cache_buf: &Buffer,
+        v_cache_buf: &Buffer,
+        out_buf: &Buffer,
+        out_offset: u64,
+        num_heads: u32,
+        num_kv_heads: u32,
+        num_kv_groups: u32,
+        head_dim: u32,
+        kv_seq: u32,
+        capacity: u32,
+        scale: f32,
+        kv_start: u32,
+        groups_per_row: u32,
+        row_bytes: u32,
+    ) {
+        encoder.set_compute_pipeline_state(&self.attention_offset_q8_0_pipeline);
+        encoder.set_buffer(0, Some(q_buf), q_offset);
+        encoder.set_buffer(1, Some(k_cache_buf), 0);
+        encoder.set_buffer(2, Some(v_cache_buf), 0);
+        encoder.set_buffer(3, Some(out_buf), out_offset);
+        encoder.set_bytes(4, 4, &num_heads as *const u32 as *const _);
+        encoder.set_bytes(5, 4, &num_kv_heads as *const u32 as *const _);
+        encoder.set_bytes(6, 4, &num_kv_groups as *const u32 as *const _);
+        encoder.set_bytes(7, 4, &head_dim as *const u32 as *const _);
+        encoder.set_bytes(8, 4, &kv_seq as *const u32 as *const _);
+        encoder.set_bytes(9, 4, &capacity as *const u32 as *const _);
+        encoder.set_bytes(10, 4, &scale as *const f32 as *const _);
+        encoder.set_bytes(11, 4, &kv_start as *const u32 as *const _);
+        encoder.set_bytes(12, 4, &groups_per_row as *const u32 as *const _);
+        encoder.set_bytes(13, 4, &row_bytes as *const u32 as *const _);
+        let tg_size = MTLSize::new(64, 1, 1);
+        encoder.dispatch_thread_groups(MTLSize::new(num_heads as u64, 1, 1), tg_size);
+    }
+
+    pub fn encode_attention_with_offset_q4_0(
+        &self,
+        encoder: &ComputeCommandEncoderRef,
+        q_buf: &Buffer,
+        k_cache_buf: &Buffer,
+        v_cache_buf: &Buffer,
+        out_buf: &Buffer,
+        num_heads: u32,
+        num_kv_heads: u32,
+        num_kv_groups: u32,
+        head_dim: u32,
+        kv_seq: u32,
+        capacity: u32,
+        scale: f32,
+        kv_start: u32,
+        groups_per_row: u32,
+        row_bytes: u32,
+    ) {
+        self.encode_attention_with_offset_q4_0_at(
+            encoder, q_buf, 0, k_cache_buf, v_cache_buf, out_buf, 0,
+            num_heads, num_kv_heads, num_kv_groups, head_dim, kv_seq, capacity, scale, kv_start, groups_per_row, row_bytes,
+        );
+    }
+
+    pub fn encode_attention_with_offset_q4_0_at(
+        &self,
+        encoder: &ComputeCommandEncoderRef,
+        q_buf: &Buffer,
+        q_offset: u64,
+        k_cache_buf: &Buffer,
+        v_cache_buf: &Buffer,
+        out_buf: &Buffer,
+        out_offset: u64,
+        num_heads: u32,
+        num_kv_heads: u32,
+        num_kv_groups: u32,
+        head_dim: u32,
+        kv_seq: u32,
+        capacity: u32,
+        scale: f32,
+        kv_start: u32,
+        groups_per_row: u32,
+        row_bytes: u32,
+    ) {
+        encoder.set_compute_pipeline_state(&self.attention_offset_q4_0_pipeline);
+        encoder.set_buffer(0, Some(q_buf), q_offset);
+        encoder.set_buffer(1, Some(k_cache_buf), 0);
+        encoder.set_buffer(2, Some(v_cache_buf), 0);
+        encoder.set_buffer(3, Some(out_buf), out_offset);
+        encoder.set_bytes(4, 4, &num_heads as *const u32 as *const _);
+        encoder.set_bytes(5, 4, &num_kv_heads as *const u32 as *const _);
+        encoder.set_bytes(6, 4, &num_kv_groups as *const u32 as *const _);
+        encoder.set_bytes(7, 4, &head_dim as *const u32 as *const _);
+        encoder.set_bytes(8, 4, &kv_seq as *const u32 as *const _);
+        encoder.set_bytes(9, 4, &capacity as *const u32 as *const _);
+        encoder.set_bytes(10, 4, &scale as *const f32 as *const _);
+        encoder.set_bytes(11, 4, &kv_start as *const u32 as *const _);
+        encoder.set_bytes(12, 4, &groups_per_row as *const u32 as *const _);
+        encoder.set_bytes(13, 4, &row_bytes as *const u32 as *const _);
+        let tg_size = MTLSize::new(64, 1, 1);
+        encoder.dispatch_thread_groups(MTLSize::new(num_heads as u64, 1, 1), tg_size);
+    }
+
+    pub fn encode_attention_causal_q8_0(
+        &self,
+        encoder: &ComputeCommandEncoderRef,
+        q_buf: &Buffer,
+        k_cache_buf: &Buffer,
+        v_cache_buf: &Buffer,
+        out_buf: &Buffer,
+        num_heads: u32,
+        num_kv_heads: u32,
+        num_kv_groups: u32,
+        head_dim: u32,
+        kv_seq: u32,
+        capacity: u32,
+        scale: f32,
+        q_len: u32,
+        q_start: u32,
+        attention_window: u32,
+        groups_per_row: u32,
+        row_bytes: u32,
+    ) {
+        encoder.set_compute_pipeline_state(&self.attention_causal_q8_0_pipeline);
+        encoder.set_buffer(0, Some(q_buf), 0);
+        encoder.set_buffer(1, Some(k_cache_buf), 0);
+        encoder.set_buffer(2, Some(v_cache_buf), 0);
+        encoder.set_buffer(3, Some(out_buf), 0);
+        encoder.set_bytes(4, 4, &num_heads as *const u32 as *const _);
+        encoder.set_bytes(5, 4, &num_kv_heads as *const u32 as *const _);
+        encoder.set_bytes(6, 4, &num_kv_groups as *const u32 as *const _);
+        encoder.set_bytes(7, 4, &head_dim as *const u32 as *const _);
+        encoder.set_bytes(8, 4, &kv_seq as *const u32 as *const _);
+        encoder.set_bytes(9, 4, &capacity as *const u32 as *const _);
+        encoder.set_bytes(10, 4, &scale as *const f32 as *const _);
+        encoder.set_bytes(11, 4, &q_len as *const u32 as *const _);
+        encoder.set_bytes(12, 4, &q_start as *const u32 as *const _);
+        encoder.set_bytes(13, 4, &attention_window as *const u32 as *const _);
+        encoder.set_bytes(14, 4, &groups_per_row as *const u32 as *const _);
+        encoder.set_bytes(15, 4, &row_bytes as *const u32 as *const _);
+        let tg_size = MTLSize::new(64, 1, 1);
+        let num_tgs = num_heads * q_len;
+        encoder.dispatch_thread_groups(MTLSize::new(num_tgs as u64, 1, 1), tg_size);
+    }
+
+    pub fn encode_attention_causal_strided_q8_0(
+        &self,
+        encoder: &ComputeCommandEncoderRef,
+        q_buf: &Buffer,
+        k_cache_buf: &Buffer,
+        v_cache_buf: &Buffer,
+        out_buf: &Buffer,
+        num_heads: u32,
+        num_kv_heads: u32,
+        num_kv_groups: u32,
+        head_dim: u32,
+        kv_seq: u32,
+        capacity: u32,
+        scale: f32,
+        q_len: u32,
+        q_pos_start: u32,
+        attention_window: u32,
+        q_stride: u32,
+        q_start_row: u32,
+        groups_per_row: u32,
+        row_bytes: u32,
+    ) {
+        encoder.set_compute_pipeline_state(&self.attention_causal_strided_q8_0_pipeline);
+        encoder.set_buffer(0, Some(q_buf), 0);
+        encoder.set_buffer(1, Some(k_cache_buf), 0);
+        encoder.set_buffer(2, Some(v_cache_buf), 0);
+        encoder.set_buffer(3, Some(out_buf), 0);
+        encoder.set_bytes(4, 4, &num_heads as *const u32 as *const _);
+        encoder.set_bytes(5, 4, &num_kv_heads as *const u32 as *const _);
+        encoder.set_bytes(6, 4, &num_kv_groups as *const u32 as *const _);
+        encoder.set_bytes(7, 4, &head_dim as *const u32 as *const _);
+        encoder.set_bytes(8, 4, &kv_seq as *const u32 as *const _);
+        encoder.set_bytes(9, 4, &capacity as *const u32 as *const _);
+        encoder.set_bytes(10, 4, &scale as *const f32 as *const _);
+        encoder.set_bytes(11, 4, &q_len as *const u32 as *const _);
+        encoder.set_bytes(12, 4, &q_pos_start as *const u32 as *const _);
+        encoder.set_bytes(13, 4, &attention_window as *const u32 as *const _);
+        encoder.set_bytes(14, 4, &q_stride as *const u32 as *const _);
+        encoder.set_bytes(15, 4, &q_start_row as *const u32 as *const _);
+        encoder.set_bytes(16, 4, &groups_per_row as *const u32 as *const _);
+        encoder.set_bytes(17, 4, &row_bytes as *const u32 as *const _);
+        let tg_size = MTLSize::new(64, 1, 1);
+        let num_tgs = num_heads * q_len;
+        encoder.dispatch_thread_groups(MTLSize::new(num_tgs as u64, 1, 1), tg_size);
+    }
+
+    pub fn encode_attention_causal_q4_0(
+        &self,
+        encoder: &ComputeCommandEncoderRef,
+        q_buf: &Buffer,
+        k_cache_buf: &Buffer,
+        v_cache_buf: &Buffer,
+        out_buf: &Buffer,
+        num_heads: u32,
+        num_kv_heads: u32,
+        num_kv_groups: u32,
+        head_dim: u32,
+        kv_seq: u32,
+        capacity: u32,
+        scale: f32,
+        q_len: u32,
+        q_start: u32,
+        attention_window: u32,
+        groups_per_row: u32,
+        row_bytes: u32,
+    ) {
+        encoder.set_compute_pipeline_state(&self.attention_causal_q4_0_pipeline);
+        encoder.set_buffer(0, Some(q_buf), 0);
+        encoder.set_buffer(1, Some(k_cache_buf), 0);
+        encoder.set_buffer(2, Some(v_cache_buf), 0);
+        encoder.set_buffer(3, Some(out_buf), 0);
+        encoder.set_bytes(4, 4, &num_heads as *const u32 as *const _);
+        encoder.set_bytes(5, 4, &num_kv_heads as *const u32 as *const _);
+        encoder.set_bytes(6, 4, &num_kv_groups as *const u32 as *const _);
+        encoder.set_bytes(7, 4, &head_dim as *const u32 as *const _);
+        encoder.set_bytes(8, 4, &kv_seq as *const u32 as *const _);
+        encoder.set_bytes(9, 4, &capacity as *const u32 as *const _);
+        encoder.set_bytes(10, 4, &scale as *const f32 as *const _);
+        encoder.set_bytes(11, 4, &q_len as *const u32 as *const _);
+        encoder.set_bytes(12, 4, &q_start as *const u32 as *const _);
+        encoder.set_bytes(13, 4, &attention_window as *const u32 as *const _);
+        encoder.set_bytes(14, 4, &groups_per_row as *const u32 as *const _);
+        encoder.set_bytes(15, 4, &row_bytes as *const u32 as *const _);
+        let tg_size = MTLSize::new(64, 1, 1);
+        let num_tgs = num_heads * q_len;
+        encoder.dispatch_thread_groups(MTLSize::new(num_tgs as u64, 1, 1), tg_size);
+    }
+
+    pub fn encode_attention_causal_strided_q4_0(
+        &self,
+        encoder: &ComputeCommandEncoderRef,
+        q_buf: &Buffer,
+        k_cache_buf: &Buffer,
+        v_cache_buf: &Buffer,
+        out_buf: &Buffer,
+        num_heads: u32,
+        num_kv_heads: u32,
+        num_kv_groups: u32,
+        head_dim: u32,
+        kv_seq: u32,
+        capacity: u32,
+        scale: f32,
+        q_len: u32,
+        q_pos_start: u32,
+        attention_window: u32,
+        q_stride: u32,
+        q_start_row: u32,
+        groups_per_row: u32,
+        row_bytes: u32,
+    ) {
+        encoder.set_compute_pipeline_state(&self.attention_causal_strided_q4_0_pipeline);
+        encoder.set_buffer(0, Some(q_buf), 0);
+        encoder.set_buffer(1, Some(k_cache_buf), 0);
+        encoder.set_buffer(2, Some(v_cache_buf), 0);
+        encoder.set_buffer(3, Some(out_buf), 0);
+        encoder.set_bytes(4, 4, &num_heads as *const u32 as *const _);
+        encoder.set_bytes(5, 4, &num_kv_heads as *const u32 as *const _);
+        encoder.set_bytes(6, 4, &num_kv_groups as *const u32 as *const _);
+        encoder.set_bytes(7, 4, &head_dim as *const u32 as *const _);
+        encoder.set_bytes(8, 4, &kv_seq as *const u32 as *const _);
+        encoder.set_bytes(9, 4, &capacity as *const u32 as *const _);
+        encoder.set_bytes(10, 4, &scale as *const f32 as *const _);
+        encoder.set_bytes(11, 4, &q_len as *const u32 as *const _);
+        encoder.set_bytes(12, 4, &q_pos_start as *const u32 as *const _);
+        encoder.set_bytes(13, 4, &attention_window as *const u32 as *const _);
+        encoder.set_bytes(14, 4, &q_stride as *const u32 as *const _);
+        encoder.set_bytes(15, 4, &q_start_row as *const u32 as *const _);
+        encoder.set_bytes(16, 4, &groups_per_row as *const u32 as *const _);
+        encoder.set_bytes(17, 4, &row_bytes as *const u32 as *const _);
+        let tg_size = MTLSize::new(64, 1, 1);
+        let num_tgs = num_heads * q_len;
+        encoder.dispatch_thread_groups(MTLSize::new(num_tgs as u64, 1, 1), tg_size);
     }
 
     // ─── Legacy standalone dispatch methods (kept for compatibility) ─────────
