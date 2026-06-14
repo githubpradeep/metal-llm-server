@@ -93,6 +93,42 @@ constant uint Q4_BLOCK_BYTES = 18;
 constant uint N_ROWS_PER_TG = 4;  // rows per threadgroup
 constant uint N_SIMDGROUPS = 2;   // SIMD groups per threadgroup
 
+// Helper: compute dot product of one Q4_0 group (32 weights) with an x chunk.
+// q points to 16 packed bytes. The 32 x values are passed as 8 float4s.
+// Uses packed_uchar4 loads so the 16 byte reads collapse to 4 vector loads.
+inline float q4_dot_vec(device const uchar* q,
+                        float4 xv0, float4 xv1, float4 xv2, float4 xv3,
+                        float4 xv4, float4 xv5, float4 xv6, float4 xv7) {
+    float local = 0.0f;
+
+    packed_uchar4 q0 = *reinterpret_cast<device const packed_uchar4*>(q + 0);
+    packed_uchar4 q1 = *reinterpret_cast<device const packed_uchar4*>(q + 4);
+    packed_uchar4 q2 = *reinterpret_cast<device const packed_uchar4*>(q + 8);
+    packed_uchar4 q3 = *reinterpret_cast<device const packed_uchar4*>(q + 12);
+
+    local += float(int(q0[0] & 0xF) - 8) * xv0[0] + float(int(q0[0] >> 4) - 8) * xv0[1];
+    local += float(int(q0[1] & 0xF) - 8) * xv0[2] + float(int(q0[1] >> 4) - 8) * xv0[3];
+    local += float(int(q0[2] & 0xF) - 8) * xv1[0] + float(int(q0[2] >> 4) - 8) * xv1[1];
+    local += float(int(q0[3] & 0xF) - 8) * xv1[2] + float(int(q0[3] >> 4) - 8) * xv1[3];
+
+    local += float(int(q1[0] & 0xF) - 8) * xv2[0] + float(int(q1[0] >> 4) - 8) * xv2[1];
+    local += float(int(q1[1] & 0xF) - 8) * xv2[2] + float(int(q1[1] >> 4) - 8) * xv2[3];
+    local += float(int(q1[2] & 0xF) - 8) * xv3[0] + float(int(q1[2] >> 4) - 8) * xv3[1];
+    local += float(int(q1[3] & 0xF) - 8) * xv3[2] + float(int(q1[3] >> 4) - 8) * xv3[3];
+
+    local += float(int(q2[0] & 0xF) - 8) * xv4[0] + float(int(q2[0] >> 4) - 8) * xv4[1];
+    local += float(int(q2[1] & 0xF) - 8) * xv4[2] + float(int(q2[1] >> 4) - 8) * xv4[3];
+    local += float(int(q2[2] & 0xF) - 8) * xv5[0] + float(int(q2[2] >> 4) - 8) * xv5[1];
+    local += float(int(q2[3] & 0xF) - 8) * xv5[2] + float(int(q2[3] >> 4) - 8) * xv5[3];
+
+    local += float(int(q3[0] & 0xF) - 8) * xv6[0] + float(int(q3[0] >> 4) - 8) * xv6[1];
+    local += float(int(q3[1] & 0xF) - 8) * xv6[2] + float(int(q3[1] >> 4) - 8) * xv6[3];
+    local += float(int(q3[2] & 0xF) - 8) * xv7[0] + float(int(q3[2] >> 4) - 8) * xv7[1];
+    local += float(int(q3[3] & 0xF) - 8) * xv7[2] + float(int(q3[3] >> 4) - 8) * xv7[3];
+
+    return local;
+}
+
 kernel void matvec_q4(
     device const uchar* W_q4 [[buffer(0)]],
     device const float* x [[buffer(1)]],
@@ -140,55 +176,18 @@ kernel void matvec_q4(
             uint block_offset = g * Q4_BLOCK_BYTES;
             float scale = float(*reinterpret_cast<device const half*>(&row0_ptr[block_offset]));
             device const uchar* q = &row0_ptr[block_offset + 2];
-            
-            float local = 0.0f;
-            // Unroll all 16 bytes (32 weights)
-            local += float(int(q[0] & 0xF) - 8) * xv0[0] + float(int(q[0] >> 4) - 8) * xv0[1];
-            local += float(int(q[1] & 0xF) - 8) * xv0[2] + float(int(q[1] >> 4) - 8) * xv0[3];
-            local += float(int(q[2] & 0xF) - 8) * xv1[0] + float(int(q[2] >> 4) - 8) * xv1[1];
-            local += float(int(q[3] & 0xF) - 8) * xv1[2] + float(int(q[3] >> 4) - 8) * xv1[3];
-            local += float(int(q[4] & 0xF) - 8) * xv2[0] + float(int(q[4] >> 4) - 8) * xv2[1];
-            local += float(int(q[5] & 0xF) - 8) * xv2[2] + float(int(q[5] >> 4) - 8) * xv2[3];
-            local += float(int(q[6] & 0xF) - 8) * xv3[0] + float(int(q[6] >> 4) - 8) * xv3[1];
-            local += float(int(q[7] & 0xF) - 8) * xv3[2] + float(int(q[7] >> 4) - 8) * xv3[3];
-            local += float(int(q[8] & 0xF) - 8) * xv4[0] + float(int(q[8] >> 4) - 8) * xv4[1];
-            local += float(int(q[9] & 0xF) - 8) * xv4[2] + float(int(q[9] >> 4) - 8) * xv4[3];
-            local += float(int(q[10] & 0xF) - 8) * xv5[0] + float(int(q[10] >> 4) - 8) * xv5[1];
-            local += float(int(q[11] & 0xF) - 8) * xv5[2] + float(int(q[11] >> 4) - 8) * xv5[3];
-            local += float(int(q[12] & 0xF) - 8) * xv6[0] + float(int(q[12] >> 4) - 8) * xv6[1];
-            local += float(int(q[13] & 0xF) - 8) * xv6[2] + float(int(q[13] >> 4) - 8) * xv6[3];
-            local += float(int(q[14] & 0xF) - 8) * xv7[0] + float(int(q[14] >> 4) - 8) * xv7[1];
-            local += float(int(q[15] & 0xF) - 8) * xv7[2] + float(int(q[15] >> 4) - 8) * xv7[3];
-            acc0 += local * scale;
+            acc0 += q4_dot_vec(q, xv0, xv1, xv2, xv3, xv4, xv5, xv6, xv7) * scale;
         }
-        
+
         // Process row1 (reuses same x-vector registers)
         if (valid1) {
             uint block_offset = g * Q4_BLOCK_BYTES;
             float scale = float(*reinterpret_cast<device const half*>(&row1_ptr[block_offset]));
             device const uchar* q = &row1_ptr[block_offset + 2];
-            
-            float local = 0.0f;
-            local += float(int(q[0] & 0xF) - 8) * xv0[0] + float(int(q[0] >> 4) - 8) * xv0[1];
-            local += float(int(q[1] & 0xF) - 8) * xv0[2] + float(int(q[1] >> 4) - 8) * xv0[3];
-            local += float(int(q[2] & 0xF) - 8) * xv1[0] + float(int(q[2] >> 4) - 8) * xv1[1];
-            local += float(int(q[3] & 0xF) - 8) * xv1[2] + float(int(q[3] >> 4) - 8) * xv1[3];
-            local += float(int(q[4] & 0xF) - 8) * xv2[0] + float(int(q[4] >> 4) - 8) * xv2[1];
-            local += float(int(q[5] & 0xF) - 8) * xv2[2] + float(int(q[5] >> 4) - 8) * xv2[3];
-            local += float(int(q[6] & 0xF) - 8) * xv3[0] + float(int(q[6] >> 4) - 8) * xv3[1];
-            local += float(int(q[7] & 0xF) - 8) * xv3[2] + float(int(q[7] >> 4) - 8) * xv3[3];
-            local += float(int(q[8] & 0xF) - 8) * xv4[0] + float(int(q[8] >> 4) - 8) * xv4[1];
-            local += float(int(q[9] & 0xF) - 8) * xv4[2] + float(int(q[9] >> 4) - 8) * xv4[3];
-            local += float(int(q[10] & 0xF) - 8) * xv5[0] + float(int(q[10] >> 4) - 8) * xv5[1];
-            local += float(int(q[11] & 0xF) - 8) * xv5[2] + float(int(q[11] >> 4) - 8) * xv5[3];
-            local += float(int(q[12] & 0xF) - 8) * xv6[0] + float(int(q[12] >> 4) - 8) * xv6[1];
-            local += float(int(q[13] & 0xF) - 8) * xv6[2] + float(int(q[13] >> 4) - 8) * xv6[3];
-            local += float(int(q[14] & 0xF) - 8) * xv7[0] + float(int(q[14] >> 4) - 8) * xv7[1];
-            local += float(int(q[15] & 0xF) - 8) * xv7[2] + float(int(q[15] >> 4) - 8) * xv7[3];
-            acc1 += local * scale;
+            acc1 += q4_dot_vec(q, xv0, xv1, xv2, xv3, xv4, xv5, xv6, xv7) * scale;
         }
     }
-    
+
     // Reduce within SIMD group
     acc0 = simd_sum(acc0);
     acc1 = simd_sum(acc1);
@@ -310,50 +309,14 @@ kernel void projection_q4_batch(
             uint block_offset = g * Q4_BLOCK_BYTES;
             float scale = float(*reinterpret_cast<device const half*>(&row0_ptr[block_offset]));
             device const uchar* q = &row0_ptr[block_offset + 2];
-
-            float local = 0.0f;
-            local += float(int(q[0] & 0xF) - 8) * xv0[0] + float(int(q[0] >> 4) - 8) * xv0[1];
-            local += float(int(q[1] & 0xF) - 8) * xv0[2] + float(int(q[1] >> 4) - 8) * xv0[3];
-            local += float(int(q[2] & 0xF) - 8) * xv1[0] + float(int(q[2] >> 4) - 8) * xv1[1];
-            local += float(int(q[3] & 0xF) - 8) * xv1[2] + float(int(q[3] >> 4) - 8) * xv1[3];
-            local += float(int(q[4] & 0xF) - 8) * xv2[0] + float(int(q[4] >> 4) - 8) * xv2[1];
-            local += float(int(q[5] & 0xF) - 8) * xv2[2] + float(int(q[5] >> 4) - 8) * xv2[3];
-            local += float(int(q[6] & 0xF) - 8) * xv3[0] + float(int(q[6] >> 4) - 8) * xv3[1];
-            local += float(int(q[7] & 0xF) - 8) * xv3[2] + float(int(q[7] >> 4) - 8) * xv3[3];
-            local += float(int(q[8] & 0xF) - 8) * xv4[0] + float(int(q[8] >> 4) - 8) * xv4[1];
-            local += float(int(q[9] & 0xF) - 8) * xv4[2] + float(int(q[9] >> 4) - 8) * xv4[3];
-            local += float(int(q[10] & 0xF) - 8) * xv5[0] + float(int(q[10] >> 4) - 8) * xv5[1];
-            local += float(int(q[11] & 0xF) - 8) * xv5[2] + float(int(q[11] >> 4) - 8) * xv5[3];
-            local += float(int(q[12] & 0xF) - 8) * xv6[0] + float(int(q[12] >> 4) - 8) * xv6[1];
-            local += float(int(q[13] & 0xF) - 8) * xv6[2] + float(int(q[13] >> 4) - 8) * xv6[3];
-            local += float(int(q[14] & 0xF) - 8) * xv7[0] + float(int(q[14] >> 4) - 8) * xv7[1];
-            local += float(int(q[15] & 0xF) - 8) * xv7[2] + float(int(q[15] >> 4) - 8) * xv7[3];
-            acc0 += local * scale;
+            acc0 += q4_dot_vec(q, xv0, xv1, xv2, xv3, xv4, xv5, xv6, xv7) * scale;
         }
 
         if (valid1) {
             uint block_offset = g * Q4_BLOCK_BYTES;
             float scale = float(*reinterpret_cast<device const half*>(&row1_ptr[block_offset]));
             device const uchar* q = &row1_ptr[block_offset + 2];
-
-            float local = 0.0f;
-            local += float(int(q[0] & 0xF) - 8) * xv0[0] + float(int(q[0] >> 4) - 8) * xv0[1];
-            local += float(int(q[1] & 0xF) - 8) * xv0[2] + float(int(q[1] >> 4) - 8) * xv0[3];
-            local += float(int(q[2] & 0xF) - 8) * xv1[0] + float(int(q[2] >> 4) - 8) * xv1[1];
-            local += float(int(q[3] & 0xF) - 8) * xv1[2] + float(int(q[3] >> 4) - 8) * xv1[3];
-            local += float(int(q[4] & 0xF) - 8) * xv2[0] + float(int(q[4] >> 4) - 8) * xv2[1];
-            local += float(int(q[5] & 0xF) - 8) * xv2[2] + float(int(q[5] >> 4) - 8) * xv2[3];
-            local += float(int(q[6] & 0xF) - 8) * xv3[0] + float(int(q[6] >> 4) - 8) * xv3[1];
-            local += float(int(q[7] & 0xF) - 8) * xv3[2] + float(int(q[7] >> 4) - 8) * xv3[3];
-            local += float(int(q[8] & 0xF) - 8) * xv4[0] + float(int(q[8] >> 4) - 8) * xv4[1];
-            local += float(int(q[9] & 0xF) - 8) * xv4[2] + float(int(q[9] >> 4) - 8) * xv4[3];
-            local += float(int(q[10] & 0xF) - 8) * xv5[0] + float(int(q[10] >> 4) - 8) * xv5[1];
-            local += float(int(q[11] & 0xF) - 8) * xv5[2] + float(int(q[11] >> 4) - 8) * xv5[3];
-            local += float(int(q[12] & 0xF) - 8) * xv6[0] + float(int(q[12] >> 4) - 8) * xv6[1];
-            local += float(int(q[13] & 0xF) - 8) * xv6[2] + float(int(q[13] >> 4) - 8) * xv6[3];
-            local += float(int(q[14] & 0xF) - 8) * xv7[0] + float(int(q[14] >> 4) - 8) * xv7[1];
-            local += float(int(q[15] & 0xF) - 8) * xv7[2] + float(int(q[15] >> 4) - 8) * xv7[3];
-            acc1 += local * scale;
+            acc1 += q4_dot_vec(q, xv0, xv1, xv2, xv3, xv4, xv5, xv6, xv7) * scale;
         }
     }
 
@@ -458,27 +421,19 @@ kernel void projection_q4_batch_tiled(
         uint x_offset = x_base + g * Q4_GROUP_SIZE;
         uint block_offset = g * Q4_BLOCK_BYTES;
 
+        float4 xv0 = *reinterpret_cast<device const float4*>(&X[x_offset]);
+        float4 xv1 = *reinterpret_cast<device const float4*>(&X[x_offset + 4]);
+        float4 xv2 = *reinterpret_cast<device const float4*>(&X[x_offset + 8]);
+        float4 xv3 = *reinterpret_cast<device const float4*>(&X[x_offset + 12]);
+        float4 xv4 = *reinterpret_cast<device const float4*>(&X[x_offset + 16]);
+        float4 xv5 = *reinterpret_cast<device const float4*>(&X[x_offset + 20]);
+        float4 xv6 = *reinterpret_cast<device const float4*>(&X[x_offset + 24]);
+        float4 xv7 = *reinterpret_cast<device const float4*>(&X[x_offset + 28]);
+
         float scale = float(*reinterpret_cast<device const half*>(&row_ptr[block_offset]));
         device const uchar* q = &row_ptr[block_offset + 2];
 
-        float local = 0.0f;
-        local += float(int(q[0] & 0xF) - 8) * X[x_offset + 0] + float(int(q[0] >> 4) - 8) * X[x_offset + 1];
-        local += float(int(q[1] & 0xF) - 8) * X[x_offset + 2] + float(int(q[1] >> 4) - 8) * X[x_offset + 3];
-        local += float(int(q[2] & 0xF) - 8) * X[x_offset + 4] + float(int(q[2] >> 4) - 8) * X[x_offset + 5];
-        local += float(int(q[3] & 0xF) - 8) * X[x_offset + 6] + float(int(q[3] >> 4) - 8) * X[x_offset + 7];
-        local += float(int(q[4] & 0xF) - 8) * X[x_offset + 8] + float(int(q[4] >> 4) - 8) * X[x_offset + 9];
-        local += float(int(q[5] & 0xF) - 8) * X[x_offset + 10] + float(int(q[5] >> 4) - 8) * X[x_offset + 11];
-        local += float(int(q[6] & 0xF) - 8) * X[x_offset + 12] + float(int(q[6] >> 4) - 8) * X[x_offset + 13];
-        local += float(int(q[7] & 0xF) - 8) * X[x_offset + 14] + float(int(q[7] >> 4) - 8) * X[x_offset + 15];
-        local += float(int(q[8] & 0xF) - 8) * X[x_offset + 16] + float(int(q[8] >> 4) - 8) * X[x_offset + 17];
-        local += float(int(q[9] & 0xF) - 8) * X[x_offset + 18] + float(int(q[9] >> 4) - 8) * X[x_offset + 19];
-        local += float(int(q[10] & 0xF) - 8) * X[x_offset + 20] + float(int(q[10] >> 4) - 8) * X[x_offset + 21];
-        local += float(int(q[11] & 0xF) - 8) * X[x_offset + 22] + float(int(q[11] >> 4) - 8) * X[x_offset + 23];
-        local += float(int(q[12] & 0xF) - 8) * X[x_offset + 24] + float(int(q[12] >> 4) - 8) * X[x_offset + 25];
-        local += float(int(q[13] & 0xF) - 8) * X[x_offset + 26] + float(int(q[13] >> 4) - 8) * X[x_offset + 27];
-        local += float(int(q[14] & 0xF) - 8) * X[x_offset + 28] + float(int(q[14] >> 4) - 8) * X[x_offset + 29];
-        local += float(int(q[15] & 0xF) - 8) * X[x_offset + 30] + float(int(q[15] >> 4) - 8) * X[x_offset + 31];
-        acc += local * scale;
+        acc += q4_dot_vec(q, xv0, xv1, xv2, xv3, xv4, xv5, xv6, xv7) * scale;
     }
 
     Y[global_s * M + global_row] = acc;
