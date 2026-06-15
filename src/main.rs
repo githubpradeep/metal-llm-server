@@ -8,6 +8,8 @@ mod gpu;
 mod gpu_model;
 mod gemma4_config;
 mod gemma4_gpu_model;
+mod gemma4_assistant_config;
+mod gemma4_assistant_model;
 mod kv_pool;
 mod metrics;
 mod model;
@@ -54,6 +56,16 @@ fn main() {
             let tokenizer = tokenizers::Tokenizer::from_file(&tokenizer_path)
                 .expect("Failed to load tokenizer.json");
 
+            // Optional MTP assistant / draft model
+            let assistant_dir = args.iter()
+                .position(|a| a == "--assistant-dir")
+                .and_then(|i| args.get(i + 1))
+                .cloned();
+
+            let assistant = assistant_dir.map(|dir| {
+                gemma4_assistant_model::Gemma4AssistantGpuModel::new(&dir)
+            });
+
             println!("Model loaded in {:.2}s", start.elapsed().as_secs_f64());
 
             // Serve mode: start OpenAI-compatible HTTP server
@@ -72,16 +84,32 @@ fn main() {
             // Interactive generation mode
             let mut gpu_model = gpu_model;
             println!("{}", "=".repeat(60));
-            println!("GEMMA4 E4B GENERATION (Metal GPU, Q4_0)");
+            if assistant.is_some() {
+                println!("GEMMA4 E4B GENERATION (Metal GPU, Q4_0, MTP speculative decoding)");
+            } else {
+                println!("GEMMA4 E4B GENERATION (Metal GPU, Q4_0)");
+            }
             println!("{}", "=".repeat(60));
 
+            let prompt = "<start_of_turn>user\n A train leaves at 8:15 AM and arrives at 11:47 AM. How long was the journey?<end_of_turn>\n<start_of_turn>model\n";
             let gen_start = Instant::now();
-            generate_gemma4_gpu(
-                "<start_of_turn>user\n A train leaves at 8:15 AM and arrives at 11:47 AM. How long was the journey?<end_of_turn>\n<start_of_turn>model\n",
-                &tokenizer,
-                &mut gpu_model,
-                1000,
-            );
+            if let Some(mut assistant) = assistant {
+                generate_gemma4_gpu_speculative(
+                    prompt,
+                    &tokenizer,
+                    &mut gpu_model,
+                    &mut assistant,
+                    1000,
+                    6, // max draft tokens
+                );
+            } else {
+                generate_gemma4_gpu(
+                    prompt,
+                    &tokenizer,
+                    &mut gpu_model,
+                    1000,
+                );
+            }
             println!("\nTotal time: {:.2}s", gen_start.elapsed().as_secs_f64());
         } else {
             println!("Loading model (GPU/Metal) from: {}", model_dir);
@@ -225,4 +253,168 @@ fn generate_gemma4_gpu(
     println!("  Throughput: {:.2} tok/s", tps);
     println!("  Context length: {} tokens", model.num_items());
     println!("  Elapsed: {:.2}s", elapsed);
+}
+
+fn generate_gemma4_gpu_speculative(
+    prompt: &str,
+    tokenizer: &tokenizers::Tokenizer,
+    model: &mut gemma4_gpu_model::Gemma4GpuModel,
+    assistant: &mut gemma4_assistant_model::Gemma4AssistantGpuModel,
+    max_tokens: usize,
+    max_draft_tokens: usize,
+) {
+    use rand::Rng;
+    use crate::sampling::{softmax, argmax};
+
+    let encoding = tokenizer.encode(prompt, true).expect("Failed to encode");
+    let input_ids: Vec<u32> = encoding.get_ids().to_vec();
+
+    print!("{}", prompt);
+    io::stdout().flush().unwrap();
+
+    // Prefill
+    let token_ids: Vec<usize> = input_ids.iter().map(|&t| t as usize).collect();
+    let logits = model.forward_prefill(&token_ids);
+
+    let start_time = Instant::now();
+    let mut tokens_generated = 0;
+    let mut accepted_draft_tokens = 0;
+    let mut drafted_total = 0;
+
+    let eos_tokens: &[usize] = &[1, 106];
+
+    // next_token is the next token to emit; it has not been emitted yet.
+    let mut next_token = sampling::min_p_sampling(&logits, 0.1);
+    while tokens_generated < max_tokens && !eos_tokens.contains(&next_token) {
+        let tok_str = tokenizer.decode(&[next_token as u32], false).unwrap_or_default();
+        print!("{}", tok_str);
+        io::stdout().flush().unwrap();
+        tokens_generated += 1;
+
+        // Forward the main model to get logits for the next position and the
+        // post-final-norm hidden state that seeds the assistant.
+        let (mut current_logits, main_hidden) =
+            model.forward_single_token_with_hidden_state(next_token);
+
+        // Ask the assistant to draft future tokens from this position.
+        let main_kv = model.assistant_kv_view();
+        let position_id = main_kv.seq_len.saturating_sub(1);
+        let drafts = assistant.draft_tokens(
+            next_token,
+            &main_hidden,
+            &model.embed_tokens_f16,
+            model.config.hidden_size,
+            &main_kv,
+            position_id,
+            max_draft_tokens,
+            eos_tokens,
+        );
+
+        // Standard speculative decoding acceptance.
+        // For each draft token x drawn from draft distribution p, we compare it to
+        // the main model distribution q at the same position. The token is accepted
+        // with probability min(1, q(x) / p(x)). If rejected, we sample a replacement
+        // from (q - p)^+ instead. If every draft token is accepted, we sample one
+        // bonus token from the main model at the final position.
+        let mut all_drafts_accepted = true;
+        let draft_ids: Vec<usize> = drafts.iter().map(|(t, _)| *t).collect();
+        if mtp_debug_enabled() {
+            eprintln!(
+                "[spec] seed={} drafts={:?} main_argmax={}",
+                next_token,
+                draft_ids,
+                argmax(&current_logits)
+            );
+        }
+
+        for (draft_token, draft_logits) in drafts {
+            if tokens_generated >= max_tokens {
+                all_drafts_accepted = false;
+                break;
+            }
+
+            drafted_total += 1;
+            let q = softmax(&current_logits);
+            let p = softmax(&draft_logits);
+
+            let ratio = if p[draft_token] > 1e-12 {
+                q[draft_token] / p[draft_token]
+            } else {
+                f32::INFINITY
+            };
+            let accept_prob = ratio.min(1.0);
+            let u: f32 = rand::thread_rng().gen();
+
+            if u < accept_prob {
+                // Accept the draft token: emit it now.
+                accepted_draft_tokens += 1;
+
+                let draft_str = tokenizer.decode(&[draft_token as u32], false).unwrap_or_default();
+                print!("{}", draft_str);
+                io::stdout().flush().unwrap();
+                tokens_generated += 1;
+
+                if eos_tokens.contains(&draft_token) || tokens_generated >= max_tokens {
+                    next_token = draft_token;
+                    all_drafts_accepted = false; // no bonus token when we hit EOS/max
+                    break;
+                }
+
+                // Advance the main model to get logits for the following position.
+                current_logits = model.forward_single_token(draft_token);
+            } else {
+                // Reject: sample a replacement from (q - p)^+.
+                // The replacement becomes the seed for the next iteration.
+                all_drafts_accepted = false;
+                let mut replacement_probs = vec![0.0f32; q.len()];
+                let mut sum = 0.0f32;
+                for i in 0..q.len() {
+                    let val = (q[i] - p[i]).max(0.0);
+                    replacement_probs[i] = val;
+                    sum += val;
+                }
+                next_token = if sum > 1e-12 {
+                    for prob in replacement_probs.iter_mut() {
+                        *prob /= sum;
+                    }
+                    sampling::multinomial_sample(&replacement_probs)
+                } else {
+                    argmax(&current_logits)
+                };
+                break;
+            }
+        }
+
+        // If every draft token was accepted, sample one bonus token from the main
+        // model at the final position. It becomes the seed for the next iteration.
+        if all_drafts_accepted && tokens_generated < max_tokens {
+            next_token = sampling::min_p_sampling(&current_logits, 0.1);
+        }
+    }
+
+    let elapsed = start_time.elapsed().as_secs_f64();
+    let tps = if elapsed > 0.0 { tokens_generated as f64 / elapsed } else { 0.0 };
+
+    println!("\n\n[Gemma4 E4B Generation - Metal GPU, Q4_0, MTP speculative]");
+    println!("  Tokens: {}", tokens_generated);
+    println!("  Throughput: {:.2} tok/s", tps);
+    println!(
+        "  Drafted: {}, Accepted: {}, Acceptance rate: {:.2}%",
+        drafted_total,
+        accepted_draft_tokens,
+        if drafted_total > 0 {
+            100.0 * accepted_draft_tokens as f64 / drafted_total as f64
+        } else {
+            0.0
+        }
+    );
+    println!("  Context length: {} tokens", model.num_items());
+    println!("  Elapsed: {:.2}s", elapsed);
+}
+
+fn mtp_debug_enabled() -> bool {
+    match std::env::var("MTP_DEBUG") {
+        Ok(v) => !v.is_empty() && v != "0",
+        Err(_) => false,
+    }
 }

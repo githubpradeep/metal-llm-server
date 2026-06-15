@@ -139,7 +139,7 @@ pub fn min_p_sampling(logits: &[f32], p_base: f32) -> usize {
 }
 
 /// Sample from a probability distribution.
-fn multinomial_sample(probs: &[f32]) -> usize {
+pub fn multinomial_sample(probs: &[f32]) -> usize {
     let mut rng = rand::thread_rng();
     let r: f32 = rng.gen();
     let mut cdf = 0.0f32;
@@ -150,6 +150,30 @@ fn multinomial_sample(probs: &[f32]) -> usize {
         }
     }
     probs.len() - 1
+}
+
+/// Compute softmax probabilities from logits.
+/// Returns a probability distribution over the vocabulary.
+pub fn softmax(logits: &[f32]) -> Vec<f32> {
+    let max_logit = logits.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+    let mut probs = vec![0.0f32; logits.len()];
+    let mut sum = 0.0f32;
+    for (i, &logit) in logits.iter().enumerate() {
+        let scaled = logit - max_logit;
+        probs[i] = scaled.exp();
+        sum += probs[i];
+    }
+    let inv_sum = 1.0 / sum;
+    for p in probs.iter_mut() {
+        *p *= inv_sum;
+    }
+    probs
+}
+
+/// Sample a token from a (possibly unnormalized) logit distribution using temperature.
+/// temperature 0.0 is treated as greedy argmax.
+pub fn sample_token(logits: &[f32], temperature: f32) -> usize {
+    sample(logits, temperature, 0.0)
 }
 
 /// Return index of maximum value.

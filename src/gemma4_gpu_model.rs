@@ -10,6 +10,47 @@ use crate::gemma4_config::{Gemma4TextConfig, KvCacheType};
 use crate::gpu::MetalContext;
 use crate::kv_pool::{KvCachePool, KvPoolError, KvSlot, KvSlotView};
 
+/// KV cache view from the main Gemma4 model, used by the MTP assistant for cross-attention.
+/// The assistant uses the main model's shared KV states, keyed by attention type:
+///   - sliding_attention KV comes from the last non-shared sliding layer
+///   - full_attention KV comes from the last non-shared full layer
+///
+/// These source layers are computed from the model config so the implementation is not
+/// tied to a specific layer count (e.g. Gemma4 E4B's 42 layers with shared layers 24-41).
+pub struct MainModelKvView<'a> {
+    pub sliding_k: &'a Buffer,
+    pub sliding_v: &'a Buffer,
+    pub full_k: &'a Buffer,
+    pub full_v: &'a Buffer,
+    pub seq_len: u32,
+    pub capacity: u32,
+    pub kv_cache_type: KvCacheType,
+    pub num_kv_heads: u32,
+    /// Head dimension of the sliding-window KV source layer.
+    pub sliding_head_dim: u32,
+    /// Head dimension of the full-attention KV source layer.
+    pub full_head_dim: u32,
+}
+
+impl<'a> MainModelKvView<'a> {
+    pub fn kv_pair(&self, is_full_attention: bool) -> (&Buffer, &Buffer) {
+        if is_full_attention {
+            (self.full_k, self.full_v)
+        } else {
+            (self.sliding_k, self.sliding_v)
+        }
+    }
+
+    /// Expected Q/K head dimension for an assistant layer of the given attention type.
+    pub fn expected_head_dim(&self, is_full_attention: bool) -> u32 {
+        if is_full_attention {
+            self.full_head_dim
+        } else {
+            self.sliding_head_dim
+        }
+    }
+}
+
 const DEFAULT_MAX_PREFILL_SEQ: usize = 128;
 const DEFAULT_MAX_DECODE_BATCH: usize = 4;
 
@@ -1995,7 +2036,7 @@ impl Gemma4GpuModel {
 
         // Logit softcapping: logits = cap * tanh(logits / cap)
         // Clamp input to tanh to prevent NaN from overflow (same issue as GeLU)
-        let cap = self.config.final_logit_softcapping;
+        let cap = self.config.final_logit_softcapping.unwrap_or(30.0);
         for l in logits.iter_mut() {
             let x = (*l / cap).clamp(-10.0, 10.0);
             *l = cap * x.tanh();
@@ -2006,6 +2047,62 @@ impl Gemma4GpuModel {
         self.kv_seq_len += 1;
 
         logits
+    }
+
+    /// Forward one token and return both logits and the hidden state *after* final norm.
+    /// This is used by the MTP drafter to seed speculative decoding. The HuggingFace
+    /// `SinglePositionMultiTokenCandidateGenerator` takes `model_outputs.hidden_states[-1]`,
+    /// which is the output of the main model's final norm.
+    pub fn forward_single_token_with_hidden_state(
+        &mut self,
+        token_id: usize,
+    ) -> (Vec<f32>, Vec<f32>) {
+        let logits = self.forward_single_token(token_id);
+        let hidden = MetalContext::read_buffer(&self.normed_buf, self.config.hidden_size);
+        (logits, hidden)
+    }
+
+    /// Run the model autoregressively over `token_ids` and return logits for every position.
+    pub fn forward_prefill_all_logits(&mut self, token_ids: &[usize]) -> Vec<Vec<f32>> {
+        let mut all_logits = Vec::with_capacity(token_ids.len());
+        for &tid in token_ids {
+            all_logits.push(self.forward_single_token(tid));
+        }
+        all_logits
+    }
+
+    /// Roll back the legacy KV cache to a shorter sequence length.
+    /// The next forward will overwrite positions >= new_seq_len.
+    pub fn rollback_legacy_state(&mut self, new_seq_len: u32) {
+        self.kv_seq_len = new_seq_len;
+        self.total_tokens = new_seq_len as usize;
+    }
+
+    /// Expose the main model's shared KV cache for the assistant's cross-attention.
+    /// Uses the last non-shared sliding layer and last non-shared full layer as the
+    /// KV sources; all assistant layers of the same attention type share these states,
+    /// matching the HuggingFace/llama.cpp Gemma4 assistant implementation.
+    pub fn assistant_kv_view(&self) -> MainModelKvView<'_> {
+        let sliding_src = self
+            .config
+            .last_non_shared_layer_of_type(false)
+            .expect("Gemma4 model has no non-shared sliding attention layer");
+        let full_src = self
+            .config
+            .last_non_shared_layer_of_type(true)
+            .expect("Gemma4 model has no non-shared full attention layer");
+        MainModelKvView {
+            sliding_k: &self.k_cache[sliding_src],
+            sliding_v: &self.v_cache[sliding_src],
+            full_k: &self.k_cache[full_src],
+            full_v: &self.v_cache[full_src],
+            seq_len: self.kv_seq_len,
+            capacity: self.kv_capacity,
+            kv_cache_type: self.kv_cache_type,
+            num_kv_heads: self.config.num_key_value_heads as u32,
+            sliding_head_dim: self.config.layer_head_dim(sliding_src) as u32,
+            full_head_dim: self.config.layer_head_dim(full_src) as u32,
+        }
     }
 
     pub fn num_items(&self) -> usize {
@@ -3871,7 +3968,7 @@ impl Gemma4GpuModel {
         cmd.wait_until_completed();
 
         let mut logits = MetalContext::read_buffer(&self.prefill_scratch.logits_buf, vocab_size);
-        let cap = self.config.final_logit_softcapping;
+        let cap = self.config.final_logit_softcapping.unwrap_or(30.0);
         for logit in &mut logits {
             let x = (*logit / cap).clamp(-10.0, 10.0);
             *logit = cap * x.tanh();
@@ -4558,7 +4655,7 @@ impl Gemma4GpuModel {
             &self.decode_batch_scratch.logits_buf,
             batch_size * vocab_size,
         );
-        let cap = self.config.final_logit_softcapping;
+        let cap = self.config.final_logit_softcapping.unwrap_or(30.0);
         let mut outputs = Vec::with_capacity(batch_size);
         for batch_idx in 0..batch_size {
             let start = batch_idx * vocab_size;
@@ -4811,7 +4908,7 @@ impl Gemma4GpuModel {
 
             let mut logits =
                 MetalContext::read_buffer(&self.prefill_scratch.logits_buf, vocab_size);
-            let cap = self.config.final_logit_softcapping;
+            let cap = self.config.final_logit_softcapping.unwrap_or(30.0);
             for logit in &mut logits {
                 let x = (*logit / cap).clamp(-10.0, 10.0);
                 *logit = cap * x.tanh();
@@ -4890,7 +4987,7 @@ impl Gemma4GpuModel {
 }
 
 /// Decode a safetensors tensor view to Vec<f32>, handling f32/f16/bf16.
-fn decode_tensor_to_f32(tensor_view: &safetensors::tensor::TensorView) -> Vec<f32> {
+pub fn decode_tensor_to_f32(tensor_view: &safetensors::tensor::TensorView) -> Vec<f32> {
     let dtype = tensor_view.dtype();
     let raw_data = tensor_view.data();
 
@@ -4917,7 +5014,7 @@ fn decode_tensor_to_f32(tensor_view: &safetensors::tensor::TensorView) -> Vec<f3
     }
 }
 
-fn half_to_f32(bits: u16) -> f32 {
+pub fn half_to_f32(bits: u16) -> f32 {
     let sign = ((bits >> 15) & 1) as u32;
     let exp = ((bits >> 10) & 0x1F) as u32;
     let mant = (bits & 0x3FF) as u32;
@@ -4944,12 +5041,12 @@ fn half_to_f32(bits: u16) -> f32 {
     }
 }
 
-fn bf16_to_f32(bits: u16) -> f32 {
+pub fn bf16_to_f32(bits: u16) -> f32 {
     f32::from_bits((bits as u32) << 16)
 }
 
 /// Convert raw bytes to Vec<u16> (for storing bf16/f16 data compactly).
-fn raw_to_u16(data: &[u8]) -> Vec<u16> {
+pub fn raw_to_u16(data: &[u8]) -> Vec<u16> {
     data.chunks_exact(2)
         .map(|b| u16::from_le_bytes([b[0], b[1]]))
         .collect()

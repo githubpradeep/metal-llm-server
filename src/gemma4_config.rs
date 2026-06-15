@@ -27,7 +27,7 @@ pub struct Gemma4TextConfig {
     #[serde(default = "default_max_pos")]
     pub max_position_embeddings: usize,
     #[serde(default = "default_final_logit_softcapping")]
-    pub final_logit_softcapping: f32,
+    pub final_logit_softcapping: Option<f32>,
     #[serde(default)]
     pub tie_word_embeddings: bool,
     #[serde(default)]
@@ -57,7 +57,7 @@ fn default_rope_factor() -> f64 { 1.0 }
 fn default_global_head_dim() -> usize { 512 }
 fn default_hidden_size_per_layer() -> usize { 256 }
 fn default_max_pos() -> usize { 131072 }
-fn default_final_logit_softcapping() -> f32 { 30.0 }
+fn default_final_logit_softcapping() -> Option<f32> { Some(30.0) }
 fn default_rope_theta() -> f64 { 10000.0 }
 fn default_partial_rotary() -> f64 { 1.0 }
 
@@ -106,12 +106,27 @@ impl Gemma4TextConfig {
         self.layer_types.get(layer_idx).map_or(false, |t| t == "full_attention")
     }
 
+    pub fn is_sliding_attention(&self, layer_idx: usize) -> bool {
+        self.layer_types.get(layer_idx).map_or(false, |t| t == "sliding_window_attention")
+    }
+
     pub fn layer_head_dim(&self, layer_idx: usize) -> usize {
         if self.is_full_attention(layer_idx) {
             self.global_head_dim
         } else {
             self.head_dim
         }
+    }
+
+    /// Returns the index of the last non-shared layer of the given attention type.
+    /// Shared KV layers are at the end of the model and reuse KV from earlier layers.
+    /// This matches the HuggingFace/llama.cpp Gemma4 architecture where the MTP
+    /// assistant cross-attends to the target's last unique sliding/full KV layers.
+    pub fn last_non_shared_layer_of_type(&self, want_full: bool) -> Option<usize> {
+        let first_shared = self.num_hidden_layers.saturating_sub(self.num_kv_shared_layers);
+        (0..first_shared)
+            .rev()
+            .find(|&i| self.is_full_attention(i) == want_full)
     }
 
     pub fn sliding_rope_theta(&self) -> f64 {
