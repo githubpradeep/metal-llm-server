@@ -526,6 +526,94 @@ kernel void rmsnorm(
     }
 }
 
+// ─── Fused RMSNorm + Residual Add ────────────────────────────────────────────
+// Computes: out[i] = ((a[i] + b[i]) / rms) * weight[i]
+// where rms = sqrt(mean((a + b)^2) + eps)
+// Saves one full memory pass vs separate vec_add + rmsnorm.
+
+kernel void rmsnorm_add(
+    device const float* a [[buffer(0)]],
+    device const float* b [[buffer(1)]],
+    device const float* weight [[buffer(2)]],
+    device float* out [[buffer(3)]],
+    constant uint& dim [[buffer(4)]],
+    constant float& eps [[buffer(5)]],
+    uint tid [[thread_index_in_threadgroup]],
+    uint tg_size [[threads_per_threadgroup]]
+) {
+    threadgroup float shared_sum[256];
+
+    float partial_sum = 0.0f;
+    for (uint i = tid; i < dim; i += tg_size) {
+        float val = a[i] + b[i];
+        partial_sum += val * val;
+    }
+    shared_sum[tid] = partial_sum;
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint stride = tg_size / 2; stride > 0; stride >>= 1) {
+        if (tid < stride) {
+            shared_sum[tid] += shared_sum[tid + stride];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    float inv_rms = rsqrt(shared_sum[0] / float(dim) + eps);
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint i = tid; i < dim; i += tg_size) {
+        out[i] = (a[i] + b[i]) * inv_rms * weight[i];
+    }
+}
+
+// ─── Fused RMSNorm + Residual Add with Residual Save ─────────────────────────
+// Computes: out[i] = ((a[i] + b[i]) / rms) * weight[i]
+//           residual_out[i] = a[i] + b[i]
+// This variant also writes the un-normalized sum back to a buffer so it can
+// be reused as the next residual. a and residual_out may alias safely because
+// each thread only reads/writes its own indices.
+
+kernel void rmsnorm_add_save_residual(
+    device const float* a [[buffer(0)]],
+    device const float* b [[buffer(1)]],
+    device const float* weight [[buffer(2)]],
+    device float* out [[buffer(3)]],
+    device float* residual_out [[buffer(4)]],
+    constant uint& dim [[buffer(5)]],
+    constant float& eps [[buffer(6)]],
+    uint tid [[thread_index_in_threadgroup]],
+    uint tg_size [[threads_per_threadgroup]]
+) {
+    threadgroup float shared_sum[256];
+
+    float partial_sum = 0.0f;
+    for (uint i = tid; i < dim; i += tg_size) {
+        float val = a[i] + b[i];
+        residual_out[i] = val;
+        partial_sum += val * val;
+    }
+    shared_sum[tid] = partial_sum;
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint stride = tg_size / 2; stride > 0; stride >>= 1) {
+        if (tid < stride) {
+            shared_sum[tid] += shared_sum[tid + stride];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    float inv_rms = rsqrt(shared_sum[0] / float(dim) + eps);
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint i = tid; i < dim; i += tg_size) {
+        out[i] = residual_out[i] * inv_rms * weight[i];
+    }
+}
+
 // ─── SiLU + Element-wise Multiply (fused gate activation) ───────────────────
 // out[i] = silu(gate[i]) * up[i]
 // where silu(x) = x / (1 + exp(-x))

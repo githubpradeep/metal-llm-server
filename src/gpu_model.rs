@@ -172,16 +172,26 @@ impl GpuLlamaModel {
         // Current KV sequence length (same for all layers in streaming mode)
         let kv_seq = self.kv_seq_lens[0];
 
+        let num_layers = self.layers.len();
+
         // ═══ SINGLE COMMAND BUFFER FOR ENTIRE FORWARD PASS ═══
         let cmd = self.ctx.queue.new_command_buffer();
         let encoder = cmd.new_compute_command_encoder();
 
-        for (layer_idx, layer) in self.layers.iter().enumerate() {
-            // Copy hidden → residual
-            self.ctx.encode_copy(encoder, &self.hidden_buf, &self.residual_buf, hidden_size as u32);
+        // Save initial hidden as residual for layer 0's attention, then compute
+        // layer 0's pre-attention RMSNorm (no preceding residual add).
+        self.ctx.encode_copy(encoder, &self.hidden_buf, &self.residual_buf, hidden_size as u32);
+        self.ctx.encode_rmsnorm(
+            encoder,
+            &self.residual_buf,
+            &self.layers[0].input_ln_weight,
+            &self.normed_buf,
+            hidden_size as u32,
+            eps,
+        );
 
-            // RMS Norm
-            self.ctx.encode_rmsnorm(encoder, &self.hidden_buf, &layer.input_ln_weight, &self.normed_buf, hidden_size as u32, eps);
+        for layer_idx in 0..num_layers {
+            let layer = &self.layers[layer_idx];
 
             // Q, K, V projections
             self.ctx.encode_matvec_q4(encoder, &layer.q_proj, &self.normed_buf, &self.q_buf, (num_heads * head_dim) as u32, hidden_size as u32);
@@ -204,14 +214,19 @@ impl GpuLlamaModel {
             // O projection
             self.ctx.encode_matvec_q4(encoder, &layer.o_proj, &self.attn_out_buf, &self.o_out_buf, hidden_size as u32, (num_heads * head_dim) as u32);
 
-            // Residual add → hidden
-            self.ctx.encode_vec_add(encoder, &self.residual_buf, &self.o_out_buf, &self.hidden_buf, hidden_size as u32);
-
-            // Copy hidden → residual (for MLP residual)
-            self.ctx.encode_copy(encoder, &self.hidden_buf, &self.residual_buf, hidden_size as u32);
-
-            // Post-attention norm
-            self.ctx.encode_rmsnorm(encoder, &self.hidden_buf, &layer.post_ln_weight, &self.normed_buf, hidden_size as u32, eps);
+            // Fused post-attention residual add + RMSNorm + save residual.
+            // normed_buf = RMSNorm(residual_buf + o_out_buf)
+            // residual_buf = residual_buf + o_out_buf
+            self.ctx.encode_rmsnorm_add_save_residual(
+                encoder,
+                &self.residual_buf,
+                &self.o_out_buf,
+                &layer.post_ln_weight,
+                &self.normed_buf,
+                &self.residual_buf,
+                hidden_size as u32,
+                eps,
+            );
 
             // MLP
             self.ctx.encode_matvec_q4(encoder, &layer.gate_proj, &self.normed_buf, &self.gate_buf, intermediate_size as u32, hidden_size as u32);
@@ -219,12 +234,34 @@ impl GpuLlamaModel {
             self.ctx.encode_silu_mul(encoder, &self.gate_buf, &self.up_buf, &self.silu_buf, intermediate_size as u32);
             self.ctx.encode_matvec_q4(encoder, &layer.down_proj, &self.silu_buf, &self.down_buf, hidden_size as u32, intermediate_size as u32);
 
-            // Residual add → hidden
-            self.ctx.encode_vec_add(encoder, &self.residual_buf, &self.down_buf, &self.hidden_buf, hidden_size as u32);
+            // For all but the last layer, fuse the MLP residual add with the next
+            // layer's pre-attention RMSNorm. For the last layer this is handled
+            // by the final norm below.
+            if layer_idx + 1 < num_layers {
+                let next_layer = &self.layers[layer_idx + 1];
+                self.ctx.encode_rmsnorm_add_save_residual(
+                    encoder,
+                    &self.residual_buf,
+                    &self.down_buf,
+                    &next_layer.input_ln_weight,
+                    &self.normed_buf,
+                    &self.residual_buf,
+                    hidden_size as u32,
+                    eps,
+                );
+            }
         }
 
-        // Final norm
-        self.ctx.encode_rmsnorm(encoder, &self.hidden_buf, &self.final_norm_weight, &self.normed_buf, hidden_size as u32, eps);
+        // Final norm: fuse last layer's MLP residual add with final RMSNorm.
+        self.ctx.encode_rmsnorm_add(
+            encoder,
+            &self.residual_buf,
+            &self.down_buf,
+            &self.final_norm_weight,
+            &self.normed_buf,
+            hidden_size as u32,
+            eps,
+        );
 
         // LM head
         self.ctx.encode_matvec_q4(encoder, &self.lm_head_weight, &self.normed_buf, &self.logits_buf, vocab_size as u32, hidden_size as u32);

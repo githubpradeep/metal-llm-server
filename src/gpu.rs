@@ -14,6 +14,8 @@ pub struct MetalContext {
     pub projection_q4_batch_tiled_pipeline: ComputePipelineState,
     pub matmul_pipeline: ComputePipelineState,
     pub rmsnorm_pipeline: ComputePipelineState,
+    pub rmsnorm_add_pipeline: ComputePipelineState,
+    pub rmsnorm_add_save_residual_pipeline: ComputePipelineState,
     pub rmsnorm_batch_pipeline: ComputePipelineState,
     pub rmsnorm_noweight_batch_pipeline: ComputePipelineState,
     pub silu_mul_pipeline: ComputePipelineState,
@@ -91,6 +93,8 @@ impl MetalContext {
         let projection_q4_batch_tiled_pipeline = get_fn("projection_q4_batch_tiled");
         let matmul_pipeline = get_fn("matmul");
         let rmsnorm_pipeline = get_fn("rmsnorm");
+        let rmsnorm_add_pipeline = get_fn("rmsnorm_add");
+        let rmsnorm_add_save_residual_pipeline = get_fn("rmsnorm_add_save_residual");
         let rmsnorm_batch_pipeline = get_fn("rmsnorm_batch");
         let rmsnorm_noweight_batch_pipeline = get_fn("rmsnorm_noweight_batch");
         let silu_mul_pipeline = get_fn("silu_mul");
@@ -147,6 +151,8 @@ impl MetalContext {
             projection_q4_batch_tiled_pipeline,
             matmul_pipeline,
             rmsnorm_pipeline,
+            rmsnorm_add_pipeline,
+            rmsnorm_add_save_residual_pipeline,
             rmsnorm_batch_pipeline,
             rmsnorm_noweight_batch_pipeline,
             silu_mul_pipeline,
@@ -448,6 +454,55 @@ impl MetalContext {
         encoder.set_buffer(2, Some(out_buf), out_offset);
         encoder.set_bytes(3, 4, &dim as *const u32 as *const _);
         encoder.set_bytes(4, 4, &eps as *const f32 as *const _);
+        let tg_size = MTLSize::new(256.min(dim as u64), 1, 1);
+        encoder.dispatch_thread_groups(MTLSize::new(1, 1, 1), tg_size);
+    }
+
+    /// Fused RMSNorm + residual add.
+    /// Computes: out = RMSNorm(a + b) * weight
+    pub fn encode_rmsnorm_add(
+        &self,
+        encoder: &ComputeCommandEncoderRef,
+        a_buf: &Buffer,
+        b_buf: &Buffer,
+        weight_buf: &Buffer,
+        out_buf: &Buffer,
+        dim: u32,
+        eps: f32,
+    ) {
+        encoder.set_compute_pipeline_state(&self.rmsnorm_add_pipeline);
+        encoder.set_buffer(0, Some(a_buf), 0);
+        encoder.set_buffer(1, Some(b_buf), 0);
+        encoder.set_buffer(2, Some(weight_buf), 0);
+        encoder.set_buffer(3, Some(out_buf), 0);
+        encoder.set_bytes(4, 4, &dim as *const u32 as *const _);
+        encoder.set_bytes(5, 4, &eps as *const f32 as *const _);
+        let tg_size = MTLSize::new(256.min(dim as u64), 1, 1);
+        encoder.dispatch_thread_groups(MTLSize::new(1, 1, 1), tg_size);
+    }
+
+    /// Fused RMSNorm + residual add with residual save.
+    /// Computes: out = RMSNorm(a + b) * weight, residual_out = a + b.
+    /// a_buf and residual_out_buf may be the same buffer (in-place residual update).
+    pub fn encode_rmsnorm_add_save_residual(
+        &self,
+        encoder: &ComputeCommandEncoderRef,
+        a_buf: &Buffer,
+        b_buf: &Buffer,
+        weight_buf: &Buffer,
+        out_buf: &Buffer,
+        residual_out_buf: &Buffer,
+        dim: u32,
+        eps: f32,
+    ) {
+        encoder.set_compute_pipeline_state(&self.rmsnorm_add_save_residual_pipeline);
+        encoder.set_buffer(0, Some(a_buf), 0);
+        encoder.set_buffer(1, Some(b_buf), 0);
+        encoder.set_buffer(2, Some(weight_buf), 0);
+        encoder.set_buffer(3, Some(out_buf), 0);
+        encoder.set_buffer(4, Some(residual_out_buf), 0);
+        encoder.set_bytes(5, 4, &dim as *const u32 as *const _);
+        encoder.set_bytes(6, 4, &eps as *const f32 as *const _);
         let tg_size = MTLSize::new(256.min(dim as u64), 1, 1);
         encoder.dispatch_thread_groups(MTLSize::new(1, 1, 1), tg_size);
     }
