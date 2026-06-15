@@ -56,7 +56,13 @@ pub struct Gemma4AssistantGpuModel {
     // Masked ordered embedding (optional)
     pub use_ordered_embeddings: bool,
     pub centroids_f32: Option<Vec<f32>>,     // [num_centroids, assistant_hidden]
+    pub centroids_buf: Option<Buffer>,       // same centroids as f16 on GPU
     pub token_ordering: Option<Vec<usize>>,  // [vocab_size]
+
+    // Ordered-embedding scratch buffers
+    pub centroid_logits_buf: Buffer,         // [num_centroids]
+    pub selected_indices_buf: Buffer,        // [top_k * vocab_per_centroid]
+    pub selected_logits_buf: Buffer,         // [top_k * vocab_per_centroid]
 
     // Scratch buffers (single token)
     pub hidden_buf: Buffer,
@@ -151,13 +157,29 @@ impl Gemma4AssistantGpuModel {
         let post_projection = ctx.buffer_from_f32_as_f16(&post_projection_data);
         let final_norm_weight = ctx.buffer_from_slice(&final_norm_data);
 
-        let (centroids_f32, token_ordering) = if config.use_ordered_embeddings {
+        let (centroids_f32, centroids_buf, token_ordering) = if config.use_ordered_embeddings {
+            assert!(
+                !centroids_data.is_empty(),
+                "masked_embedding.centroids.weight required when use_ordered_embeddings is true"
+            );
+            assert!(
+                !token_ordering.is_empty(),
+                "masked_embedding.token_ordering required when use_ordered_embeddings is true"
+            );
+            assert_eq!(
+                token_ordering.len(),
+                vocab_size,
+                "token_ordering length ({}) must match vocab_size ({})",
+                token_ordering.len(),
+                vocab_size
+            );
             (
-                Some(centroids_data),
+                Some(centroids_data.clone()),
+                Some(ctx.buffer_from_f32_as_f16(&centroids_data)),
                 Some(token_ordering),
             )
         } else {
-            (None, None)
+            (None, None, None)
         };
 
         // Load layers
@@ -232,6 +254,41 @@ impl Gemma4AssistantGpuModel {
         let hidden_buf = ctx.buffer_empty(hidden_size);
         let normed_buf = ctx.buffer_empty(hidden_size);
         let residual_buf = ctx.buffer_empty(hidden_size);
+
+        let (centroid_logits_buf, selected_indices_buf, selected_logits_buf) =
+            if config.use_ordered_embeddings {
+                let num_centroids = config.num_centroids;
+                let top_k = config.centroid_intermediate_top_k;
+                assert!(
+                    num_centroids > 0,
+                    "num_centroids must be positive when use_ordered_embeddings is true"
+                );
+                assert!(
+                    top_k > 0,
+                    "centroid_intermediate_top_k must be positive when use_ordered_embeddings is true"
+                );
+                assert_eq!(
+                    vocab_size % num_centroids,
+                    0,
+                    "vocab_size ({}) must be divisible by num_centroids ({})",
+                    vocab_size,
+                    num_centroids
+                );
+                let vocab_per_centroid = vocab_size / num_centroids;
+                let num_selected = top_k * vocab_per_centroid;
+                (
+                    ctx.buffer_empty(num_centroids),
+                    ctx.buffer_empty_u32(num_selected),
+                    ctx.buffer_empty(num_selected),
+                )
+            } else {
+                (
+                    ctx.buffer_empty(1),
+                    ctx.buffer_empty_u32(1),
+                    ctx.buffer_empty(1),
+                )
+            };
+
         let max_q_out = layers.iter().map(|l| l.q_out_dim).max().unwrap_or(0);
         let q_buf = ctx.buffer_empty(max_q_out);
         let q_normed_buf = ctx.buffer_empty(max_q_out);
@@ -262,7 +319,11 @@ impl Gemma4AssistantGpuModel {
             layers,
             use_ordered_embeddings: config.use_ordered_embeddings,
             centroids_f32,
+            centroids_buf,
             token_ordering,
+            centroid_logits_buf,
+            selected_indices_buf,
+            selected_logits_buf,
             hidden_buf,
             normed_buf,
             residual_buf,
@@ -609,21 +670,98 @@ impl Gemma4AssistantGpuModel {
 
         // LM head
         if self.use_ordered_embeddings {
-            // For ordered embeddings we read the small hidden state back and compute
-            // the sparse logits on CPU. This avoids writing a new Metal kernel for v1.
+            // Compute centroid logits on the GPU, then pick top-k centroids on the
+            // CPU (small vector) and gather/score only the tokens inside those
+            // centroids on the GPU. This avoids the expensive CPU sparse matmul
+            // and the full [vocab_size] GPU matvec.
+            let num_centroids = self.config.num_centroids;
+            let top_k = self.config.centroid_intermediate_top_k;
+            let vocab_per_centroid = vocab_size / num_centroids;
+            let num_selected = top_k * vocab_per_centroid;
+
+            self.ctx.encode_matvec_f16(
+                encoder,
+                self.centroids_buf.as_ref().unwrap(),
+                &self.normed_buf,
+                &self.centroid_logits_buf,
+                num_centroids as u32,
+                hidden_size as u32,
+            );
             encoder.end_encoding();
             cmd.commit();
             cmd.wait_until_completed();
 
-            let hidden = MetalContext::read_buffer(&self.normed_buf, hidden_size);
-            let logits = self.compute_masked_logits(&hidden);
+            // Read back centroid scores and pick the top-k centroids on the CPU.
+            let centroid_logits =
+                MetalContext::read_buffer(&self.centroid_logits_buf, num_centroids);
+            let mut indexed: Vec<(usize, f32)> = centroid_logits
+                .iter()
+                .enumerate()
+                .map(|(i, &v)| (i, v))
+                .collect();
+            indexed.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+            let top_centroids: Vec<usize> =
+                indexed.iter().take(top_k).map(|(i, _)| *i).collect();
 
-            // Post-projection: backbone_hidden = W[2560, 256] @ hidden[256]
-            let projected = self.post_project(&hidden);
+            // Build the list of canonical token positions whose embeddings we need.
+            let ordering = self.token_ordering.as_ref().unwrap();
+            let mut selected_indices = vec![0u32; num_selected];
+            for (i, &centroid_idx) in top_centroids.iter().enumerate() {
+                for offset in 0..vocab_per_centroid {
+                    let canonical_pos = ordering[centroid_idx * vocab_per_centroid + offset];
+                    selected_indices[i * vocab_per_centroid + offset] = canonical_pos as u32;
+                }
+            }
+            MetalContext::write_u32_buffer(&self.selected_indices_buf, &selected_indices);
+
+            // Second GPU pass: fill full logits with mask value, gather selected
+            // logits, scatter them back, and compute the post-projection.
+            let cmd2 = self.ctx.queue.new_command_buffer();
+            let encoder2 = cmd2.new_compute_command_encoder();
+
+            let mask_value = -1e9f32;
+            self.ctx.encode_ordered_embedding_fill(
+                encoder2,
+                &self.logits_buf,
+                vocab_size as u32,
+                mask_value,
+            );
+            self.ctx.encode_ordered_embedding_gather_logits(
+                encoder2,
+                &self.lm_head_buf,
+                &self.normed_buf,
+                &self.selected_indices_buf,
+                &self.selected_logits_buf,
+                hidden_size as u32,
+                num_selected as u32,
+            );
+            self.ctx.encode_ordered_embedding_scatter_logits(
+                encoder2,
+                &self.logits_buf,
+                &self.selected_indices_buf,
+                &self.selected_logits_buf,
+                num_selected as u32,
+            );
+            self.ctx.encode_matvec_f16(
+                encoder2,
+                &self.post_projection,
+                &self.normed_buf,
+                &self.projected_hidden_buf,
+                self.config.backbone_hidden_size as u32,
+                hidden_size as u32,
+            );
+
+            encoder2.end_encoding();
+            cmd2.commit();
+            cmd2.wait_until_completed();
+
+            let logits = MetalContext::read_buffer(&self.logits_buf, vocab_size);
+            let projected_hidden_state =
+                MetalContext::read_buffer(&self.projected_hidden_buf, self.config.backbone_hidden_size);
 
             return AssistantForwardOutput {
                 logits,
-                projected_hidden_state: projected,
+                projected_hidden_state,
             };
         }
 
@@ -658,94 +796,6 @@ impl Gemma4AssistantGpuModel {
             logits,
             projected_hidden_state,
         }
-    }
-
-    fn post_project(&self, hidden: &[f32]) -> Vec<f32> {
-        let backbone_hidden = self.config.backbone_hidden_size;
-        let hidden_size = self.config.text_config.hidden_size;
-        assert_eq!(hidden.len(), hidden_size);
-
-        MetalContext::write_buffer(&self.hidden_buf, hidden);
-        let cmd = self.ctx.queue.new_command_buffer();
-        let encoder = cmd.new_compute_command_encoder();
-        self.ctx.encode_matvec_f16(
-            encoder,
-            &self.post_projection,
-            &self.hidden_buf,
-            &self.projected_hidden_buf,
-            backbone_hidden as u32,
-            hidden_size as u32,
-        );
-        encoder.end_encoding();
-        cmd.commit();
-        cmd.wait_until_completed();
-        MetalContext::read_buffer(&self.projected_hidden_buf, backbone_hidden)
-    }
-
-    /// Compute the ordered-embedding logits on CPU.
-    fn compute_masked_logits(&self, hidden: &[f32]) -> Vec<f32> {
-        let vocab_size = self.config.text_config.vocab_size;
-        let num_centroids = self.config.num_centroids;
-        let top_k = self.config.centroid_intermediate_top_k;
-        let vocab_per_centroid = vocab_size / num_centroids;
-        let hidden_size = self.config.text_config.hidden_size;
-
-        let centroids_f32 = self.centroids_f32.as_ref().expect("centroids missing");
-        let ordering = self.token_ordering.as_ref().expect("token_ordering missing");
-
-        assert_eq!(
-            centroids_f32.len(),
-            num_centroids * hidden_size,
-            "centroids shape mismatch"
-        );
-
-        // centroid_logits[i] = dot(hidden, centroids[i])
-        let mut centroid_logits = vec![0.0f32; num_centroids];
-        for i in 0..num_centroids {
-            let mut acc = 0.0f32;
-            for j in 0..hidden_size {
-                acc += hidden[j] * centroids_f32[i * hidden_size + j];
-            }
-            centroid_logits[i] = acc;
-        }
-
-        // Top-k centroids
-        let mut indexed: Vec<(usize, f32)> = centroid_logits
-            .iter()
-            .enumerate()
-            .map(|(i, &v)| (i, v))
-            .collect();
-        indexed.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
-        let top_centroids: Vec<usize> = indexed.iter().take(top_k).map(|(i, _)| *i).collect();
-
-        // Gather embeddings from lm_head at canonical positions and compute logits.
-        // We need the assistant's lm_head weights in f32.
-        let lm_head_f32: Vec<f32> = self.embed_tokens_f16.iter().map(|&b| bf16_to_f32(b)).collect();
-
-        let mut selected_logits: Vec<(usize, f32)> = Vec::with_capacity(top_k * vocab_per_centroid);
-        for &centroid_idx in &top_centroids {
-            for offset in 0..vocab_per_centroid {
-                let canonical_pos = ordering[centroid_idx * vocab_per_centroid + offset];
-                let embed_offset = canonical_pos * hidden_size;
-                let mut logit = 0.0f32;
-                for j in 0..hidden_size {
-                    logit += hidden[j] * lm_head_f32[embed_offset + j];
-                }
-                selected_logits.push((canonical_pos, logit));
-            }
-        }
-
-        let min_logit = selected_logits
-            .iter()
-            .map(|(_, v)| *v)
-            .fold(f32::INFINITY, f32::min);
-        let mask_value = min_logit - 1.0;
-
-        let mut logits = vec![mask_value; vocab_size];
-        for (pos, val) in selected_logits {
-            logits[pos] = val;
-        }
-        logits
     }
 
     /// Draft multiple tokens autoregressively from a single starting position.

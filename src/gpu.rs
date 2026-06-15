@@ -58,6 +58,9 @@ pub struct MetalContext {
     pub attention_offset_q4_0_pipeline: ComputePipelineState,
     pub attention_causal_q4_0_pipeline: ComputePipelineState,
     pub attention_causal_strided_q4_0_pipeline: ComputePipelineState,
+    pub ordered_embedding_fill_pipeline: ComputePipelineState,
+    pub ordered_embedding_gather_pipeline: ComputePipelineState,
+    pub ordered_embedding_scatter_pipeline: ComputePipelineState,
 }
 
 impl MetalContext {
@@ -138,6 +141,9 @@ impl MetalContext {
         let attention_offset_q4_0_pipeline = get_fn("attention_single_token_offset_q4_0");
         let attention_causal_q4_0_pipeline = get_fn("attention_causal_q4_0");
         let attention_causal_strided_q4_0_pipeline = get_fn("attention_causal_strided_q4_0");
+        let ordered_embedding_fill_pipeline = get_fn("ordered_embedding_fill");
+        let ordered_embedding_gather_pipeline = get_fn("ordered_embedding_gather_logits");
+        let ordered_embedding_scatter_pipeline = get_fn("ordered_embedding_scatter_logits");
 
         MetalContext {
             device,
@@ -195,6 +201,9 @@ impl MetalContext {
             attention_offset_q4_0_pipeline,
             attention_causal_q4_0_pipeline,
             attention_causal_strided_q4_0_pipeline,
+            ordered_embedding_fill_pipeline,
+            ordered_embedding_gather_pipeline,
+            ordered_embedding_scatter_pipeline,
         }
     }
 
@@ -1890,6 +1899,58 @@ impl MetalContext {
         let tg_size = MTLSize::new(64, 1, 1);
         let num_tgs = num_heads * q_len;
         encoder.dispatch_thread_groups(MTLSize::new(num_tgs as u64, 1, 1), tg_size);
+    }
+
+    // ─── Gemma4 ordered-embedding sparse logits ──────────────────────────────
+
+    pub fn encode_ordered_embedding_fill(
+        &self,
+        encoder: &ComputeCommandEncoderRef,
+        out_buf: &Buffer,
+        n: u32,
+        value: f32,
+    ) {
+        encoder.set_compute_pipeline_state(&self.ordered_embedding_fill_pipeline);
+        encoder.set_buffer(0, Some(out_buf), 0);
+        encoder.set_bytes(1, 4, &n as *const u32 as *const _);
+        encoder.set_bytes(2, 4, &value as *const f32 as *const _);
+        encoder.dispatch_threads(MTLSize::new(n as u64, 1, 1), MTLSize::new(256, 1, 1));
+    }
+
+    pub fn encode_ordered_embedding_gather_logits(
+        &self,
+        encoder: &ComputeCommandEncoderRef,
+        lm_head_buf: &Buffer,
+        hidden_buf: &Buffer,
+        indices_buf: &Buffer,
+        selected_logits_buf: &Buffer,
+        hidden_size: u32,
+        num_selected: u32,
+    ) {
+        encoder.set_compute_pipeline_state(&self.ordered_embedding_gather_pipeline);
+        encoder.set_buffer(0, Some(lm_head_buf), 0);
+        encoder.set_buffer(1, Some(hidden_buf), 0);
+        encoder.set_buffer(2, Some(indices_buf), 0);
+        encoder.set_buffer(3, Some(selected_logits_buf), 0);
+        encoder.set_bytes(4, 4, &hidden_size as *const u32 as *const _);
+        encoder.set_bytes(5, 4, &num_selected as *const u32 as *const _);
+        encoder.dispatch_threads(MTLSize::new(num_selected as u64, 1, 1), MTLSize::new(256, 1, 1));
+    }
+
+    pub fn encode_ordered_embedding_scatter_logits(
+        &self,
+        encoder: &ComputeCommandEncoderRef,
+        logits_buf: &Buffer,
+        indices_buf: &Buffer,
+        selected_logits_buf: &Buffer,
+        num_selected: u32,
+    ) {
+        encoder.set_compute_pipeline_state(&self.ordered_embedding_scatter_pipeline);
+        encoder.set_buffer(0, Some(logits_buf), 0);
+        encoder.set_buffer(1, Some(indices_buf), 0);
+        encoder.set_buffer(2, Some(selected_logits_buf), 0);
+        encoder.set_bytes(3, 4, &num_selected as *const u32 as *const _);
+        encoder.dispatch_threads(MTLSize::new(num_selected as u64, 1, 1), MTLSize::new(256, 1, 1));
     }
 
     // ─── Legacy standalone dispatch methods (kept for compatibility) ─────────

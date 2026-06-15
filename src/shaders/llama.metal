@@ -2789,3 +2789,68 @@ kernel void transpose_hsd_to_shd(
     uint out_idx = (s * num_heads + h) * head_dim + d;
     output[out_idx] = input[gid];
 }
+
+// ─── Gemma4 Ordered Embedding Logits (GPU sparse LM head) ───────────────────
+// The assistant LM head is tied to the embedding table and is too large for a
+// full matvec on every draft token. Instead we:
+//   1. Score every centroid: centroid_logits[i] = dot(hidden, centroids[i])
+//   2. Pick top-k centroids on the host (small vector)
+//   3. Gather and score only the tokens inside those centroids on the GPU
+//   4. Scatter the selected logits back into a full [vocab_size] vector and
+//      mask every other position with a very negative value.
+
+// Fill every element of an output buffer with a constant value.
+kernel void ordered_embedding_fill(
+    device float* out [[buffer(0)]],
+    constant uint& n [[buffer(1)]],
+    constant float& value [[buffer(2)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    if (gid >= n) return;
+    out[gid] = value;
+}
+
+// Gather logits for a sparse set of vocabulary positions.
+// lm_head is [vocab_size, hidden_size] in f16 row-major.
+// indices lists the token ids whose logits we need.
+// Each thread computes one dot(hidden, lm_head[idx]).
+kernel void ordered_embedding_gather_logits(
+    device const half* lm_head [[buffer(0)]],
+    device const float* hidden [[buffer(1)]],
+    device const uint* indices [[buffer(2)]],
+    device float* out [[buffer(3)]],
+    constant uint& hidden_size [[buffer(4)]],
+    constant uint& num_selected [[buffer(5)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    if (gid >= num_selected) return;
+
+    uint idx = indices[gid];
+    uint row_offset = idx * hidden_size;
+    float acc = 0.0f;
+
+    uint k = 0;
+    for (; k + 3 < hidden_size; k += 4) {
+        half4 w = *reinterpret_cast<device const half4*>(&lm_head[row_offset + k]);
+        float4 xv = *reinterpret_cast<device const float4*>(&hidden[k]);
+        acc += dot(float4(w), xv);
+    }
+    for (; k < hidden_size; k++) {
+        acc += float(lm_head[row_offset + k]) * hidden[k];
+    }
+
+    out[gid] = acc;
+}
+
+// Scatter the selected logits into their canonical vocabulary positions.
+kernel void ordered_embedding_scatter_logits(
+    device float* logits [[buffer(0)]],          // [vocab_size]
+    device const uint* indices [[buffer(1)]],    // [num_selected]
+    device const float* selected_logits [[buffer(2)]], // [num_selected]
+    constant uint& num_selected [[buffer(3)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    if (gid >= num_selected) return;
+    uint idx = indices[gid];
+    logits[idx] = selected_logits[gid];
+}
