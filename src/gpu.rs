@@ -2018,3 +2018,14 @@ fn quantize_q4_0(data: &[f32], rows: usize, cols: usize) -> Vec<u8> {
 
     output
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn metal_context_compiles_shaders() {
+        // Creating a context compiles every Metal function in llama.metal.
+        let _ctx = MetalContext::new();
+    }
+}

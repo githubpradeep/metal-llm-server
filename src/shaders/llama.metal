@@ -1958,6 +1958,24 @@ inline float q4_0_read(device const uchar* cache, uint head_base, uint pos, uint
     }
 }
 
+// Vectorized variant: reads 4 consecutive Q4_0 values starting at d (d must be a multiple of 4).
+// Each 32-element group is stored as 16 packed bytes, so 4 values span exactly 2 bytes.
+inline float4 q4_0_read4(device const uchar* cache, uint head_base, uint pos, uint row_bytes, uint d) {
+    uint g = d / 32;
+    uint d_in_group = d % 32;
+    uint offset = head_base + pos * row_bytes + g * 18;
+    float scale = float(*reinterpret_cast<device const half*>(&cache[offset]));
+    uint byte_idx = d_in_group / 2;
+    uchar b0 = cache[offset + 2 + byte_idx];
+    uchar b1 = cache[offset + 2 + byte_idx + 1];
+    return float4(
+        float(int(b0 & 0xF) - 8) * scale,
+        float(int(b0 >> 4) - 8) * scale,
+        float(int(b1 & 0xF) - 8) * scale,
+        float(int(b1 >> 4) - 8) * scale
+    );
+}
+
 // ─── Attention with Q8_0 KV cache (single token offset) ──────────────────────
 
 kernel void attention_single_token_offset_q8_0(
@@ -2262,7 +2280,10 @@ kernel void attention_single_token_offset_q4_0(
         shared_update[0] = -INFINITY;
         shared_update[1] = 0.0f;
     }
-    for (uint d = tid; d < head_dim; d += tg_size) {
+    for (uint d = tid * 4; d + 3 < head_dim; d += tg_size * 4) {
+        *reinterpret_cast<device float4*>(&output[q_offset + d]) = float4(0.0f);
+    }
+    for (uint d = (head_dim / 4) * 4 + tid; d < head_dim; d += tg_size) {
         output[q_offset + d] = 0.0f;
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -2270,7 +2291,12 @@ kernel void attention_single_token_offset_q4_0(
     for (uint kv = 0; kv < kv_seq; kv++) {
         uint actual_pos = kv_start + kv;
         float partial_dot = 0.0f;
-        for (uint d = tid; d < head_dim; d += tg_size) {
+        for (uint d = tid * 4; d + 3 < head_dim; d += tg_size * 4) {
+            float4 qv = *reinterpret_cast<device const float4*>(&Q[q_offset + d]);
+            float4 k_vals = q4_0_read4(K_cache, k_head_base, actual_pos, row_bytes, d);
+            partial_dot += dot(qv, k_vals);
+        }
+        for (uint d = (head_dim / 4) * 4 + tid; d < head_dim; d += tg_size) {
             partial_dot += Q[q_offset + d] * q4_0_read(K_cache, k_head_base, actual_pos, row_bytes, d);
         }
         shared_dot[tid] = partial_dot;
@@ -2300,7 +2326,14 @@ kernel void attention_single_token_offset_q4_0(
 
         float old_factor = shared_update[2];
         float new_factor = shared_update[3];
-        for (uint d = tid; d < head_dim; d += tg_size) {
+        for (uint d = tid * 4; d + 3 < head_dim; d += tg_size * 4) {
+            uint out_idx = q_offset + d;
+            float4 ov = *reinterpret_cast<device float4*>(&output[out_idx]);
+            float4 vv = q4_0_read4(V_cache, v_head_base, actual_pos, row_bytes, d);
+            ov = ov * old_factor + new_factor * vv;
+            *reinterpret_cast<device float4*>(&output[out_idx]) = ov;
+        }
+        for (uint d = (head_dim / 4) * 4 + tid; d < head_dim; d += tg_size) {
             uint out_idx = q_offset + d;
             output[out_idx] = output[out_idx] * old_factor
                 + new_factor * q4_0_read(V_cache, v_head_base, actual_pos, row_bytes, d);
@@ -2354,14 +2387,22 @@ kernel void attention_causal_q4_0(
         shared_update[0] = -INFINITY;
         shared_update[1] = 0.0f;
     }
-    for (uint d = tid; d < head_dim; d += tg_size) {
+    for (uint d = tid * 4; d + 3 < head_dim; d += tg_size * 4) {
+        *reinterpret_cast<device float4*>(&output[out_offset + d]) = float4(0.0f);
+    }
+    for (uint d = (head_dim / 4) * 4 + tid; d < head_dim; d += tg_size) {
         output[out_offset + d] = 0.0f;
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
     for (uint kv = attend_start; kv < attend_len; kv++) {
         float partial_dot = 0.0f;
-        for (uint d = tid; d < head_dim; d += tg_size) {
+        for (uint d = tid * 4; d + 3 < head_dim; d += tg_size * 4) {
+            float4 qv = *reinterpret_cast<device const float4*>(&Q[q_offset + d]);
+            float4 k_vals = q4_0_read4(K_cache, k_head_base, kv, row_bytes, d);
+            partial_dot += dot(qv, k_vals);
+        }
+        for (uint d = (head_dim / 4) * 4 + tid; d < head_dim; d += tg_size) {
             partial_dot += Q[q_offset + d] * q4_0_read(K_cache, k_head_base, kv, row_bytes, d);
         }
         shared_dot[tid] = partial_dot;
@@ -2391,7 +2432,14 @@ kernel void attention_causal_q4_0(
 
         float old_factor = shared_update[2];
         float new_factor = shared_update[3];
-        for (uint d = tid; d < head_dim; d += tg_size) {
+        for (uint d = tid * 4; d + 3 < head_dim; d += tg_size * 4) {
+            uint out_idx = out_offset + d;
+            float4 ov = *reinterpret_cast<device float4*>(&output[out_idx]);
+            float4 vv = q4_0_read4(V_cache, v_head_base, kv, row_bytes, d);
+            ov = ov * old_factor + new_factor * vv;
+            *reinterpret_cast<device float4*>(&output[out_idx]) = ov;
+        }
+        for (uint d = (head_dim / 4) * 4 + tid; d < head_dim; d += tg_size) {
             uint out_idx = out_offset + d;
             output[out_idx] = output[out_idx] * old_factor
                 + new_factor * q4_0_read(V_cache, v_head_base, kv, row_bytes, d);
@@ -2448,14 +2496,22 @@ kernel void attention_causal_strided_q4_0(
         shared_update[0] = -INFINITY;
         shared_update[1] = 0.0f;
     }
-    for (uint d = tid; d < head_dim; d += tg_size) {
+    for (uint d = tid * 4; d + 3 < head_dim; d += tg_size * 4) {
+        *reinterpret_cast<device float4*>(&output[out_offset + d]) = float4(0.0f);
+    }
+    for (uint d = (head_dim / 4) * 4 + tid; d < head_dim; d += tg_size) {
         output[out_offset + d] = 0.0f;
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
     for (uint kv = attend_start; kv < attend_len; kv++) {
         float partial_dot = 0.0f;
-        for (uint d = tid; d < head_dim; d += tg_size) {
+        for (uint d = tid * 4; d + 3 < head_dim; d += tg_size * 4) {
+            float4 qv = *reinterpret_cast<device const float4*>(&Q[q_offset + d]);
+            float4 k_vals = q4_0_read4(K_cache, k_head_base, kv, row_bytes, d);
+            partial_dot += dot(qv, k_vals);
+        }
+        for (uint d = (head_dim / 4) * 4 + tid; d < head_dim; d += tg_size) {
             partial_dot += Q[q_offset + d] * q4_0_read(K_cache, k_head_base, kv, row_bytes, d);
         }
         shared_dot[tid] = partial_dot;
@@ -2485,7 +2541,14 @@ kernel void attention_causal_strided_q4_0(
 
         float old_factor = shared_update[2];
         float new_factor = shared_update[3];
-        for (uint d = tid; d < head_dim; d += tg_size) {
+        for (uint d = tid * 4; d + 3 < head_dim; d += tg_size * 4) {
+            uint out_idx = out_offset + d;
+            float4 ov = *reinterpret_cast<device float4*>(&output[out_idx]);
+            float4 vv = q4_0_read4(V_cache, v_head_base, kv, row_bytes, d);
+            ov = ov * old_factor + new_factor * vv;
+            *reinterpret_cast<device float4*>(&output[out_idx]) = ov;
+        }
+        for (uint d = (head_dim / 4) * 4 + tid; d < head_dim; d += tg_size) {
             uint out_idx = out_offset + d;
             output[out_idx] = output[out_idx] * old_factor
                 + new_factor * q4_0_read(V_cache, v_head_base, kv, row_bytes, d);
