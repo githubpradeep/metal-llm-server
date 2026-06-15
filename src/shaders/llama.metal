@@ -2268,12 +2268,18 @@ kernel void attention_single_token_offset_q4_0(
     uint h = tgid;
     if (h >= num_heads) return;
 
+    const uint TILE_KV = 4;
     uint kv_h = h / num_kv_groups;
     uint q_offset = h * head_dim;
     uint k_head_base = kv_h * capacity * row_bytes;
     uint v_head_base = kv_h * capacity * row_bytes;
 
-    threadgroup float shared_dot[256];
+    uint simd_id = tid / SIMD_SIZE;
+    uint lane = tid % SIMD_SIZE;
+    uint num_simds = tg_size / SIMD_SIZE;
+
+    threadgroup float shared_scores[TILE_KV * 4];
+    threadgroup float shared_exp[TILE_KV];
     threadgroup float shared_update[4];
 
     if (tid == 0) {
@@ -2288,55 +2294,82 @@ kernel void attention_single_token_offset_q4_0(
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    for (uint kv = 0; kv < kv_seq; kv++) {
-        uint actual_pos = kv_start + kv;
-        float partial_dot = 0.0f;
-        for (uint d = tid * 4; d + 3 < head_dim; d += tg_size * 4) {
-            float4 qv = *reinterpret_cast<device const float4*>(&Q[q_offset + d]);
-            float4 k_vals = q4_0_read4(K_cache, k_head_base, actual_pos, row_bytes, d);
-            partial_dot += dot(qv, k_vals);
+    for (uint kv_tile = 0; kv_tile < kv_seq; kv_tile += TILE_KV) {
+        uint tile_end = min(kv_tile + TILE_KV, kv_seq);
+        uint tile_count = tile_end - kv_tile;
+
+        // Compute scores for all KV positions in this tile.
+        for (uint kv_offset = 0; kv_offset < tile_count; kv_offset++) {
+            uint actual_pos = kv_start + kv_tile + kv_offset;
+            float partial_dot = 0.0f;
+            for (uint d = tid * 4; d + 3 < head_dim; d += tg_size * 4) {
+                float4 qv = *reinterpret_cast<device const float4*>(&Q[q_offset + d]);
+                float4 k_vals = q4_0_read4(K_cache, k_head_base, actual_pos, row_bytes, d);
+                partial_dot += dot(qv, k_vals);
+            }
+            for (uint d = (head_dim / 4) * 4 + tid; d < head_dim; d += tg_size) {
+                partial_dot += Q[q_offset + d] * q4_0_read(K_cache, k_head_base, actual_pos, row_bytes, d);
+            }
+            partial_dot = simd_sum(partial_dot);
+            if (lane == 0) {
+                shared_scores[kv_offset * num_simds + simd_id] = partial_dot;
+            }
         }
-        for (uint d = (head_dim / 4) * 4 + tid; d < head_dim; d += tg_size) {
-            partial_dot += Q[q_offset + d] * q4_0_read(K_cache, k_head_base, actual_pos, row_bytes, d);
-        }
-        shared_dot[tid] = partial_dot;
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
-        for (uint stride = tg_size / 2; stride > 0; stride >>= 1) {
-            if (tid < stride) {
-                shared_dot[tid] += shared_dot[tid + stride];
-            }
-            threadgroup_barrier(mem_flags::mem_threadgroup);
-        }
-
+        // Update running softmax statistics for the tile.
         if (tid == 0) {
-            float m = shared_update[0];
-            float l = shared_update[1];
-            float score = shared_dot[0] * scale;
-            float new_m = max(m, score);
-            float alpha = exp(m - new_m);
-            float beta = exp(score - new_m);
-            float new_l = l * alpha + beta;
-            shared_update[0] = new_m;
-            shared_update[1] = new_l;
-            shared_update[2] = new_l > 0.0f ? (l * alpha) / new_l : 0.0f;
-            shared_update[3] = new_l > 0.0f ? beta / new_l : 0.0f;
+            float m_old = shared_update[0];
+            float l_old = shared_update[1];
+            float m_new = m_old;
+
+            float tile_scores[TILE_KV];
+            for (uint kv_offset = 0; kv_offset < tile_count; kv_offset++) {
+                float s = 0.0f;
+                for (uint s_id = 0; s_id < num_simds; s_id++) {
+                    s += shared_scores[kv_offset * num_simds + s_id];
+                }
+                tile_scores[kv_offset] = s * scale;
+                m_new = max(m_new, tile_scores[kv_offset]);
+            }
+
+            float tile_sum = 0.0f;
+            for (uint kv_offset = 0; kv_offset < tile_count; kv_offset++) {
+                float e = exp(tile_scores[kv_offset] - m_new);
+                shared_exp[kv_offset] = e;
+                tile_sum += e;
+            }
+
+            float l_new = l_old * exp(m_old - m_new) + tile_sum;
+            shared_update[0] = m_new;
+            shared_update[1] = l_new;
+            shared_update[2] = l_new > 0.0f ? (l_old * exp(m_old - m_new)) / l_new : 0.0f;
+            shared_update[3] = l_new > 0.0f ? 1.0f / l_new : 0.0f;
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
         float old_factor = shared_update[2];
-        float new_factor = shared_update[3];
+        float inv_l_new = shared_update[3];
+
         for (uint d = tid * 4; d + 3 < head_dim; d += tg_size * 4) {
             uint out_idx = q_offset + d;
             float4 ov = *reinterpret_cast<device float4*>(&output[out_idx]);
-            float4 vv = q4_0_read4(V_cache, v_head_base, actual_pos, row_bytes, d);
-            ov = ov * old_factor + new_factor * vv;
+            float4 acc = float4(0.0f);
+            for (uint kv_offset = 0; kv_offset < tile_count; kv_offset++) {
+                uint actual_pos = kv_start + kv_tile + kv_offset;
+                acc += shared_exp[kv_offset] * q4_0_read4(V_cache, v_head_base, actual_pos, row_bytes, d);
+            }
+            ov = ov * old_factor + acc * inv_l_new;
             *reinterpret_cast<device float4*>(&output[out_idx]) = ov;
         }
         for (uint d = (head_dim / 4) * 4 + tid; d < head_dim; d += tg_size) {
             uint out_idx = q_offset + d;
-            output[out_idx] = output[out_idx] * old_factor
-                + new_factor * q4_0_read(V_cache, v_head_base, actual_pos, row_bytes, d);
+            float acc = 0.0f;
+            for (uint kv_offset = 0; kv_offset < tile_count; kv_offset++) {
+                uint actual_pos = kv_start + kv_tile + kv_offset;
+                acc += shared_exp[kv_offset] * q4_0_read(V_cache, v_head_base, actual_pos, row_bytes, d);
+            }
+            output[out_idx] = output[out_idx] * old_factor + acc * inv_l_new;
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
@@ -2369,6 +2402,7 @@ kernel void attention_causal_q4_0(
     uint qi = tgid % q_len;
     if (h >= num_heads) return;
 
+    const uint TILE_KV = 4;
     uint kv_h = h / num_kv_groups;
     uint q_offset = (h * q_len + qi) * head_dim;
     uint k_head_base = kv_h * capacity * row_bytes;
@@ -2379,7 +2413,12 @@ kernel void attention_causal_q4_0(
         attend_start = attend_len - attention_window;
     }
 
-    threadgroup float shared_dot[256];
+    uint simd_id = tid / SIMD_SIZE;
+    uint lane = tid % SIMD_SIZE;
+    uint num_simds = tg_size / SIMD_SIZE;
+
+    threadgroup float shared_scores[TILE_KV * 4];
+    threadgroup float shared_exp[TILE_KV];
     threadgroup float shared_update[4];
 
     uint out_offset = (h * q_len + qi) * head_dim;
@@ -2395,54 +2434,80 @@ kernel void attention_causal_q4_0(
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    for (uint kv = attend_start; kv < attend_len; kv++) {
-        float partial_dot = 0.0f;
-        for (uint d = tid * 4; d + 3 < head_dim; d += tg_size * 4) {
-            float4 qv = *reinterpret_cast<device const float4*>(&Q[q_offset + d]);
-            float4 k_vals = q4_0_read4(K_cache, k_head_base, kv, row_bytes, d);
-            partial_dot += dot(qv, k_vals);
+    for (uint kv_tile = attend_start; kv_tile < attend_len; kv_tile += TILE_KV) {
+        uint tile_end = min(kv_tile + TILE_KV, attend_len);
+        uint tile_count = tile_end - kv_tile;
+
+        for (uint kv_offset = 0; kv_offset < tile_count; kv_offset++) {
+            uint kv = kv_tile + kv_offset;
+            float partial_dot = 0.0f;
+            for (uint d = tid * 4; d + 3 < head_dim; d += tg_size * 4) {
+                float4 qv = *reinterpret_cast<device const float4*>(&Q[q_offset + d]);
+                float4 k_vals = q4_0_read4(K_cache, k_head_base, kv, row_bytes, d);
+                partial_dot += dot(qv, k_vals);
+            }
+            for (uint d = (head_dim / 4) * 4 + tid; d < head_dim; d += tg_size) {
+                partial_dot += Q[q_offset + d] * q4_0_read(K_cache, k_head_base, kv, row_bytes, d);
+            }
+            partial_dot = simd_sum(partial_dot);
+            if (lane == 0) {
+                shared_scores[kv_offset * num_simds + simd_id] = partial_dot;
+            }
         }
-        for (uint d = (head_dim / 4) * 4 + tid; d < head_dim; d += tg_size) {
-            partial_dot += Q[q_offset + d] * q4_0_read(K_cache, k_head_base, kv, row_bytes, d);
-        }
-        shared_dot[tid] = partial_dot;
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
-        for (uint stride = tg_size / 2; stride > 0; stride >>= 1) {
-            if (tid < stride) {
-                shared_dot[tid] += shared_dot[tid + stride];
-            }
-            threadgroup_barrier(mem_flags::mem_threadgroup);
-        }
-
         if (tid == 0) {
-            float m = shared_update[0];
-            float l = shared_update[1];
-            float score = shared_dot[0] * scale;
-            float new_m = max(m, score);
-            float alpha = exp(m - new_m);
-            float beta = exp(score - new_m);
-            float new_l = l * alpha + beta;
-            shared_update[0] = new_m;
-            shared_update[1] = new_l;
-            shared_update[2] = new_l > 0.0f ? (l * alpha) / new_l : 0.0f;
-            shared_update[3] = new_l > 0.0f ? beta / new_l : 0.0f;
+            float m_old = shared_update[0];
+            float l_old = shared_update[1];
+            float m_new = m_old;
+
+            float tile_scores[TILE_KV];
+            for (uint kv_offset = 0; kv_offset < tile_count; kv_offset++) {
+                float s = 0.0f;
+                for (uint s_id = 0; s_id < num_simds; s_id++) {
+                    s += shared_scores[kv_offset * num_simds + s_id];
+                }
+                tile_scores[kv_offset] = s * scale;
+                m_new = max(m_new, tile_scores[kv_offset]);
+            }
+
+            float tile_sum = 0.0f;
+            for (uint kv_offset = 0; kv_offset < tile_count; kv_offset++) {
+                float e = exp(tile_scores[kv_offset] - m_new);
+                shared_exp[kv_offset] = e;
+                tile_sum += e;
+            }
+
+            float l_new = l_old * exp(m_old - m_new) + tile_sum;
+            shared_update[0] = m_new;
+            shared_update[1] = l_new;
+            shared_update[2] = l_new > 0.0f ? (l_old * exp(m_old - m_new)) / l_new : 0.0f;
+            shared_update[3] = l_new > 0.0f ? 1.0f / l_new : 0.0f;
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
         float old_factor = shared_update[2];
-        float new_factor = shared_update[3];
+        float inv_l_new = shared_update[3];
+
         for (uint d = tid * 4; d + 3 < head_dim; d += tg_size * 4) {
             uint out_idx = out_offset + d;
             float4 ov = *reinterpret_cast<device float4*>(&output[out_idx]);
-            float4 vv = q4_0_read4(V_cache, v_head_base, kv, row_bytes, d);
-            ov = ov * old_factor + new_factor * vv;
+            float4 acc = float4(0.0f);
+            for (uint kv_offset = 0; kv_offset < tile_count; kv_offset++) {
+                uint kv = kv_tile + kv_offset;
+                acc += shared_exp[kv_offset] * q4_0_read4(V_cache, v_head_base, kv, row_bytes, d);
+            }
+            ov = ov * old_factor + acc * inv_l_new;
             *reinterpret_cast<device float4*>(&output[out_idx]) = ov;
         }
         for (uint d = (head_dim / 4) * 4 + tid; d < head_dim; d += tg_size) {
             uint out_idx = out_offset + d;
-            output[out_idx] = output[out_idx] * old_factor
-                + new_factor * q4_0_read(V_cache, v_head_base, kv, row_bytes, d);
+            float acc = 0.0f;
+            for (uint kv_offset = 0; kv_offset < tile_count; kv_offset++) {
+                uint kv = kv_tile + kv_offset;
+                acc += shared_exp[kv_offset] * q4_0_read(V_cache, v_head_base, kv, row_bytes, d);
+            }
+            output[out_idx] = output[out_idx] * old_factor + acc * inv_l_new;
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
@@ -2477,6 +2542,7 @@ kernel void attention_causal_strided_q4_0(
     uint qi = tgid % q_len;
     if (h >= num_heads) return;
 
+    const uint TILE_KV = 4;
     uint kv_h = h / num_kv_groups;
     uint q_row = q_start_row + qi;
     uint q_offset = (h * q_stride + q_row) * head_dim;
@@ -2488,7 +2554,12 @@ kernel void attention_causal_strided_q4_0(
         attend_start = attend_len - attention_window;
     }
 
-    threadgroup float shared_dot[256];
+    uint simd_id = tid / SIMD_SIZE;
+    uint lane = tid % SIMD_SIZE;
+    uint num_simds = tg_size / SIMD_SIZE;
+
+    threadgroup float shared_scores[TILE_KV * 4];
+    threadgroup float shared_exp[TILE_KV];
     threadgroup float shared_update[4];
 
     uint out_offset = (h * q_stride + q_row) * head_dim;
@@ -2504,54 +2575,80 @@ kernel void attention_causal_strided_q4_0(
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    for (uint kv = attend_start; kv < attend_len; kv++) {
-        float partial_dot = 0.0f;
-        for (uint d = tid * 4; d + 3 < head_dim; d += tg_size * 4) {
-            float4 qv = *reinterpret_cast<device const float4*>(&Q[q_offset + d]);
-            float4 k_vals = q4_0_read4(K_cache, k_head_base, kv, row_bytes, d);
-            partial_dot += dot(qv, k_vals);
+    for (uint kv_tile = attend_start; kv_tile < attend_len; kv_tile += TILE_KV) {
+        uint tile_end = min(kv_tile + TILE_KV, attend_len);
+        uint tile_count = tile_end - kv_tile;
+
+        for (uint kv_offset = 0; kv_offset < tile_count; kv_offset++) {
+            uint kv = kv_tile + kv_offset;
+            float partial_dot = 0.0f;
+            for (uint d = tid * 4; d + 3 < head_dim; d += tg_size * 4) {
+                float4 qv = *reinterpret_cast<device const float4*>(&Q[q_offset + d]);
+                float4 k_vals = q4_0_read4(K_cache, k_head_base, kv, row_bytes, d);
+                partial_dot += dot(qv, k_vals);
+            }
+            for (uint d = (head_dim / 4) * 4 + tid; d < head_dim; d += tg_size) {
+                partial_dot += Q[q_offset + d] * q4_0_read(K_cache, k_head_base, kv, row_bytes, d);
+            }
+            partial_dot = simd_sum(partial_dot);
+            if (lane == 0) {
+                shared_scores[kv_offset * num_simds + simd_id] = partial_dot;
+            }
         }
-        for (uint d = (head_dim / 4) * 4 + tid; d < head_dim; d += tg_size) {
-            partial_dot += Q[q_offset + d] * q4_0_read(K_cache, k_head_base, kv, row_bytes, d);
-        }
-        shared_dot[tid] = partial_dot;
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
-        for (uint stride = tg_size / 2; stride > 0; stride >>= 1) {
-            if (tid < stride) {
-                shared_dot[tid] += shared_dot[tid + stride];
-            }
-            threadgroup_barrier(mem_flags::mem_threadgroup);
-        }
-
         if (tid == 0) {
-            float m = shared_update[0];
-            float l = shared_update[1];
-            float score = shared_dot[0] * scale;
-            float new_m = max(m, score);
-            float alpha = exp(m - new_m);
-            float beta = exp(score - new_m);
-            float new_l = l * alpha + beta;
-            shared_update[0] = new_m;
-            shared_update[1] = new_l;
-            shared_update[2] = new_l > 0.0f ? (l * alpha) / new_l : 0.0f;
-            shared_update[3] = new_l > 0.0f ? beta / new_l : 0.0f;
+            float m_old = shared_update[0];
+            float l_old = shared_update[1];
+            float m_new = m_old;
+
+            float tile_scores[TILE_KV];
+            for (uint kv_offset = 0; kv_offset < tile_count; kv_offset++) {
+                float s = 0.0f;
+                for (uint s_id = 0; s_id < num_simds; s_id++) {
+                    s += shared_scores[kv_offset * num_simds + s_id];
+                }
+                tile_scores[kv_offset] = s * scale;
+                m_new = max(m_new, tile_scores[kv_offset]);
+            }
+
+            float tile_sum = 0.0f;
+            for (uint kv_offset = 0; kv_offset < tile_count; kv_offset++) {
+                float e = exp(tile_scores[kv_offset] - m_new);
+                shared_exp[kv_offset] = e;
+                tile_sum += e;
+            }
+
+            float l_new = l_old * exp(m_old - m_new) + tile_sum;
+            shared_update[0] = m_new;
+            shared_update[1] = l_new;
+            shared_update[2] = l_new > 0.0f ? (l_old * exp(m_old - m_new)) / l_new : 0.0f;
+            shared_update[3] = l_new > 0.0f ? 1.0f / l_new : 0.0f;
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
         float old_factor = shared_update[2];
-        float new_factor = shared_update[3];
+        float inv_l_new = shared_update[3];
+
         for (uint d = tid * 4; d + 3 < head_dim; d += tg_size * 4) {
             uint out_idx = out_offset + d;
             float4 ov = *reinterpret_cast<device float4*>(&output[out_idx]);
-            float4 vv = q4_0_read4(V_cache, v_head_base, kv, row_bytes, d);
-            ov = ov * old_factor + new_factor * vv;
+            float4 acc = float4(0.0f);
+            for (uint kv_offset = 0; kv_offset < tile_count; kv_offset++) {
+                uint kv = kv_tile + kv_offset;
+                acc += shared_exp[kv_offset] * q4_0_read4(V_cache, v_head_base, kv, row_bytes, d);
+            }
+            ov = ov * old_factor + acc * inv_l_new;
             *reinterpret_cast<device float4*>(&output[out_idx]) = ov;
         }
         for (uint d = (head_dim / 4) * 4 + tid; d < head_dim; d += tg_size) {
             uint out_idx = out_offset + d;
-            output[out_idx] = output[out_idx] * old_factor
-                + new_factor * q4_0_read(V_cache, v_head_base, kv, row_bytes, d);
+            float acc = 0.0f;
+            for (uint kv_offset = 0; kv_offset < tile_count; kv_offset++) {
+                uint kv = kv_tile + kv_offset;
+                acc += shared_exp[kv_offset] * q4_0_read(V_cache, v_head_base, kv, row_bytes, d);
+            }
+            output[out_idx] = output[out_idx] * old_factor + acc * inv_l_new;
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
