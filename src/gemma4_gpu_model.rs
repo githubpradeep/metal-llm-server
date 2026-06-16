@@ -2012,6 +2012,37 @@ impl Gemma4GpuModel {
         self.total_tokens
     }
 
+    pub fn token_embedding(&self, token_id: usize) -> Result<Vec<f32>, String> {
+        let hidden_size = self.config.hidden_size;
+        let embed_offset = token_id
+            .checked_mul(hidden_size)
+            .ok_or_else(|| format!("token id {} overflowed embedding offset", token_id))?;
+        if embed_offset + hidden_size > self.embed_tokens_f16.len() {
+            return Err(format!("token id {} is outside embed_tokens", token_id));
+        }
+
+        let embed_scale = (hidden_size as f32).sqrt();
+        let mut embedding = vec![0.0f32; hidden_size];
+        for i in 0..hidden_size {
+            embedding[i] = bf16_to_f32(self.embed_tokens_f16[embed_offset + i]) * embed_scale;
+        }
+        Ok(embedding)
+    }
+
+    pub fn last_hidden_activation(&self) -> Vec<f32> {
+        MetalContext::read_buffer(&self.hidden_buf, self.config.hidden_size)
+    }
+
+    pub fn mtp_kv_source_layer(&self, is_full_attention: bool) -> Option<usize> {
+        let non_shared_layers = self
+            .config
+            .num_hidden_layers
+            .saturating_sub(self.config.num_kv_shared_layers);
+        (0..non_shared_layers)
+            .rev()
+            .find(|&layer_idx| self.config.is_full_attention(layer_idx) == is_full_attention)
+    }
+
     pub fn reset_legacy_state(&mut self) {
         self.kv_seq_len = 0;
         self.total_tokens = 0;
