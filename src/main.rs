@@ -82,7 +82,8 @@ fn main() {
 
             let gen_start = Instant::now();
             //let prompt = "<start_of_turn>user\n A train leaves at 8:15 AM and arrives at 11:47 AM. How long was the journey?<end_of_turn>\n<start_of_turn>model\n";
-            let prompt = "<start_of_turn>user\n Write a short essay about the benefits of exercise. Include an introduction, 3 key points, and a conlcusion. <end_of_turn>\n<start_of_turn>model\n";
+            //let prompt = "<start_of_turn>user\n Write a short essay about the benefits of exercise. Include an introduction, 3 key points, and a conlcusion. <end_of_turn>\n<start_of_turn>model\n";
+            let prompt = "<start_of_turn>user\n Implement bubble sort in python <end_of_turn>\n<start_of_turn>model\n";
             if let Some(assistant_dir) = assistant_dir {
                 println!("Loading Gemma4 MTP assistant from: {}", assistant_dir);
                 let mut assistant = gemma4_mtp::Gemma4MtpAssistant::new(&assistant_dir, &gpu_model);
