@@ -1,0 +1,146 @@
+LLAMA_KV_CACHE_TYPE=q4_0 cargo run --release -- --gpu /Users/pradeep.borado/Downloads/models--google--gemma-4-E4B-it/snapshots/d6436b3d62967e1af08bbb046c6300b2a9ae8e85 
+warning: unused doc comment
+  --> src/quantize.rs:1:1
+   |
+ 1 | / /// Linear layer using Accelerate BLAS for all matmuls.
+ 2 | | /// On Apple Silicon, Accelerate's sgemv/sgemm uses the AMX coprocessor
+ 3 | | /// which is faster than any scalar int8 kernel we could write.
+ 4 | | /// The model weights stay in f32 for maximum BLAS throughput.
+   | |______________________________________________________________^
+ 5 |
+ 6 | / extern "C" {
+ 7 | |     fn cblas_sgemv(
+ 8 | |         order: i32, trans: i32, m: i32, n: i32,
+ 9 | |         alpha: f32, a: *const f32, lda: i32,
+...  |
+20 | |     );
+21 | | }
+   | |_- rustdoc does not generate documentation for extern blocks
+   |
+   = help: use `//` for a plain comment
+   = note: `#[warn(unused_doc_comments)]` on by default
+
+warning: `llama-sinks` (bin "llama-sinks") generated 1 warning
+    Finished `release` profile [optimized] target(s) in 0.31s
+     Running `target/release/llama-sinks --gpu /Users/pradeep.borado/Downloads/models--google--gemma-4-E4B-it/snapshots/d6436b3d62967e1af08bbb046c6300b2a9ae8e85`
+Loading Gemma4 model (GPU/Metal) from: /Users/pradeep.borado/Downloads/models--google--gemma-4-E4B-it/snapshots/d6436b3d62967e1af08bbb046c6300b2a9ae8e85
+  Found Q4 cache, loading pre-quantized weights...
+  Metal GPU: Apple M1 Pro
+    embed_tokens: 1280.0 MB
+    embed_tokens_per_layer: 5376.0 MB
+    Loaded layer 10/42
+    Loaded layer 20/42
+    Loaded layer 30/42
+    Loaded layer 40/42
+    Loaded layer 42/42
+  KV cache type: q4_0, est. memory per layer: 0.1 MB (vs f16: 0.3 MB, 72% savings)
+  Parallel prefill scratch: max_seq=128
+  Decode batch scratch: max_batch=4
+  Loaded from Q4 cache successfully
+Model loaded in 33.25s
+============================================================
+GEMMA4 E4B GENERATION (Metal GPU, Q4_0)
+============================================================
+<start_of_turn>user
+ Write a short essay about the benefits of exercise. Include an introduction, 3 key points, and a conclusion.<end_of_turn>
+<start_of_turn>model
+## The Undeniable Benefits of Movement
+
+In our fast-paced modern world, where sedentary habits are becoming alarmingly common, the profound benefits of exercise often go overlooked. Exercise is not merely a means to achieve a superficial physique; it is a powerful, holistic tool that revitalizes our bodies and strengthens our minds. By integrating consistent movement into our lives, we unlock a cascade of tangible benefits—from improving cardiovascular health to boosting mental clarity—making it an investment that yields dividends throughout our entire lifespan.
+
+Firstly, and perhaps most critically, **exercise dramatically enhances cardiovascular health**. Consistent activity strengthens the heart muscle, allowing it to pump blood more efficiently. This improved circulation is vital, as it reduces the risk of serious conditions such as heart attacks and strokes, which are often linked to poor circulation and sedentary lifestyles. Regular movement helps to maintain healthy blood pressure and cholesterol levels, ensuring that our circulatory system remains robust and resilient, allowing us to feel vibrant and capable for years to come.
+
+Secondly, and equally important in the modern context, **exercise serves as a potent natural mood elevator**. Physical activity stimulates the release of endorphins—natural chemicals in the brain that trigger feelings of euphoria and well-being. This effect is highly beneficial in combating stress, anxiety, and symptoms of depression. When we move, we are actively managing our mental landscape; the rhythm of a run or the focus of a yoga session can provide a powerful, positive distraction from daily worries, fostering a profound sense of calm and contentment.
+
+Finally, **regular physical activity significantly contributes to overall strength and bone density**. As we age, the risk of osteoporosis and muscle atrophy increases. Exercise, particularly weight-bearing activities, sends signals to our bones to become denser and stronger, helping to prevent fragility. Furthermore, it builds muscle mass, which is essential for maintaining mobility and functional strength throughout life, ensuring that we can navigate our environment confidently and maintain our independence well into our later years.
+
+In conclusion, the benefits of exercise extend far beyond the aesthetic. It is a powerful, multifaceted intervention that fortifies our hearts, uplifts our spirits, and preserves our physical strength. By committing to movement—whether it is a brisk walk, a vigorous workout, or simply choosing to move more often—we are actively investing in a healthier, happier, and more resilient future. Exercise is truly the most accessible and enduring prescription for a vibrant life.
+
+[Gemma4 E4B Generation - Metal GPU, Q4_0]
+  Tokens: 483
+  Throughput: 16.93 tok/s
+  Context length: 531 tokens
+  Elapsed: 28.53s
+
+Total time: 31.34s
+
+
+
+LLAMA_KV_CACHE_TYPE=q4_0 cargo run --release -- --gpu /Users/pradeep.borado/Downloads/models--google--gemma-4-E4B-it/snapshots/d6436b3d62967e1af08bbb046c6300b2a9ae8e85 --assistant-dir /Users/pradeep.borado/Downloads/gemma-4-E4B-it-assistant
+   Compiling llama-sinks v0.1.0 (/Users/pradeep.borado/work/scripts/metal-llm-server)
+warning: unused doc comment
+  --> src/quantize.rs:1:1
+   |
+ 1 | / /// Linear layer using Accelerate BLAS for all matmuls.
+ 2 | | /// On Apple Silicon, Accelerate's sgemv/sgemm uses the AMX coprocessor
+ 3 | | /// which is faster than any scalar int8 kernel we could write.
+ 4 | | /// The model weights stay in f32 for maximum BLAS throughput.
+   | |______________________________________________________________^
+ 5 |
+ 6 | / extern "C" {
+ 7 | |     fn cblas_sgemv(
+ 8 | |         order: i32, trans: i32, m: i32, n: i32,
+ 9 | |         alpha: f32, a: *const f32, lda: i32,
+...  |
+20 | |     );
+21 | | }
+   | |_- rustdoc does not generate documentation for extern blocks
+   |
+   = help: use `//` for a plain comment
+   = note: `#[warn(unused_doc_comments)]` on by default
+
+warning: `llama-sinks` (bin "llama-sinks") generated 1 warning
+    Finished `release` profile [optimized] target(s) in 35.21s
+     Running `target/release/llama-sinks --gpu /Users/pradeep.borado/Downloads/models--google--gemma-4-E4B-it/snapshots/d6436b3d62967e1af08bbb046c6300b2a9ae8e85 --assistant-dir /Users/pradeep.borado/Downloads/gemma-4-E4B-it-assistant`
+Loading Gemma4 model (GPU/Metal) from: /Users/pradeep.borado/Downloads/models--google--gemma-4-E4B-it/snapshots/d6436b3d62967e1af08bbb046c6300b2a9ae8e85
+  Found Q4 cache, loading pre-quantized weights...
+  Metal GPU: Apple M1 Pro
+    embed_tokens: 1280.0 MB
+    embed_tokens_per_layer: 5376.0 MB
+    Loaded layer 10/42
+    Loaded layer 20/42
+    Loaded layer 30/42
+    Loaded layer 40/42
+    Loaded layer 42/42
+  KV cache type: q4_0, est. memory per layer: 0.1 MB (vs f16: 0.3 MB, 72% savings)
+  Parallel prefill scratch: max_seq=128
+  Decode batch scratch: max_batch=4
+  Loaded from Q4 cache successfully
+  Metal GPU: Apple M1 Pro
+Loading Gemma4 assistant (MTP drafter) from: /Users/pradeep.borado/Downloads/gemma-4-E4B-it-assistant
+  Assistant: 4 layers, hidden=256, heads=4, kv_heads=2
+  Backbone hidden size: 2560
+  Ordered embeddings: true
+    embed_tokens: [262144, 256] (tied lm_head)
+    pre_projection: [256, 5120]
+    masked_embedding centroids: [2048, 256]
+    post_projection: [2560, 256]
+    masked_embedding token_ordering: [262144] (dtype I64)
+  Assistant loaded successfully
+Model loaded in 18.19s
+============================================================
+GEMMA4 E4B GENERATION (Metal GPU, Q4_0, MTP speculative decoding)
+============================================================
+<start_of_turn>user
+ Write a short essay about the benefits of exercise. Include an introduction, 3 key points, and a conclusion.<end_of_turn>
+<start_of_turn>model
+## Moving Towards a Healthier Self: The Profound Benefits of Exercise
+
+In the relentless pace of modern life, the call to exercise can often be overlooked in favor of immediate convenience. However, to treat exercise as merely a form of physical activity is to undervalue its profound impact on our holistic well-being. Far from being a tedious chore, intentional movement is a powerful tool that unlocks numerous benefits—physical, mental, and emotional—making it a fundamental investment in a healthier, more vibrant self.
+
+One of the most tangible benefits of regular activity is the **significant improvement in cardiovascular and physical health**. Exercise directly strengthens the heart muscle, allowing it to pump blood more efficiently. This, in turn, lowers blood pressure and reduces the risk of debilitating diseases such as heart attacks and strokes. Furthermore, movement helps to build and maintain strong bones, fighting off the effects of osteoporosis, and helps manage healthy body weight by burning calories, making the body a more resilient machine.
+
+Beyond the physical fortress, exercise serves as a powerful **natural regulator of mental and emotional health**. When we move, our bodies release endorphins—natural mood elevators—which can effectively combat feelings of stress, anxiety, and even symptoms of depression. Physical activity acts as a constructive distraction from negative thought patterns, providing a focused space where the mind can calm down. Essentially, exercise provides a healthy, productive outlet for the internal pressures we all face.
+
+Finally, consistent movement fosters **enhanced focus and cognitive function**. By engaging in aerobic and strength training, we improve blood flow to the brain, which supports better neural pathways. This translates into tangible benefits in daily life, such as the ability to concentrate better at work or school, improving memory recall, and sharpening overall cognitive acuity. Exercise is not just about sweating; it is about optimizing the brain's ability to function under pressure.
+
+In conclusion, the benefits of incorporating regular exercise into our lives are far too compelling to ignore. Whether we are fortifying our heart, stabilizing our mood, or sharpening our cognitive edge, movement acts as a catalyst for profound personal enhancement. Far from being a burdensome requirement, exercise is a vibrant, accessible pathway to mastering our health, ensuring that we not only survive the demands of modern life but truly thrive within them.
+
+[Gemma4 E4B Generation - Metal GPU, Q4_0, MTP speculative]
+  Tokens: 456
+  Throughput: 14.08 tok/s
+  Drafted: 454, Accepted: 178, Acceptance rate: 39.21%
+  Context length: 504 tokens
+  Elapsed: 32.38s
+
+Total time: 34.94s

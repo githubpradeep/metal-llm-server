@@ -91,7 +91,7 @@ fn main() {
             }
             println!("{}", "=".repeat(60));
 
-            let prompt = "<start_of_turn>user\n A train leaves at 8:15 AM and arrives at 11:47 AM. How long was the journey?<end_of_turn>\n<start_of_turn>model\n";
+            let prompt = "<start_of_turn>user\n Write a short essay about the benefits of exercise. Include an introduction, 3 key points, and a conclusion.<end_of_turn>\n<start_of_turn>model\n";
             let gen_start = Instant::now();
             if let Some(mut assistant) = assistant {
                 generate_gemma4_gpu_speculative(
