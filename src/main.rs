@@ -183,6 +183,9 @@ fn generate_gemma4_gpu_mtp(
 
     let token_ids: Vec<usize> = input_ids.iter().map(|&t| t as usize).collect();
     let mut logits = model.forward_prefill(&token_ids);
+    let mut last_token: usize = 0;
+    let mut mtp_hidden = Vec::new();
+    let mut need_first_token = true;
 
     let start_time = Instant::now();
     let mut tokens_generated = 0usize;
@@ -190,21 +193,31 @@ fn generate_gemma4_gpu_mtp(
     let mut accepted_total = 0usize;
     let mut rejected_total = 0usize;
     let draft_steps = parse_mtp_draft_steps();
+    let mtp_debug = std::env::var("LLAMA_MTP_DEBUG").is_ok();
+    let mut mtp_debug_cycles = 0usize;
     let eos_tokens: &[usize] = &[1, 106];
 
     'outer: while tokens_generated < max_tokens {
-        let first_token = sampling::argmax(&logits);
-        if !print_gemma_token(first_token, tokenizer, eos_tokens) {
-            break;
-        }
-        tokens_generated += 1;
-        logits = model.forward_single_token(first_token);
-        if tokens_generated >= max_tokens {
-            break;
+        // Reference skips drafting on the first iteration (prefill → emit one token).
+        if need_first_token {
+            last_token = sampling::argmax(&logits);
+            if !print_gemma_token(last_token, tokenizer, eos_tokens) {
+                break;
+            }
+            tokens_generated += 1;
+            if tokens_generated >= max_tokens {
+                break;
+            }
+            logits = model.forward_single_token(last_token);
+            mtp_hidden = model.last_hidden_activation();
+            need_first_token = false;
+            continue;
         }
 
-        let mut draft_token = first_token;
-        let mut draft_activation = model.last_hidden_activation();
+        // llama.cpp draft-mtp: concat(sqrt-scaled target embed(last_token), h_nextn).
+        // h_nextn is post-final-norm; on partial reject keep h at last accepted index.
+        let mut draft_token = last_token;
+        let mut draft_activation = mtp_hidden.clone();
         let mut drafted = Vec::with_capacity(draft_steps);
         for _ in 0..draft_steps {
             let draft = assistant
@@ -216,12 +229,29 @@ fn generate_gemma4_gpu_mtp(
         }
         drafted_total += drafted.len();
 
-        for drafted_token in drafted {
+        if mtp_debug && mtp_debug_cycles < 5 {
+            eprintln!(
+                "MTP debug cycle {}: last_token={} drafts={:?}",
+                mtp_debug_cycles, last_token, drafted
+            );
+            mtp_debug_cycles += 1;
+        }
+
+        for (draft_idx, drafted_token) in drafted.into_iter().enumerate() {
             if tokens_generated >= max_tokens {
                 break 'outer;
             }
 
             let verifier_token = sampling::argmax(&logits);
+            if mtp_debug && mtp_debug_cycles <= 5 {
+                eprintln!(
+                    "  draft[{}]: drafted={} verifier={} match={}",
+                    draft_idx,
+                    drafted_token,
+                    verifier_token,
+                    drafted_token == verifier_token
+                );
+            }
             if verifier_token == drafted_token {
                 if !print_gemma_token(drafted_token, tokenizer, eos_tokens) {
                     break 'outer;
@@ -229,6 +259,8 @@ fn generate_gemma4_gpu_mtp(
                 accepted_total += 1;
                 tokens_generated += 1;
                 logits = model.forward_single_token(drafted_token);
+                last_token = drafted_token;
+                mtp_hidden = model.last_hidden_activation();
             } else {
                 if !print_gemma_token(verifier_token, tokenizer, eos_tokens) {
                     break 'outer;
@@ -236,6 +268,12 @@ fn generate_gemma4_gpu_mtp(
                 rejected_total += 1;
                 tokens_generated += 1;
                 logits = model.forward_single_token(verifier_token);
+                last_token = verifier_token;
+                if draft_idx == 0 {
+                    // n_accepted=0: pair correction with its own h_nextn
+                    mtp_hidden = model.last_hidden_activation();
+                }
+                // draft_idx > 0: keep mtp_hidden at last accepted index (llama accept())
                 continue 'outer;
             }
         }
@@ -244,12 +282,15 @@ fn generate_gemma4_gpu_mtp(
             break;
         }
 
+        // All drafts accepted: emit the bonus token (n_matches + 1 in reference).
         let bonus_token = sampling::argmax(&logits);
         if !print_gemma_token(bonus_token, tokenizer, eos_tokens) {
             break;
         }
         tokens_generated += 1;
         logits = model.forward_single_token(bonus_token);
+        last_token = bonus_token;
+        mtp_hidden = model.last_hidden_activation();
     }
 
     let elapsed = start_time.elapsed().as_secs_f64();

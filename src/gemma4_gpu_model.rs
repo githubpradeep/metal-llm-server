@@ -2029,8 +2029,29 @@ impl Gemma4GpuModel {
         Ok(embedding)
     }
 
+    /// Raw (unscaled) input embedding row, matching a plain `nn.Embedding` lookup.
+    /// The MTP drafter concatenates this with the target hidden state and feeds it to
+    /// `pre_projection`, bypassing the text model's sqrt(hidden) scaling (see
+    /// `SinglePositionMultiTokenCandidateGenerator.get_candidates`).
+    pub fn token_embedding_raw(&self, token_id: usize) -> Result<Vec<f32>, String> {
+        let hidden_size = self.config.hidden_size;
+        let embed_offset = token_id
+            .checked_mul(hidden_size)
+            .ok_or_else(|| format!("token id {} overflowed embedding offset", token_id))?;
+        if embed_offset + hidden_size > self.embed_tokens_f16.len() {
+            return Err(format!("token id {} is outside embed_tokens", token_id));
+        }
+        let mut embedding = vec![0.0f32; hidden_size];
+        for i in 0..hidden_size {
+            embedding[i] = bf16_to_f32(self.embed_tokens_f16[embed_offset + i]);
+        }
+        Ok(embedding)
+    }
+
     pub fn last_hidden_activation(&self) -> Vec<f32> {
-        MetalContext::read_buffer(&self.hidden_buf, self.config.hidden_size)
+        // Post-final-norm hidden (LM-head input / h_nextn). llama.cpp gemma4.cpp explicitly
+        // exposes this for MTP; matches transformers/vLLM/SGLang reference.
+        MetalContext::read_buffer(&self.normed_buf, self.config.hidden_size)
     }
 
     pub fn mtp_kv_source_layer(&self, is_full_attention: bool) -> Option<usize> {

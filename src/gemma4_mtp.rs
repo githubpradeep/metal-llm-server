@@ -14,8 +14,12 @@ pub struct Gemma4MtpAssistant {
     ctx: MetalContext,
     config: AssistantTextConfig,
     backbone_hidden_size: usize,
-    token_to_ordered_row: Vec<usize>,
-    lm_head_buf: Buffer,
+    num_centroids: usize,
+    centroid_top_k: usize,
+    vocab_size_per_centroid: usize,
+    embed_tokens_f32: Vec<f32>,
+    centroids_weight_f32: Vec<f32>,
+    token_ordering_clusters: Vec<Vec<usize>>,
     pre_projection: Buffer,
     post_projection: Buffer,
     layers: Vec<AssistantLayer>,
@@ -31,7 +35,6 @@ pub struct Gemma4MtpAssistant {
     gate_buf: Buffer,
     up_buf: Buffer,
     gelu_buf: Buffer,
-    logits_buf: Buffer,
     projected_activation_buf: Buffer,
     per_layer_cos_bufs: Vec<Buffer>,
     per_layer_sin_bufs: Vec<Buffer>,
@@ -62,7 +65,21 @@ struct AssistantLayer {
 #[derive(Clone, Debug, Deserialize)]
 struct AssistantOuterConfig {
     backbone_hidden_size: usize,
+    #[serde(default = "default_num_centroids")]
+    num_centroids: usize,
+    #[serde(default = "default_centroid_top_k")]
+    centroid_intermediate_top_k: usize,
+    #[serde(default)]
+    use_ordered_embeddings: bool,
     text_config: AssistantTextConfig,
+}
+
+fn default_num_centroids() -> usize {
+    2048
+}
+
+fn default_centroid_top_k() -> usize {
+    32
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -148,6 +165,18 @@ impl Gemma4MtpAssistant {
             serde_json::from_str(&config_str).expect("Failed to parse assistant config");
         let config = outer.text_config;
         let backbone_hidden_size = outer.backbone_hidden_size;
+        let num_centroids = outer.num_centroids;
+        let centroid_top_k = outer.centroid_intermediate_top_k;
+        assert!(
+            outer.use_ordered_embeddings,
+            "assistant must use ordered embeddings (centroid lm_head)"
+        );
+        assert_eq!(
+            config.vocab_size % num_centroids,
+            0,
+            "vocab_size must be divisible by num_centroids"
+        );
+        let vocab_size_per_centroid = config.vocab_size / num_centroids;
 
         assert_eq!(
             backbone_hidden_size, target.config.hidden_size,
@@ -166,24 +195,39 @@ impl Gemma4MtpAssistant {
         let tensors = load_assistant_tensors(model_dir);
 
         let embed_tokens_f16 = raw_tensor_u16(&tensors, "model.embed_tokens.weight");
-        let ordered_row_to_token = tensor_i64(&tensors, "masked_embedding.token_ordering")
+        let token_ordering_flat = tensor_i64(&tensors, "masked_embedding.token_ordering")
             .into_iter()
             .map(|value| value as usize)
             .collect::<Vec<_>>();
         assert_eq!(
-            ordered_row_to_token.len(),
+            token_ordering_flat.len(),
             config.vocab_size,
             "assistant token_ordering must match vocab size"
         );
-        let mut token_to_ordered_row = vec![0usize; ordered_row_to_token.len()];
-        for (ordered_row, &token_id) in ordered_row_to_token.iter().enumerate() {
-            token_to_ordered_row[token_id] = ordered_row;
+        let mut token_ordering_clusters = vec![Vec::with_capacity(vocab_size_per_centroid); num_centroids];
+        for (idx, &token_id) in token_ordering_flat.iter().enumerate() {
+            let cluster = idx / vocab_size_per_centroid;
+            token_ordering_clusters[cluster].push(token_id);
         }
+        for cluster in &token_ordering_clusters {
+            assert_eq!(
+                cluster.len(),
+                vocab_size_per_centroid,
+                "each centroid cluster must have vocab_size/num_centroids entries"
+            );
+        }
+
         let embed_tokens_f32 = embed_tokens_f16
             .iter()
             .map(|&bits| bf16_to_f32(bits))
             .collect::<Vec<_>>();
-        let lm_head_buf = ctx.buffer_from_f32_as_f16(&embed_tokens_f32);
+        let centroids_weight_f32 = tensor_f32(&tensors, "masked_embedding.centroids.weight");
+        let hidden_size = config.hidden_size;
+        assert_eq!(
+            centroids_weight_f32.len(),
+            num_centroids * hidden_size,
+            "centroids weight must be [num_centroids, hidden_size]"
+        );
 
         let pre_projection = ctx.buffer_from_f32_as_f16(&tensor_f32(&tensors, "pre_projection.weight"));
         let post_projection = ctx.buffer_from_f32_as_f16(&tensor_f32(&tensors, "post_projection.weight"));
@@ -227,7 +271,6 @@ impl Gemma4MtpAssistant {
         let gate_buf = ctx.buffer_empty(config.intermediate_size);
         let up_buf = ctx.buffer_empty(config.intermediate_size);
         let gelu_buf = ctx.buffer_empty(config.intermediate_size);
-        let logits_buf = ctx.buffer_empty(config.vocab_size);
         let projected_activation_buf = ctx.buffer_empty(backbone_hidden_size);
 
         let mut per_layer_cos_bufs = Vec::with_capacity(config.num_hidden_layers);
@@ -242,7 +285,10 @@ impl Gemma4MtpAssistant {
             "  Gemma4 MTP assistant: {} layers, hidden={}, backbone_hidden={}, vocab={}",
             config.num_hidden_layers, config.hidden_size, backbone_hidden_size, config.vocab_size
         );
-        println!("  Ordered embeddings: true");
+        println!(
+            "  Centroid lm_head: {} centroids, top_k={}, {} tokens/cluster",
+            num_centroids, centroid_top_k, vocab_size_per_centroid
+        );
         if let (Some(sliding), Some(full)) = (
             target.mtp_kv_source_layer(false),
             target.mtp_kv_source_layer(true),
@@ -254,8 +300,12 @@ impl Gemma4MtpAssistant {
             ctx,
             config,
             backbone_hidden_size,
-            token_to_ordered_row,
-            lm_head_buf,
+            num_centroids,
+            centroid_top_k,
+            vocab_size_per_centroid,
+            embed_tokens_f32,
+            centroids_weight_f32,
+            token_ordering_clusters,
             pre_projection,
             post_projection,
             layers,
@@ -271,7 +321,6 @@ impl Gemma4MtpAssistant {
             gate_buf,
             up_buf,
             gelu_buf,
-            logits_buf,
             projected_activation_buf,
             per_layer_cos_bufs,
             per_layer_sin_bufs,
@@ -296,6 +345,9 @@ impl Gemma4MtpAssistant {
         }
 
         self.prepare_activation(token_id, target_activation, target)?;
+        // `token_id` is the last token committed to the target KV (at index total_tokens-1).
+        // Its query uses that position for RoPE; the drafter predicts the next token. With
+        // constant draft positions, all chained draft steps reuse this same position.
         self.prepare_rotary(target.total_tokens.saturating_sub(1));
 
         let hidden_size = self.config.hidden_size;
@@ -401,7 +453,7 @@ impl Gemma4MtpAssistant {
                 KvCacheType::F16 => {
                     self.ctx.encode_attention_with_offset_f16(
                         encoder,
-                        &self.q_buf,
+                        &self.q_rotary_buf,
                         k_cache,
                         v_cache,
                         &self.attn_out_buf,
@@ -420,7 +472,7 @@ impl Gemma4MtpAssistant {
                     let row_bytes = groups_per_row * 34;
                     self.ctx.encode_attention_with_offset_q8_0(
                         encoder,
-                        &self.q_buf,
+                        &self.q_rotary_buf,
                         k_cache,
                         v_cache,
                         &self.attn_out_buf,
@@ -441,7 +493,7 @@ impl Gemma4MtpAssistant {
                     let row_bytes = groups_per_row * 18;
                     self.ctx.encode_attention_with_offset_q4_0(
                         encoder,
-                        &self.q_buf,
+                        &self.q_rotary_buf,
                         k_cache,
                         v_cache,
                         &self.attn_out_buf,
@@ -572,14 +624,6 @@ impl Gemma4MtpAssistant {
             );
             self.ctx.encode_matvec_f16(
                 encoder,
-                &self.lm_head_buf,
-                &self.normed_buf,
-                &self.logits_buf,
-                self.config.vocab_size as u32,
-                hidden_size as u32,
-            );
-            self.ctx.encode_matvec_f16(
-                encoder,
                 &self.post_projection,
                 &self.normed_buf,
                 &self.projected_activation_buf,
@@ -591,13 +635,8 @@ impl Gemma4MtpAssistant {
         cmd.commit();
         cmd.wait_until_completed();
 
-        let mut logits = MetalContext::read_buffer(&self.logits_buf, self.config.vocab_size);
-        if let Some(cap) = self.config.final_logit_softcapping {
-            for logit in &mut logits {
-                let x = (*logit / cap).clamp(-10.0, 10.0);
-                *logit = cap * x.tanh();
-            }
-        }
+        let normed_hidden = MetalContext::read_buffer(&self.normed_buf, hidden_size);
+        let logits = self.compute_masked_logits(&normed_hidden);
         let projected_activation =
             MetalContext::read_buffer(&self.projected_activation_buf, self.backbone_hidden_size);
         let token_id = sampling::argmax(&logits);
@@ -608,12 +647,62 @@ impl Gemma4MtpAssistant {
         })
     }
 
+    /// Sparse centroid lm_head from Gemma4AssistantMaskedEmbedder (transformers).
+    fn compute_masked_logits(&self, hidden: &[f32]) -> Vec<f32> {
+        let hidden_size = self.config.hidden_size;
+        let mut centroid_scores = vec![0.0f32; self.num_centroids];
+        for (cluster, score) in centroid_scores.iter_mut().enumerate() {
+            let weight_offset = cluster * hidden_size;
+            let mut dot = 0.0f32;
+            for i in 0..hidden_size {
+                dot += self.centroids_weight_f32[weight_offset + i] * hidden[i];
+            }
+            *score = dot;
+        }
+
+        let mut ranked_centroids: Vec<usize> = (0..self.num_centroids).collect();
+        ranked_centroids.select_nth_unstable_by(self.centroid_top_k - 1, |&a, &b| {
+            centroid_scores[b]
+                .partial_cmp(&centroid_scores[a])
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        ranked_centroids.truncate(self.centroid_top_k);
+
+        let num_selected = self.centroid_top_k * self.vocab_size_per_centroid;
+        let mut sparse_logits = Vec::with_capacity(num_selected);
+        let mut scatter_idx = Vec::with_capacity(num_selected);
+        for &cluster in &ranked_centroids {
+            for &token_id in &self.token_ordering_clusters[cluster] {
+                let emb_offset = token_id * hidden_size;
+                let mut dot = 0.0f32;
+                for i in 0..hidden_size {
+                    dot += self.embed_tokens_f32[emb_offset + i] * hidden[i];
+                }
+                sparse_logits.push(dot);
+                scatter_idx.push(token_id);
+            }
+        }
+
+        let mask_value = sparse_logits
+            .iter()
+            .copied()
+            .fold(f32::INFINITY, f32::min)
+            - 1.0;
+        let mut logits = vec![mask_value; self.config.vocab_size];
+        for (token_id, logit) in scatter_idx.into_iter().zip(sparse_logits) {
+            logits[token_id] = logit;
+        }
+        logits
+    }
+
     fn prepare_activation(
         &self,
         token_id: usize,
         target_activation: &[f32],
         target: &Gemma4GpuModel,
     ) -> Result<(), String> {
+        // Target embed scaled by sqrt(backbone_hidden) — see llama.cpp gemma4-assistant.cpp
+        // (ggml_scale on model_other->tok_embd before concat with h_nextn).
         let mut activation = target.token_embedding(token_id)?;
         activation.extend_from_slice(target_activation);
         MetalContext::write_buffer(&self.activation_buf, &activation);
