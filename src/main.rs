@@ -86,7 +86,7 @@ fn main() {
             let prompt = "<start_of_turn>user\n Implement bubble sort in python <end_of_turn>\n<start_of_turn>model\n";
             if let Some(assistant_dir) = assistant_dir {
                 println!("Loading Gemma4 MTP assistant from: {}", assistant_dir);
-                let mut assistant = gemma4_mtp::Gemma4MtpAssistant::new(&assistant_dir, &gpu_model);
+                let mut assistant = gemma4_mtp::Gemma4MtpAssistant::new(&assistant_dir, &gpu_model.ctx, &gpu_model);
                 generate_gemma4_gpu_mtp(prompt, &tokenizer, &mut gpu_model, &mut assistant, 1000);
             } else {
                 generate_gemma4_gpu(prompt, &tokenizer, &mut gpu_model, 1000);
@@ -154,6 +154,68 @@ fn parse_mtp_draft_steps() -> usize {
         .unwrap_or(4)
 }
 
+fn parse_mtp_adaptive() -> bool {
+    std::env::var("LLAMA_MTP_ADAPTIVE")
+        .map(|value| value == "1" || value.to_ascii_lowercase() == "true")
+        .unwrap_or(false)
+}
+
+/// Google-style heuristic: don't draft N-1 tail tokens when recent accept depth is low.
+fn adaptive_draft_tail_steps(accept_history: &[usize], max_steps: usize) -> usize {
+    if max_steps <= 1 {
+        return 0;
+    }
+    if accept_history.is_empty() {
+        return max_steps - 1;
+    }
+    let window = accept_history.len().min(12);
+    let recent = &accept_history[accept_history.len() - window..];
+    let avg = recent.iter().sum::<usize>() as f64 / window as f64;
+    if avg >= 3.0 {
+        max_steps - 1
+    } else if avg >= 2.0 {
+        (max_steps - 1).min(2)
+    } else if avg >= 1.2 {
+        1
+    } else {
+        0
+    }
+}
+
+/// Verify attention reads the full KV cache on global-attention layers, so cost
+/// grows linearly with context. Shrink draft depth as the cache grows (same idea
+/// as llama.cpp backing off `--spec-draft-n-max` at long context).
+fn context_limited_draft_tail_steps(tail_steps: usize, context_len: usize, sliding_window: usize) -> usize {
+    if tail_steps == 0 {
+        return 0;
+    }
+    if context_len > sliding_window.saturating_mul(2) {
+        return 0;
+    }
+    if context_len > sliding_window {
+        return tail_steps.min(1);
+    }
+    if context_len > sliding_window * 3 / 4 {
+        return tail_steps.min(2);
+    }
+    tail_steps
+}
+
+fn effective_draft_tail_steps(
+    accept_history: &[usize],
+    max_steps: usize,
+    mtp_adaptive: bool,
+    context_len: usize,
+    sliding_window: usize,
+) -> usize {
+    let tail = if mtp_adaptive {
+        adaptive_draft_tail_steps(accept_history, max_steps)
+    } else {
+        max_steps.saturating_sub(1)
+    };
+    context_limited_draft_tail_steps(tail, context_len, sliding_window)
+}
+
 fn print_gemma_token(
     token: usize,
     tokenizer: &tokenizers::Tokenizer,
@@ -192,9 +254,15 @@ fn generate_gemma4_gpu_mtp(
     let mut drafted_total = 0usize;
     let mut accepted_total = 0usize;
     let mut rejected_total = 0usize;
+    let mut main_forwards = 0usize;
     let draft_steps = parse_mtp_draft_steps();
+    let mtp_adaptive = parse_mtp_adaptive();
     let mtp_debug = std::env::var("LLAMA_MTP_DEBUG").is_ok();
     let mut mtp_debug_cycles = 0usize;
+    let mut accept_history: Vec<usize> = Vec::new();
+    let mut draft_us = 0u128;
+    let mut verify_us = 0u128;
+    let mut main_other_us = 0u128;
     let eos_tokens: &[usize] = &[1, 106];
 
     'outer: while tokens_generated < max_tokens {
@@ -208,95 +276,182 @@ fn generate_gemma4_gpu_mtp(
             if tokens_generated >= max_tokens {
                 break;
             }
+            let t0 = Instant::now();
             logits = model.forward_single_token(last_token);
+            main_forwards += 1;
+            main_other_us += t0.elapsed().as_micros();
             mtp_hidden = model.last_hidden_activation();
             need_first_token = false;
             continue;
         }
 
-        // llama.cpp draft-mtp: concat(sqrt-scaled target embed(last_token), h_nextn).
-        // h_nextn is post-final-norm; on partial reject keep h at last accepted index.
-        let mut draft_token = last_token;
-        let mut draft_activation = mtp_hidden.clone();
-        let mut drafted = Vec::with_capacity(draft_steps);
-        for _ in 0..draft_steps {
-            let draft = assistant
-                .draft_next(draft_token, &draft_activation, model)
-                .expect("MTP assistant draft failed");
-            draft_token = draft.token_id;
-            draft_activation = draft.projected_activation;
-            drafted.push(draft_token);
-        }
-        drafted_total += drafted.len();
+        let tail_steps = effective_draft_tail_steps(
+            &accept_history,
+            draft_steps,
+            mtp_adaptive,
+            model.kv_seq_len as usize,
+            model.config.sliding_window,
+        );
+
+        let t_draft = Instant::now();
+        let d0 = assistant
+            .draft_first(last_token, &mtp_hidden, model)
+            .expect("MTP assistant draft failed");
+        drafted_total += 1;
 
         if mtp_debug && mtp_debug_cycles < 5 {
             eprintln!(
-                "MTP debug cycle {}: last_token={} drafts={:?}",
-                mtp_debug_cycles, last_token, drafted
+                "MTP debug cycle {}: last_token={} draft0={} tail_steps={}",
+                mtp_debug_cycles, last_token, d0, tail_steps
             );
             mtp_debug_cycles += 1;
         }
 
-        for (draft_idx, drafted_token) in drafted.into_iter().enumerate() {
-            if tokens_generated >= max_tokens {
+        let first_verifier = sampling::argmax(&logits);
+        if first_verifier != d0 {
+            draft_us += t_draft.elapsed().as_micros();
+            if mtp_debug && mtp_debug_cycles <= 5 {
+                eprintln!(
+                    "  draft[0]: drafted={} verifier={} match=false",
+                    d0, first_verifier
+                );
+            }
+            accept_history.push(0);
+            if !print_gemma_token(first_verifier, tokenizer, eos_tokens) {
                 break 'outer;
             }
+            rejected_total += 1;
+            tokens_generated += 1;
+            let t0 = Instant::now();
+            logits = model.forward_single_token(first_verifier);
+            main_forwards += 1;
+            main_other_us += t0.elapsed().as_micros();
+            last_token = first_verifier;
+            mtp_hidden = model.last_hidden_activation();
+            continue;
+        }
 
-            let verifier_token = sampling::argmax(&logits);
+        let mut drafted = vec![d0];
+        if tail_steps > 0 {
+            let tail = assistant
+                .draft_tail(d0, tail_steps, model)
+                .expect("MTP assistant draft tail failed");
+            drafted_total += tail.len();
+            drafted.extend(tail);
+        }
+        draft_us += t_draft.elapsed().as_micros();
+
+        if mtp_debug && mtp_debug_cycles <= 5 {
+            eprintln!("  drafts={:?}", drafted);
+        }
+
+        let t_verify = Instant::now();
+        let verify_tokens = model
+            .forward_verify_chunk(&drafted)
+            .expect("MTP verify chunk failed");
+        main_forwards += 1;
+        verify_us += t_verify.elapsed().as_micros();
+
+        let mut n_accepted = 1usize;
+        for i in 1..drafted.len() {
+            let verifier_token = verify_tokens[i - 1];
             if mtp_debug && mtp_debug_cycles <= 5 {
                 eprintln!(
                     "  draft[{}]: drafted={} verifier={} match={}",
-                    draft_idx,
-                    drafted_token,
+                    i,
+                    drafted[i],
                     verifier_token,
-                    drafted_token == verifier_token
+                    verifier_token == drafted[i]
                 );
             }
-            if verifier_token == drafted_token {
-                if !print_gemma_token(drafted_token, tokenizer, eos_tokens) {
-                    break 'outer;
-                }
-                accepted_total += 1;
-                tokens_generated += 1;
-                logits = model.forward_single_token(drafted_token);
-                last_token = drafted_token;
-                mtp_hidden = model.last_hidden_activation();
+            if verifier_token == drafted[i] {
+                n_accepted += 1;
             } else {
-                if !print_gemma_token(verifier_token, tokenizer, eos_tokens) {
-                    break 'outer;
-                }
-                rejected_total += 1;
-                tokens_generated += 1;
-                logits = model.forward_single_token(verifier_token);
-                last_token = verifier_token;
-                if draft_idx == 0 {
-                    // n_accepted=0: pair correction with its own h_nextn
-                    mtp_hidden = model.last_hidden_activation();
-                }
-                // draft_idx > 0: keep mtp_hidden at last accepted index (llama accept())
-                continue 'outer;
+                break;
             }
+        }
+        accepted_total += n_accepted;
+        accept_history.push(n_accepted);
+
+        if n_accepted < drafted.len() {
+            rejected_total += 1;
+            model.truncate_kv((drafted.len() - n_accepted) as u32);
+        }
+
+        for i in 0..n_accepted {
+            if tokens_generated >= max_tokens {
+                break 'outer;
+            }
+            if !print_gemma_token(drafted[i], tokenizer, eos_tokens) {
+                break 'outer;
+            }
+            tokens_generated += 1;
+            last_token = drafted[i];
+        }
+
+        if n_accepted < drafted.len() {
+            if tokens_generated >= max_tokens {
+                break;
+            }
+            let correction = verify_tokens[n_accepted - 1];
+            if !print_gemma_token(correction, tokenizer, eos_tokens) {
+                break 'outer;
+            }
+            tokens_generated += 1;
+            last_token = correction;
+            let t0 = Instant::now();
+            logits = model.forward_single_token(correction);
+            main_forwards += 1;
+            main_other_us += t0.elapsed().as_micros();
+            // Partial reject: keep h_nextn at last accepted draft index (llama.cpp accept()).
+            mtp_hidden = model.prefill_hidden_activation_at(n_accepted - 1);
+            continue;
         }
 
         if tokens_generated >= max_tokens {
             break;
         }
 
-        // All drafts accepted: emit the bonus token (n_matches + 1 in reference).
-        let bonus_token = sampling::argmax(&logits);
+        // All drafts accepted: bonus comes free from the verify pass (Google MTP spec).
+        let bonus_token = verify_tokens[drafted.len() - 1];
         if !print_gemma_token(bonus_token, tokenizer, eos_tokens) {
             break;
         }
         tokens_generated += 1;
-        logits = model.forward_single_token(bonus_token);
         last_token = bonus_token;
+        let t0 = Instant::now();
+        logits = model.forward_single_token(bonus_token);
+        main_forwards += 1;
+        main_other_us += t0.elapsed().as_micros();
         mtp_hidden = model.last_hidden_activation();
     }
 
     let elapsed = start_time.elapsed().as_secs_f64();
     let tps = if elapsed > 0.0 { tokens_generated as f64 / elapsed } else { 0.0 };
+    let tokens_per_forward = if main_forwards > 0 {
+        tokens_generated as f64 / main_forwards as f64
+    } else {
+        0.0
+    };
     let accept_rate = if drafted_total > 0 {
         accepted_total as f64 * 100.0 / drafted_total as f64
+    } else {
+        0.0
+    };
+    let assistant_passes = assistant.gpu_passes;
+    let total_us = draft_us + verify_us + main_other_us;
+    let draft_pct = if total_us > 0 {
+        draft_us as f64 * 100.0 / total_us as f64
+    } else {
+        0.0
+    };
+    let verify_pct = if total_us > 0 {
+        verify_us as f64 * 100.0 / total_us as f64
+    } else {
+        0.0
+    };
+    let main_pct = if total_us > 0 {
+        main_other_us as f64 * 100.0 / total_us as f64
     } else {
         0.0
     };
@@ -304,11 +459,21 @@ fn generate_gemma4_gpu_mtp(
     println!("\n\n[Gemma4 E4B Generation - Metal GPU, MTP assistant]");
     println!("  Tokens: {}", tokens_generated);
     println!("  Throughput: {:.2} tok/s", tps);
+    println!("  Main-model forwards: {}", main_forwards);
+    println!("  Assistant GPU passes: {} ({:.1}x main forwards)", assistant_passes, assistant_passes as f64 / main_forwards.max(1) as f64);
+    println!("  Tokens / main forward: {:.2} (need ~2.0+ for 2x speedup)", tokens_per_forward);
+    println!(
+        "  Wall time: draft {:.0}% | verify {:.0}% | main-other {:.0}%",
+        draft_pct, verify_pct, main_pct
+    );
     println!("  Context length: {} tokens", model.num_items());
     println!("  Drafted: {}", drafted_total);
     println!("  Accepted: {} ({:.1}%)", accepted_total, accept_rate);
     println!("  Rejected cycles: {}", rejected_total);
-    println!("  Draft steps: {}", draft_steps);
+    println!(
+        "  Draft steps: {} (max), adaptive={}",
+        draft_steps, mtp_adaptive
+    );
     println!("  Elapsed: {:.2}s", elapsed);
 }
 

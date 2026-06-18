@@ -5,6 +5,7 @@ use std::path::Path;
 pub struct MetalContext {
     pub device: Device,
     pub queue: CommandQueue,
+    pub argmax_rows_f32_pipeline: ComputePipelineState,
     pub matvec_pipeline: ComputePipelineState,
     pub matvec_f16_pipeline: ComputePipelineState,
     pub matvec_q4_pipeline: ComputePipelineState,
@@ -84,6 +85,7 @@ impl MetalContext {
                 .unwrap_or_else(|e| panic!("Failed to create pipeline for '{}': {:?}", name, e))
         };
 
+        let argmax_rows_f32_pipeline = get_fn("argmax_rows_f32");
         let matvec_pipeline = get_fn("matvec");
         let matvec_f16_pipeline = get_fn("matvec_f16");
         let matvec_q4_pipeline = get_fn("matvec_q4");
@@ -142,6 +144,7 @@ impl MetalContext {
         MetalContext {
             device,
             queue,
+            argmax_rows_f32_pipeline,
             matvec_pipeline,
             matvec_f16_pipeline,
             matvec_q4_pipeline,
@@ -248,6 +251,23 @@ impl MetalContext {
         unsafe { std::slice::from_raw_parts(ptr, count).to_vec() }
     }
 
+    pub fn read_u32_buffer(buf: &Buffer, count: usize) -> Vec<u32> {
+        let ptr = buf.contents() as *const u32;
+        unsafe { std::slice::from_raw_parts(ptr, count).to_vec() }
+    }
+
+    pub fn write_buffer_at(buf: &Buffer, offset: usize, data: &[f32]) {
+        let ptr = buf.contents() as *mut f32;
+        unsafe {
+            std::ptr::copy_nonoverlapping(data.as_ptr(), ptr.add(offset), data.len());
+        }
+    }
+
+    pub fn read_buffer_at(buf: &Buffer, offset: usize, count: usize) -> Vec<f32> {
+        let ptr = buf.contents() as *const f32;
+        unsafe { std::slice::from_raw_parts(ptr.add(offset), count).to_vec() }
+    }
+
     pub fn write_buffer(buf: &Buffer, data: &[f32]) {
         let ptr = buf.contents() as *mut f32;
         unsafe {
@@ -260,6 +280,22 @@ impl MetalContext {
         unsafe {
             std::ptr::copy_nonoverlapping(data.as_ptr(), ptr, data.len());
         }
+    }
+
+    pub fn encode_argmax_rows_f32(
+        &self,
+        encoder: &ComputeCommandEncoderRef,
+        logits_buf: &Buffer,
+        out_buf: &Buffer,
+        rows: u32,
+        cols: u32,
+    ) {
+        encoder.set_compute_pipeline_state(&self.argmax_rows_f32_pipeline);
+        encoder.set_buffer(0, Some(logits_buf), 0);
+        encoder.set_buffer(1, Some(out_buf), 0);
+        encoder.set_bytes(2, 4, &rows as *const u32 as *const _);
+        encoder.set_bytes(3, 4, &cols as *const u32 as *const _);
+        encoder.dispatch_thread_groups(MTLSize::new(rows as u64, 1, 1), MTLSize::new(256, 1, 1));
     }
 
     // ─── Encoder-based methods (encode into existing encoder) ────────────────

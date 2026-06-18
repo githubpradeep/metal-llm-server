@@ -12,6 +12,14 @@ use crate::kv_pool::{KvCachePool, KvPoolError, KvSlot, KvSlotView};
 
 const DEFAULT_MAX_PREFILL_SEQ: usize = 128;
 const DEFAULT_MAX_DECODE_BATCH: usize = 4;
+const MAX_MTP_VERIFY_SEQ: usize = 8;
+
+struct DecodeTokenPrep {
+    embed: Vec<f32>,
+    ple_token_identity: Vec<f32>,
+    rotary_cos_per_layer: Vec<Vec<f32>>,
+    rotary_sin_per_layer: Vec<Vec<f32>>,
+}
 
 fn configured_max_prefill_seq(kv_capacity: u32) -> usize {
     std::env::var("LLAMA_MAX_PREFILL_SEQ")
@@ -60,6 +68,12 @@ pub struct Gemma4GpuModel {
     pub logits_buf: Buffer,
     pub prefill_scratch: PrefillScratch,
     pub decode_batch_scratch: DecodeBatchScratch,
+    /// Row-major logits for MTP verify: [seq_len, vocab_size]
+    pub mtp_verify_logits_buf: Buffer,
+    pub mtp_verify_argmax_buf: Buffer,
+    /// Row-major post-final-norm hidden for MTP verify: [seq_len, hidden_size]
+    pub mtp_verify_hidden_buf: Buffer,
+    pub mtp_verify_scratch: MtpVerifyScratch,
 
     // PLE scratch buffers
     pub ple_embed_buf: Buffer, // [ple_dim] = 256 (unused now, kept for compat)
@@ -120,6 +134,39 @@ pub struct PrefillScratch {
     pub ple_combined_buf: Buffer,
     pub q_normed_buf: Buffer,
     pub k_normed_buf: Buffer,
+}
+
+/// Reused staging for fused MTP verify (avoids per-cycle Metal buffer allocation).
+pub struct MtpVerifyScratch {
+    pub max_seq_len: usize,
+    pub hidden_buf: Buffer,
+    pub ple_token_id_buf: Buffer,
+    pub cos_bufs: Vec<Buffer>,
+    pub sin_bufs: Vec<Buffer>,
+}
+
+impl MtpVerifyScratch {
+    fn new(
+        ctx: &MetalContext,
+        max_seq_len: usize,
+        hidden_size: usize,
+        ple_total_dim: usize,
+        head_dims: &[usize],
+    ) -> Self {
+        Self {
+            max_seq_len,
+            hidden_buf: ctx.buffer_empty(max_seq_len * hidden_size),
+            ple_token_id_buf: ctx.buffer_empty(max_seq_len * ple_total_dim),
+            cos_bufs: head_dims
+                .iter()
+                .map(|&hd| ctx.buffer_empty(max_seq_len * hd))
+                .collect(),
+            sin_bufs: head_dims
+                .iter()
+                .map(|&hd| ctx.buffer_empty(max_seq_len * hd))
+                .collect(),
+        }
+    }
 }
 
 pub struct DecodeBatchScratch {
@@ -727,6 +774,19 @@ impl Gemma4GpuModel {
             num_layers,
             ple_dim,
         );
+        let mtp_verify_logits_buf =
+            ctx.buffer_empty(MAX_MTP_VERIFY_SEQ * vocab_size);
+        let mtp_verify_argmax_buf = ctx.buffer_empty_u32(MAX_MTP_VERIFY_SEQ);
+        let mtp_verify_hidden_buf =
+            ctx.buffer_empty(MAX_MTP_VERIFY_SEQ * hidden_size);
+        let mtp_head_dims: Vec<usize> = (0..num_layers).map(|i| config.layer_head_dim(i)).collect();
+        let mtp_verify_scratch = MtpVerifyScratch::new(
+            &ctx,
+            MAX_MTP_VERIFY_SEQ,
+            hidden_size,
+            num_layers * ple_dim,
+            &mtp_head_dims,
+        );
         // Rotary buffers (allocate for max head_dim)
         let cos_buf = ctx.buffer_empty(max_head_dim);
         let sin_buf = ctx.buffer_empty(max_head_dim);
@@ -793,6 +853,10 @@ impl Gemma4GpuModel {
             logits_buf,
             prefill_scratch,
             decode_batch_scratch,
+            mtp_verify_logits_buf,
+            mtp_verify_argmax_buf,
+            mtp_verify_hidden_buf,
+            mtp_verify_scratch,
             ple_embed_buf,
             ple_gated_buf,
             ple_normed_buf,
@@ -1177,6 +1241,19 @@ impl Gemma4GpuModel {
             num_layers,
             ple_dim,
         );
+        let mtp_verify_logits_buf =
+            ctx.buffer_empty(MAX_MTP_VERIFY_SEQ * vocab_size);
+        let mtp_verify_argmax_buf = ctx.buffer_empty_u32(MAX_MTP_VERIFY_SEQ);
+        let mtp_verify_hidden_buf =
+            ctx.buffer_empty(MAX_MTP_VERIFY_SEQ * hidden_size);
+        let mtp_head_dims: Vec<usize> = (0..num_layers).map(|i| config.layer_head_dim(i)).collect();
+        let mtp_verify_scratch = MtpVerifyScratch::new(
+            &ctx,
+            MAX_MTP_VERIFY_SEQ,
+            hidden_size,
+            num_layers * ple_dim,
+            &mtp_head_dims,
+        );
 
         let cos_buf = ctx.buffer_empty(max_head_dim);
         let sin_buf = ctx.buffer_empty(max_head_dim);
@@ -1242,6 +1319,10 @@ impl Gemma4GpuModel {
             logits_buf,
             prefill_scratch,
             decode_batch_scratch,
+            mtp_verify_logits_buf,
+            mtp_verify_argmax_buf,
+            mtp_verify_hidden_buf,
+            mtp_verify_scratch,
             ple_embed_buf,
             ple_gated_buf,
             ple_normed_buf,
@@ -1272,42 +1353,19 @@ impl Gemma4GpuModel {
         }
     }
 
-    /// Forward one token through the entire model. One command buffer per layer.
-    pub fn forward_single_token(&mut self, token_id: usize) -> Vec<f32> {
+    fn compute_decode_token_prep(&self, token_id: usize, position: usize) -> DecodeTokenPrep {
         let hidden_size = self.config.hidden_size;
-        let num_heads = self.config.num_attention_heads;
-        let num_kv_heads = self.config.num_key_value_heads;
-        let num_kv_groups = (num_heads / num_kv_heads) as u32;
-        let intermediate_size = self.config.intermediate_size;
-        let vocab_size = self.config.vocab_size;
-        let eps = self.config.rms_norm_eps as f32;
         let ple_dim = self.config.hidden_size_per_layer_input;
         let num_layers = self.config.num_hidden_layers;
+        let ple_total_dim = num_layers * ple_dim;
 
-        // Embed token (CPU — decode from f16 on the fly)
-        // Gemma scales embeddings by sqrt(hidden_size)
         let embed_offset = token_id * hidden_size;
         let embed_scale = (hidden_size as f32).sqrt();
-        let mut embed_f32 = vec![0.0f32; hidden_size];
+        let mut embed = vec![0.0f32; hidden_size];
         for i in 0..hidden_size {
-            embed_f32[i] = bf16_to_f32(self.embed_tokens_f16[embed_offset + i]) * embed_scale;
+            embed[i] = bf16_to_f32(self.embed_tokens_f16[embed_offset + i]) * embed_scale;
         }
-        MetalContext::write_buffer(&self.hidden_buf, &embed_f32);
 
-        let kv_seq = self.kv_seq_len;
-
-        // ─── PLE: Compute per-layer inputs on GPU ───
-        // Reference: Gemma4TextModel.get_per_layer_inputs() + project_per_layer_inputs()
-        //
-        // 1. Token identity: embed_tokens_per_layer(token_id) * sqrt(ple_dim)
-        // 2. Context projection: per_layer_model_projection(embed) * (1/sqrt(hidden_size))
-        //    then per_layer_projection_norm (RMSNorm per layer)
-        // 3. Combined: (context_proj + token_identity) * (1/sqrt(2))
-        let ple_total_dim = num_layers * ple_dim;
-        let ple_input_scale = std::f32::consts::FRAC_1_SQRT_2; // 1/sqrt(2)
-        let context_proj_scale = 1.0 / (hidden_size as f32).sqrt();
-
-        // Step 1: Token identity from embed_tokens_per_layer (CPU decode bf16, write to GPU)
         let ple_token_offset = token_id * ple_total_dim;
         let ple_scale = (ple_dim as f32).sqrt();
         let mut ple_token_identity = vec![0.0f32; ple_total_dim];
@@ -1317,17 +1375,10 @@ impl Gemma4GpuModel {
                     bf16_to_f32(self.embed_tokens_per_layer_f16[ple_token_offset + i]) * ple_scale;
             }
         }
-        MetalContext::write_buffer(&self.ple_token_id_buf, &ple_token_identity);
 
-        // Steps 2-3: GPU computation (will be part of main command buffer)
-        // We'll encode PLE ops at the start of the main command buffer,
-        // then reference ple_context_proj_buf with offsets per layer.
-
-        // Precompute all rotary cos/sin per layer (CPU, trivial)
-        let pos = self.total_tokens as f32;
-        let mut rotary_cos_per_layer: Vec<Vec<f32>> = Vec::with_capacity(self.layers.len());
-        let mut rotary_sin_per_layer: Vec<Vec<f32>> = Vec::with_capacity(self.layers.len());
-
+        let pos = position as f32;
+        let mut rotary_cos_per_layer = Vec::with_capacity(self.layers.len());
+        let mut rotary_sin_per_layer = Vec::with_capacity(self.layers.len());
         for layer_idx in 0..self.layers.len() {
             let layer = &self.layers[layer_idx];
             let head_dim = layer.head_dim;
@@ -1338,28 +1389,22 @@ impl Gemma4GpuModel {
             } else {
                 self.config.sliding_rope_theta()
             };
-
             let rope_factor = if is_full {
                 self.config.full_rope_factor()
             } else {
                 self.config.sliding_rope_factor()
             };
-
             let rotary_dim = if is_full {
                 (head_dim as f64 * self.config.full_partial_rotary_factor()) as usize
             } else {
                 head_dim
             };
 
-            // Proportional RoPE: compute rope_angles frequencies using head_dim as denominator
-            // then pad with zeros for non-rotary dimensions.
-            // Reference: _compute_proportional_rope_parameters in modeling_rope_utils.py
-            let rope_angles = rotary_dim / 2; // = partial_rotary_factor * head_dim / 2
+            let rope_angles = rotary_dim / 2;
             let half_dim = head_dim / 2;
             let mut cos_data = vec![0.0f32; head_dim];
             let mut sin_data = vec![0.0f32; head_dim];
             for i in 0..rope_angles {
-                // inv_freq = 1 / (theta ^ (2i / head_dim)) / factor
                 let inv_freq = 1.0
                     / (rope_theta.powf(i as f64 * 2.0 / head_dim as f64) as f32)
                     / rope_factor as f32;
@@ -1369,40 +1414,120 @@ impl Gemma4GpuModel {
                 sin_data[i] = angle.sin();
                 sin_data[i + half_dim] = angle.sin();
             }
-            // Non-rotary angles (nope_angles) remain 0 in inv_freq → cos=1, sin=0
-            // cos_data[rope_angles..half_dim] and cos_data[half_dim+rope_angles..head_dim] stay 0
-            // But for the rotary kernel, we need cos=1 for pass-through dimensions
             for i in rope_angles..half_dim {
                 cos_data[i] = 1.0;
                 cos_data[i + half_dim] = 1.0;
-                // sin stays 0.0 (already initialized)
             }
 
             rotary_cos_per_layer.push(cos_data);
             rotary_sin_per_layer.push(sin_data);
         }
 
-        // ═══ ENCODE ALL LAYERS INTO A SINGLE COMMAND BUFFER ═══
-        // Write per-layer cos/sin data into persistent buffers
-        let actual_num_layers = self.layers.len();
-        for layer_idx in 0..actual_num_layers {
+        DecodeTokenPrep {
+            embed,
+            ple_token_identity,
+            rotary_cos_per_layer,
+            rotary_sin_per_layer,
+        }
+    }
+
+    fn upload_decode_token_prep(&self, prep: &DecodeTokenPrep) {
+        MetalContext::write_buffer(&self.hidden_buf, &prep.embed);
+        MetalContext::write_buffer(&self.ple_token_id_buf, &prep.ple_token_identity);
+        for layer_idx in 0..self.layers.len() {
             MetalContext::write_buffer(
                 &self.per_layer_cos_bufs[layer_idx],
-                &rotary_cos_per_layer[layer_idx],
+                &prep.rotary_cos_per_layer[layer_idx],
             );
             MetalContext::write_buffer(
                 &self.per_layer_sin_bufs[layer_idx],
-                &rotary_sin_per_layer[layer_idx],
+                &prep.rotary_sin_per_layer[layer_idx],
             );
         }
+    }
 
-        let cmd = self.ctx.queue.new_command_buffer();
+    /// CPU-side setup for single-token decode: embed, PLE token identity, rotary cos/sin.
+    fn prepare_decode_token_cpu(&mut self, token_id: usize, position: usize) {
+        let prep = self.compute_decode_token_prep(token_id, position);
+        self.upload_decode_token_prep(&prep);
+    }
 
-        // ─── PLE pre-pass: encode into the same command buffer ───
+    fn encode_copy_decode_prep_from_staging_on_cmd(
+        &self,
+        cmd: &CommandBufferRef,
+        token_idx: usize,
+        staging_hidden: &Buffer,
+        staging_ple: &Buffer,
+        staging_cos: &[Buffer],
+        staging_sin: &[Buffer],
+    ) {
+        let hidden_size = self.config.hidden_size;
+        let ple_total_dim = self.config.num_hidden_layers * self.config.hidden_size_per_layer_input;
+        let encoder = cmd.new_compute_command_encoder();
+        self.ctx.encode_copy_at(
+            encoder,
+            staging_hidden,
+            Self::f32_byte_offset(token_idx * hidden_size),
+            &self.hidden_buf,
+            0,
+            hidden_size as u32,
+        );
+        self.ctx.encode_copy_at(
+            encoder,
+            staging_ple,
+            Self::f32_byte_offset(token_idx * ple_total_dim),
+            &self.ple_token_id_buf,
+            0,
+            ple_total_dim as u32,
+        );
+        for layer_idx in 0..self.layers.len() {
+            let head_dim = self.layers[layer_idx].head_dim;
+            self.ctx.encode_copy_at(
+                encoder,
+                &staging_cos[layer_idx],
+                Self::f32_byte_offset(token_idx * head_dim),
+                &self.per_layer_cos_bufs[layer_idx],
+                0,
+                head_dim as u32,
+            );
+            self.ctx.encode_copy_at(
+                encoder,
+                &staging_sin[layer_idx],
+                Self::f32_byte_offset(token_idx * head_dim),
+                &self.per_layer_sin_bufs[layer_idx],
+                0,
+                head_dim as u32,
+            );
+        }
+        encoder.end_encoding();
+    }
+
+    /// Encode PLE + all transformer layers + final norm + optional lm_head on `cmd`.
+    /// `logits_row: Some(row)` writes lm_head to `mtp_verify_logits_buf` and copies final
+    /// norm output to `mtp_verify_hidden_buf`; `None` writes lm_head to `logits_buf`.
+    fn encode_decode_token_on_cmd(
+        &self,
+        cmd: &CommandBufferRef,
+        kv_seq: u32,
+        logits_row: Option<usize>,
+        write_lm_head: bool,
+    ) {
+        let hidden_size = self.config.hidden_size;
+        let num_heads = self.config.num_attention_heads;
+        let num_kv_heads = self.config.num_key_value_heads;
+        let num_kv_groups = (num_heads / num_kv_heads) as u32;
+        let intermediate_size = self.config.intermediate_size;
+        let vocab_size = self.config.vocab_size;
+        let eps = self.config.rms_norm_eps as f32;
+        let ple_dim = self.config.hidden_size_per_layer_input;
+        let num_layers = self.config.num_hidden_layers;
+        let ple_total_dim = num_layers * ple_dim;
+        let ple_input_scale = std::f32::consts::FRAC_1_SQRT_2;
+        let context_proj_scale = 1.0 / (hidden_size as f32).sqrt();
+        let actual_num_layers = self.layers.len();
+
         {
             let ple_enc = cmd.new_compute_command_encoder();
-
-            // Step 2a: context_proj = per_layer_model_projection @ embed (GPU matvec)
             self.ctx.encode_matvec_q4(
                 ple_enc,
                 &self.per_layer_model_projection_weight,
@@ -1411,8 +1536,6 @@ impl Gemma4GpuModel {
                 ple_total_dim as u32,
                 hidden_size as u32,
             );
-
-            // Step 2b: context_proj *= 1/sqrt(hidden_size)
             self.ctx.encode_vec_scale(
                 ple_enc,
                 &self.ple_context_proj_buf,
@@ -1420,8 +1543,6 @@ impl Gemma4GpuModel {
                 ple_total_dim as u32,
                 context_proj_scale,
             );
-
-            // Step 2c: RMSNorm per layer (42 chunks of 256)
             self.ctx.encode_rmsnorm_per_head(
                 ple_enc,
                 &self.ple_combined_buf,
@@ -1431,8 +1552,6 @@ impl Gemma4GpuModel {
                 ple_dim as u32,
                 eps,
             );
-
-            // Step 3: combined = (context_proj + token_identity) * 1/sqrt(2)
             self.ctx.encode_vec_add(
                 ple_enc,
                 &self.ple_context_proj_buf,
@@ -1447,11 +1566,8 @@ impl Gemma4GpuModel {
                 ple_total_dim as u32,
                 ple_input_scale,
             );
-
-            // Copy per-layer slices from ple_context_proj_buf to per_layer_ple_bufs
-            // (GPU-to-GPU copy, avoids CPU readback)
             for i in 0..actual_num_layers {
-                let offset = (i * ple_dim * 4) as u64; // byte offset
+                let offset = (i * ple_dim * 4) as u64;
                 ple_enc.set_compute_pipeline_state(&self.ctx.buf_copy_pipeline);
                 ple_enc.set_buffer(0, Some(&self.ple_context_proj_buf), offset);
                 ple_enc.set_buffer(1, Some(&self.per_layer_ple_bufs[i]), 0);
@@ -1460,7 +1576,6 @@ impl Gemma4GpuModel {
                 ple_enc
                     .dispatch_threads(MTLSize::new(ple_dim as u64, 1, 1), MTLSize::new(256, 1, 1));
             }
-
             ple_enc.end_encoding();
         }
 
@@ -1470,21 +1585,16 @@ impl Gemma4GpuModel {
             let q_out = layer.q_out_dim;
             let kv_out = layer.kv_out_dim;
             let is_full = layer.is_full_attention;
-            // Gemma4 uses attention_scale = 1.0 (QK norm handles scaling)
             let scale = 1.0f32;
 
             let encoder = cmd.new_compute_command_encoder();
 
-            // ─── Attention Block ───
-            // Save residual
             self.ctx.encode_copy(
                 encoder,
                 &self.hidden_buf,
                 &self.residual_buf,
                 hidden_size as u32,
             );
-
-            // Pre-attention norm
             self.ctx.encode_rmsnorm(
                 encoder,
                 &self.hidden_buf,
@@ -1494,7 +1604,6 @@ impl Gemma4GpuModel {
                 eps,
             );
 
-            // Q projection (always computed)
             if layer.use_f16 {
                 self.ctx.encode_matvec_f16(
                     encoder,
@@ -1515,7 +1624,6 @@ impl Gemma4GpuModel {
                 );
             }
 
-            // QK Norm on Q
             self.ctx.encode_rmsnorm_per_head(
                 encoder,
                 &self.q_buf,
@@ -1525,8 +1633,6 @@ impl Gemma4GpuModel {
                 head_dim as u32,
                 eps,
             );
-
-            // Apply rotary to Q (full head_dim — non-rotary dims have cos=1, sin=0 for pass-through)
             self.ctx.encode_rotary(
                 encoder,
                 &self.q_normed_buf,
@@ -1538,7 +1644,6 @@ impl Gemma4GpuModel {
                 head_dim as u32,
             );
 
-            // K, V only for non-shared layers
             if layer.has_kv {
                 if layer.use_f16 {
                     self.ctx.encode_matvec_f16(
@@ -1576,7 +1681,6 @@ impl Gemma4GpuModel {
                     );
                 }
 
-                // K norm + rotary (full head_dim — non-rotary dims pass through)
                 self.ctx.encode_rmsnorm_per_head(
                     encoder,
                     &self.k_buf,
@@ -1596,8 +1700,6 @@ impl Gemma4GpuModel {
                     num_kv_heads as u32,
                     head_dim as u32,
                 );
-
-                // V norm (no weight)
                 self.ctx.encode_rmsnorm_per_head_noweight(
                     encoder,
                     &self.v_buf,
@@ -1607,7 +1709,6 @@ impl Gemma4GpuModel {
                     eps,
                 );
 
-                // Append to this layer's cache
                 match self.kv_cache_type {
                     KvCacheType::F16 => {
                         self.ctx.encode_kv_append_f16(
@@ -1672,17 +1773,12 @@ impl Gemma4GpuModel {
                 }
             }
 
-            // Attention
             let attn_kv_seq = kv_seq + 1;
-
-            // For sliding window layers, limit attention to last sliding_window tokens
             let effective_kv_seq = if !is_full {
                 attn_kv_seq.min(self.config.sliding_window as u32)
             } else {
                 attn_kv_seq
             };
-
-            // For sliding window, adjust the start position in the cache
             let kv_start = if !is_full && attn_kv_seq > self.config.sliding_window as u32 {
                 attn_kv_seq - self.config.sliding_window as u32
             } else {
@@ -1751,7 +1847,6 @@ impl Gemma4GpuModel {
                 }
             }
 
-            // O projection (always f16 for quality)
             self.ctx.encode_matvec_f16(
                 encoder,
                 &layer.o_proj,
@@ -1760,8 +1855,6 @@ impl Gemma4GpuModel {
                 hidden_size as u32,
                 q_out as u32,
             );
-
-            // Post-attention norm (cannot be in-place, use normed_buf as temp)
             self.ctx.encode_rmsnorm(
                 encoder,
                 &self.o_out_buf,
@@ -1770,8 +1863,6 @@ impl Gemma4GpuModel {
                 hidden_size as u32,
                 eps,
             );
-
-            // Residual add: hidden = residual + normed_attn_output
             self.ctx.encode_vec_add(
                 encoder,
                 &self.residual_buf,
@@ -1780,16 +1871,12 @@ impl Gemma4GpuModel {
                 hidden_size as u32,
             );
 
-            // ─── MLP Block ───
-            // Save residual
             self.ctx.encode_copy(
                 encoder,
                 &self.hidden_buf,
                 &self.residual_buf,
                 hidden_size as u32,
             );
-
-            // Pre-feedforward norm
             self.ctx.encode_rmsnorm(
                 encoder,
                 &self.hidden_buf,
@@ -1799,7 +1886,6 @@ impl Gemma4GpuModel {
                 eps,
             );
 
-            // MLP: gate_proj, up_proj, GeLU activation, down_proj
             if layer.use_f16 {
                 self.ctx.encode_matvec_f16(
                     encoder,
@@ -1861,8 +1947,6 @@ impl Gemma4GpuModel {
                     intermediate_size as u32,
                 );
             }
-
-            // Post-feedforward norm (cannot be in-place, use normed_buf as temp)
             self.ctx.encode_rmsnorm(
                 encoder,
                 &self.down_buf,
@@ -1871,8 +1955,6 @@ impl Gemma4GpuModel {
                 hidden_size as u32,
                 eps,
             );
-
-            // Residual add: hidden = residual + normed_mlp_output
             self.ctx.encode_vec_add(
                 encoder,
                 &self.residual_buf,
@@ -1881,15 +1963,12 @@ impl Gemma4GpuModel {
                 hidden_size as u32,
             );
 
-            // ─── Per-Layer Embedding (PLE) — after MLP, before layer_scalar ───
-            // Save residual for PLE
             self.ctx.encode_copy(
                 encoder,
                 &self.hidden_buf,
                 &self.residual_buf,
                 hidden_size as u32,
             );
-            // Gate: ple_gated = per_layer_input_gate(hidden) → [ple_dim]
             self.ctx.encode_matvec_f16(
                 encoder,
                 &layer.per_layer_input_gate_weight,
@@ -1898,9 +1977,6 @@ impl Gemma4GpuModel {
                 ple_dim as u32,
                 hidden_size as u32,
             );
-            // GeLU activation (PLE uses GeLU, not the model's hidden_activation)
-            // Reuse gelu_mul with up=ple_embed (element-wise multiply after gelu)
-            // gelu_mul does: out = gelu(gate) * up
             self.ctx.encode_gelu_mul(
                 encoder,
                 &self.ple_gated_buf,
@@ -1908,7 +1984,6 @@ impl Gemma4GpuModel {
                 &self.ple_normed_buf,
                 ple_dim as u32,
             );
-            // Project back: ple_projected = per_layer_projection(ple_normed) → [hidden]
             self.ctx.encode_matvec_f16(
                 encoder,
                 &layer.per_layer_projection_weight,
@@ -1917,7 +1992,6 @@ impl Gemma4GpuModel {
                 hidden_size as u32,
                 ple_dim as u32,
             );
-            // Post-PLE norm
             self.ctx.encode_rmsnorm(
                 encoder,
                 &self.ple_projected_buf,
@@ -1926,7 +2000,6 @@ impl Gemma4GpuModel {
                 hidden_size as u32,
                 eps,
             );
-            // Residual: hidden = hidden + ple_output
             self.ctx.encode_vec_add(
                 encoder,
                 &self.residual_buf,
@@ -1934,9 +2007,6 @@ impl Gemma4GpuModel {
                 &self.hidden_buf,
                 hidden_size as u32,
             );
-
-            // Layer scalar: hidden *= layer_scalar (prevents signal growth across layers)
-            // Use residual_buf as temp to avoid in-place read/write race
             self.ctx.encode_vec_scale(
                 encoder,
                 &self.hidden_buf,
@@ -1954,12 +2024,6 @@ impl Gemma4GpuModel {
             encoder.end_encoding();
         }
 
-        // Commit all layer work
-        cmd.commit();
-        cmd.wait_until_completed();
-
-        // Final norm
-        let cmd = self.ctx.queue.new_command_buffer();
         let encoder = cmd.new_compute_command_encoder();
         self.ctx.encode_rmsnorm(
             encoder,
@@ -1969,42 +2033,104 @@ impl Gemma4GpuModel {
             hidden_size as u32,
             eps,
         );
+        if let Some(row) = logits_row {
+            let hidden_offset = Self::f32_byte_offset(row * hidden_size);
+            self.ctx.encode_copy_at(
+                encoder,
+                &self.normed_buf,
+                0,
+                &self.mtp_verify_hidden_buf,
+                hidden_offset,
+                hidden_size as u32,
+            );
+        }
+        if write_lm_head {
+            let (logits_buf, logits_offset) = if let Some(row) = logits_row {
+                (
+                    &self.mtp_verify_logits_buf,
+                    Self::f32_byte_offset(row * vocab_size),
+                )
+            } else {
+                (&self.logits_buf, 0)
+            };
+            self.ctx.encode_matvec_q4_at(
+                encoder,
+                &self.lm_head_buf,
+                &self.normed_buf,
+                0,
+                logits_buf,
+                logits_offset,
+                vocab_size as u32,
+                hidden_size as u32,
+            );
+        }
         encoder.end_encoding();
+    }
 
-        // Submit and wait
+    /// Forward one token through the entire model (single command buffer, single sync).
+    pub fn forward_single_token(&mut self, token_id: usize) -> Vec<f32> {
+        let position = self.total_tokens;
+        let kv_seq = self.kv_seq_len;
+        self.prepare_decode_token_cpu(token_id, position);
+
+        let cmd = self.ctx.queue.new_command_buffer();
+        self.encode_decode_token_on_cmd(&cmd, kv_seq, None, true);
         cmd.commit();
         cmd.wait_until_completed();
 
-        // Compute logits using GPU (tied embeddings = embed_tokens as lm_head)
-        // Use matvec_f16: embed_tokens_f16 is (vocab_size, hidden_size) in bf16
-        let cmd2 = self.ctx.queue.new_command_buffer();
-        let enc2 = cmd2.new_compute_command_encoder();
-        self.ctx.encode_matvec_q4(
-            enc2,
-            &self.lm_head_buf,
-            &self.normed_buf,
-            &self.logits_buf,
-            vocab_size as u32,
-            hidden_size as u32,
-        );
-        enc2.end_encoding();
-        cmd2.commit();
-        cmd2.wait_until_completed();
-
+        let vocab_size = self.config.vocab_size;
         let mut logits = MetalContext::read_buffer(&self.logits_buf, vocab_size);
-
-        // Logit softcapping: logits = cap * tanh(logits / cap)
-        // Clamp input to tanh to prevent NaN from overflow (same issue as GeLU)
         let cap = self.config.final_logit_softcapping;
         for l in logits.iter_mut() {
             let x = (*l / cap).clamp(-10.0, 10.0);
             *l = cap * x.tanh();
         }
 
-        // Update state
         self.total_tokens += 1;
         self.kv_seq_len += 1;
+        logits
+    }
 
+    /// Append one token to KV without lm_head readback (decode + final norm only).
+    pub fn forward_append_token(&mut self, token_id: usize) {
+        let position = self.total_tokens;
+        let kv_seq = self.kv_seq_len;
+        self.prepare_decode_token_cpu(token_id, position);
+
+        let cmd = self.ctx.queue.new_command_buffer();
+        self.encode_decode_token_on_cmd(&cmd, kv_seq, None, false);
+        cmd.commit();
+        cmd.wait_until_completed();
+
+        self.total_tokens += 1;
+        self.kv_seq_len += 1;
+    }
+
+    /// Run lm_head on the current `normed_buf` (post-final-norm). Used after
+    /// `forward_append_token` when logits were already consumed from verify.
+    pub fn forward_logits_from_normed_buf(&self) -> Vec<f32> {
+        let vocab_size = self.config.vocab_size;
+        let hidden_size = self.config.hidden_size;
+        let cmd = self.ctx.queue.new_command_buffer();
+        let encoder = cmd.new_compute_command_encoder();
+        self.ctx.encode_matvec_q4(
+            encoder,
+            &self.lm_head_buf,
+            &self.normed_buf,
+            &self.logits_buf,
+            vocab_size as u32,
+            hidden_size as u32,
+        );
+        encoder.end_encoding();
+        cmd.commit();
+        cmd.wait_until_completed();
+
+        let mut logits = MetalContext::read_buffer(&self.logits_buf, vocab_size);
+        let cap = self.config.final_logit_softcapping;
+        for l in logits.iter_mut() {
+            let x = (*l / cap).clamp(-10.0, 10.0);
+            *l = cap * x.tanh();
+        }
         logits
     }
 
@@ -2052,6 +2178,596 @@ impl Gemma4GpuModel {
         // Post-final-norm hidden (LM-head input / h_nextn). llama.cpp gemma4.cpp explicitly
         // exposes this for MTP; matches transformers/vLLM/SGLang reference.
         MetalContext::read_buffer(&self.normed_buf, self.config.hidden_size)
+    }
+
+    /// Post-final-norm hidden from an MTP verify row.
+    pub fn prefill_hidden_activation_at(&self, row: usize) -> Vec<f32> {
+        let hidden_size = self.config.hidden_size;
+        let end = (row + 1) * hidden_size;
+        let all = MetalContext::read_buffer(&self.mtp_verify_hidden_buf, end);
+        all[row * hidden_size..end].to_vec()
+    }
+
+    /// Roll back trailing KV entries after a partial MTP accept.
+    pub fn truncate_kv(&mut self, tail_count: u32) {
+        self.kv_seq_len = self.kv_seq_len.saturating_sub(tail_count);
+        self.total_tokens = self
+            .total_tokens
+            .saturating_sub(tail_count as usize);
+    }
+
+    /// Batched MTP verify: run draft tokens and return argmax token after each row.
+    pub fn forward_verify_chunk(
+        &mut self,
+        token_ids: &[usize],
+    ) -> Result<Vec<usize>, String> {
+        if token_ids.is_empty() {
+            return Err("verify chunk token_ids must not be empty".to_string());
+        }
+        if token_ids.len() > MAX_MTP_VERIFY_SEQ {
+            return Err(format!(
+                "verify chunk has {} tokens, max supported is {}",
+                token_ids.len(),
+                MAX_MTP_VERIFY_SEQ
+            ));
+        }
+        if token_ids.len() == 1 {
+            let logits = self.forward_single_token(token_ids[0]);
+            return Ok(vec![Self::argmax_cpu(&logits)]);
+        }
+        if !self.can_use_sequential_fused_verify(token_ids.len()) {
+            let mut tokens = Vec::with_capacity(token_ids.len());
+            for &token_id in token_ids {
+                let logits = self.forward_single_token(token_id);
+                tokens.push(Self::argmax_cpu(&logits));
+            }
+            return Ok(tokens);
+        }
+        let force_sequential =
+            std::env::var("LLAMA_MTP_VERIFY_SEQUENTIAL").ok().as_deref() == Some("1");
+        if !force_sequential && self.can_use_legacy_parallel_verify(token_ids.len()) {
+            // Default verifier: one causal multi-row pass through the main model. This is
+            // the path that amortizes KV reads and projections across the drafted chunk.
+            return self.forward_verify_chunk_parallel_legacy(token_ids);
+        }
+
+        self.forward_verify_chunk_sequential_fused(token_ids)
+    }
+
+    fn can_use_sequential_fused_verify(&self, seq_len: usize) -> bool {
+        if seq_len <= 1 || seq_len > MAX_MTP_VERIFY_SEQ {
+            return false;
+        }
+        let start_pos = self.kv_seq_len as usize;
+        start_pos + seq_len <= self.kv_capacity as usize
+    }
+
+    fn forward_verify_chunk_sequential_fused(
+        &mut self,
+        token_ids: &[usize],
+    ) -> Result<Vec<usize>, String> {
+        let seq_len = token_ids.len();
+        let start_total = self.total_tokens;
+        let start_kv = self.kv_seq_len;
+        let hidden_size = self.config.hidden_size;
+        let ple_total_dim =
+            self.config.num_hidden_layers * self.config.hidden_size_per_layer_input;
+
+        let preps: Vec<DecodeTokenPrep> = token_ids
+            .iter()
+            .enumerate()
+            .map(|(i, &token_id)| self.compute_decode_token_prep(token_id, start_total + i))
+            .collect();
+
+        let scratch = &self.mtp_verify_scratch;
+        for (i, prep) in preps.iter().enumerate() {
+            MetalContext::write_buffer_at(&scratch.hidden_buf, i * hidden_size, &prep.embed);
+            MetalContext::write_buffer_at(
+                &scratch.ple_token_id_buf,
+                i * ple_total_dim,
+                &prep.ple_token_identity,
+            );
+            for layer_idx in 0..self.layers.len() {
+                let head_dim = self.layers[layer_idx].head_dim;
+                MetalContext::write_buffer_at(
+                    &scratch.cos_bufs[layer_idx],
+                    i * head_dim,
+                    &prep.rotary_cos_per_layer[layer_idx],
+                );
+                MetalContext::write_buffer_at(
+                    &scratch.sin_bufs[layer_idx],
+                    i * head_dim,
+                    &prep.rotary_sin_per_layer[layer_idx],
+                );
+            }
+        }
+
+        let cmd = self.ctx.queue.new_command_buffer();
+        for row in 0..seq_len {
+            self.encode_copy_decode_prep_from_staging_on_cmd(
+                &cmd,
+                row,
+                &scratch.hidden_buf,
+                &scratch.ple_token_id_buf,
+                &scratch.cos_bufs,
+                &scratch.sin_bufs,
+            );
+            self.encode_decode_token_on_cmd(&cmd, start_kv + row as u32, Some(row), true);
+        }
+        let encoder = cmd.new_compute_command_encoder();
+        self.ctx.encode_argmax_rows_f32(
+            encoder,
+            &self.mtp_verify_logits_buf,
+            &self.mtp_verify_argmax_buf,
+            seq_len as u32,
+            self.config.vocab_size as u32,
+        );
+        encoder.end_encoding();
+
+        cmd.commit();
+        cmd.wait_until_completed();
+
+        self.kv_seq_len = start_kv + seq_len as u32;
+        self.total_tokens = start_total + seq_len;
+
+        Ok(self.read_verify_argmax(seq_len))
+    }
+
+    fn can_use_legacy_parallel_verify(&self, seq_len: usize) -> bool {
+        if seq_len <= 1 || seq_len > self.prefill_scratch.max_seq_len {
+            return false;
+        }
+        let start_pos = self.kv_seq_len as usize;
+        start_pos + seq_len <= self.kv_capacity as usize
+    }
+
+    fn read_verify_argmax(&self, seq_len: usize) -> Vec<usize> {
+        MetalContext::read_u32_buffer(&self.mtp_verify_argmax_buf, seq_len)
+            .into_iter()
+            .map(|token_id| token_id as usize)
+            .collect()
+    }
+
+    fn argmax_cpu(values: &[f32]) -> usize {
+        let mut best_idx = 0usize;
+        let mut best_val = f32::NEG_INFINITY;
+        for (idx, &value) in values.iter().enumerate() {
+            if value > best_val {
+                best_val = value;
+                best_idx = idx;
+            }
+        }
+        best_idx
+    }
+
+    fn forward_verify_chunk_parallel_legacy(
+        &mut self,
+        token_ids: &[usize],
+    ) -> Result<Vec<usize>, String> {
+        let seq_len = token_ids.len();
+        let start_pos = self.kv_seq_len as usize;
+        let hidden_size = self.config.hidden_size;
+        let vocab_size = self.config.vocab_size;
+        let eps = self.config.rms_norm_eps as f32;
+
+        self.prepare_parallel_prefill_inputs(token_ids)?;
+        self.prepare_parallel_prefill_rotary(start_pos, seq_len)?;
+        self.encode_parallel_prefill_ple_context(seq_len)?;
+
+        let cmd = self.ctx.queue.new_command_buffer();
+
+        for layer_idx in 0..self.layers.len() {
+            let encoder = cmd.new_compute_command_encoder();
+            self.encode_parallel_prefill_attention_inputs(encoder, layer_idx, seq_len)?;
+
+            let layer = self
+                .layers
+                .get(layer_idx)
+                .ok_or_else(|| format!("invalid layer index {}", layer_idx))?;
+            let intermediate_size = self.config.intermediate_size;
+            let num_heads = self.config.num_attention_heads;
+            let num_kv_heads = self.config.num_key_value_heads;
+            let num_kv_groups = (num_heads / num_kv_heads) as u32;
+            let ple_dim = self.config.hidden_size_per_layer_input;
+            let head_dim = layer.head_dim;
+            let q_out = layer.q_out_dim;
+            let total_hidden = (seq_len * hidden_size) as u32;
+            let total_intermediate = (seq_len * intermediate_size) as u32;
+            let scale = 1.0f32;
+            let attention_window = if layer.is_full_attention {
+                0
+            } else {
+                self.config.sliding_window as u32
+            };
+
+            if layer.has_kv {
+                let k_cache = &self.k_cache[layer_idx];
+                let v_cache = &self.v_cache[layer_idx];
+                match self.kv_cache_type {
+                    KvCacheType::F16 => {
+                        self.ctx.encode_kv_batch_append_f16(
+                            encoder,
+                            &self.prefill_scratch.k_buf,
+                            k_cache,
+                            num_kv_heads as u32,
+                            head_dim as u32,
+                            self.kv_capacity,
+                            start_pos as u32,
+                            seq_len as u32,
+                        );
+                        self.ctx.encode_kv_batch_append_f16(
+                            encoder,
+                            &self.prefill_scratch.v_buf,
+                            v_cache,
+                            num_kv_heads as u32,
+                            head_dim as u32,
+                            self.kv_capacity,
+                            start_pos as u32,
+                            seq_len as u32,
+                        );
+                    }
+                    KvCacheType::Q8_0 => {
+                        self.ctx.encode_kv_batch_append_q8_0(
+                            encoder,
+                            &self.prefill_scratch.k_buf,
+                            k_cache,
+                            num_kv_heads as u32,
+                            head_dim as u32,
+                            self.kv_capacity,
+                            start_pos as u32,
+                            seq_len as u32,
+                        );
+                        self.ctx.encode_kv_batch_append_q8_0(
+                            encoder,
+                            &self.prefill_scratch.v_buf,
+                            v_cache,
+                            num_kv_heads as u32,
+                            head_dim as u32,
+                            self.kv_capacity,
+                            start_pos as u32,
+                            seq_len as u32,
+                        );
+                    }
+                    KvCacheType::Q4_0 => {
+                        self.ctx.encode_kv_batch_append_q4_0(
+                            encoder,
+                            &self.prefill_scratch.k_buf,
+                            k_cache,
+                            num_kv_heads as u32,
+                            head_dim as u32,
+                            self.kv_capacity,
+                            start_pos as u32,
+                            seq_len as u32,
+                        );
+                        self.ctx.encode_kv_batch_append_q4_0(
+                            encoder,
+                            &self.prefill_scratch.v_buf,
+                            v_cache,
+                            num_kv_heads as u32,
+                            head_dim as u32,
+                            self.kv_capacity,
+                            start_pos as u32,
+                            seq_len as u32,
+                        );
+                    }
+                }
+            }
+
+            let k_cache = &self.k_cache[layer.kv_source_layer];
+            let v_cache = &self.v_cache[layer.kv_source_layer];
+            match self.kv_cache_type {
+                KvCacheType::F16 => {
+                    self.ctx.encode_attention_causal_f16(
+                        encoder,
+                        &self.prefill_scratch.q_buf,
+                        k_cache,
+                        v_cache,
+                        &self.prefill_scratch.attn_out_buf,
+                        num_heads as u32,
+                        num_kv_heads as u32,
+                        num_kv_groups,
+                        head_dim as u32,
+                        (start_pos + seq_len) as u32,
+                        self.kv_capacity,
+                        scale,
+                        seq_len as u32,
+                        start_pos as u32,
+                        attention_window,
+                    );
+                }
+                KvCacheType::Q8_0 => {
+                    let groups_per_row = (head_dim / 32) as u32;
+                    let row_bytes = groups_per_row * 34;
+                    self.ctx.encode_attention_causal_q8_0(
+                        encoder,
+                        &self.prefill_scratch.q_buf,
+                        k_cache,
+                        v_cache,
+                        &self.prefill_scratch.attn_out_buf,
+                        num_heads as u32,
+                        num_kv_heads as u32,
+                        num_kv_groups,
+                        head_dim as u32,
+                        (start_pos + seq_len) as u32,
+                        self.kv_capacity,
+                        scale,
+                        seq_len as u32,
+                        start_pos as u32,
+                        attention_window,
+                        groups_per_row,
+                        row_bytes,
+                    );
+                }
+                KvCacheType::Q4_0 => {
+                    let groups_per_row = (head_dim / 32) as u32;
+                    let row_bytes = groups_per_row * 18;
+                    self.ctx.encode_attention_causal_q4_0(
+                        encoder,
+                        &self.prefill_scratch.q_buf,
+                        k_cache,
+                        v_cache,
+                        &self.prefill_scratch.attn_out_buf,
+                        num_heads as u32,
+                        num_kv_heads as u32,
+                        num_kv_groups,
+                        head_dim as u32,
+                        (start_pos + seq_len) as u32,
+                        self.kv_capacity,
+                        scale,
+                        seq_len as u32,
+                        start_pos as u32,
+                        attention_window,
+                        groups_per_row,
+                        row_bytes,
+                    );
+                }
+            }
+
+            self.ctx.encode_copy(
+                encoder,
+                &self.prefill_scratch.hidden_buf,
+                &self.prefill_scratch.residual_buf,
+                total_hidden,
+            );
+            self.ctx.encode_transpose_hsd(
+                encoder,
+                &self.prefill_scratch.attn_out_buf,
+                &self.prefill_scratch.q_normed_buf,
+                seq_len as u32,
+                num_heads as u32,
+                head_dim as u32,
+            );
+            self.ctx.encode_projection_f16_batch(
+                encoder,
+                &layer.o_proj,
+                &self.prefill_scratch.q_normed_buf,
+                &self.prefill_scratch.o_out_buf,
+                hidden_size as u32,
+                q_out as u32,
+                seq_len as u32,
+            );
+            self.ctx.encode_rmsnorm_batch(
+                encoder,
+                &self.prefill_scratch.o_out_buf,
+                &layer.post_attention_layernorm_weight,
+                &self.prefill_scratch.normed_buf,
+                hidden_size as u32,
+                eps,
+                seq_len as u32,
+            );
+            self.ctx.encode_vec_add_batch(
+                encoder,
+                &self.prefill_scratch.residual_buf,
+                &self.prefill_scratch.normed_buf,
+                &self.prefill_scratch.hidden_buf,
+                total_hidden,
+            );
+            self.ctx.encode_copy(
+                encoder,
+                &self.prefill_scratch.hidden_buf,
+                &self.prefill_scratch.residual_buf,
+                total_hidden,
+            );
+            self.ctx.encode_rmsnorm_batch(
+                encoder,
+                &self.prefill_scratch.hidden_buf,
+                &layer.pre_feedforward_layernorm_weight,
+                &self.prefill_scratch.normed_buf,
+                hidden_size as u32,
+                eps,
+                seq_len as u32,
+            );
+            if layer.use_f16 {
+                self.ctx.encode_projection_f16_batch(
+                    encoder,
+                    &layer.gate_proj,
+                    &self.prefill_scratch.normed_buf,
+                    &self.prefill_scratch.gate_buf,
+                    intermediate_size as u32,
+                    hidden_size as u32,
+                    seq_len as u32,
+                );
+                self.ctx.encode_projection_f16_batch(
+                    encoder,
+                    &layer.up_proj,
+                    &self.prefill_scratch.normed_buf,
+                    &self.prefill_scratch.up_buf,
+                    intermediate_size as u32,
+                    hidden_size as u32,
+                    seq_len as u32,
+                );
+            } else {
+                self.ctx.encode_projection_q4_batch(
+                    encoder,
+                    &layer.gate_proj,
+                    &self.prefill_scratch.normed_buf,
+                    &self.prefill_scratch.gate_buf,
+                    intermediate_size as u32,
+                    hidden_size as u32,
+                    seq_len as u32,
+                );
+                self.ctx.encode_projection_q4_batch(
+                    encoder,
+                    &layer.up_proj,
+                    &self.prefill_scratch.normed_buf,
+                    &self.prefill_scratch.up_buf,
+                    intermediate_size as u32,
+                    hidden_size as u32,
+                    seq_len as u32,
+                );
+            }
+            self.ctx.encode_gelu_mul(
+                encoder,
+                &self.prefill_scratch.gate_buf,
+                &self.prefill_scratch.up_buf,
+                &self.prefill_scratch.gelu_buf,
+                total_intermediate,
+            );
+            if layer.use_f16 {
+                self.ctx.encode_projection_f16_batch(
+                    encoder,
+                    &layer.down_proj,
+                    &self.prefill_scratch.gelu_buf,
+                    &self.prefill_scratch.down_buf,
+                    hidden_size as u32,
+                    intermediate_size as u32,
+                    seq_len as u32,
+                );
+            } else {
+                self.ctx.encode_projection_q4_batch(
+                    encoder,
+                    &layer.down_proj,
+                    &self.prefill_scratch.gelu_buf,
+                    &self.prefill_scratch.down_buf,
+                    hidden_size as u32,
+                    intermediate_size as u32,
+                    seq_len as u32,
+                );
+            }
+            self.ctx.encode_rmsnorm_batch(
+                encoder,
+                &self.prefill_scratch.down_buf,
+                &layer.post_feedforward_layernorm_weight,
+                &self.prefill_scratch.normed_buf,
+                hidden_size as u32,
+                eps,
+                seq_len as u32,
+            );
+            self.ctx.encode_vec_add_batch(
+                encoder,
+                &self.prefill_scratch.residual_buf,
+                &self.prefill_scratch.normed_buf,
+                &self.prefill_scratch.hidden_buf,
+                total_hidden,
+            );
+            self.ctx.encode_copy(
+                encoder,
+                &self.prefill_scratch.hidden_buf,
+                &self.prefill_scratch.residual_buf,
+                total_hidden,
+            );
+            self.ctx.encode_projection_f16_batch(
+                encoder,
+                &layer.per_layer_input_gate_weight,
+                &self.prefill_scratch.hidden_buf,
+                &self.prefill_scratch.gate_buf,
+                ple_dim as u32,
+                hidden_size as u32,
+                seq_len as u32,
+            );
+            self.ctx.encode_ple_gelu_mul_batch(
+                encoder,
+                &self.prefill_scratch.gate_buf,
+                &self.prefill_scratch.ple_context_proj_buf,
+                &self.prefill_scratch.up_buf,
+                layer_idx as u32,
+                self.config.num_hidden_layers as u32,
+                ple_dim as u32,
+                seq_len as u32,
+            );
+            self.ctx.encode_projection_f16_batch(
+                encoder,
+                &layer.per_layer_projection_weight,
+                &self.prefill_scratch.up_buf,
+                &self.prefill_scratch.o_out_buf,
+                hidden_size as u32,
+                ple_dim as u32,
+                seq_len as u32,
+            );
+            self.ctx.encode_rmsnorm_batch(
+                encoder,
+                &self.prefill_scratch.o_out_buf,
+                &layer.post_per_layer_input_norm_weight,
+                &self.prefill_scratch.normed_buf,
+                hidden_size as u32,
+                eps,
+                seq_len as u32,
+            );
+            self.ctx.encode_vec_add_batch(
+                encoder,
+                &self.prefill_scratch.residual_buf,
+                &self.prefill_scratch.normed_buf,
+                &self.prefill_scratch.hidden_buf,
+                total_hidden,
+            );
+            self.ctx.encode_vec_scale(
+                encoder,
+                &self.prefill_scratch.hidden_buf,
+                &self.prefill_scratch.residual_buf,
+                total_hidden,
+                layer.layer_scalar,
+            );
+            self.ctx.encode_copy(
+                encoder,
+                &self.prefill_scratch.residual_buf,
+                &self.prefill_scratch.hidden_buf,
+                total_hidden,
+            );
+
+            encoder.end_encoding();
+        }
+
+        let encoder = cmd.new_compute_command_encoder();
+        self.ctx.encode_rmsnorm_batch(
+            encoder,
+            &self.prefill_scratch.hidden_buf,
+            &self.final_norm_weight,
+            &self.prefill_scratch.normed_buf,
+            hidden_size as u32,
+            eps,
+            seq_len as u32,
+        );
+        self.ctx.encode_projection_q4_batch(
+            encoder,
+            &self.lm_head_buf,
+            &self.prefill_scratch.normed_buf,
+            &self.mtp_verify_logits_buf,
+            vocab_size as u32,
+            hidden_size as u32,
+            seq_len as u32,
+        );
+        self.ctx.encode_copy(
+            encoder,
+            &self.prefill_scratch.normed_buf,
+            &self.mtp_verify_hidden_buf,
+            (seq_len * hidden_size) as u32,
+        );
+        self.ctx.encode_argmax_rows_f32(
+            encoder,
+            &self.mtp_verify_logits_buf,
+            &self.mtp_verify_argmax_buf,
+            seq_len as u32,
+            vocab_size as u32,
+        );
+        encoder.end_encoding();
+
+        cmd.commit();
+        cmd.wait_until_completed();
+
+        self.kv_seq_len += seq_len as u32;
+        self.total_tokens += seq_len;
+
+        Ok(self.read_verify_argmax(seq_len))
     }
 
     pub fn mtp_kv_source_layer(&self, is_full_attention: bool) -> Option<usize> {

@@ -7,6 +7,54 @@ using namespace metal;
 
 constant uint SIMD_SIZE = 32;
 
+// Row-wise argmax for logits laid out as [rows, cols].
+// Logit softcap is monotonic, so greedy argmax can run on raw logits.
+kernel void argmax_rows_f32(
+    device const float* logits [[buffer(0)]],
+    device uint* out_tokens [[buffer(1)]],
+    constant uint& rows [[buffer(2)]],
+    constant uint& cols [[buffer(3)]],
+    uint row [[threadgroup_position_in_grid]],
+    uint tid [[thread_index_in_threadgroup]]
+) {
+    if (row >= rows) return;
+
+    threadgroup float best_vals[256];
+    threadgroup uint best_idxs[256];
+
+    float best = -INFINITY;
+    uint best_idx = 0;
+    uint base = row * cols;
+    for (uint col = tid; col < cols; col += 256) {
+        float value = logits[base + col];
+        if (value > best || (value == best && col < best_idx)) {
+            best = value;
+            best_idx = col;
+        }
+    }
+
+    best_vals[tid] = best;
+    best_idxs[tid] = best_idx;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint stride = 128; stride > 0; stride >>= 1) {
+        if (tid < stride) {
+            float other = best_vals[tid + stride];
+            uint other_idx = best_idxs[tid + stride];
+            if (other > best_vals[tid]
+                || (other == best_vals[tid] && other_idx < best_idxs[tid])) {
+                best_vals[tid] = other;
+                best_idxs[tid] = other_idx;
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    if (tid == 0) {
+        out_tokens[row] = best_idxs[0];
+    }
+}
+
 kernel void matvec(
     device const float* W [[buffer(0)]],
     device const float* x [[buffer(1)]],

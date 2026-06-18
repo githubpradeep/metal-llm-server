@@ -8,10 +8,8 @@ use std::path::Path;
 use crate::gemma4_config::{KvCacheType, RopeParameters};
 use crate::gemma4_gpu_model::Gemma4GpuModel;
 use crate::gpu::MetalContext;
-use crate::sampling;
 
 pub struct Gemma4MtpAssistant {
-    ctx: MetalContext,
     config: AssistantTextConfig,
     backbone_hidden_size: usize,
     num_centroids: usize,
@@ -36,8 +34,14 @@ pub struct Gemma4MtpAssistant {
     up_buf: Buffer,
     gelu_buf: Buffer,
     projected_activation_buf: Buffer,
+    centroids_weight_buf: Buffer,
+    centroid_scores_buf: Buffer,
     per_layer_cos_bufs: Vec<Buffer>,
     per_layer_sin_bufs: Vec<Buffer>,
+    embed_scale: f32,
+    cached_rotary_pos: Option<usize>,
+    cached_target_tokens: usize,
+    pub gpu_passes: u64,
 }
 
 pub struct MtpDraft {
@@ -158,7 +162,7 @@ fn default_global_head_dim() -> usize {
 }
 
 impl Gemma4MtpAssistant {
-    pub fn new(model_dir: &str, target: &Gemma4GpuModel) -> Self {
+    pub fn new(model_dir: &str, ctx: &MetalContext, target: &Gemma4GpuModel) -> Self {
         let config_path = Path::new(model_dir).join("config.json");
         let config_str = fs::read_to_string(&config_path).expect("Failed to read assistant config");
         let outer: AssistantOuterConfig =
@@ -191,7 +195,6 @@ impl Gemma4MtpAssistant {
             "assistant and target vocab sizes must match"
         );
 
-        let ctx = MetalContext::new();
         let tensors = load_assistant_tensors(model_dir);
 
         let embed_tokens_f16 = raw_tensor_u16(&tensors, "model.embed_tokens.weight");
@@ -272,6 +275,9 @@ impl Gemma4MtpAssistant {
         let up_buf = ctx.buffer_empty(config.intermediate_size);
         let gelu_buf = ctx.buffer_empty(config.intermediate_size);
         let projected_activation_buf = ctx.buffer_empty(backbone_hidden_size);
+        let centroids_weight_buf = ctx.buffer_from_f32_as_f16(&centroids_weight_f32);
+        let centroid_scores_buf = ctx.buffer_empty(num_centroids);
+        let embed_scale = (backbone_hidden_size as f32).sqrt();
 
         let mut per_layer_cos_bufs = Vec::with_capacity(config.num_hidden_layers);
         let mut per_layer_sin_bufs = Vec::with_capacity(config.num_hidden_layers);
@@ -297,7 +303,6 @@ impl Gemma4MtpAssistant {
         }
 
         Self {
-            ctx,
             config,
             backbone_hidden_size,
             num_centroids,
@@ -322,9 +327,102 @@ impl Gemma4MtpAssistant {
             up_buf,
             gelu_buf,
             projected_activation_buf,
+            centroids_weight_buf,
+            centroid_scores_buf,
             per_layer_cos_bufs,
             per_layer_sin_bufs,
+            embed_scale,
+            cached_rotary_pos: None,
+            cached_target_tokens: usize::MAX,
+            gpu_passes: 0,
         }
+    }
+
+    /// Draft only the first token (cheap probe before main-model verify).
+    pub fn draft_first(
+        &mut self,
+        initial_token: usize,
+        initial_activation: &[f32],
+        target: &Gemma4GpuModel,
+    ) -> Result<usize, String> {
+        let tokens = self.draft_chain(initial_token, initial_activation, 1, target)?;
+        Ok(tokens[0])
+    }
+
+    /// Continue drafting after `draft_first` matched. Reuses GPU projected activation.
+    pub fn draft_tail(
+        &mut self,
+        from_token: usize,
+        steps: usize,
+        target: &Gemma4GpuModel,
+    ) -> Result<Vec<usize>, String> {
+        if steps == 0 {
+            return Ok(Vec::new());
+        }
+        if target.kv_seq_len == 0 {
+            return Err("target KV cache is empty; prefill or decode one token first".to_string());
+        }
+
+        self.ensure_rotary(target);
+
+        let mut draft_token = from_token;
+        let mut drafts = Vec::with_capacity(steps);
+
+        for _ in 0..steps {
+            self.write_activation_first_half(draft_token, target)?;
+            self.encode_draft_forward(target, true)?;
+            draft_token = self.centroid_argmax_from_gpu()?;
+            drafts.push(draft_token);
+        }
+
+        Ok(drafts)
+    }
+
+    /// Draft multiple tokens with one RoPE table build and minimal GPU/CPU sync.
+    pub fn draft_chain(
+        &mut self,
+        initial_token: usize,
+        initial_activation: &[f32],
+        steps: usize,
+        target: &Gemma4GpuModel,
+    ) -> Result<Vec<usize>, String> {
+        if steps == 0 {
+            return Ok(Vec::new());
+        }
+        if initial_activation.len() != self.backbone_hidden_size {
+            return Err(format!(
+                "target activation has {} values, expected {}",
+                initial_activation.len(),
+                self.backbone_hidden_size
+            ));
+        }
+        if target.kv_seq_len == 0 {
+            return Err("target KV cache is empty; prefill or decode one token first".to_string());
+        }
+
+        self.ensure_rotary(target);
+
+        let mut draft_token = initial_token;
+        let mut drafts = Vec::with_capacity(steps);
+
+        for step in 0..steps {
+            if step == 0 {
+                self.write_activation_first_half(draft_token, target)?;
+                MetalContext::write_buffer_at(
+                    &self.activation_buf,
+                    self.backbone_hidden_size,
+                    initial_activation,
+                );
+            } else {
+                self.write_activation_first_half(draft_token, target)?;
+            }
+
+            self.encode_draft_forward(target, step > 0)?;
+            draft_token = self.centroid_argmax_from_gpu()?;
+            drafts.push(draft_token);
+        }
+
+        Ok(drafts)
     }
 
     pub fn draft_next(
@@ -333,23 +431,53 @@ impl Gemma4MtpAssistant {
         target_activation: &[f32],
         target: &Gemma4GpuModel,
     ) -> Result<MtpDraft, String> {
-        if target_activation.len() != self.backbone_hidden_size {
-            return Err(format!(
-                "target activation has {} values, expected {}",
-                target_activation.len(),
-                self.backbone_hidden_size
-            ));
+        let tokens = self.draft_chain(token_id, target_activation, 1, target)?;
+        let projected_activation =
+            MetalContext::read_buffer(&self.projected_activation_buf, self.backbone_hidden_size);
+        Ok(MtpDraft {
+            token_id: tokens[0],
+            projected_activation,
+        })
+    }
+
+    fn ensure_rotary(&mut self, target: &Gemma4GpuModel) {
+        let position = target.total_tokens.saturating_sub(1);
+        if self.cached_rotary_pos == Some(position)
+            && self.cached_target_tokens == target.total_tokens
+        {
+            return;
         }
-        if target.kv_seq_len == 0 {
-            return Err("target KV cache is empty; prefill or decode one token first".to_string());
+        self.prepare_rotary(position);
+        self.cached_rotary_pos = Some(position);
+        self.cached_target_tokens = target.total_tokens;
+    }
+
+    fn write_activation_first_half(
+        &self,
+        token_id: usize,
+        target: &Gemma4GpuModel,
+    ) -> Result<(), String> {
+        let hidden_size = self.backbone_hidden_size;
+        let embed_offset = token_id
+            .checked_mul(hidden_size)
+            .ok_or_else(|| format!("token id {} overflowed embedding offset", token_id))?;
+        if embed_offset + hidden_size > target.embed_tokens_f16.len() {
+            return Err(format!("token id {} is outside embed_tokens", token_id));
         }
 
-        self.prepare_activation(token_id, target_activation, target)?;
-        // `token_id` is the last token committed to the target KV (at index total_tokens-1).
-        // Its query uses that position for RoPE; the drafter predicts the next token. With
-        // constant draft positions, all chained draft steps reuse this same position.
-        self.prepare_rotary(target.total_tokens.saturating_sub(1));
+        let ptr = self.activation_buf.contents() as *mut f32;
+        let scale = self.embed_scale;
+        unsafe {
+            for i in 0..hidden_size {
+                let bits = target.embed_tokens_f16[embed_offset + i];
+                *ptr.add(i) = bf16_to_f32(bits) * scale;
+            }
+        }
+        Ok(())
+    }
 
+    fn encode_draft_forward(&mut self, target: &Gemma4GpuModel, chain_from_projected: bool) -> Result<(), String> {
+        let ctx = &target.ctx;
         let hidden_size = self.config.hidden_size;
         let intermediate_size = self.config.intermediate_size;
         let num_heads = self.config.num_attention_heads;
@@ -357,23 +485,31 @@ impl Gemma4MtpAssistant {
         let num_kv_groups = (num_heads / num_kv_heads) as u32;
         let eps = self.config.rms_norm_eps as f32;
 
-        let cmd = self.ctx.queue.new_command_buffer();
-        {
-            let encoder = cmd.new_compute_command_encoder();
-            self.ctx.encode_matvec_f16(
+        let cmd = ctx.queue.new_command_buffer();
+        let encoder = cmd.new_compute_command_encoder();
+
+        if chain_from_projected {
+            ctx.encode_copy_at(
                 encoder,
-                &self.pre_projection,
+                &self.projected_activation_buf,
+                0,
                 &self.activation_buf,
-                &self.hidden_buf,
-                hidden_size as u32,
-                (self.backbone_hidden_size * 2) as u32,
+                (self.backbone_hidden_size as u64) * 4,
+                self.backbone_hidden_size as u32,
             );
-            encoder.end_encoding();
         }
+
+        ctx.encode_matvec_f16(
+            encoder,
+            &self.pre_projection,
+            &self.activation_buf,
+            &self.hidden_buf,
+            hidden_size as u32,
+            (self.backbone_hidden_size * 2) as u32,
+        );
 
         for layer_idx in 0..self.layers.len() {
             let layer = &self.layers[layer_idx];
-            let encoder = cmd.new_compute_command_encoder();
             let head_dim = layer.head_dim;
             let q_out = layer.q_out_dim;
             let source_layer = target
@@ -394,13 +530,13 @@ impl Gemma4MtpAssistant {
                 .get(source_layer)
                 .ok_or_else(|| format!("target V cache layer {} missing", source_layer))?;
 
-            self.ctx.encode_copy(
+            ctx.encode_copy(
                 encoder,
                 &self.hidden_buf,
                 &self.residual_buf,
                 hidden_size as u32,
             );
-            self.ctx.encode_rmsnorm(
+            ctx.encode_rmsnorm(
                 encoder,
                 &self.hidden_buf,
                 &layer.input_layernorm_weight,
@@ -408,7 +544,7 @@ impl Gemma4MtpAssistant {
                 hidden_size as u32,
                 eps,
             );
-            self.ctx.encode_matvec_f16(
+            ctx.encode_matvec_f16(
                 encoder,
                 &layer.q_proj,
                 &self.normed_buf,
@@ -416,7 +552,7 @@ impl Gemma4MtpAssistant {
                 q_out as u32,
                 hidden_size as u32,
             );
-            self.ctx.encode_rmsnorm_per_head(
+            ctx.encode_rmsnorm_per_head(
                 encoder,
                 &self.q_buf,
                 &layer.q_norm_weight,
@@ -425,7 +561,7 @@ impl Gemma4MtpAssistant {
                 head_dim as u32,
                 eps,
             );
-            self.ctx.encode_rotary(
+            ctx.encode_rotary(
                 encoder,
                 &self.q_rotary_buf,
                 &self.q_buf,
@@ -451,7 +587,7 @@ impl Gemma4MtpAssistant {
 
             match target.kv_cache_type {
                 KvCacheType::F16 => {
-                    self.ctx.encode_attention_with_offset_f16(
+                    ctx.encode_attention_with_offset_f16(
                         encoder,
                         &self.q_rotary_buf,
                         k_cache,
@@ -470,7 +606,7 @@ impl Gemma4MtpAssistant {
                 KvCacheType::Q8_0 => {
                     let groups_per_row = (head_dim / 32) as u32;
                     let row_bytes = groups_per_row * 34;
-                    self.ctx.encode_attention_with_offset_q8_0(
+                    ctx.encode_attention_with_offset_q8_0(
                         encoder,
                         &self.q_rotary_buf,
                         k_cache,
@@ -491,7 +627,7 @@ impl Gemma4MtpAssistant {
                 KvCacheType::Q4_0 => {
                     let groups_per_row = (head_dim / 32) as u32;
                     let row_bytes = groups_per_row * 18;
-                    self.ctx.encode_attention_with_offset_q4_0(
+                    ctx.encode_attention_with_offset_q4_0(
                         encoder,
                         &self.q_rotary_buf,
                         k_cache,
@@ -511,7 +647,7 @@ impl Gemma4MtpAssistant {
                 }
             }
 
-            self.ctx.encode_matvec_f16(
+            ctx.encode_matvec_f16(
                 encoder,
                 &layer.o_proj,
                 &self.attn_out_buf,
@@ -519,7 +655,7 @@ impl Gemma4MtpAssistant {
                 hidden_size as u32,
                 q_out as u32,
             );
-            self.ctx.encode_rmsnorm(
+            ctx.encode_rmsnorm(
                 encoder,
                 &self.o_out_buf,
                 &layer.post_attention_layernorm_weight,
@@ -527,21 +663,20 @@ impl Gemma4MtpAssistant {
                 hidden_size as u32,
                 eps,
             );
-            self.ctx.encode_vec_add(
+            ctx.encode_vec_add(
                 encoder,
                 &self.residual_buf,
                 &self.normed_buf,
                 &self.hidden_buf,
                 hidden_size as u32,
             );
-
-            self.ctx.encode_copy(
+            ctx.encode_copy(
                 encoder,
                 &self.hidden_buf,
                 &self.residual_buf,
                 hidden_size as u32,
             );
-            self.ctx.encode_rmsnorm(
+            ctx.encode_rmsnorm(
                 encoder,
                 &self.hidden_buf,
                 &layer.pre_feedforward_layernorm_weight,
@@ -549,7 +684,7 @@ impl Gemma4MtpAssistant {
                 hidden_size as u32,
                 eps,
             );
-            self.ctx.encode_matvec_f16(
+            ctx.encode_matvec_f16(
                 encoder,
                 &layer.gate_proj,
                 &self.normed_buf,
@@ -557,7 +692,7 @@ impl Gemma4MtpAssistant {
                 intermediate_size as u32,
                 hidden_size as u32,
             );
-            self.ctx.encode_matvec_f16(
+            ctx.encode_matvec_f16(
                 encoder,
                 &layer.up_proj,
                 &self.normed_buf,
@@ -565,14 +700,14 @@ impl Gemma4MtpAssistant {
                 intermediate_size as u32,
                 hidden_size as u32,
             );
-            self.ctx.encode_gelu_mul(
+            ctx.encode_gelu_mul(
                 encoder,
                 &self.gate_buf,
                 &self.up_buf,
                 &self.gelu_buf,
                 intermediate_size as u32,
             );
-            self.ctx.encode_matvec_f16(
+            ctx.encode_matvec_f16(
                 encoder,
                 &layer.down_proj,
                 &self.gelu_buf,
@@ -580,7 +715,7 @@ impl Gemma4MtpAssistant {
                 hidden_size as u32,
                 intermediate_size as u32,
             );
-            self.ctx.encode_rmsnorm(
+            ctx.encode_rmsnorm(
                 encoder,
                 &self.o_out_buf,
                 &layer.post_feedforward_layernorm_weight,
@@ -588,77 +723,75 @@ impl Gemma4MtpAssistant {
                 hidden_size as u32,
                 eps,
             );
-            self.ctx.encode_vec_add(
+            ctx.encode_vec_add(
                 encoder,
                 &self.residual_buf,
                 &self.normed_buf,
                 &self.hidden_buf,
                 hidden_size as u32,
             );
-            self.ctx.encode_vec_scale(
+            ctx.encode_vec_scale(
                 encoder,
                 &self.hidden_buf,
                 &self.residual_buf,
                 hidden_size as u32,
                 layer.layer_scalar,
             );
-            self.ctx.encode_copy(
+            ctx.encode_copy(
                 encoder,
                 &self.residual_buf,
                 &self.hidden_buf,
                 hidden_size as u32,
             );
-
-            encoder.end_encoding();
         }
 
-        {
-            let encoder = cmd.new_compute_command_encoder();
-            self.ctx.encode_rmsnorm(
-                encoder,
-                &self.hidden_buf,
-                &self.final_norm_weight,
-                &self.normed_buf,
-                hidden_size as u32,
-                eps,
-            );
-            self.ctx.encode_matvec_f16(
-                encoder,
-                &self.post_projection,
-                &self.normed_buf,
-                &self.projected_activation_buf,
-                self.backbone_hidden_size as u32,
-                hidden_size as u32,
-            );
-            encoder.end_encoding();
-        }
+        ctx.encode_rmsnorm(
+            encoder,
+            &self.hidden_buf,
+            &self.final_norm_weight,
+            &self.normed_buf,
+            hidden_size as u32,
+            eps,
+        );
+        ctx.encode_matvec_f16(
+            encoder,
+            &self.centroids_weight_buf,
+            &self.normed_buf,
+            &self.centroid_scores_buf,
+            self.num_centroids as u32,
+            hidden_size as u32,
+        );
+        ctx.encode_matvec_f16(
+            encoder,
+            &self.post_projection,
+            &self.normed_buf,
+            &self.projected_activation_buf,
+            self.backbone_hidden_size as u32,
+            hidden_size as u32,
+        );
+
+        encoder.end_encoding();
         cmd.commit();
         cmd.wait_until_completed();
-
-        let normed_hidden = MetalContext::read_buffer(&self.normed_buf, hidden_size);
-        let logits = self.compute_masked_logits(&normed_hidden);
-        let projected_activation =
-            MetalContext::read_buffer(&self.projected_activation_buf, self.backbone_hidden_size);
-        let token_id = sampling::argmax(&logits);
-
-        Ok(MtpDraft {
-            token_id,
-            projected_activation,
-        })
+        self.gpu_passes += 1;
+        Ok(())
     }
 
-    /// Sparse centroid lm_head from Gemma4AssistantMaskedEmbedder (transformers).
-    fn compute_masked_logits(&self, hidden: &[f32]) -> Vec<f32> {
+    /// Top-k centroid sparse argmax over ~4096 candidates (no full-vocab buffer).
+    fn centroid_argmax_from_gpu(&self) -> Result<usize, String> {
         let hidden_size = self.config.hidden_size;
-        let mut centroid_scores = vec![0.0f32; self.num_centroids];
-        for (cluster, score) in centroid_scores.iter_mut().enumerate() {
-            let weight_offset = cluster * hidden_size;
-            let mut dot = 0.0f32;
-            for i in 0..hidden_size {
-                dot += self.centroids_weight_f32[weight_offset + i] * hidden[i];
-            }
-            *score = dot;
-        }
+        let centroid_scores = unsafe {
+            std::slice::from_raw_parts(
+                self.centroid_scores_buf.contents() as *const f32,
+                self.num_centroids,
+            )
+        };
+        let hidden = unsafe {
+            std::slice::from_raw_parts(
+                self.normed_buf.contents() as *const f32,
+                hidden_size,
+            )
+        };
 
         let mut ranked_centroids: Vec<usize> = (0..self.num_centroids).collect();
         ranked_centroids.select_nth_unstable_by(self.centroid_top_k - 1, |&a, &b| {
@@ -668,9 +801,8 @@ impl Gemma4MtpAssistant {
         });
         ranked_centroids.truncate(self.centroid_top_k);
 
-        let num_selected = self.centroid_top_k * self.vocab_size_per_centroid;
-        let mut sparse_logits = Vec::with_capacity(num_selected);
-        let mut scatter_idx = Vec::with_capacity(num_selected);
+        let mut best_token = 0usize;
+        let mut best_score = f32::NEG_INFINITY;
         for &cluster in &ranked_centroids {
             for &token_id in &self.token_ordering_clusters[cluster] {
                 let emb_offset = token_id * hidden_size;
@@ -678,35 +810,14 @@ impl Gemma4MtpAssistant {
                 for i in 0..hidden_size {
                     dot += self.embed_tokens_f32[emb_offset + i] * hidden[i];
                 }
-                sparse_logits.push(dot);
-                scatter_idx.push(token_id);
+                if dot > best_score {
+                    best_score = dot;
+                    best_token = token_id;
+                }
             }
         }
 
-        let mask_value = sparse_logits
-            .iter()
-            .copied()
-            .fold(f32::INFINITY, f32::min)
-            - 1.0;
-        let mut logits = vec![mask_value; self.config.vocab_size];
-        for (token_id, logit) in scatter_idx.into_iter().zip(sparse_logits) {
-            logits[token_id] = logit;
-        }
-        logits
-    }
-
-    fn prepare_activation(
-        &self,
-        token_id: usize,
-        target_activation: &[f32],
-        target: &Gemma4GpuModel,
-    ) -> Result<(), String> {
-        // Target embed scaled by sqrt(backbone_hidden) — see llama.cpp gemma4-assistant.cpp
-        // (ggml_scale on model_other->tok_embd before concat with h_nextn).
-        let mut activation = target.token_embedding(token_id)?;
-        activation.extend_from_slice(target_activation);
-        MetalContext::write_buffer(&self.activation_buf, &activation);
-        Ok(())
+        Ok(best_token)
     }
 
     fn prepare_rotary(&self, position: usize) {
