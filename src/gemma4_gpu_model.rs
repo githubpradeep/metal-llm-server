@@ -2,16 +2,34 @@ use metal::*;
 use std::collections::HashMap;
 use std::fs;
 use std::path::Path;
+use std::time::Instant;
 
+use memmap2::Mmap;
 use safetensors::SafeTensors;
 use serde::Deserialize;
 
 use crate::gemma4_config::{Gemma4TextConfig, KvCacheType};
-use crate::gpu::MetalContext;
+use crate::gpu::{BufferView, MetalContext};
 use crate::kv_pool::{KvCachePool, KvPoolError, KvSlot, KvSlotView};
 
 const DEFAULT_MAX_PREFILL_SEQ: usize = 128;
 const DEFAULT_MAX_DECODE_BATCH: usize = 4;
+/// Metal `setBuffer` offset alignment on Apple GPUs.
+const WEIGHT_BLOB_ALIGN: usize = 256;
+const WEIGHT_CACHE_MAGIC_LEN: usize = 4;
+
+fn weight_section_pad(section_offset: usize) -> usize {
+    (WEIGHT_BLOB_ALIGN - (section_offset % WEIGHT_BLOB_ALIGN)) % WEIGHT_BLOB_ALIGN
+}
+
+fn pad_weights_file_to_section_align(file: &mut fs::File) {
+    use std::io::{Seek, Write};
+    let pos = file.stream_position().expect("stream position") as usize;
+    let pad = weight_section_pad(pos - WEIGHT_CACHE_MAGIC_LEN);
+    if pad > 0 {
+        file.write_all(&vec![0u8; pad]).expect("write padding");
+    }
+}
 
 fn configured_max_prefill_seq(kv_capacity: u32) -> usize {
     std::env::var("LLAMA_MAX_PREFILL_SEQ")
@@ -28,21 +46,19 @@ pub struct Gemma4GpuModel {
     pub ctx: MetalContext,
     pub config: Gemma4TextConfig,
 
-    // Embedding table (Q4 quantized for memory efficiency)
-    pub embed_tokens_f16: Vec<u16>, // [vocab_size * hidden_size] as bf16 (~1.3GB)
-    // Per-layer embedding table (Q4 quantized, ~1.6GB)
-    pub embed_tokens_per_layer_f16: Vec<u16>, // [vocab_size * num_layers * ple_dim] as bf16
+    // Embedding tables on CPU (mmap'd from cache for instant load; lm_head is separate Q4 on GPU)
+    embed_tables: EmbedTables,
 
-    // LM head (tied to embed_tokens, stored as f16 Metal buffer for GPU matvec)
-    pub lm_head_buf: Buffer,
+    // LM head (tied to embed_tokens, stored as Q4 Metal buffer for GPU matvec)
+    pub lm_head_buf: BufferView,
 
     // Per-layer weights on GPU
     pub layers: Vec<Gemma4GpuLayer>,
 
     // Shared weights
-    pub final_norm_weight: Buffer,
-    pub per_layer_projection_norm_weight: Buffer,
-    pub per_layer_model_projection_weight: Buffer, // [num_layers * ple_dim, hidden_size] f16
+    pub final_norm_weight: BufferView,
+    pub per_layer_projection_norm_weight: BufferView,
+    pub per_layer_model_projection_weight: BufferView, // [num_layers * ple_dim, hidden_size] f16
 
     // Pre-allocated scratch buffers (reused every token)
     pub hidden_buf: Buffer,
@@ -98,6 +114,11 @@ pub struct Gemma4GpuModel {
     pub per_layer_ple_bufs: Vec<Buffer>,
 
     pub total_tokens: usize,
+
+    // Legacy monolithic cache: offset into embed mmap for fast weights save during migration.
+    weights_mmap_offset: Option<usize>,
+    embed_decode_scratch: Vec<f32>,
+    ple_decode_scratch: Vec<f32>,
 }
 
 pub struct PrefillScratch {
@@ -246,30 +267,136 @@ impl PrefillScratch {
     }
 }
 
+/// CPU-resident embedding tables. Cache load mmap's the file (instant); first safetensors load owns bytes.
+struct EmbedTables {
+    mmap: Option<Mmap>,
+    embed_offset: usize,
+    embed_byte_len: usize,
+    ple_offset: usize,
+    ple_byte_len: usize,
+    owned_embed: Option<Vec<u8>>,
+    owned_ple: Option<Vec<u8>>,
+}
+
+impl EmbedTables {
+    fn from_mmap(
+        mmap: Mmap,
+        embed_offset: usize,
+        embed_byte_len: usize,
+        ple_offset: usize,
+        ple_byte_len: usize,
+    ) -> Self {
+        Self {
+            mmap: Some(mmap),
+            embed_offset,
+            embed_byte_len,
+            ple_offset,
+            ple_byte_len,
+            owned_embed: None,
+            owned_ple: None,
+        }
+    }
+
+    fn from_owned(embed: Vec<u8>, ple: Vec<u8>) -> Self {
+        let embed_byte_len = embed.len();
+        let ple_byte_len = ple.len();
+        Self {
+            mmap: None,
+            embed_offset: 0,
+            embed_byte_len,
+            ple_offset: 0,
+            ple_byte_len,
+            owned_embed: Some(embed),
+            owned_ple: Some(ple),
+        }
+    }
+
+    fn embed_bytes(&self) -> &[u8] {
+        if let Some(mmap) = &self.mmap {
+            &mmap[self.embed_offset..self.embed_offset + self.embed_byte_len]
+        } else {
+            self.owned_embed.as_ref().unwrap()
+        }
+    }
+
+    fn ple_bytes(&self) -> &[u8] {
+        if let Some(mmap) = &self.mmap {
+            &mmap[self.ple_offset..self.ple_offset + self.ple_byte_len]
+        } else {
+            self.owned_ple.as_ref().unwrap()
+        }
+    }
+
+    fn mmap_ref(&self) -> Option<&Mmap> {
+        self.mmap.as_ref()
+    }
+
+    fn decode_embed_into(&self, token_id: usize, hidden_size: usize, out: &mut [f32]) {
+        let byte_start = token_id * hidden_size * 2;
+        let bytes = &self.embed_bytes()[byte_start..byte_start + hidden_size * 2];
+        let scale = (hidden_size as f32).sqrt();
+        for (i, chunk) in bytes.chunks_exact(2).enumerate() {
+            out[i] = bf16_to_f32(u16::from_le_bytes([chunk[0], chunk[1]])) * scale;
+        }
+    }
+
+    fn decode_ple_into(
+        &self,
+        token_id: usize,
+        ple_total_dim: usize,
+        ple_dim: usize,
+        out: &mut [f32],
+    ) {
+        let byte_start = token_id * ple_total_dim * 2;
+        let bytes = &self.ple_bytes()[byte_start..byte_start + ple_total_dim * 2];
+        let scale = (ple_dim as f32).sqrt();
+        for (i, chunk) in bytes.chunks_exact(2).enumerate() {
+            out[i] = bf16_to_f32(u16::from_le_bytes([chunk[0], chunk[1]])) * scale;
+        }
+    }
+
+    fn decode_embed_row_f32(&self, token_id: usize, hidden_size: usize) -> Vec<f32> {
+        let mut out = vec![0.0f32; hidden_size];
+        self.decode_embed_into(token_id, hidden_size, &mut out);
+        out
+    }
+
+    fn decode_ple_row_f32(
+        &self,
+        token_id: usize,
+        ple_total_dim: usize,
+        ple_dim: usize,
+    ) -> Vec<f32> {
+        let mut out = vec![0.0f32; ple_total_dim];
+        self.decode_ple_into(token_id, ple_total_dim, ple_dim, &mut out);
+        out
+    }
+}
+
 pub struct Gemma4GpuLayer {
-    pub q_proj: Buffer,
-    pub k_proj: Buffer,
-    pub v_proj: Buffer,
-    pub o_proj: Buffer,
-    pub gate_proj: Buffer,
-    pub up_proj: Buffer,
-    pub down_proj: Buffer,
+    pub q_proj: BufferView,
+    pub k_proj: BufferView,
+    pub v_proj: BufferView,
+    pub o_proj: BufferView,
+    pub gate_proj: BufferView,
+    pub up_proj: BufferView,
+    pub down_proj: BufferView,
 
     // 4 norms per layer (Gemma-style)
-    pub input_layernorm_weight: Buffer,
-    pub post_attention_layernorm_weight: Buffer,
-    pub pre_feedforward_layernorm_weight: Buffer,
-    pub post_feedforward_layernorm_weight: Buffer,
+    pub input_layernorm_weight: BufferView,
+    pub post_attention_layernorm_weight: BufferView,
+    pub pre_feedforward_layernorm_weight: BufferView,
+    pub post_feedforward_layernorm_weight: BufferView,
 
     // PLE weights
-    pub post_per_layer_input_norm_weight: Buffer,
-    pub per_layer_input_gate_weight: Buffer, // Q4: [ple_dim, hidden_size]
-    pub per_layer_projection_weight: Buffer, // Q4: [hidden_size, ple_dim]
+    pub post_per_layer_input_norm_weight: BufferView,
+    pub per_layer_input_gate_weight: BufferView, // Q4: [ple_dim, hidden_size]
+    pub per_layer_projection_weight: BufferView, // Q4: [hidden_size, ple_dim]
     pub layer_scalar: f32,
 
     // QK norm weights
-    pub q_norm_weight: Buffer,
-    pub k_norm_weight: Buffer,
+    pub q_norm_weight: BufferView,
+    pub k_norm_weight: BufferView,
 
     // Layer properties
     pub is_full_attention: bool,
@@ -292,10 +419,31 @@ impl Gemma4GpuModel {
     /// Subsequent runs: loads pre-quantized cache directly (~5-10s).
     pub fn new(model_dir: &str) -> Self {
         let cache_path = Path::new(model_dir).join("model.q4cache");
+        let embed_cache_path = Path::new(model_dir).join("model.embed.cache");
+
+        if embed_cache_path.exists() && Self::is_split_weights_cache(&cache_path) {
+            println!("  Found split Q4 cache, loading...");
+            return Self::load_from_split_cache(model_dir, &embed_cache_path, &cache_path);
+        }
+
+        if cache_path.exists() && Self::is_legacy_weights_cache(&cache_path) {
+            println!("  Found Q4 cache, loading pre-quantized weights...");
+            return Self::load_from_legacy_cache(model_dir, &cache_path);
+        }
+
+        if embed_cache_path.exists() && cache_path.exists() {
+            eprintln!(
+                "  Corrupt cache: model.embed.cache exists but model.q4cache is not a valid split weights file."
+            );
+            eprintln!(
+                "  Delete model.q4cache and model.embed.cache in the model directory, then re-run to re-quantize."
+            );
+            std::process::exit(1);
+        }
 
         if cache_path.exists() {
-            println!("  Found Q4 cache, loading pre-quantized weights...");
-            return Self::load_from_cache(model_dir, &cache_path);
+            eprintln!("  Unrecognized model.q4cache format. Delete it and re-run to re-quantize.");
+            std::process::exit(1);
         }
 
         println!("  No Q4 cache found, quantizing from safetensors (one-time)...");
@@ -364,15 +512,14 @@ impl Gemma4GpuModel {
         // We'll use a helper that loads a shard and returns a HashMap of tensors
         let prefix = "model.language_model.";
 
-        println!("  Loading embeddings (f16, memory-efficient)...");
+        println!("  Loading embeddings...");
 
-        // embed_tokens: [262144, 2560] in bf16 = 1.34 GB (keep as u16 vec)
-        // embed_tokens_per_layer: [262144, 10752] in bf16 = 5.6 GB (keep as u16 vec)
-        let mut embed_tokens_f16: Vec<u16> = Vec::new();
-        let mut embed_tokens_per_layer_f16: Vec<u16> = Vec::new();
+        let mut owned_embed: Option<Vec<u8>> = None;
+        let mut owned_ple: Option<Vec<u8>> = None;
         let mut final_norm_data: Vec<f32> = Vec::new();
         let mut per_layer_proj_norm_data: Vec<f32> = Vec::new();
         let mut per_layer_model_proj_data: Vec<f32> = Vec::new();
+        let mut lm_head_f32: Vec<f32> = Vec::new();
 
         // Load global weights from shards — use memory mapping to avoid loading entire file
         for shard_file in &shard_files {
@@ -387,22 +534,26 @@ impl Gemma4GpuModel {
             for (name, tensor_view) in safetensors.tensors() {
                 let clean_name = name.strip_prefix(prefix).unwrap_or(&name);
 
-                if clean_name == "embed_tokens.weight" && embed_tokens_f16.is_empty() {
-                    embed_tokens_f16 = raw_to_u16(tensor_view.data());
+                if clean_name == "embed_tokens.weight" && owned_embed.is_none() {
+                    let data = tensor_view.data();
                     println!(
-                        "    embed_tokens: {:?} (kept as f16, {:.1} MB)",
+                        "    embed_tokens: {:?} ({:.1} MB)",
                         tensor_view.shape(),
-                        embed_tokens_f16.len() * 2 / 1024 / 1024
+                        data.len() as f64 / 1024.0 / 1024.0
                     );
-                } else if clean_name == "embed_tokens_per_layer.weight"
-                    && embed_tokens_per_layer_f16.is_empty()
-                {
-                    embed_tokens_per_layer_f16 = raw_to_u16(tensor_view.data());
+                    lm_head_f32 = data
+                        .chunks_exact(2)
+                        .map(|b| bf16_to_f32(u16::from_le_bytes([b[0], b[1]])))
+                        .collect();
+                    owned_embed = Some(data.to_vec());
+                } else if clean_name == "embed_tokens_per_layer.weight" && owned_ple.is_none() {
+                    let data = tensor_view.data();
                     println!(
-                        "    embed_tokens_per_layer: {:?} (kept as f16, {:.1} MB)",
+                        "    embed_tokens_per_layer: {:?} ({:.1} MB)",
                         tensor_view.shape(),
-                        embed_tokens_per_layer_f16.len() * 2 / 1024 / 1024
+                        data.len() as f64 / 1024.0 / 1024.0
                     );
+                    owned_ple = Some(data.to_vec());
                 } else if clean_name == "model.norm.weight" || clean_name == "norm.weight" {
                     if final_norm_data.is_empty() {
                         final_norm_data = decode_tensor_to_f32(&tensor_view);
@@ -425,38 +576,35 @@ impl Gemma4GpuModel {
             // mmap dropped here
         }
 
-        assert!(!embed_tokens_f16.is_empty(), "embed_tokens not found");
-        assert!(
-            !embed_tokens_per_layer_f16.is_empty(),
-            "embed_tokens_per_layer not found"
+        let embed_tables = EmbedTables::from_owned(
+            owned_embed.expect("embed_tokens not found"),
+            owned_ple.expect("embed_tokens_per_layer not found"),
         );
 
         // Create GPU buffer for lm_head (tied embeddings — quantize to Q4_0)
-        // Convert bf16 → f32 first, then quantize to Q4_0
-        let lm_head_f32: Vec<f32> = embed_tokens_f16
-            .iter()
-            .map(|&bits| bf16_to_f32(bits))
-            .collect();
-        let lm_head_buf = ctx.buffer_from_f32_as_q4(&lm_head_f32, vocab_size, hidden_size);
+        let lm_head_buf = BufferView::from_buffer(ctx.buffer_from_f32_as_q4(&lm_head_f32, vocab_size, hidden_size));
         println!(
             "    lm_head (tied, Q4_0 on GPU): {:.1} MB",
-            lm_head_buf.length() as f64 / 1024.0 / 1024.0
+            lm_head_buf.length as f64 / 1024.0 / 1024.0
         );
 
-        let final_norm_weight = ctx.buffer_from_slice(&final_norm_data);
-        let per_layer_projection_norm_weight = ctx.buffer_from_slice(&per_layer_proj_norm_data);
+        let final_norm_weight = BufferView::from_buffer(ctx.buffer_from_slice(&final_norm_data));
+        let per_layer_projection_norm_weight =
+            BufferView::from_buffer(ctx.buffer_from_slice(&per_layer_proj_norm_data));
         let per_layer_model_projection_weight = if !per_layer_model_proj_data.is_empty() {
-            ctx.buffer_from_f32_as_q4(
-                &per_layer_model_proj_data,
-                num_layers * ple_dim,
-                hidden_size,
+            BufferView::from_buffer(
+                ctx.buffer_from_f32_as_q4(
+                    &per_layer_model_proj_data,
+                    num_layers * ple_dim,
+                    hidden_size,
+                ),
             )
         } else {
             // Fallback: create empty buffer (shouldn't happen for E4B)
             println!(
                 "  WARNING: per_layer_model_projection not found, PLE context projection disabled"
             );
-            ctx.buffer_empty(1)
+            BufferView::from_buffer(ctx.buffer_empty(1))
         };
 
         // Load all layers
@@ -565,50 +713,50 @@ impl Gemma4GpuModel {
             let is_sensitive_layer = layer_idx < 3 || layer_idx >= (num_layers - 3);
 
             let layer = Gemma4GpuLayer {
-                q_proj: if is_sensitive_layer {
+                q_proj: BufferView::from_buffer(if is_sensitive_layer {
                     ctx.buffer_from_f32_as_f16(&q_proj_data)
                 } else {
                     ctx.buffer_from_f32_as_q4(&q_proj_data, q_out, hidden_size)
-                },
-                k_proj: if is_sensitive_layer {
+                }),
+                k_proj: BufferView::from_buffer(if is_sensitive_layer {
                     ctx.buffer_from_f32_as_f16(&k_proj_data)
                 } else {
                     ctx.buffer_from_f32_as_q4(&k_proj_data, kv_out, hidden_size)
-                },
-                v_proj: if is_sensitive_layer {
+                }),
+                v_proj: BufferView::from_buffer(if is_sensitive_layer {
                     ctx.buffer_from_f32_as_f16(&v_proj_data)
                 } else {
                     ctx.buffer_from_f32_as_q4(&v_proj_data, kv_out, hidden_size)
-                },
-                o_proj: ctx.buffer_from_f32_as_f16(&o_proj_data), // always f16 (quality-critical)
-                gate_proj: if is_sensitive_layer {
+                }),
+                o_proj: BufferView::from_buffer(ctx.buffer_from_f32_as_f16(&o_proj_data)),
+                gate_proj: BufferView::from_buffer(if is_sensitive_layer {
                     ctx.buffer_from_f32_as_f16(&gate_proj_data)
                 } else {
                     ctx.buffer_from_f32_as_q4(&gate_proj_data, intermediate_size, hidden_size)
-                },
-                up_proj: if is_sensitive_layer {
+                }),
+                up_proj: BufferView::from_buffer(if is_sensitive_layer {
                     ctx.buffer_from_f32_as_f16(&up_proj_data)
                 } else {
                     ctx.buffer_from_f32_as_q4(&up_proj_data, intermediate_size, hidden_size)
-                },
-                down_proj: if is_sensitive_layer {
+                }),
+                down_proj: BufferView::from_buffer(if is_sensitive_layer {
                     ctx.buffer_from_f32_as_f16(&down_proj_data)
                 } else {
                     ctx.buffer_from_f32_as_q4(&down_proj_data, hidden_size, intermediate_size)
-                },
+                }),
 
-                input_layernorm_weight: ctx.buffer_from_slice(&input_ln),
-                post_attention_layernorm_weight: ctx.buffer_from_slice(&post_attn_ln),
-                pre_feedforward_layernorm_weight: ctx.buffer_from_slice(&pre_ff_ln),
-                post_feedforward_layernorm_weight: ctx.buffer_from_slice(&post_ff_ln),
-                post_per_layer_input_norm_weight: ctx.buffer_from_slice(&post_ple_norm),
+                input_layernorm_weight: BufferView::from_buffer(ctx.buffer_from_slice(&input_ln)),
+                post_attention_layernorm_weight: BufferView::from_buffer(ctx.buffer_from_slice(&post_attn_ln)),
+                pre_feedforward_layernorm_weight: BufferView::from_buffer(ctx.buffer_from_slice(&pre_ff_ln)),
+                post_feedforward_layernorm_weight: BufferView::from_buffer(ctx.buffer_from_slice(&post_ff_ln)),
+                post_per_layer_input_norm_weight: BufferView::from_buffer(ctx.buffer_from_slice(&post_ple_norm)),
 
-                per_layer_input_gate_weight: ctx.buffer_from_f32_as_f16(&ple_gate_data), // always f16 (small, quality-critical)
-                per_layer_projection_weight: ctx.buffer_from_f32_as_f16(&ple_proj_data), // always f16
+                per_layer_input_gate_weight: BufferView::from_buffer(ctx.buffer_from_f32_as_f16(&ple_gate_data)),
+                per_layer_projection_weight: BufferView::from_buffer(ctx.buffer_from_f32_as_f16(&ple_proj_data)),
                 layer_scalar,
 
-                q_norm_weight: ctx.buffer_from_slice(&q_norm_data),
-                k_norm_weight: ctx.buffer_from_slice(&k_norm_data),
+                q_norm_weight: BufferView::from_buffer(ctx.buffer_from_slice(&q_norm_data)),
+                k_norm_weight: BufferView::from_buffer(ctx.buffer_from_slice(&k_norm_data)),
 
                 is_full_attention: is_full,
                 has_kv: layer_idx < (num_layers - config.num_kv_shared_layers),
@@ -771,8 +919,7 @@ impl Gemma4GpuModel {
         Gemma4GpuModel {
             ctx,
             config,
-            embed_tokens_f16,
-            embed_tokens_per_layer_f16,
+            embed_tables,
             lm_head_buf,
             layers,
             final_norm_weight,
@@ -820,110 +967,91 @@ impl Gemma4GpuModel {
             per_layer_decode_batch_kv_len_bufs,
             per_layer_ple_bufs,
             total_tokens: 0,
+            weights_mmap_offset: None,
+            embed_decode_scratch: vec![0.0f32; hidden_size],
+            ple_decode_scratch: vec![0.0f32; num_layers * ple_dim],
         }
     }
 
-    /// Save all quantized weights to a binary cache file for fast loading.
+    /// Save split cache: model.embed.cache (CPU mmap) + model.q4cache (GPU weights).
     fn save_cache(&self, path: &Path) {
-        use std::io::Write;
-        let mut file = fs::File::create(path).expect("Failed to create cache file");
-        let magic = b"GQ4C"; // Gemma Q4 Cache
-        file.write_all(magic).unwrap();
+        let embed_path = path
+            .parent()
+            .expect("cache path has no parent")
+            .join("model.embed.cache");
+        self.save_embed_cache(&embed_path);
+        self.save_weights_cache(path);
+    }
 
-        // Save embeddings (raw bf16)
-        let embed_bytes = unsafe {
-            std::slice::from_raw_parts(
-                self.embed_tokens_f16.as_ptr() as *const u8,
-                self.embed_tokens_f16.len() * 2,
-            )
-        };
-        let len = embed_bytes.len() as u64;
-        file.write_all(&len.to_le_bytes()).unwrap();
+    fn save_embed_cache(&self, path: &Path) {
+        use std::io::{Seek, Write};
+        let mut file = fs::File::create(path).expect("Failed to create embed cache");
+        file.write_all(b"GQ4E").unwrap();
+        let embed_bytes = self.embed_tables.embed_bytes();
+        file.write_all(&(embed_bytes.len() as u64).to_le_bytes()).unwrap();
         file.write_all(embed_bytes).unwrap();
-
-        // Save embed_tokens_per_layer (raw bf16)
-        let ple_bytes = unsafe {
-            std::slice::from_raw_parts(
-                self.embed_tokens_per_layer_f16.as_ptr() as *const u8,
-                self.embed_tokens_per_layer_f16.len() * 2,
-            )
-        };
-        let len = ple_bytes.len() as u64;
-        file.write_all(&len.to_le_bytes()).unwrap();
+        let ple_bytes = self.embed_tables.ple_bytes();
+        file.write_all(&(ple_bytes.len() as u64).to_le_bytes()).unwrap();
         file.write_all(ple_bytes).unwrap();
+        println!(
+            "  Embed cache saved: {:.1} MB",
+            file.metadata().map(|m| m.len()).unwrap_or(0) as f64 / 1024.0 / 1024.0
+        );
+    }
 
-        // Save lm_head (Q4 on GPU)
-        let lm_head_len = self.lm_head_buf.length() as u64;
-        file.write_all(&lm_head_len.to_le_bytes()).unwrap();
-        let lm_head_bytes = unsafe {
-            std::slice::from_raw_parts(
-                self.lm_head_buf.contents() as *const u8,
-                lm_head_len as usize,
-            )
-        };
-        file.write_all(lm_head_bytes).unwrap();
+    fn save_weights_cache(&self, path: &Path) {
+        if let Some(start_offset) = self.weights_mmap_offset {
+            let mmap = self
+                .embed_tables
+                .mmap_ref()
+                .expect("weights_mmap_offset set without backing mmap");
+            Self::write_weights_cache_from_mmap(mmap, start_offset, path, self.layers.len());
+            return;
+        }
 
-        // Save per_layer_model_projection (Q4 on GPU)
-        let proj_len = self.per_layer_model_projection_weight.length() as u64;
-        file.write_all(&proj_len.to_le_bytes()).unwrap();
-        let proj_bytes = unsafe {
-            std::slice::from_raw_parts(
-                self.per_layer_model_projection_weight.contents() as *const u8,
-                proj_len as usize,
-            )
+        use std::io::{Seek, Write};
+        let mut file = fs::File::create(path).expect("Failed to create weights cache");
+        file.write_all(b"GQ4A").unwrap();
+        let save_view = |f: &mut fs::File, view: &BufferView| {
+            f.write_all(&view.length.to_le_bytes()).unwrap();
+            let pos = f.stream_position().expect("stream position") as usize;
+            let pad_before = weight_section_pad(pos - WEIGHT_CACHE_MAGIC_LEN);
+            if pad_before > 0 {
+                f.write_all(&vec![0u8; pad_before]).unwrap();
+            }
+            f.write_all(view.as_bytes()).unwrap();
+            let pos = f.stream_position().expect("stream position") as usize;
+            let pad_after = weight_section_pad(pos - WEIGHT_CACHE_MAGIC_LEN);
+            if pad_after > 0 {
+                f.write_all(&vec![0u8; pad_after]).unwrap();
+            }
         };
-        file.write_all(proj_bytes).unwrap();
-
-        // Save norms
-        let norm_len = self.final_norm_weight.length() as u64;
-        file.write_all(&norm_len.to_le_bytes()).unwrap();
-        let norm_bytes = unsafe {
-            std::slice::from_raw_parts(
-                self.final_norm_weight.contents() as *const u8,
-                norm_len as usize,
-            )
-        };
-        file.write_all(norm_bytes).unwrap();
-
-        let pnorm_len = self.per_layer_projection_norm_weight.length() as u64;
-        file.write_all(&pnorm_len.to_le_bytes()).unwrap();
-        let pnorm_bytes = unsafe {
-            std::slice::from_raw_parts(
-                self.per_layer_projection_norm_weight.contents() as *const u8,
-                pnorm_len as usize,
-            )
-        };
-        file.write_all(pnorm_bytes).unwrap();
+        save_view(&mut file, &self.lm_head_buf);
+        save_view(&mut file, &self.per_layer_model_projection_weight);
+        save_view(&mut file, &self.final_norm_weight);
+        save_view(&mut file, &self.per_layer_projection_norm_weight);
 
         // Save per-layer weights
         let num_layers = self.layers.len() as u32;
         file.write_all(&num_layers.to_le_bytes()).unwrap();
+        pad_weights_file_to_section_align(&mut file);
         for layer in &self.layers {
-            // Save all GPU buffers as raw bytes
-            let save_buf = |f: &mut fs::File, buf: &Buffer| {
-                let len = buf.length() as u64;
-                f.write_all(&len.to_le_bytes()).unwrap();
-                let bytes = unsafe {
-                    std::slice::from_raw_parts(buf.contents() as *const u8, len as usize)
-                };
-                f.write_all(bytes).unwrap();
-            };
-            save_buf(&mut file, &layer.q_proj);
-            save_buf(&mut file, &layer.k_proj);
-            save_buf(&mut file, &layer.v_proj);
-            save_buf(&mut file, &layer.o_proj);
-            save_buf(&mut file, &layer.gate_proj);
-            save_buf(&mut file, &layer.up_proj);
-            save_buf(&mut file, &layer.down_proj);
-            save_buf(&mut file, &layer.input_layernorm_weight);
-            save_buf(&mut file, &layer.post_attention_layernorm_weight);
-            save_buf(&mut file, &layer.pre_feedforward_layernorm_weight);
-            save_buf(&mut file, &layer.post_feedforward_layernorm_weight);
-            save_buf(&mut file, &layer.post_per_layer_input_norm_weight);
-            save_buf(&mut file, &layer.per_layer_input_gate_weight);
-            save_buf(&mut file, &layer.per_layer_projection_weight);
-            save_buf(&mut file, &layer.q_norm_weight);
-            save_buf(&mut file, &layer.k_norm_weight);
+            save_view(&mut file, &layer.q_proj);
+            save_view(&mut file, &layer.k_proj);
+            save_view(&mut file, &layer.v_proj);
+            save_view(&mut file, &layer.o_proj);
+            save_view(&mut file, &layer.gate_proj);
+            save_view(&mut file, &layer.up_proj);
+            save_view(&mut file, &layer.down_proj);
+            save_view(&mut file, &layer.input_layernorm_weight);
+            save_view(&mut file, &layer.post_attention_layernorm_weight);
+            save_view(&mut file, &layer.pre_feedforward_layernorm_weight);
+            save_view(&mut file, &layer.post_feedforward_layernorm_weight);
+            save_view(&mut file, &layer.post_per_layer_input_norm_weight);
+            save_view(&mut file, &layer.per_layer_input_gate_weight);
+            save_view(&mut file, &layer.per_layer_projection_weight);
+            save_view(&mut file, &layer.q_norm_weight);
+            save_view(&mut file, &layer.k_norm_weight);
             file.write_all(&layer.layer_scalar.to_le_bytes()).unwrap();
             file.write_all(&(layer.is_full_attention as u8).to_le_bytes())
                 .unwrap();
@@ -938,139 +1066,209 @@ impl Gemma4GpuModel {
                 .unwrap();
             file.write_all(&(layer.kv_out_dim as u32).to_le_bytes())
                 .unwrap();
+            pad_weights_file_to_section_align(&mut file);
         }
         println!(
-            "  Cache saved: {:.1} MB",
+            "  Weights cache saved: {:.1} MB",
             file.metadata().map(|m| m.len()).unwrap_or(0) as f64 / 1024.0 / 1024.0
         );
     }
 
-    /// Load model from pre-quantized cache file (fast path).
-    fn load_from_cache(model_dir: &str, cache_path: &Path) -> Self {
-        use std::io::Read;
+    fn write_weights_cache_from_mmap(
+        mmap: &Mmap,
+        mut offset: usize,
+        path: &Path,
+        num_layers: usize,
+    ) {
+        use std::io::{Seek, Write};
+        let mut file = fs::File::create(path).expect("Failed to create weights cache");
+        file.write_all(b"GQ4A").unwrap();
 
-        let config_path = Path::new(model_dir).join("config.json");
-        let config_str = fs::read_to_string(&config_path).expect("Failed to read config.json");
-        let outer: serde_json::Value =
-            serde_json::from_str(&config_str).expect("Failed to parse config.json");
-        let config: Gemma4TextConfig = if let Some(tc) = outer.get("text_config") {
-            serde_json::from_value(tc.clone()).expect("Failed to parse text_config")
-        } else {
-            serde_json::from_str(&config_str).expect("Failed to parse config")
+        let write_blob = |file: &mut fs::File, mmap: &Mmap, offset: &mut usize| {
+            let len = Self::read_u64_at(mmap, offset);
+            if *offset + len as usize > mmap.len() {
+                panic!(
+                    "Internal error while writing weights cache: source blob at offset {} \
+                     needs {} bytes but mmap is {} bytes",
+                    *offset,
+                    len,
+                    mmap.len()
+                );
+            }
+            file.write_all(&len.to_le_bytes()).unwrap();
+            let pos = file.stream_position().expect("stream position") as usize;
+            let pad_before = weight_section_pad(pos - WEIGHT_CACHE_MAGIC_LEN);
+            if pad_before > 0 {
+                file.write_all(&vec![0u8; pad_before]).unwrap();
+            }
+            file.write_all(&mmap[*offset..*offset + len as usize]).unwrap();
+            *offset += len as usize;
+            let pos = file.stream_position().expect("stream position") as usize;
+            let pad_after = weight_section_pad(pos - WEIGHT_CACHE_MAGIC_LEN);
+            if pad_after > 0 {
+                file.write_all(&vec![0u8; pad_after]).unwrap();
+            }
         };
 
-        let ctx = MetalContext::new();
-        let hidden_size = config.hidden_size;
-        let num_heads = config.num_attention_heads;
-        let num_kv_heads = config.num_key_value_heads;
-        let intermediate_size = config.intermediate_size;
-        let vocab_size = config.vocab_size;
-        let num_layers = config.num_hidden_layers;
-        let ple_dim = config.hidden_size_per_layer_input;
-        let max_head_dim = config.global_head_dim;
-        let max_q_out = num_heads * max_head_dim;
-        let max_kv_out = num_kv_heads * max_head_dim;
+        write_blob(&mut file, mmap, &mut offset);
+        write_blob(&mut file, mmap, &mut offset);
+        write_blob(&mut file, mmap, &mut offset);
+        write_blob(&mut file, mmap, &mut offset);
 
-        let mut file = fs::File::open(cache_path).expect("Failed to open cache");
-        let mut magic = [0u8; 4];
-        file.read_exact(&mut magic).unwrap();
-        assert_eq!(&magic, b"GQ4C", "Invalid cache magic");
+        file.write_all(&mmap[offset..offset + 4]).unwrap();
+        offset += 4;
+        pad_weights_file_to_section_align(&mut file);
 
-        let read_len = |f: &mut fs::File| -> u64 {
-            let mut buf = [0u8; 8];
-            f.read_exact(&mut buf).unwrap();
-            u64::from_le_bytes(buf)
-        };
+        for _ in 0..num_layers {
+            for _ in 0..16 {
+                write_blob(&mut file, mmap, &mut offset);
+            }
+            // layer_scalar + 3 bools + 4 u32 metadata fields
+            file.write_all(&mmap[offset..offset + 23]).unwrap();
+            offset += 23;
+            pad_weights_file_to_section_align(&mut file);
+        }
 
-        let read_buf = |f: &mut fs::File, device: &Device| -> Buffer {
-            let len = read_len(f);
-            let mut data = vec![0u8; len as usize];
-            f.read_exact(&mut data).unwrap();
-            device.new_buffer_with_data(
-                data.as_ptr() as *const _,
-                len,
-                MTLResourceOptions::StorageModeShared,
-            )
-        };
-
-        // Load embeddings
-        let embed_len = read_len(&mut file) as usize;
-        let mut embed_bytes = vec![0u8; embed_len];
-        file.read_exact(&mut embed_bytes).unwrap();
-        let embed_tokens_f16: Vec<u16> = embed_bytes
-            .chunks_exact(2)
-            .map(|b| u16::from_le_bytes([b[0], b[1]]))
-            .collect();
         println!(
-            "    embed_tokens: {:.1} MB",
-            embed_len as f64 / 1024.0 / 1024.0
+            "  Weights cache saved: {:.1} MB",
+            file.metadata().map(|m| m.len()).unwrap_or(0) as f64 / 1024.0 / 1024.0
         );
+    }
 
-        // Load embed_tokens_per_layer
-        let ple_embed_len = read_len(&mut file) as usize;
-        let mut ple_bytes = vec![0u8; ple_embed_len];
-        file.read_exact(&mut ple_bytes).unwrap();
-        let embed_tokens_per_layer_f16: Vec<u16> = ple_bytes
-            .chunks_exact(2)
-            .map(|b| u16::from_le_bytes([b[0], b[1]]))
-            .collect();
-        println!(
-            "    embed_tokens_per_layer: {:.1} MB",
-            ple_embed_len as f64 / 1024.0 / 1024.0
-        );
+    fn read_u64_at(mmap: &[u8], offset: &mut usize) -> u64 {
+        if *offset + 8 > mmap.len() {
+            panic!(
+                "Corrupt weights cache near offset {} (file size {}). \
+                 Delete model.q4cache and model.embed.cache, then re-run to re-quantize.",
+                *offset,
+                mmap.len()
+            );
+        }
+        let value = u64::from_le_bytes(mmap[*offset..*offset + 8].try_into().unwrap());
+        *offset += 8;
+        value
+    }
 
-        // Load lm_head, projection, norms
-        let lm_head_buf = read_buf(&mut file, &ctx.device);
-        let per_layer_model_projection_weight = read_buf(&mut file, &ctx.device);
-        let final_norm_weight = read_buf(&mut file, &ctx.device);
-        let per_layer_projection_norm_weight = read_buf(&mut file, &ctx.device);
+    fn load_weight_sections(
+        data: &[u8],
+        offset: &mut usize,
+        device: &Device,
+        num_layers: usize,
+        aligned_layout: bool,
+        parent: Option<&Buffer>,
+        parent_base: usize,
+    ) -> (
+        BufferView,
+        BufferView,
+        BufferView,
+        BufferView,
+        Vec<Gemma4GpuLayer>,
+    ) {
+        let read_buf = |offset: &mut usize| -> BufferView {
+            let len = Self::read_u64_at(data, offset);
+            let view = if aligned_layout {
+                let parent = parent.expect("aligned layout requires parent buffer");
+                let pad_before =
+                    weight_section_pad(*offset - parent_base);
+                *offset += pad_before;
+                if *offset + len as usize > data.len() {
+                    panic!(
+                        "Corrupt weights cache: blob at offset {} needs {} bytes but file is {} bytes. \
+                         Delete model.q4cache and model.embed.cache, then re-run to re-quantize.",
+                        *offset,
+                        len,
+                        data.len()
+                    );
+                }
+                let parent_off = *offset - parent_base;
+                assert_eq!(
+                    parent_off % WEIGHT_BLOB_ALIGN,
+                    0,
+                    "unaligned blob at file offset {} (section offset {}). \
+                     Delete model.q4cache and model.embed.cache, then re-run to re-quantize.",
+                    *offset,
+                    parent_off
+                );
+                let view = BufferView::subrange(parent, parent_off as u64, len);
+                *offset += len as usize;
+                let pad_after = weight_section_pad(*offset - parent_base);
+                *offset += pad_after;
+                view
+            } else {
+                if *offset + len as usize > data.len() {
+                    panic!(
+                        "Corrupt weights cache: blob at offset {} needs {} bytes but file is {} bytes. \
+                         Delete model.q4cache and model.embed.cache, then re-run to re-quantize.",
+                        *offset,
+                        len,
+                        data.len()
+                    );
+                }
+                let buf =
+                    MetalContext::buffer_from_slice_parallel(device, &data[*offset..*offset + len as usize]);
+                *offset += len as usize;
+                BufferView::from_buffer(buf)
+            };
+            view
+        };
 
-        // Load layers
-        let mut nl_buf = [0u8; 4];
-        file.read_exact(&mut nl_buf).unwrap();
-        let num_layers_in_cache = u32::from_le_bytes(nl_buf) as usize;
+        let lm_head_buf = read_buf(offset);
+        let per_layer_model_projection_weight = read_buf(offset);
+        let final_norm_weight = read_buf(offset);
+        let per_layer_projection_norm_weight = read_buf(offset);
+
+        let num_layers_in_cache =
+            u32::from_le_bytes(data[*offset..*offset + 4].try_into().unwrap()) as usize;
+        *offset += 4;
+        let pad = weight_section_pad(*offset - parent_base);
+        *offset += pad;
         assert_eq!(num_layers_in_cache, num_layers);
 
         let mut layers = Vec::with_capacity(num_layers);
         for layer_idx in 0..num_layers {
-            let q_proj = read_buf(&mut file, &ctx.device);
-            let k_proj = read_buf(&mut file, &ctx.device);
-            let v_proj = read_buf(&mut file, &ctx.device);
-            let o_proj = read_buf(&mut file, &ctx.device);
-            let gate_proj = read_buf(&mut file, &ctx.device);
-            let up_proj = read_buf(&mut file, &ctx.device);
-            let down_proj = read_buf(&mut file, &ctx.device);
-            let input_layernorm_weight = read_buf(&mut file, &ctx.device);
-            let post_attention_layernorm_weight = read_buf(&mut file, &ctx.device);
-            let pre_feedforward_layernorm_weight = read_buf(&mut file, &ctx.device);
-            let post_feedforward_layernorm_weight = read_buf(&mut file, &ctx.device);
-            let post_per_layer_input_norm_weight = read_buf(&mut file, &ctx.device);
-            let per_layer_input_gate_weight = read_buf(&mut file, &ctx.device);
-            let per_layer_projection_weight = read_buf(&mut file, &ctx.device);
-            let q_norm_weight = read_buf(&mut file, &ctx.device);
-            let k_norm_weight = read_buf(&mut file, &ctx.device);
+            let q_proj = read_buf(offset);
+            let k_proj = read_buf(offset);
+            let v_proj = read_buf(offset);
+            let o_proj = read_buf(offset);
+            let gate_proj = read_buf(offset);
+            let up_proj = read_buf(offset);
+            let down_proj = read_buf(offset);
+            let input_layernorm_weight = read_buf(offset);
+            let post_attention_layernorm_weight = read_buf(offset);
+            let pre_feedforward_layernorm_weight = read_buf(offset);
+            let post_feedforward_layernorm_weight = read_buf(offset);
+            let post_per_layer_input_norm_weight = read_buf(offset);
+            let per_layer_input_gate_weight = read_buf(offset);
+            let per_layer_projection_weight = read_buf(offset);
+            let q_norm_weight = read_buf(offset);
+            let k_norm_weight = read_buf(offset);
 
-            let mut scalar_buf = [0u8; 4];
-            file.read_exact(&mut scalar_buf).unwrap();
-            let layer_scalar = f32::from_le_bytes(scalar_buf);
+            let layer_scalar = f32::from_le_bytes(data[*offset..*offset + 4].try_into().unwrap());
+            *offset += 4;
 
-            let mut meta = [0u8; 1];
-            file.read_exact(&mut meta).unwrap();
-            let is_full_attention = meta[0] != 0;
-            file.read_exact(&mut meta).unwrap();
-            let has_kv = meta[0] != 0;
-            file.read_exact(&mut meta).unwrap();
-            let use_f16 = meta[0] != 0;
+            let is_full_attention = data[*offset] != 0;
+            *offset += 1;
+            let has_kv = data[*offset] != 0;
+            *offset += 1;
+            let use_f16 = data[*offset] != 0;
+            *offset += 1;
 
-            let mut u32_buf = [0u8; 4];
-            file.read_exact(&mut u32_buf).unwrap();
-            let kv_source_layer = u32::from_le_bytes(u32_buf) as usize;
-            file.read_exact(&mut u32_buf).unwrap();
-            let head_dim = u32::from_le_bytes(u32_buf) as usize;
-            file.read_exact(&mut u32_buf).unwrap();
-            let q_out_dim = u32::from_le_bytes(u32_buf) as usize;
-            file.read_exact(&mut u32_buf).unwrap();
-            let kv_out_dim = u32::from_le_bytes(u32_buf) as usize;
+            let kv_source_layer =
+                u32::from_le_bytes(data[*offset..*offset + 4].try_into().unwrap()) as usize;
+            *offset += 4;
+            let head_dim =
+                u32::from_le_bytes(data[*offset..*offset + 4].try_into().unwrap()) as usize;
+            *offset += 4;
+            let q_out_dim =
+                u32::from_le_bytes(data[*offset..*offset + 4].try_into().unwrap()) as usize;
+            *offset += 4;
+            let kv_out_dim =
+                u32::from_le_bytes(data[*offset..*offset + 4].try_into().unwrap()) as usize;
+            *offset += 4;
+            if aligned_layout {
+                let pad = weight_section_pad(*offset - parent_base);
+                *offset += pad;
+            }
 
             if (layer_idx + 1) % 10 == 0 || layer_idx == num_layers - 1 {
                 println!("    Loaded layer {}/{}", layer_idx + 1, num_layers);
@@ -1104,7 +1302,171 @@ impl Gemma4GpuModel {
             });
         }
 
-        // Allocate scratch buffers (same as load_from_safetensors)
+        (
+            lm_head_buf,
+            per_layer_model_projection_weight,
+            final_norm_weight,
+            per_layer_projection_norm_weight,
+            layers,
+        )
+    }
+
+    /// Legacy monolithic GQ4C cache: mmap embeds on CPU + zero-copy GPU weights.
+    fn load_from_legacy_cache(model_dir: &str, cache_path: &Path) -> Self {
+        let load_start = Instant::now();
+
+        let config_path = Path::new(model_dir).join("config.json");
+        let config_str = fs::read_to_string(&config_path).expect("Failed to read config.json");
+        let outer: serde_json::Value =
+            serde_json::from_str(&config_str).expect("Failed to parse config.json");
+        let config: Gemma4TextConfig = if let Some(tc) = outer.get("text_config") {
+            serde_json::from_value(tc.clone()).expect("Failed to parse text_config")
+        } else {
+            serde_json::from_str(&config_str).expect("Failed to parse config")
+        };
+
+        let ctx = MetalContext::new();
+        let hidden_size = config.hidden_size;
+        let num_heads = config.num_attention_heads;
+        let num_kv_heads = config.num_key_value_heads;
+        let intermediate_size = config.intermediate_size;
+        let vocab_size = config.vocab_size;
+        let num_layers = config.num_hidden_layers;
+        let ple_dim = config.hidden_size_per_layer_input;
+        let max_head_dim = config.global_head_dim;
+        let max_q_out = num_heads * max_head_dim;
+        let max_kv_out = num_kv_heads * max_head_dim;
+        let device = &ctx.device;
+
+        let cache_file = fs::File::open(cache_path).expect("Failed to open cache");
+        let mmap = unsafe { Mmap::map(&cache_file).expect("Failed to mmap cache") };
+        assert_eq!(&mmap[0..4], b"GQ4C", "Invalid cache magic (expected GQ4C legacy format)");
+
+        let mut offset = 4;
+        let embed_len = Self::read_u64_at(&mmap, &mut offset);
+        let embed_offset = offset;
+        offset += embed_len as usize;
+        println!(
+            "    embed_tokens: {:.1} MB (mmap)",
+            embed_len as f64 / 1024.0 / 1024.0
+        );
+
+        let ple_embed_len = Self::read_u64_at(&mmap, &mut offset);
+        let ple_offset = offset;
+        offset += ple_embed_len as usize;
+        println!(
+            "    embed_tokens_per_layer: {:.1} MB (mmap)",
+            ple_embed_len as f64 / 1024.0 / 1024.0
+        );
+
+        let weights_mmap_offset = offset;
+        println!("  Loading weights (per-tensor copy)...");
+        let weights_load_start = Instant::now();
+        let (
+            lm_head_buf,
+            per_layer_model_projection_weight,
+            final_norm_weight,
+            per_layer_projection_norm_weight,
+            layers,
+        ) = Self::load_weight_sections(
+            mmap.as_ref(),
+            &mut offset,
+            device,
+            num_layers,
+            false,
+            None,
+            weights_mmap_offset,
+        );
+        println!(
+            "  Weights loaded in {:.2}s",
+            weights_load_start.elapsed().as_secs_f64()
+        );
+
+        let embed_tables = EmbedTables::from_mmap(
+            mmap,
+            embed_offset,
+            embed_len as usize,
+            ple_offset,
+            ple_embed_len as usize,
+        );
+
+        let model = Self::finish_cache_load(
+            ctx,
+            config,
+            embed_tables,
+            Some(weights_mmap_offset),
+            lm_head_buf,
+            per_layer_model_projection_weight,
+            final_norm_weight,
+            per_layer_projection_norm_weight,
+            layers,
+            load_start,
+            "legacy Q4 cache",
+        );
+
+        // One-time migration to split cache (instant load on subsequent runs).
+        let embed_path = Path::new(model_dir).join("model.embed.cache");
+        if !Self::is_split_weights_cache(cache_path) {
+            println!("  Migrating to split cache format...");
+            if !embed_path.exists() {
+                model.save_embed_cache(&embed_path);
+            }
+            model.save_weights_cache(cache_path);
+        }
+
+        model
+    }
+
+    fn is_split_weights_cache(path: &Path) -> bool {
+        use std::io::Read;
+        let file = match fs::File::open(path) {
+            Ok(file) => file,
+            Err(_) => return false,
+        };
+        // Weights-only cache should be hundreds of MB, not a truncated header.
+        const MIN_BYTES: u64 = 64 * 1024 * 1024;
+        if file.metadata().map(|m| m.len()).unwrap_or(0) < MIN_BYTES {
+            return false;
+        }
+        let mut magic = [0u8; 4];
+        let mut file = file;
+        file.read_exact(&mut magic).is_ok() && (magic == *b"GQ4W" || magic == *b"GQ4A")
+    }
+
+    fn is_legacy_weights_cache(path: &Path) -> bool {
+        use std::io::Read;
+        let mut file = match fs::File::open(path) {
+            Ok(file) => file,
+            Err(_) => return false,
+        };
+        let mut magic = [0u8; 4];
+        file.read_exact(&mut magic).is_ok() && magic == *b"GQ4C"
+    }
+
+    fn finish_cache_load(
+        ctx: MetalContext,
+        config: Gemma4TextConfig,
+        embed_tables: EmbedTables,
+        weights_mmap_offset: Option<usize>,
+        lm_head_buf: BufferView,
+        per_layer_model_projection_weight: BufferView,
+        final_norm_weight: BufferView,
+        per_layer_projection_norm_weight: BufferView,
+        layers: Vec<Gemma4GpuLayer>,
+        load_start: Instant,
+        load_label: &str,
+    ) -> Self {
+        let hidden_size = config.hidden_size;
+        let num_heads = config.num_attention_heads;
+        let num_kv_heads = config.num_key_value_heads;
+        let intermediate_size = config.intermediate_size;
+        let vocab_size = config.vocab_size;
+        let num_layers = config.num_hidden_layers;
+        let ple_dim = config.hidden_size_per_layer_input;
+        let max_head_dim = config.global_head_dim;
+        let max_q_out = num_heads * max_head_dim;
+        let max_kv_out = num_kv_heads * max_head_dim;
+
         let hidden_buf = ctx.buffer_empty(hidden_size);
         let normed_buf = ctx.buffer_empty(hidden_size);
         let residual_buf = ctx.buffer_empty(hidden_size);
@@ -1146,9 +1508,12 @@ impl Gemma4GpuModel {
                     .new_buffer(byte_len, MTLResourceOptions::StorageModeShared),
             );
         }
-        let f16_bytes = num_kv_heads * kv_capacity as usize * config.head_dim * 2 + num_kv_heads * kv_capacity as usize * config.global_head_dim * 2;
-        let quant_bytes = num_kv_heads * kv_capacity as usize * kv_cache_type.bytes_per_row(config.head_dim) + num_kv_heads * kv_capacity as usize * kv_cache_type.bytes_per_row(config.global_head_dim);
-        println!("  KV cache type: {}, est. memory per layer: {:.1} MB (vs f16: {:.1} MB, {:.0}% savings)",
+        let f16_bytes = num_kv_heads * kv_capacity as usize * config.head_dim * 2
+            + num_kv_heads * kv_capacity as usize * config.global_head_dim * 2;
+        let quant_bytes = num_kv_heads * kv_capacity as usize * kv_cache_type.bytes_per_row(config.head_dim)
+            + num_kv_heads * kv_capacity as usize * kv_cache_type.bytes_per_row(config.global_head_dim);
+        println!(
+            "  KV cache type: {}, est. memory per layer: {:.1} MB (vs f16: {:.1} MB, {:.0}% savings)",
             kv_cache_type,
             quant_bytes as f64 / num_layers as f64 / 1024.0 / 1024.0,
             f16_bytes as f64 / num_layers as f64 / 1024.0 / 1024.0,
@@ -1215,13 +1580,16 @@ impl Gemma4GpuModel {
             "  Decode batch scratch: max_batch={}",
             decode_batch_scratch.max_batch_size
         );
-        println!("  Loaded from Q4 cache successfully");
+        println!(
+            "  Loaded from {} in {:.2}s",
+            load_label,
+            load_start.elapsed().as_secs_f64()
+        );
 
         Gemma4GpuModel {
             ctx,
             config,
-            embed_tokens_f16,
-            embed_tokens_per_layer_f16,
+            embed_tables,
             lm_head_buf,
             layers,
             final_norm_weight,
@@ -1269,7 +1637,150 @@ impl Gemma4GpuModel {
             per_layer_decode_batch_kv_len_bufs,
             per_layer_ple_bufs,
             total_tokens: 0,
+            weights_mmap_offset,
+            embed_decode_scratch: vec![0.0f32; hidden_size],
+            ple_decode_scratch: vec![0.0f32; num_layers * ple_dim],
         }
+    }
+
+    /// Split cache: load weights first, then mmap embeddings.
+    fn load_from_split_cache(
+        model_dir: &str,
+        embed_cache_path: &Path,
+        weights_cache_path: &Path,
+    ) -> Self {
+        let load_start = Instant::now();
+
+        let config_path = Path::new(model_dir).join("config.json");
+        let config_str = fs::read_to_string(&config_path).expect("Failed to read config.json");
+        let outer: serde_json::Value =
+            serde_json::from_str(&config_str).expect("Failed to parse config.json");
+        let config: Gemma4TextConfig = if let Some(tc) = outer.get("text_config") {
+            serde_json::from_value(tc.clone()).expect("Failed to parse text_config")
+        } else {
+            serde_json::from_str(&config_str).expect("Failed to parse config")
+        };
+
+        let ctx = MetalContext::new();
+        let device = &ctx.device;
+        let num_layers = config.num_hidden_layers;
+
+        let mut weights_file =
+            fs::File::open(weights_cache_path).expect("Failed to open weights cache");
+        let file_len = weights_file
+            .metadata()
+            .expect("weights metadata")
+            .len();
+        let weights_bytes = file_len.saturating_sub(4) as u64;
+
+        let mut magic = [0u8; 4];
+        use std::io::Read;
+        weights_file
+            .read_exact(&mut magic)
+            .expect("read weights cache magic");
+        let aligned_layout = magic == *b"GQ4A";
+        if magic != *b"GQ4W" && !aligned_layout {
+            panic!("Invalid weights cache magic (expected GQ4W or GQ4A)");
+        }
+
+        let mut offset = 4;
+        let (
+            lm_head_buf,
+            per_layer_model_projection_weight,
+            final_norm_weight,
+            per_layer_projection_norm_weight,
+            layers,
+        ) = if aligned_layout {
+            println!(
+                "  Copying weights to GPU: {:.1} MB (aligned layout)...",
+                weights_bytes as f64 / 1024.0 / 1024.0
+            );
+            let copy_start = Instant::now();
+            let weights_buf =
+                MetalContext::buffer_read_from_file(device, &mut weights_file, 4, weights_bytes);
+            println!(
+                "  Weights copied in {:.2}s",
+                copy_start.elapsed().as_secs_f64()
+            );
+            let section = unsafe {
+                std::slice::from_raw_parts(weights_buf.contents() as *const u8, weights_bytes as usize)
+            };
+            let mut section_offset = 0;
+            Self::load_weight_sections(
+                section,
+                &mut section_offset,
+                device,
+                num_layers,
+                true,
+                Some(&weights_buf),
+                0,
+            )
+        } else {
+            let weights_mmap =
+                unsafe { Mmap::map(&weights_file).expect("Failed to mmap weights cache") };
+            println!("  Loading weights (per-tensor copy)...");
+            let weights_load_start = Instant::now();
+            let sections = Self::load_weight_sections(
+                weights_mmap.as_ref(),
+                &mut offset,
+                device,
+                num_layers,
+                false,
+                None,
+                4,
+            );
+            println!(
+                "  Weights loaded in {:.2}s",
+                weights_load_start.elapsed().as_secs_f64()
+            );
+            sections
+        };
+
+        let embed_file = fs::File::open(embed_cache_path).expect("Failed to open embed cache");
+        let embed_mmap = unsafe { Mmap::map(&embed_file).expect("Failed to mmap embed cache") };
+        assert_eq!(&embed_mmap[0..4], b"GQ4E", "Invalid embed cache magic");
+        let mut eoff = 4;
+        let embed_len = Self::read_u64_at(&embed_mmap, &mut eoff);
+        let embed_offset = eoff;
+        eoff += embed_len as usize;
+        println!(
+            "    embed_tokens: {:.1} MB (mmap)",
+            embed_len as f64 / 1024.0 / 1024.0
+        );
+        let ple_len = Self::read_u64_at(&embed_mmap, &mut eoff);
+        let ple_offset = eoff;
+        println!(
+            "    embed_tokens_per_layer: {:.1} MB (mmap)",
+            ple_len as f64 / 1024.0 / 1024.0
+        );
+        let embed_tables = EmbedTables::from_mmap(
+            embed_mmap,
+            embed_offset,
+            embed_len as usize,
+            ple_offset,
+            ple_len as usize,
+        );
+
+        let model = Self::finish_cache_load(
+            ctx,
+            config,
+            embed_tables,
+            None,
+            lm_head_buf,
+            per_layer_model_projection_weight,
+            final_norm_weight,
+            per_layer_projection_norm_weight,
+            layers,
+            load_start,
+            "split Q4 cache",
+        );
+
+        if !aligned_layout {
+            println!("  Upgrading weights cache to aligned format for faster loads...");
+            model.save_weights_cache(weights_cache_path);
+        }
+
+        model
     }
 
     /// Forward one token through the entire model. One command buffer per layer.
@@ -1283,45 +1794,25 @@ impl Gemma4GpuModel {
         let eps = self.config.rms_norm_eps as f32;
         let ple_dim = self.config.hidden_size_per_layer_input;
         let num_layers = self.config.num_hidden_layers;
+        let ple_total_dim = num_layers * ple_dim;
 
-        // Embed token (CPU — decode from f16 on the fly)
-        // Gemma scales embeddings by sqrt(hidden_size)
-        let embed_offset = token_id * hidden_size;
-        let embed_scale = (hidden_size as f32).sqrt();
-        let mut embed_f32 = vec![0.0f32; hidden_size];
-        for i in 0..hidden_size {
-            embed_f32[i] = bf16_to_f32(self.embed_tokens_f16[embed_offset + i]) * embed_scale;
-        }
-        MetalContext::write_buffer(&self.hidden_buf, &embed_f32);
+        // CPU embedding lookup (mmap-backed, no GPU gather)
+        self.embed_tables
+            .decode_embed_into(token_id, hidden_size, &mut self.embed_decode_scratch);
+        MetalContext::write_buffer(&self.hidden_buf, &self.embed_decode_scratch);
+        self.embed_tables.decode_ple_into(
+            token_id,
+            ple_total_dim,
+            ple_dim,
+            &mut self.ple_decode_scratch,
+        );
+        MetalContext::write_buffer(&self.ple_token_id_buf, &self.ple_decode_scratch);
 
         let kv_seq = self.kv_seq_len;
 
         // ─── PLE: Compute per-layer inputs on GPU ───
-        // Reference: Gemma4TextModel.get_per_layer_inputs() + project_per_layer_inputs()
-        //
-        // 1. Token identity: embed_tokens_per_layer(token_id) * sqrt(ple_dim)
-        // 2. Context projection: per_layer_model_projection(embed) * (1/sqrt(hidden_size))
-        //    then per_layer_projection_norm (RMSNorm per layer)
-        // 3. Combined: (context_proj + token_identity) * (1/sqrt(2))
-        let ple_total_dim = num_layers * ple_dim;
         let ple_input_scale = std::f32::consts::FRAC_1_SQRT_2; // 1/sqrt(2)
         let context_proj_scale = 1.0 / (hidden_size as f32).sqrt();
-
-        // Step 1: Token identity from embed_tokens_per_layer (CPU decode bf16, write to GPU)
-        let ple_token_offset = token_id * ple_total_dim;
-        let ple_scale = (ple_dim as f32).sqrt();
-        let mut ple_token_identity = vec![0.0f32; ple_total_dim];
-        if ple_token_offset + ple_total_dim <= self.embed_tokens_per_layer_f16.len() {
-            for i in 0..ple_total_dim {
-                ple_token_identity[i] =
-                    bf16_to_f32(self.embed_tokens_per_layer_f16[ple_token_offset + i]) * ple_scale;
-            }
-        }
-        MetalContext::write_buffer(&self.ple_token_id_buf, &ple_token_identity);
-
-        // Steps 2-3: GPU computation (will be part of main command buffer)
-        // We'll encode PLE ops at the start of the main command buffer,
-        // then reference ple_context_proj_buf with offsets per layer.
 
         // Precompute all rotary cos/sin per layer (CPU, trivial)
         let pos = self.total_tokens as f32;
@@ -1403,7 +1894,7 @@ impl Gemma4GpuModel {
             let ple_enc = cmd.new_compute_command_encoder();
 
             // Step 2a: context_proj = per_layer_model_projection @ embed (GPU matvec)
-            self.ctx.encode_matvec_q4(
+            self.ctx.encode_matvec_q4_view(
                 ple_enc,
                 &self.per_layer_model_projection_weight,
                 &self.hidden_buf,
@@ -1422,7 +1913,7 @@ impl Gemma4GpuModel {
             );
 
             // Step 2c: RMSNorm per layer (42 chunks of 256)
-            self.ctx.encode_rmsnorm_per_head(
+            self.ctx.encode_rmsnorm_per_head_view(
                 ple_enc,
                 &self.ple_combined_buf,
                 &self.per_layer_projection_norm_weight,
@@ -1485,7 +1976,7 @@ impl Gemma4GpuModel {
             );
 
             // Pre-attention norm
-            self.ctx.encode_rmsnorm(
+            self.ctx.encode_rmsnorm_view(
                 encoder,
                 &self.hidden_buf,
                 &layer.input_layernorm_weight,
@@ -1496,7 +1987,7 @@ impl Gemma4GpuModel {
 
             // Q projection (always computed)
             if layer.use_f16 {
-                self.ctx.encode_matvec_f16(
+                self.ctx.encode_matvec_f16_view(
                     encoder,
                     &layer.q_proj,
                     &self.normed_buf,
@@ -1505,7 +1996,7 @@ impl Gemma4GpuModel {
                     hidden_size as u32,
                 );
             } else {
-                self.ctx.encode_matvec_q4(
+                self.ctx.encode_matvec_q4_view(
                     encoder,
                     &layer.q_proj,
                     &self.normed_buf,
@@ -1516,7 +2007,7 @@ impl Gemma4GpuModel {
             }
 
             // QK Norm on Q
-            self.ctx.encode_rmsnorm_per_head(
+            self.ctx.encode_rmsnorm_per_head_view(
                 encoder,
                 &self.q_buf,
                 &layer.q_norm_weight,
@@ -1541,7 +2032,7 @@ impl Gemma4GpuModel {
             // K, V only for non-shared layers
             if layer.has_kv {
                 if layer.use_f16 {
-                    self.ctx.encode_matvec_f16(
+                    self.ctx.encode_matvec_f16_view(
                         encoder,
                         &layer.k_proj,
                         &self.normed_buf,
@@ -1549,7 +2040,7 @@ impl Gemma4GpuModel {
                         kv_out as u32,
                         hidden_size as u32,
                     );
-                    self.ctx.encode_matvec_f16(
+                    self.ctx.encode_matvec_f16_view(
                         encoder,
                         &layer.v_proj,
                         &self.normed_buf,
@@ -1558,7 +2049,7 @@ impl Gemma4GpuModel {
                         hidden_size as u32,
                     );
                 } else {
-                    self.ctx.encode_matvec_q4(
+                    self.ctx.encode_matvec_q4_view(
                         encoder,
                         &layer.k_proj,
                         &self.normed_buf,
@@ -1566,7 +2057,7 @@ impl Gemma4GpuModel {
                         kv_out as u32,
                         hidden_size as u32,
                     );
-                    self.ctx.encode_matvec_q4(
+                    self.ctx.encode_matvec_q4_view(
                         encoder,
                         &layer.v_proj,
                         &self.normed_buf,
@@ -1577,7 +2068,7 @@ impl Gemma4GpuModel {
                 }
 
                 // K norm + rotary (full head_dim — non-rotary dims pass through)
-                self.ctx.encode_rmsnorm_per_head(
+                self.ctx.encode_rmsnorm_per_head_view(
                     encoder,
                     &self.k_buf,
                     &layer.k_norm_weight,
@@ -1752,7 +2243,7 @@ impl Gemma4GpuModel {
             }
 
             // O projection (always f16 for quality)
-            self.ctx.encode_matvec_f16(
+            self.ctx.encode_matvec_f16_view(
                 encoder,
                 &layer.o_proj,
                 &self.attn_out_buf,
@@ -1762,7 +2253,7 @@ impl Gemma4GpuModel {
             );
 
             // Post-attention norm (cannot be in-place, use normed_buf as temp)
-            self.ctx.encode_rmsnorm(
+            self.ctx.encode_rmsnorm_view(
                 encoder,
                 &self.o_out_buf,
                 &layer.post_attention_layernorm_weight,
@@ -1790,7 +2281,7 @@ impl Gemma4GpuModel {
             );
 
             // Pre-feedforward norm
-            self.ctx.encode_rmsnorm(
+            self.ctx.encode_rmsnorm_view(
                 encoder,
                 &self.hidden_buf,
                 &layer.pre_feedforward_layernorm_weight,
@@ -1801,7 +2292,7 @@ impl Gemma4GpuModel {
 
             // MLP: gate_proj, up_proj, GeLU activation, down_proj
             if layer.use_f16 {
-                self.ctx.encode_matvec_f16(
+                self.ctx.encode_matvec_f16_view(
                     encoder,
                     &layer.gate_proj,
                     &self.normed_buf,
@@ -1809,7 +2300,7 @@ impl Gemma4GpuModel {
                     intermediate_size as u32,
                     hidden_size as u32,
                 );
-                self.ctx.encode_matvec_f16(
+                self.ctx.encode_matvec_f16_view(
                     encoder,
                     &layer.up_proj,
                     &self.normed_buf,
@@ -1818,7 +2309,7 @@ impl Gemma4GpuModel {
                     hidden_size as u32,
                 );
             } else {
-                self.ctx.encode_matvec_q4(
+                self.ctx.encode_matvec_q4_view(
                     encoder,
                     &layer.gate_proj,
                     &self.normed_buf,
@@ -1826,7 +2317,7 @@ impl Gemma4GpuModel {
                     intermediate_size as u32,
                     hidden_size as u32,
                 );
-                self.ctx.encode_matvec_q4(
+                self.ctx.encode_matvec_q4_view(
                     encoder,
                     &layer.up_proj,
                     &self.normed_buf,
@@ -1843,7 +2334,7 @@ impl Gemma4GpuModel {
                 intermediate_size as u32,
             );
             if layer.use_f16 {
-                self.ctx.encode_matvec_f16(
+                self.ctx.encode_matvec_f16_view(
                     encoder,
                     &layer.down_proj,
                     &self.gelu_buf,
@@ -1852,7 +2343,7 @@ impl Gemma4GpuModel {
                     intermediate_size as u32,
                 );
             } else {
-                self.ctx.encode_matvec_q4(
+                self.ctx.encode_matvec_q4_view(
                     encoder,
                     &layer.down_proj,
                     &self.gelu_buf,
@@ -1863,7 +2354,7 @@ impl Gemma4GpuModel {
             }
 
             // Post-feedforward norm (cannot be in-place, use normed_buf as temp)
-            self.ctx.encode_rmsnorm(
+            self.ctx.encode_rmsnorm_view(
                 encoder,
                 &self.down_buf,
                 &layer.post_feedforward_layernorm_weight,
@@ -1890,7 +2381,7 @@ impl Gemma4GpuModel {
                 hidden_size as u32,
             );
             // Gate: ple_gated = per_layer_input_gate(hidden) → [ple_dim]
-            self.ctx.encode_matvec_f16(
+            self.ctx.encode_matvec_f16_view(
                 encoder,
                 &layer.per_layer_input_gate_weight,
                 &self.hidden_buf,
@@ -1909,7 +2400,7 @@ impl Gemma4GpuModel {
                 ple_dim as u32,
             );
             // Project back: ple_projected = per_layer_projection(ple_normed) → [hidden]
-            self.ctx.encode_matvec_f16(
+            self.ctx.encode_matvec_f16_view(
                 encoder,
                 &layer.per_layer_projection_weight,
                 &self.ple_normed_buf,
@@ -1918,7 +2409,7 @@ impl Gemma4GpuModel {
                 ple_dim as u32,
             );
             // Post-PLE norm
-            self.ctx.encode_rmsnorm(
+            self.ctx.encode_rmsnorm_view(
                 encoder,
                 &self.ple_projected_buf,
                 &layer.post_per_layer_input_norm_weight,
@@ -1961,7 +2452,7 @@ impl Gemma4GpuModel {
         // Final norm
         let cmd = self.ctx.queue.new_command_buffer();
         let encoder = cmd.new_compute_command_encoder();
-        self.ctx.encode_rmsnorm(
+        self.ctx.encode_rmsnorm_view(
             encoder,
             &self.hidden_buf,
             &self.final_norm_weight,
@@ -1979,7 +2470,7 @@ impl Gemma4GpuModel {
         // Use matvec_f16: embed_tokens_f16 is (vocab_size, hidden_size) in bf16
         let cmd2 = self.ctx.queue.new_command_buffer();
         let enc2 = cmd2.new_compute_command_encoder();
-        self.ctx.encode_matvec_q4(
+        self.ctx.encode_matvec_q4_view(
             enc2,
             &self.lm_head_buf,
             &self.normed_buf,
@@ -2153,6 +2644,42 @@ impl Gemma4GpuModel {
         Ok(())
     }
 
+    fn prepare_batched_token_inputs(
+        &self,
+        token_ids: &[usize],
+    ) -> Result<BatchedTokenInputs, String> {
+        let hidden_size = self.config.hidden_size;
+        let num_layers = self.config.num_hidden_layers;
+        let ple_dim = self.config.hidden_size_per_layer_input;
+        let ple_total_dim = num_layers * ple_dim;
+
+        let mut hidden = vec![0.0f32; token_ids.len() * hidden_size];
+        let mut ple_token_identity = vec![0.0f32; token_ids.len() * ple_total_dim];
+
+        for (pos, &token_id) in token_ids.iter().enumerate() {
+            let hidden_offset = pos * hidden_size;
+            self.embed_tables.decode_embed_into(
+                token_id,
+                hidden_size,
+                &mut hidden[hidden_offset..hidden_offset + hidden_size],
+            );
+
+            let ple_out_offset = pos * ple_total_dim;
+            self.embed_tables.decode_ple_into(
+                token_id,
+                ple_total_dim,
+                ple_dim,
+                &mut ple_token_identity[ple_out_offset..ple_out_offset + ple_total_dim],
+            );
+        }
+
+        Ok(BatchedTokenInputs {
+            batch_size: token_ids.len(),
+            hidden,
+            ple_token_identity,
+        })
+    }
+
     fn prepare_decode_batch_rotary(&mut self, slot_views: &[KvSlotView]) -> Result<(), String> {
         for layer_idx in 0..self.layers.len() {
             let layer = &self.layers[layer_idx];
@@ -2256,58 +2783,6 @@ impl Gemma4GpuModel {
         Ok(())
     }
 
-    fn prepare_batched_token_inputs(
-        &self,
-        token_ids: &[usize],
-    ) -> Result<BatchedTokenInputs, String> {
-        let hidden_size = self.config.hidden_size;
-        let num_layers = self.config.num_hidden_layers;
-        let ple_dim = self.config.hidden_size_per_layer_input;
-        let ple_total_dim = num_layers * ple_dim;
-        let embed_scale = (hidden_size as f32).sqrt();
-        let ple_scale = (ple_dim as f32).sqrt();
-
-        let mut hidden = vec![0.0f32; token_ids.len() * hidden_size];
-        let mut ple_token_identity = vec![0.0f32; token_ids.len() * ple_total_dim];
-
-        for (pos, &token_id) in token_ids.iter().enumerate() {
-            let embed_offset = token_id
-                .checked_mul(hidden_size)
-                .ok_or_else(|| format!("token id {} overflowed embedding offset", token_id))?;
-            if embed_offset + hidden_size > self.embed_tokens_f16.len() {
-                return Err(format!("token id {} is outside embed_tokens", token_id));
-            }
-
-            let hidden_offset = pos * hidden_size;
-            for i in 0..hidden_size {
-                hidden[hidden_offset + i] =
-                    bf16_to_f32(self.embed_tokens_f16[embed_offset + i]) * embed_scale;
-            }
-
-            let ple_token_offset = token_id
-                .checked_mul(ple_total_dim)
-                .ok_or_else(|| format!("token id {} overflowed PLE offset", token_id))?;
-            if ple_token_offset + ple_total_dim > self.embed_tokens_per_layer_f16.len() {
-                return Err(format!(
-                    "token id {} is outside embed_tokens_per_layer",
-                    token_id
-                ));
-            }
-
-            let ple_out_offset = pos * ple_total_dim;
-            for i in 0..ple_total_dim {
-                ple_token_identity[ple_out_offset + i] =
-                    bf16_to_f32(self.embed_tokens_per_layer_f16[ple_token_offset + i]) * ple_scale;
-            }
-        }
-
-        Ok(BatchedTokenInputs {
-            batch_size: token_ids.len(),
-            hidden,
-            ple_token_identity,
-        })
-    }
-
     fn f32_byte_offset(elements: usize) -> u64 {
         (elements * std::mem::size_of::<f32>()) as u64
     }
@@ -2395,7 +2870,7 @@ impl Gemma4GpuModel {
         let encoder = cmd.new_compute_command_encoder();
         let total_ple = (seq_len * ple_total_dim) as u32;
 
-        self.ctx.encode_projection_q4_batch(
+        self.ctx.encode_projection_q4_batch_view(
             encoder,
             &self.per_layer_model_projection_weight,
             &self.prefill_scratch.hidden_buf,
@@ -2411,7 +2886,7 @@ impl Gemma4GpuModel {
             total_ple,
             context_proj_scale,
         );
-        self.ctx.encode_rmsnorm_batch(
+        self.ctx.encode_rmsnorm_batch_view(
             encoder,
             &self.prefill_scratch.ple_combined_buf,
             &self.per_layer_projection_norm_weight,
@@ -2469,7 +2944,7 @@ impl Gemma4GpuModel {
         let kv_out = layer.kv_out_dim;
         let eps = self.config.rms_norm_eps as f32;
 
-        self.ctx.encode_rmsnorm_batch(
+        self.ctx.encode_rmsnorm_batch_view(
             encoder,
             &self.prefill_scratch.hidden_buf,
             &layer.input_layernorm_weight,
@@ -2480,7 +2955,7 @@ impl Gemma4GpuModel {
         );
 
         if layer.use_f16 {
-            self.ctx.encode_projection_f16_batch(
+            self.ctx.encode_projection_f16_batch_view(
                 encoder,
                 &layer.q_proj,
                 &self.prefill_scratch.normed_buf,
@@ -2490,7 +2965,7 @@ impl Gemma4GpuModel {
                 seq_len as u32,
             );
             if layer.has_kv {
-                self.ctx.encode_projection_f16_batch(
+                self.ctx.encode_projection_f16_batch_view(
                     encoder,
                     &layer.k_proj,
                     &self.prefill_scratch.normed_buf,
@@ -2499,7 +2974,7 @@ impl Gemma4GpuModel {
                     hidden_size as u32,
                     seq_len as u32,
                 );
-                self.ctx.encode_projection_f16_batch(
+                self.ctx.encode_projection_f16_batch_view(
                     encoder,
                     &layer.v_proj,
                     &self.prefill_scratch.normed_buf,
@@ -2510,7 +2985,7 @@ impl Gemma4GpuModel {
                 );
             }
         } else {
-            self.ctx.encode_projection_q4_batch(
+            self.ctx.encode_projection_q4_batch_view(
                 encoder,
                 &layer.q_proj,
                 &self.prefill_scratch.normed_buf,
@@ -2520,7 +2995,7 @@ impl Gemma4GpuModel {
                 seq_len as u32,
             );
             if layer.has_kv {
-                self.ctx.encode_projection_q4_batch(
+                self.ctx.encode_projection_q4_batch_view(
                     encoder,
                     &layer.k_proj,
                     &self.prefill_scratch.normed_buf,
@@ -2529,7 +3004,7 @@ impl Gemma4GpuModel {
                     hidden_size as u32,
                     seq_len as u32,
                 );
-                self.ctx.encode_projection_q4_batch(
+                self.ctx.encode_projection_q4_batch_view(
                     encoder,
                     &layer.v_proj,
                     &self.prefill_scratch.normed_buf,
@@ -2541,7 +3016,7 @@ impl Gemma4GpuModel {
             }
         }
 
-        self.ctx.encode_rmsnorm_batch(
+        self.ctx.encode_rmsnorm_batch_view(
             encoder,
             &self.prefill_scratch.q_buf,
             &layer.q_norm_weight,
@@ -2552,7 +3027,7 @@ impl Gemma4GpuModel {
         );
 
         if layer.has_kv {
-            self.ctx.encode_rmsnorm_batch(
+            self.ctx.encode_rmsnorm_batch_view(
                 encoder,
                 &self.prefill_scratch.k_buf,
                 &layer.k_norm_weight,
@@ -2832,7 +3307,7 @@ impl Gemma4GpuModel {
             num_heads as u32,
             head_dim as u32,
         );
-        self.ctx.encode_projection_f16_batch(
+        self.ctx.encode_projection_f16_batch_view(
             encoder,
             &layer.o_proj,
             &self.prefill_scratch.q_normed_buf,
@@ -2841,7 +3316,7 @@ impl Gemma4GpuModel {
             q_out as u32,
             seq_len as u32,
         );
-        self.ctx.encode_rmsnorm_batch(
+        self.ctx.encode_rmsnorm_batch_view(
             encoder,
             &self.prefill_scratch.o_out_buf,
             &layer.post_attention_layernorm_weight,
@@ -2864,7 +3339,7 @@ impl Gemma4GpuModel {
             &self.prefill_scratch.residual_buf,
             total_hidden,
         );
-        self.ctx.encode_rmsnorm_batch(
+        self.ctx.encode_rmsnorm_batch_view(
             encoder,
             &self.prefill_scratch.hidden_buf,
             &layer.pre_feedforward_layernorm_weight,
@@ -2874,7 +3349,7 @@ impl Gemma4GpuModel {
             seq_len as u32,
         );
         if layer.use_f16 {
-            self.ctx.encode_projection_f16_batch(
+            self.ctx.encode_projection_f16_batch_view(
                 encoder,
                 &layer.gate_proj,
                 &self.prefill_scratch.normed_buf,
@@ -2883,7 +3358,7 @@ impl Gemma4GpuModel {
                 hidden_size as u32,
                 seq_len as u32,
             );
-            self.ctx.encode_projection_f16_batch(
+            self.ctx.encode_projection_f16_batch_view(
                 encoder,
                 &layer.up_proj,
                 &self.prefill_scratch.normed_buf,
@@ -2893,7 +3368,7 @@ impl Gemma4GpuModel {
                 seq_len as u32,
             );
         } else {
-            self.ctx.encode_projection_q4_batch(
+            self.ctx.encode_projection_q4_batch_view(
                 encoder,
                 &layer.gate_proj,
                 &self.prefill_scratch.normed_buf,
@@ -2902,7 +3377,7 @@ impl Gemma4GpuModel {
                 hidden_size as u32,
                 seq_len as u32,
             );
-            self.ctx.encode_projection_q4_batch(
+            self.ctx.encode_projection_q4_batch_view(
                 encoder,
                 &layer.up_proj,
                 &self.prefill_scratch.normed_buf,
@@ -2920,7 +3395,7 @@ impl Gemma4GpuModel {
             total_intermediate,
         );
         if layer.use_f16 {
-            self.ctx.encode_projection_f16_batch(
+            self.ctx.encode_projection_f16_batch_view(
                 encoder,
                 &layer.down_proj,
                 &self.prefill_scratch.gelu_buf,
@@ -2930,7 +3405,7 @@ impl Gemma4GpuModel {
                 seq_len as u32,
             );
         } else {
-            self.ctx.encode_projection_q4_batch(
+            self.ctx.encode_projection_q4_batch_view(
                 encoder,
                 &layer.down_proj,
                 &self.prefill_scratch.gelu_buf,
@@ -2940,7 +3415,7 @@ impl Gemma4GpuModel {
                 seq_len as u32,
             );
         }
-        self.ctx.encode_rmsnorm_batch(
+        self.ctx.encode_rmsnorm_batch_view(
             encoder,
             &self.prefill_scratch.down_buf,
             &layer.post_feedforward_layernorm_weight,
@@ -2963,7 +3438,7 @@ impl Gemma4GpuModel {
             &self.prefill_scratch.residual_buf,
             total_hidden,
         );
-        self.ctx.encode_projection_f16_batch(
+        self.ctx.encode_projection_f16_batch_view(
             encoder,
             &layer.per_layer_input_gate_weight,
             &self.prefill_scratch.hidden_buf,
@@ -2982,7 +3457,7 @@ impl Gemma4GpuModel {
             ple_dim as u32,
             seq_len as u32,
         );
-        self.ctx.encode_projection_f16_batch(
+        self.ctx.encode_projection_f16_batch_view(
             encoder,
             &layer.per_layer_projection_weight,
             &self.prefill_scratch.up_buf,
@@ -2991,7 +3466,7 @@ impl Gemma4GpuModel {
             ple_dim as u32,
             seq_len as u32,
         );
-        self.ctx.encode_rmsnorm_batch(
+        self.ctx.encode_rmsnorm_batch_view(
             encoder,
             &self.prefill_scratch.o_out_buf,
             &layer.post_per_layer_input_norm_weight,
@@ -3247,7 +3722,7 @@ impl Gemma4GpuModel {
             num_heads as u32,
             head_dim as u32,
         );
-        self.ctx.encode_projection_f16_batch(
+        self.ctx.encode_projection_f16_batch_view(
             encoder,
             &layer.o_proj,
             &self.prefill_scratch.q_normed_buf,
@@ -3256,7 +3731,7 @@ impl Gemma4GpuModel {
             q_out as u32,
             total_seq_len as u32,
         );
-        self.ctx.encode_rmsnorm_batch(
+        self.ctx.encode_rmsnorm_batch_view(
             encoder,
             &self.prefill_scratch.o_out_buf,
             &layer.post_attention_layernorm_weight,
@@ -3279,7 +3754,7 @@ impl Gemma4GpuModel {
             &self.prefill_scratch.residual_buf,
             total_hidden,
         );
-        self.ctx.encode_rmsnorm_batch(
+        self.ctx.encode_rmsnorm_batch_view(
             encoder,
             &self.prefill_scratch.hidden_buf,
             &layer.pre_feedforward_layernorm_weight,
@@ -3289,7 +3764,7 @@ impl Gemma4GpuModel {
             total_seq_len as u32,
         );
         if layer.use_f16 {
-            self.ctx.encode_projection_f16_batch(
+            self.ctx.encode_projection_f16_batch_view(
                 encoder,
                 &layer.gate_proj,
                 &self.prefill_scratch.normed_buf,
@@ -3298,7 +3773,7 @@ impl Gemma4GpuModel {
                 hidden_size as u32,
                 total_seq_len as u32,
             );
-            self.ctx.encode_projection_f16_batch(
+            self.ctx.encode_projection_f16_batch_view(
                 encoder,
                 &layer.up_proj,
                 &self.prefill_scratch.normed_buf,
@@ -3308,7 +3783,7 @@ impl Gemma4GpuModel {
                 total_seq_len as u32,
             );
         } else {
-            self.ctx.encode_projection_q4_batch(
+            self.ctx.encode_projection_q4_batch_view(
                 encoder,
                 &layer.gate_proj,
                 &self.prefill_scratch.normed_buf,
@@ -3317,7 +3792,7 @@ impl Gemma4GpuModel {
                 hidden_size as u32,
                 total_seq_len as u32,
             );
-            self.ctx.encode_projection_q4_batch(
+            self.ctx.encode_projection_q4_batch_view(
                 encoder,
                 &layer.up_proj,
                 &self.prefill_scratch.normed_buf,
@@ -3335,7 +3810,7 @@ impl Gemma4GpuModel {
             total_intermediate,
         );
         if layer.use_f16 {
-            self.ctx.encode_projection_f16_batch(
+            self.ctx.encode_projection_f16_batch_view(
                 encoder,
                 &layer.down_proj,
                 &self.prefill_scratch.gelu_buf,
@@ -3345,7 +3820,7 @@ impl Gemma4GpuModel {
                 total_seq_len as u32,
             );
         } else {
-            self.ctx.encode_projection_q4_batch(
+            self.ctx.encode_projection_q4_batch_view(
                 encoder,
                 &layer.down_proj,
                 &self.prefill_scratch.gelu_buf,
@@ -3355,7 +3830,7 @@ impl Gemma4GpuModel {
                 total_seq_len as u32,
             );
         }
-        self.ctx.encode_rmsnorm_batch(
+        self.ctx.encode_rmsnorm_batch_view(
             encoder,
             &self.prefill_scratch.down_buf,
             &layer.post_feedforward_layernorm_weight,
@@ -3378,7 +3853,7 @@ impl Gemma4GpuModel {
             &self.prefill_scratch.residual_buf,
             total_hidden,
         );
-        self.ctx.encode_projection_f16_batch(
+        self.ctx.encode_projection_f16_batch_view(
             encoder,
             &layer.per_layer_input_gate_weight,
             &self.prefill_scratch.hidden_buf,
@@ -3397,7 +3872,7 @@ impl Gemma4GpuModel {
             ple_dim as u32,
             total_seq_len as u32,
         );
-        self.ctx.encode_projection_f16_batch(
+        self.ctx.encode_projection_f16_batch_view(
             encoder,
             &layer.per_layer_projection_weight,
             &self.prefill_scratch.up_buf,
@@ -3406,7 +3881,7 @@ impl Gemma4GpuModel {
             ple_dim as u32,
             total_seq_len as u32,
         );
-        self.ctx.encode_rmsnorm_batch(
+        self.ctx.encode_rmsnorm_batch_view(
             encoder,
             &self.prefill_scratch.o_out_buf,
             &layer.post_per_layer_input_norm_weight,
@@ -3650,7 +4125,7 @@ impl Gemma4GpuModel {
                 num_heads as u32,
                 head_dim as u32,
             );
-            self.ctx.encode_projection_f16_batch(
+            self.ctx.encode_projection_f16_batch_view(
                 encoder,
                 &layer.o_proj,
                 &self.prefill_scratch.q_normed_buf,
@@ -3659,7 +4134,7 @@ impl Gemma4GpuModel {
                 q_out as u32,
                 seq_len as u32,
             );
-            self.ctx.encode_rmsnorm_batch(
+            self.ctx.encode_rmsnorm_batch_view(
                 encoder,
                 &self.prefill_scratch.o_out_buf,
                 &layer.post_attention_layernorm_weight,
@@ -3682,7 +4157,7 @@ impl Gemma4GpuModel {
                 &self.prefill_scratch.residual_buf,
                 total_hidden,
             );
-            self.ctx.encode_rmsnorm_batch(
+            self.ctx.encode_rmsnorm_batch_view(
                 encoder,
                 &self.prefill_scratch.hidden_buf,
                 &layer.pre_feedforward_layernorm_weight,
@@ -3692,7 +4167,7 @@ impl Gemma4GpuModel {
                 seq_len as u32,
             );
             if layer.use_f16 {
-                self.ctx.encode_projection_f16_batch(
+                self.ctx.encode_projection_f16_batch_view(
                     encoder,
                     &layer.gate_proj,
                     &self.prefill_scratch.normed_buf,
@@ -3701,7 +4176,7 @@ impl Gemma4GpuModel {
                     hidden_size as u32,
                     seq_len as u32,
                 );
-                self.ctx.encode_projection_f16_batch(
+                self.ctx.encode_projection_f16_batch_view(
                     encoder,
                     &layer.up_proj,
                     &self.prefill_scratch.normed_buf,
@@ -3711,7 +4186,7 @@ impl Gemma4GpuModel {
                     seq_len as u32,
                 );
             } else {
-                self.ctx.encode_projection_q4_batch(
+                self.ctx.encode_projection_q4_batch_view(
                     encoder,
                     &layer.gate_proj,
                     &self.prefill_scratch.normed_buf,
@@ -3720,7 +4195,7 @@ impl Gemma4GpuModel {
                     hidden_size as u32,
                     seq_len as u32,
                 );
-                self.ctx.encode_projection_q4_batch(
+                self.ctx.encode_projection_q4_batch_view(
                     encoder,
                     &layer.up_proj,
                     &self.prefill_scratch.normed_buf,
@@ -3738,7 +4213,7 @@ impl Gemma4GpuModel {
                 total_intermediate,
             );
             if layer.use_f16 {
-                self.ctx.encode_projection_f16_batch(
+                self.ctx.encode_projection_f16_batch_view(
                     encoder,
                     &layer.down_proj,
                     &self.prefill_scratch.gelu_buf,
@@ -3748,7 +4223,7 @@ impl Gemma4GpuModel {
                     seq_len as u32,
                 );
             } else {
-                self.ctx.encode_projection_q4_batch(
+                self.ctx.encode_projection_q4_batch_view(
                     encoder,
                     &layer.down_proj,
                     &self.prefill_scratch.gelu_buf,
@@ -3758,7 +4233,7 @@ impl Gemma4GpuModel {
                     seq_len as u32,
                 );
             }
-            self.ctx.encode_rmsnorm_batch(
+            self.ctx.encode_rmsnorm_batch_view(
                 encoder,
                 &self.prefill_scratch.down_buf,
                 &layer.post_feedforward_layernorm_weight,
@@ -3781,7 +4256,7 @@ impl Gemma4GpuModel {
                 &self.prefill_scratch.residual_buf,
                 total_hidden,
             );
-            self.ctx.encode_projection_f16_batch(
+            self.ctx.encode_projection_f16_batch_view(
                 encoder,
                 &layer.per_layer_input_gate_weight,
                 &self.prefill_scratch.hidden_buf,
@@ -3800,7 +4275,7 @@ impl Gemma4GpuModel {
                 ple_dim as u32,
                 seq_len as u32,
             );
-            self.ctx.encode_projection_f16_batch(
+            self.ctx.encode_projection_f16_batch_view(
                 encoder,
                 &layer.per_layer_projection_weight,
                 &self.prefill_scratch.up_buf,
@@ -3809,7 +4284,7 @@ impl Gemma4GpuModel {
                 ple_dim as u32,
                 seq_len as u32,
             );
-            self.ctx.encode_rmsnorm_batch(
+            self.ctx.encode_rmsnorm_batch_view(
                 encoder,
                 &self.prefill_scratch.o_out_buf,
                 &layer.post_per_layer_input_norm_weight,
@@ -3844,7 +4319,7 @@ impl Gemma4GpuModel {
 
         // Final norm + lm_head (still in the same command buffer)
         let encoder = cmd.new_compute_command_encoder();
-        self.ctx.encode_rmsnorm_batch(
+        self.ctx.encode_rmsnorm_batch_view(
             encoder,
             &self.prefill_scratch.hidden_buf,
             &self.final_norm_weight,
@@ -3854,7 +4329,7 @@ impl Gemma4GpuModel {
             seq_len as u32,
         );
         let last_offsets = self.prefill_row_offsets(seq_len - 1);
-        self.ctx.encode_matvec_q4_at(
+        self.ctx.encode_matvec_q4_at_view(
             encoder,
             &self.lm_head_buf,
             &self.prefill_scratch.normed_buf,
@@ -3917,7 +4392,7 @@ impl Gemma4GpuModel {
             let encoder = cmd.new_compute_command_encoder();
             for batch_idx in 0..batch_size {
                 let offsets = self.decode_batch_row_offsets(batch_idx);
-                self.ctx.encode_matvec_q4_at(
+                self.ctx.encode_matvec_q4_at_view(
                     encoder,
                     &self.per_layer_model_projection_weight,
                     &self.decode_batch_scratch.hidden_buf,
@@ -3936,7 +4411,7 @@ impl Gemma4GpuModel {
                     ple_total_dim as u32,
                     context_proj_scale,
                 );
-                self.ctx.encode_rmsnorm_per_head_at(
+                self.ctx.encode_rmsnorm_per_head_at_view(
                     encoder,
                     &self.decode_batch_scratch.ple_combined_buf,
                     offsets.ple_row,
@@ -4006,7 +4481,7 @@ impl Gemma4GpuModel {
                     offsets.hidden,
                     hidden_size as u32,
                 );
-                self.ctx.encode_rmsnorm_at(
+                self.ctx.encode_rmsnorm_at_view(
                     encoder,
                     &self.decode_batch_scratch.hidden_buf,
                     offsets.hidden,
@@ -4018,7 +4493,7 @@ impl Gemma4GpuModel {
                 );
 
                 if layer.use_f16 {
-                    self.ctx.encode_matvec_f16_at(
+                    self.ctx.encode_matvec_f16_at_view(
                         encoder,
                         &layer.q_proj,
                         &self.decode_batch_scratch.normed_buf,
@@ -4029,7 +4504,7 @@ impl Gemma4GpuModel {
                         hidden_size as u32,
                     );
                 } else {
-                    self.ctx.encode_matvec_q4_at(
+                    self.ctx.encode_matvec_q4_at_view(
                         encoder,
                         &layer.q_proj,
                         &self.decode_batch_scratch.normed_buf,
@@ -4040,7 +4515,7 @@ impl Gemma4GpuModel {
                         hidden_size as u32,
                     );
                 }
-                self.ctx.encode_rmsnorm_per_head_at(
+                self.ctx.encode_rmsnorm_per_head_at_view(
                     encoder,
                     &self.decode_batch_scratch.q_buf,
                     offsets.q,
@@ -4068,7 +4543,7 @@ impl Gemma4GpuModel {
 
                 if layer.has_kv {
                     if layer.use_f16 {
-                        self.ctx.encode_matvec_f16_at(
+                        self.ctx.encode_matvec_f16_at_view(
                             encoder,
                             &layer.k_proj,
                             &self.decode_batch_scratch.normed_buf,
@@ -4078,7 +4553,7 @@ impl Gemma4GpuModel {
                             kv_out as u32,
                             hidden_size as u32,
                         );
-                        self.ctx.encode_matvec_f16_at(
+                        self.ctx.encode_matvec_f16_at_view(
                             encoder,
                             &layer.v_proj,
                             &self.decode_batch_scratch.normed_buf,
@@ -4089,7 +4564,7 @@ impl Gemma4GpuModel {
                             hidden_size as u32,
                         );
                     } else {
-                        self.ctx.encode_matvec_q4_at(
+                        self.ctx.encode_matvec_q4_at_view(
                             encoder,
                             &layer.k_proj,
                             &self.decode_batch_scratch.normed_buf,
@@ -4099,7 +4574,7 @@ impl Gemma4GpuModel {
                             kv_out as u32,
                             hidden_size as u32,
                         );
-                        self.ctx.encode_matvec_q4_at(
+                        self.ctx.encode_matvec_q4_at_view(
                             encoder,
                             &layer.v_proj,
                             &self.decode_batch_scratch.normed_buf,
@@ -4111,7 +4586,7 @@ impl Gemma4GpuModel {
                         );
                     }
 
-                    self.ctx.encode_rmsnorm_per_head_at(
+                    self.ctx.encode_rmsnorm_per_head_at_view(
                         encoder,
                         &self.decode_batch_scratch.k_buf,
                         offsets.kv,
@@ -4297,7 +4772,7 @@ impl Gemma4GpuModel {
                     }
                 }
 
-                self.ctx.encode_matvec_f16_at(
+                self.ctx.encode_matvec_f16_at_view(
                     encoder,
                     &layer.o_proj,
                     &self.decode_batch_scratch.attn_out_buf,
@@ -4307,7 +4782,7 @@ impl Gemma4GpuModel {
                     hidden_size as u32,
                     q_out as u32,
                 );
-                self.ctx.encode_rmsnorm_at(
+                self.ctx.encode_rmsnorm_at_view(
                     encoder,
                     &self.decode_batch_scratch.o_out_buf,
                     offsets.hidden,
@@ -4336,7 +4811,7 @@ impl Gemma4GpuModel {
                     offsets.hidden,
                     hidden_size as u32,
                 );
-                self.ctx.encode_rmsnorm_at(
+                self.ctx.encode_rmsnorm_at_view(
                     encoder,
                     &self.decode_batch_scratch.hidden_buf,
                     offsets.hidden,
@@ -4347,7 +4822,7 @@ impl Gemma4GpuModel {
                     eps,
                 );
                 if layer.use_f16 {
-                    self.ctx.encode_matvec_f16_at(
+                    self.ctx.encode_matvec_f16_at_view(
                         encoder,
                         &layer.gate_proj,
                         &self.decode_batch_scratch.normed_buf,
@@ -4357,7 +4832,7 @@ impl Gemma4GpuModel {
                         intermediate_size as u32,
                         hidden_size as u32,
                     );
-                    self.ctx.encode_matvec_f16_at(
+                    self.ctx.encode_matvec_f16_at_view(
                         encoder,
                         &layer.up_proj,
                         &self.decode_batch_scratch.normed_buf,
@@ -4368,7 +4843,7 @@ impl Gemma4GpuModel {
                         hidden_size as u32,
                     );
                 } else {
-                    self.ctx.encode_matvec_q4_at(
+                    self.ctx.encode_matvec_q4_at_view(
                         encoder,
                         &layer.gate_proj,
                         &self.decode_batch_scratch.normed_buf,
@@ -4378,7 +4853,7 @@ impl Gemma4GpuModel {
                         intermediate_size as u32,
                         hidden_size as u32,
                     );
-                    self.ctx.encode_matvec_q4_at(
+                    self.ctx.encode_matvec_q4_at_view(
                         encoder,
                         &layer.up_proj,
                         &self.decode_batch_scratch.normed_buf,
@@ -4400,7 +4875,7 @@ impl Gemma4GpuModel {
                     intermediate_size as u32,
                 );
                 if layer.use_f16 {
-                    self.ctx.encode_matvec_f16_at(
+                    self.ctx.encode_matvec_f16_at_view(
                         encoder,
                         &layer.down_proj,
                         &self.decode_batch_scratch.gelu_buf,
@@ -4411,7 +4886,7 @@ impl Gemma4GpuModel {
                         intermediate_size as u32,
                     );
                 } else {
-                    self.ctx.encode_matvec_q4_at(
+                    self.ctx.encode_matvec_q4_at_view(
                         encoder,
                         &layer.down_proj,
                         &self.decode_batch_scratch.gelu_buf,
@@ -4422,7 +4897,7 @@ impl Gemma4GpuModel {
                         intermediate_size as u32,
                     );
                 }
-                self.ctx.encode_rmsnorm_at(
+                self.ctx.encode_rmsnorm_at_view(
                     encoder,
                     &self.decode_batch_scratch.down_buf,
                     offsets.hidden,
@@ -4451,7 +4926,7 @@ impl Gemma4GpuModel {
                     offsets.hidden,
                     hidden_size as u32,
                 );
-                self.ctx.encode_matvec_f16_at(
+                self.ctx.encode_matvec_f16_at_view(
                     encoder,
                     &layer.per_layer_input_gate_weight,
                     &self.decode_batch_scratch.hidden_buf,
@@ -4471,7 +4946,7 @@ impl Gemma4GpuModel {
                     offsets.intermediate,
                     ple_dim as u32,
                 );
-                self.ctx.encode_matvec_f16_at(
+                self.ctx.encode_matvec_f16_at_view(
                     encoder,
                     &layer.per_layer_projection_weight,
                     &self.decode_batch_scratch.up_buf,
@@ -4481,7 +4956,7 @@ impl Gemma4GpuModel {
                     hidden_size as u32,
                     ple_dim as u32,
                 );
-                self.ctx.encode_rmsnorm_at(
+                self.ctx.encode_rmsnorm_at_view(
                     encoder,
                     &self.decode_batch_scratch.o_out_buf,
                     offsets.hidden,
@@ -4525,7 +5000,7 @@ impl Gemma4GpuModel {
 
         {
             let encoder = cmd.new_compute_command_encoder();
-            self.ctx.encode_rmsnorm_batch(
+            self.ctx.encode_rmsnorm_batch_view(
                 encoder,
                 &self.decode_batch_scratch.hidden_buf,
                 &self.final_norm_weight,
@@ -4537,7 +5012,7 @@ impl Gemma4GpuModel {
             for batch_idx in 0..batch_size {
                 let offsets = self.decode_batch_row_offsets(batch_idx);
                 let logits_offset = Self::f32_byte_offset(batch_idx * vocab_size);
-                self.ctx.encode_matvec_q4_at(
+                self.ctx.encode_matvec_q4_at_view(
                     encoder,
                     &self.lm_head_buf,
                     &self.decode_batch_scratch.normed_buf,
@@ -4776,7 +5251,7 @@ impl Gemma4GpuModel {
         let eps = self.config.rms_norm_eps as f32;
         let cmd = self.ctx.queue.new_command_buffer();
         let encoder = cmd.new_compute_command_encoder();
-        self.ctx.encode_rmsnorm_batch(
+        self.ctx.encode_rmsnorm_batch_view(
             encoder,
             &self.prefill_scratch.hidden_buf,
             &self.final_norm_weight,
@@ -4795,7 +5270,7 @@ impl Gemma4GpuModel {
                 self.prefill_row_offsets(segment.row_start + segment.token_count - 1);
             let cmd = self.ctx.queue.new_command_buffer();
             let encoder = cmd.new_compute_command_encoder();
-            self.ctx.encode_matvec_q4_at(
+            self.ctx.encode_matvec_q4_at_view(
                 encoder,
                 &self.lm_head_buf,
                 &self.prefill_scratch.normed_buf,
@@ -4946,11 +5421,4 @@ fn half_to_f32(bits: u16) -> f32 {
 
 fn bf16_to_f32(bits: u16) -> f32 {
     f32::from_bits((bits as u32) << 16)
-}
-
-/// Convert raw bytes to Vec<u16> (for storing bf16/f16 data compactly).
-fn raw_to_u16(data: &[u8]) -> Vec<u16> {
-    data.chunks_exact(2)
-        .map(|b| u16::from_le_bytes([b[0], b[1]]))
-        .collect()
 }

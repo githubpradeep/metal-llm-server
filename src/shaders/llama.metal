@@ -774,6 +774,44 @@ kernel void vec_add(
     c[gid] = a[gid] + b[gid];
 }
 
+// ─── Embedding Gather (bf16 table → f32 output) ─────────────────────────────
+// Table rows are stored as raw bf16 bits (ushort). Gemma scales by sqrt(row_width).
+
+inline float bf16_bits_to_float(ushort bits) {
+    return as_type<float>(bits << 16);
+}
+
+kernel void embed_gather_bf16(
+    device const ushort* table [[buffer(0)]],
+    device float* out [[buffer(1)]],
+    constant uint& token_id [[buffer(2)]],
+    constant uint& row_width [[buffer(3)]],
+    constant float& scale [[buffer(4)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    if (gid >= row_width) return;
+    ushort bits = table[token_id * row_width + gid];
+    out[gid] = bf16_bits_to_float(bits) * scale;
+}
+
+kernel void embed_gather_bf16_batch(
+    device const ushort* table [[buffer(0)]],
+    device const uint* token_ids [[buffer(1)]],
+    device float* out [[buffer(2)]],
+    constant uint& batch_size [[buffer(3)]],
+    constant uint& row_width [[buffer(4)]],
+    constant float& scale [[buffer(5)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    uint total = batch_size * row_width;
+    if (gid >= total) return;
+    uint batch_idx = gid / row_width;
+    uint col = gid % row_width;
+    uint token_id = token_ids[batch_idx];
+    ushort bits = table[token_id * row_width + col];
+    out[gid] = bf16_bits_to_float(bits) * scale;
+}
+
 // ─── Buffer Copy ─────────────────────────────────────────────────────────────
 // Copy n floats from src to dst (used for residual save)
 
