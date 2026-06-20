@@ -133,7 +133,7 @@ fn flash_attention_enabled() -> bool {
     )
 }
 
-/// Head-dim specialized flash decode (Gemma4 h128/h512). Set ATTENTION_KERNEL=generic
+/// Head-dim specialized flash decode (Gemma4 h256/h512). Set ATTENTION_KERNEL=generic
 /// to force the runtime head_dim kernel. Set ATTENTION_KERNEL=ggml for llama.cpp FA.
 pub fn attention_use_ggml() -> bool {
     matches!(
@@ -160,6 +160,32 @@ pub fn fused_kv_attention_enabled() -> bool {
     )
 }
 
+/// Fuse gate+up+GeLU+down MLP in one encoder call (default on).
+/// Phase 1: parallel dual_gelu → gelu scratch. Phase 2: down matvec.
+/// Set FUSED_MLP_GELU_DOWN=0 to use separate dispatches via FUSED_MLP_PLE.
+pub fn fused_mlp_gelu_down_enabled() -> bool {
+    !matches!(
+        std::env::var("FUSED_MLP_GELU_DOWN").as_deref(),
+        Ok("0") | Ok("false") | Ok("FALSE")
+    )
+}
+
+/// Fuse gate+up+GeLU MLP and PLE gate+GeLU decode paths (default on). Set FUSED_MLP_PLE=0 to disable.
+pub fn fused_mlp_ple_enabled() -> bool {
+    !matches!(
+        std::env::var("FUSED_MLP_PLE").as_deref(),
+        Ok("0") | Ok("false") | Ok("FALSE")
+    )
+}
+
+/// Fuse RMSNorm(sublayer)+residual add on post-attn/post-MLP paths (default on).
+pub fn fused_rmsnorm_acc_enabled() -> bool {
+    !matches!(
+        std::env::var("FUSED_RMSNORM_ACC").as_deref(),
+        Ok("0") | Ok("false") | Ok("FALSE")
+    )
+}
+
 fn attention_threadgroup_size(flash: bool) -> MTLSize {
     if flash {
         MTLSize::new(256, 1, 1)
@@ -182,6 +208,8 @@ pub struct MetalContext {
     pub matvec_q4_lc_pipeline: ComputePipelineState,
     pub matvec_q4_splitk_pipeline: ComputePipelineState,
     pub matvec_q4_dual_pipeline: ComputePipelineState,
+    pub matvec_q4_dual_gelu_pipeline: ComputePipelineState,
+    pub ple_matvec_gelu_q4_pipeline: ComputePipelineState,
     pub matvec_ggml_q4_pipeline: ComputePipelineState,
     pub matvec_ggml_ext_q4_nx4_pipeline: ComputePipelineState,
     pub matvec_ggml_ext_q4_nx8_pipeline: ComputePipelineState,
@@ -196,6 +224,8 @@ pub struct MetalContext {
     pub rmsnorm_pipeline: ComputePipelineState,
     pub rmsnorm_add_pipeline: ComputePipelineState,
     pub rmsnorm_add_save_residual_pipeline: ComputePipelineState,
+    pub rmsnorm_acc_pipeline: ComputePipelineState,
+    pub rmsnorm_acc_out_pipeline: ComputePipelineState,
     pub rmsnorm_batch_pipeline: ComputePipelineState,
     pub rmsnorm_noweight_batch_pipeline: ComputePipelineState,
     pub silu_mul_pipeline: ComputePipelineState,
@@ -237,9 +267,11 @@ pub struct MetalContext {
     pub attention_causal_q8_0_pipeline: ComputePipelineState,
     pub attention_causal_strided_q8_0_pipeline: ComputePipelineState,
     pub attention_offset_q4_0_pipeline: ComputePipelineState,
+    pub attention_offset_q4_0_h256_pipeline: ComputePipelineState,
     pub attention_offset_q4_0_h128_pipeline: ComputePipelineState,
     pub attention_offset_q4_0_h512_pipeline: ComputePipelineState,
     pub attention_fused_q4_0_pipeline: ComputePipelineState,
+    pub attention_fused_q4_0_h256_pipeline: ComputePipelineState,
     pub attention_fused_q4_0_h128_pipeline: ComputePipelineState,
     pub attention_fused_q4_0_h512_pipeline: ComputePipelineState,
     pub flash_attn_ggml_q4_h256_pipeline: ComputePipelineState,
@@ -307,6 +339,8 @@ impl MetalContext {
         let matvec_q4_lc_pipeline = get_fn("matvec_q4_lc");
         let matvec_q4_splitk_pipeline = get_fn("matvec_q4_splitk");
         let matvec_q4_dual_pipeline = get_fn("matvec_q4_dual");
+        let matvec_q4_dual_gelu_pipeline = get_fn("matvec_q4_dual_gelu");
+        let ple_matvec_gelu_q4_pipeline = get_fn("ple_matvec_gelu_q4");
         let matvec_ggml_q4_pipeline = get_fn("matvec_ggml_q4_0");
         let matvec_ggml_ext_q4_nx4_pipeline = get_fn("matvec_ggml_ext_q4_nx4_r4");
         let matvec_ggml_ext_q4_nx8_pipeline = get_fn("matvec_ggml_ext_q4_nx8_r4");
@@ -338,6 +372,8 @@ impl MetalContext {
         let rmsnorm_pipeline = get_fn("rmsnorm");
         let rmsnorm_add_pipeline = get_fn("rmsnorm_add");
         let rmsnorm_add_save_residual_pipeline = get_fn("rmsnorm_add_save_residual");
+        let rmsnorm_acc_pipeline = get_fn("rmsnorm_acc");
+        let rmsnorm_acc_out_pipeline = get_fn("rmsnorm_acc_out");
         let rmsnorm_batch_pipeline = get_fn("rmsnorm_batch");
         let rmsnorm_noweight_batch_pipeline = get_fn("rmsnorm_noweight_batch");
         let silu_mul_pipeline = get_fn("silu_mul");
@@ -396,9 +432,11 @@ impl MetalContext {
         } else {
             "attention_single_token_offset_q4_0"
         });
+        let attention_offset_q4_0_h256_pipeline = get_fn("attention_flash_decode_q4_0_h256");
         let attention_offset_q4_0_h128_pipeline = get_fn("attention_flash_decode_q4_0_h128");
         let attention_offset_q4_0_h512_pipeline = get_fn("attention_flash_decode_q4_0_h512");
         let attention_fused_q4_0_pipeline = get_fn("attention_flash_decode_fused_q4_0");
+        let attention_fused_q4_0_h256_pipeline = get_fn("attention_flash_decode_fused_q4_0_h256");
         let attention_fused_q4_0_h128_pipeline = get_fn("attention_flash_decode_fused_q4_0_h128");
         let attention_fused_q4_0_h512_pipeline = get_fn("attention_flash_decode_fused_q4_0_h512");
         let flash_attn_ggml_q4_h256_pipeline = get_fn("flash_attn_ggml_q4_0_h256");
@@ -423,10 +461,18 @@ impl MetalContext {
             if attention_use_ggml() {
                 println!("  Q4 decode attention: ggml flash_attn_ext_vec (ATTENTION_KERNEL=ggml)");
             } else if attention_q4_hd_specialized() {
-                println!("  Q4 decode attention: h128/h512 specialized (ATTENTION_KERNEL=generic to disable)");
+                println!("  Q4 decode attention: h256/h512 specialized (ATTENTION_KERNEL=generic to disable)");
             }
             if fused_kv_attention_enabled() {
                 println!("  Fused KV append + Q4 flash attention (FUSED_KV_ATTN=0 to disable)");
+            }
+            if fused_mlp_gelu_down_enabled() {
+                println!("  Fused MLP gate+up+GeLU+down pipeline (FUSED_MLP_GELU_DOWN=0 to disable)");
+            } else if fused_mlp_ple_enabled() {
+                println!("  Fused MLP gate+up+GeLU and PLE gate+GeLU (FUSED_MLP_PLE=0 to disable)");
+            }
+            if fused_rmsnorm_acc_enabled() {
+                println!("  Fused post-attn/post-MLP RMSNorm+residual (FUSED_RMSNORM_ACC=0 to disable)");
             }
         }
 
@@ -443,6 +489,8 @@ impl MetalContext {
             matvec_q4_lc_pipeline,
             matvec_q4_splitk_pipeline,
             matvec_q4_dual_pipeline,
+            matvec_q4_dual_gelu_pipeline,
+            ple_matvec_gelu_q4_pipeline,
             matvec_ggml_q4_pipeline,
             matvec_ggml_ext_q4_nx4_pipeline,
             matvec_ggml_ext_q4_nx8_pipeline,
@@ -456,6 +504,8 @@ impl MetalContext {
             rmsnorm_pipeline,
             rmsnorm_add_pipeline,
             rmsnorm_add_save_residual_pipeline,
+            rmsnorm_acc_pipeline,
+            rmsnorm_acc_out_pipeline,
             rmsnorm_batch_pipeline,
             rmsnorm_noweight_batch_pipeline,
             silu_mul_pipeline,
@@ -497,9 +547,11 @@ impl MetalContext {
             attention_causal_q8_0_pipeline,
             attention_causal_strided_q8_0_pipeline,
             attention_offset_q4_0_pipeline,
+            attention_offset_q4_0_h256_pipeline,
             attention_offset_q4_0_h128_pipeline,
             attention_offset_q4_0_h512_pipeline,
             attention_fused_q4_0_pipeline,
+            attention_fused_q4_0_h256_pipeline,
             attention_fused_q4_0_h128_pipeline,
             attention_fused_q4_0_h512_pipeline,
             flash_attn_ggml_q4_h256_pipeline,
@@ -1287,6 +1339,170 @@ impl MetalContext {
         encoder.dispatch_thread_groups(num_tgs, tg_size);
     }
 
+    /// Fused gate+up Q4 matvec + GeLU(gate)*up → single output (MLP decode).
+    pub fn encode_matvec_q4_dual_gelu_view(
+        &self,
+        encoder: &ComputeCommandEncoderRef,
+        w0: &BufferView,
+        w1: &BufferView,
+        x_buf: &Buffer,
+        y_buf: &Buffer,
+        m: u32,
+        k: u32,
+    ) {
+        self.encode_matvec_q4_dual_gelu_at_view(
+            encoder, w0, w1, x_buf, 0, y_buf, 0, m, k,
+        );
+    }
+
+    pub fn encode_matvec_q4_dual_gelu_at_view(
+        &self,
+        encoder: &ComputeCommandEncoderRef,
+        w0: &BufferView,
+        w1: &BufferView,
+        x_buf: &Buffer,
+        x_offset: u64,
+        y_buf: &Buffer,
+        y_offset: u64,
+        m: u32,
+        k: u32,
+    ) {
+        encoder.set_compute_pipeline_state(&self.matvec_q4_dual_gelu_pipeline);
+        encoder.set_buffer(0, Some(&w0.buffer), w0.offset);
+        encoder.set_buffer(1, Some(&w1.buffer), w1.offset);
+        encoder.set_buffer(2, Some(x_buf), x_offset);
+        encoder.set_buffer(3, Some(y_buf), y_offset);
+        encoder.set_bytes(4, 4, &m as *const u32 as *const _);
+        encoder.set_bytes(5, 4, &k as *const u32 as *const _);
+        const SG_PER_TG: u64 = 8;
+        let rows_per_tg = SG_PER_TG * 4;
+        let num_tgs = MTLSize::new((m as u64 + rows_per_tg - 1) / rows_per_tg, 1, 1);
+        let tg_size = MTLSize::new(SG_PER_TG * 32, 1, 1);
+        encoder.dispatch_thread_groups(num_tgs, tg_size);
+    }
+
+    /// Fused gate+up+GeLU+down Q4 MLP: dual_gelu into scratch, then down matvec
+    /// (same command-buffer encoder, sequential dispatches — no gelu DRAM round-trip
+    /// between separate Rust call sites).
+    pub fn encode_mlp_fused_q4_gelu_down_view(
+        &self,
+        encoder: &ComputeCommandEncoderRef,
+        gate: &BufferView,
+        up: &BufferView,
+        down: &BufferView,
+        x_buf: &Buffer,
+        gelu_buf: &Buffer,
+        y_buf: &Buffer,
+        hidden_size: u32,
+        intermediate_size: u32,
+    ) {
+        self.encode_mlp_fused_q4_gelu_down_at_view(
+            encoder,
+            gate,
+            up,
+            down,
+            x_buf,
+            0,
+            gelu_buf,
+            0,
+            y_buf,
+            0,
+            hidden_size,
+            intermediate_size,
+        );
+    }
+
+    pub fn encode_mlp_fused_q4_gelu_down_at_view(
+        &self,
+        encoder: &ComputeCommandEncoderRef,
+        gate: &BufferView,
+        up: &BufferView,
+        down: &BufferView,
+        x_buf: &Buffer,
+        x_offset: u64,
+        gelu_buf: &Buffer,
+        gelu_offset: u64,
+        y_buf: &Buffer,
+        y_offset: u64,
+        hidden_size: u32,
+        intermediate_size: u32,
+    ) {
+        self.encode_matvec_q4_dual_gelu_at_view(
+            encoder,
+            gate,
+            up,
+            x_buf,
+            x_offset,
+            gelu_buf,
+            gelu_offset,
+            intermediate_size,
+            hidden_size,
+        );
+        self.encode_matvec_q4_at_view(
+            encoder,
+            down,
+            gelu_buf,
+            gelu_offset,
+            y_buf,
+            y_offset,
+            hidden_size,
+            intermediate_size,
+        );
+    }
+
+    /// Fused PLE gate Q4 matvec + GeLU(gate)*context slice.
+    pub fn encode_ple_matvec_gelu_q4_view(
+        &self,
+        encoder: &ComputeCommandEncoderRef,
+        gate_weight: &BufferView,
+        hidden_buf: &Buffer,
+        context_buf: &Buffer,
+        context_offset: u64,
+        out_buf: &Buffer,
+        ple_dim: u32,
+        hidden_size: u32,
+    ) {
+        self.encode_ple_matvec_gelu_q4_at_view(
+            encoder,
+            gate_weight,
+            hidden_buf,
+            0,
+            context_buf,
+            context_offset,
+            out_buf,
+            0,
+            ple_dim,
+            hidden_size,
+        );
+    }
+
+    pub fn encode_ple_matvec_gelu_q4_at_view(
+        &self,
+        encoder: &ComputeCommandEncoderRef,
+        gate_weight: &BufferView,
+        hidden_buf: &Buffer,
+        hidden_offset: u64,
+        context_buf: &Buffer,
+        context_offset: u64,
+        out_buf: &Buffer,
+        out_offset: u64,
+        ple_dim: u32,
+        hidden_size: u32,
+    ) {
+        encoder.set_compute_pipeline_state(&self.ple_matvec_gelu_q4_pipeline);
+        encoder.set_buffer(0, Some(&gate_weight.buffer), gate_weight.offset);
+        encoder.set_buffer(1, Some(hidden_buf), hidden_offset);
+        encoder.set_buffer(2, Some(context_buf), context_offset);
+        encoder.set_buffer(3, Some(out_buf), out_offset);
+        encoder.set_bytes(4, 4, &ple_dim as *const u32 as *const _);
+        encoder.set_bytes(5, 4, &hidden_size as *const u32 as *const _);
+        const SG_PER_TG: u64 = 8;
+        let rows_per_tg = SG_PER_TG * 4;
+        let num_tgs = MTLSize::new((ple_dim as u64 + rows_per_tg - 1) / rows_per_tg, 1, 1);
+        let tg_size = MTLSize::new(SG_PER_TG * 32, 1, 1);
+        encoder.dispatch_thread_groups(num_tgs, tg_size);
+    }
+
     pub fn encode_projection_f16_batch(
         &self,
         encoder: &ComputeCommandEncoderRef,
@@ -1520,6 +1736,67 @@ impl MetalContext {
         encoder.set_buffer(4, Some(residual_out_buf), 0);
         encoder.set_bytes(5, 4, &dim as *const u32 as *const _);
         encoder.set_bytes(6, 4, &eps as *const f32 as *const _);
+        let tg_size = MTLSize::new(256.min(dim as u64), 1, 1);
+        encoder.dispatch_thread_groups(MTLSize::new(1, 1, 1), tg_size);
+    }
+
+    /// Fused RMSNorm(x)*weight accumulated into acc in place (Gemma4 post-norm residual).
+    pub fn encode_rmsnorm_acc_view(
+        &self,
+        encoder: &ComputeCommandEncoderRef,
+        acc_buf: &Buffer,
+        x_buf: &Buffer,
+        weight: &BufferView,
+        dim: u32,
+        eps: f32,
+    ) {
+        self.encode_rmsnorm_acc_at_view(
+            encoder, acc_buf, 0, x_buf, 0, weight, dim, eps,
+        );
+    }
+
+    pub fn encode_rmsnorm_acc_at_view(
+        &self,
+        encoder: &ComputeCommandEncoderRef,
+        acc_buf: &Buffer,
+        acc_offset: u64,
+        x_buf: &Buffer,
+        x_offset: u64,
+        weight: &BufferView,
+        dim: u32,
+        eps: f32,
+    ) {
+        encoder.set_compute_pipeline_state(&self.rmsnorm_acc_pipeline);
+        encoder.set_buffer(0, Some(acc_buf), acc_offset);
+        encoder.set_buffer(1, Some(x_buf), x_offset);
+        encoder.set_buffer(2, Some(&weight.buffer), weight.offset);
+        encoder.set_bytes(3, 4, &dim as *const u32 as *const _);
+        encoder.set_bytes(4, 4, &eps as *const f32 as *const _);
+        let tg_size = MTLSize::new(256.min(dim as u64), 1, 1);
+        encoder.dispatch_thread_groups(MTLSize::new(1, 1, 1), tg_size);
+    }
+
+    /// Fused RMSNorm(x)*weight + acc -> out (batch decode residual path).
+    pub fn encode_rmsnorm_acc_out_at_view(
+        &self,
+        encoder: &ComputeCommandEncoderRef,
+        acc_buf: &Buffer,
+        acc_offset: u64,
+        x_buf: &Buffer,
+        x_offset: u64,
+        weight: &BufferView,
+        out_buf: &Buffer,
+        out_offset: u64,
+        dim: u32,
+        eps: f32,
+    ) {
+        encoder.set_compute_pipeline_state(&self.rmsnorm_acc_out_pipeline);
+        encoder.set_buffer(0, Some(acc_buf), acc_offset);
+        encoder.set_buffer(1, Some(x_buf), x_offset);
+        encoder.set_buffer(2, Some(&weight.buffer), weight.offset);
+        encoder.set_buffer(3, Some(out_buf), out_offset);
+        encoder.set_bytes(4, 4, &dim as *const u32 as *const _);
+        encoder.set_bytes(5, 4, &eps as *const f32 as *const _);
         let tg_size = MTLSize::new(256.min(dim as u64), 1, 1);
         encoder.dispatch_thread_groups(MTLSize::new(1, 1, 1), tg_size);
     }
@@ -2356,6 +2633,7 @@ impl MetalContext {
     fn attention_fused_q4_0_pipeline_for(&self, head_dim: u32) -> &ComputePipelineState {
         if self.use_flash_attention && attention_q4_hd_specialized() {
             match head_dim {
+                256 => return &self.attention_fused_q4_0_h256_pipeline,
                 128 => return &self.attention_fused_q4_0_h128_pipeline,
                 512 => return &self.attention_fused_q4_0_h512_pipeline,
                 _ => {}
@@ -3032,6 +3310,7 @@ impl MetalContext {
     fn attention_offset_q4_0_pipeline_for(&self, head_dim: u32) -> &ComputePipelineState {
         if self.use_flash_attention && attention_q4_hd_specialized() {
             match head_dim {
+                256 => return &self.attention_offset_q4_0_h256_pipeline,
                 128 => return &self.attention_offset_q4_0_h128_pipeline,
                 512 => return &self.attention_offset_q4_0_h512_pipeline,
                 _ => {}

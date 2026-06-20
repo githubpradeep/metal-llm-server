@@ -415,6 +415,161 @@ kernel void matvec_q4_dual(
     matvec_q4_dual_body<4>(W0, W1, x, y0, y1, M, K, tgid, sgid, lane, Q4F_SG);
 }
 
+inline float gelu_pytorch_tanh(float x) {
+    float inner = 0.7978845608f * (x + 0.044715f * x * x * x);
+    inner = clamp(inner, -10.0f, 10.0f);
+    return 0.5f * x * (1.0f + tanh(inner));
+}
+
+// gate+up Q4 matvec fused with GeLU(gate)*up — skips gate/up buffer writes.
+template <uint ROWS>
+inline void matvec_q4_dual_gelu_body(
+    device const uchar* W0,
+    device const uchar* W1,
+    device const float* x,
+    device float* y,
+    uint M,
+    uint K,
+    uint tgid,
+    uint sgid,
+    uint lane,
+    uint sg_per_tg
+) {
+    uint base_row = tgid * (sg_per_tg * ROWS) + sgid * ROWS;
+    uint num_groups = K / Q4_GROUP_SIZE;
+    uint row_bytes = num_groups * Q4_BLOCK_BYTES;
+
+    float acc0[ROWS];
+    float acc1[ROWS];
+    bool valid[ROWS];
+    device const uchar* rptr0[ROWS];
+    device const uchar* rptr1[ROWS];
+    for (uint r = 0; r < ROWS; ++r) {
+        acc0[r] = 0.0f;
+        acc1[r] = 0.0f;
+        uint row = base_row + r;
+        valid[r] = row < M;
+        rptr0[r] = W0 + row * row_bytes;
+        rptr1[r] = W1 + row * row_bytes;
+    }
+
+    for (uint g = lane; g < num_groups; g += SIMD_SIZE) {
+        uint xo = g * Q4_GROUP_SIZE;
+        float4 xv0 = *reinterpret_cast<device const float4*>(&x[xo]);
+        float4 xv1 = *reinterpret_cast<device const float4*>(&x[xo + 4]);
+        float4 xv2 = *reinterpret_cast<device const float4*>(&x[xo + 8]);
+        float4 xv3 = *reinterpret_cast<device const float4*>(&x[xo + 12]);
+        float4 xv4 = *reinterpret_cast<device const float4*>(&x[xo + 16]);
+        float4 xv5 = *reinterpret_cast<device const float4*>(&x[xo + 20]);
+        float4 xv6 = *reinterpret_cast<device const float4*>(&x[xo + 24]);
+        float4 xv7 = *reinterpret_cast<device const float4*>(&x[xo + 28]);
+
+        uint bo = g * Q4_BLOCK_BYTES;
+        for (uint r = 0; r < ROWS; ++r) {
+            if (!valid[r]) continue;
+            float scale0 = float(*reinterpret_cast<device const half*>(&rptr0[r][bo]));
+            acc0[r] += q4_dot_vec_fast(&rptr0[r][bo + 2],
+                                         xv0, xv1, xv2, xv3, xv4, xv5, xv6, xv7) * scale0;
+            float scale1 = float(*reinterpret_cast<device const half*>(&rptr1[r][bo]));
+            acc1[r] += q4_dot_vec_fast(&rptr1[r][bo + 2],
+                                         xv0, xv1, xv2, xv3, xv4, xv5, xv6, xv7) * scale1;
+        }
+    }
+
+    for (uint r = 0; r < ROWS; ++r) {
+        float s0 = simd_sum(acc0[r]);
+        float s1 = simd_sum(acc1[r]);
+        if (lane == 0 && valid[r]) {
+            y[base_row + r] = gelu_pytorch_tanh(s0) * s1;
+        }
+    }
+}
+
+kernel void matvec_q4_dual_gelu(
+    device const uchar* W0 [[buffer(0)]],
+    device const uchar* W1 [[buffer(1)]],
+    device const float* x [[buffer(2)]],
+    device float* y [[buffer(3)]],
+    constant uint& M [[buffer(4)]],
+    constant uint& K [[buffer(5)]],
+    uint tgid [[threadgroup_position_in_grid]],
+    uint sgid [[simdgroup_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]]
+) {
+    matvec_q4_dual_gelu_body<4>(W0, W1, x, y, M, K, tgid, sgid, lane, Q4F_SG);
+}
+
+// PLE decode: gate Q4 matvec + GeLU(gate)*context slice in one dispatch.
+template <uint ROWS>
+inline void matvec_q4_gelu_mul_body(
+    device const uchar* W,
+    device const float* x,
+    device const float* context,
+    device float* y,
+    uint M,
+    uint K,
+    uint tgid,
+    uint sgid,
+    uint lane,
+    uint sg_per_tg
+) {
+    uint base_row = tgid * (sg_per_tg * ROWS) + sgid * ROWS;
+    uint num_groups = K / Q4_GROUP_SIZE;
+    uint row_bytes = num_groups * Q4_BLOCK_BYTES;
+
+    float acc[ROWS];
+    bool valid[ROWS];
+    device const uchar* rptr[ROWS];
+    for (uint r = 0; r < ROWS; ++r) {
+        acc[r] = 0.0f;
+        uint row = base_row + r;
+        valid[r] = row < M;
+        rptr[r] = W + row * row_bytes;
+    }
+
+    for (uint g = lane; g < num_groups; g += SIMD_SIZE) {
+        uint xo = g * Q4_GROUP_SIZE;
+        float4 xv0 = *reinterpret_cast<device const float4*>(&x[xo]);
+        float4 xv1 = *reinterpret_cast<device const float4*>(&x[xo + 4]);
+        float4 xv2 = *reinterpret_cast<device const float4*>(&x[xo + 8]);
+        float4 xv3 = *reinterpret_cast<device const float4*>(&x[xo + 12]);
+        float4 xv4 = *reinterpret_cast<device const float4*>(&x[xo + 16]);
+        float4 xv5 = *reinterpret_cast<device const float4*>(&x[xo + 20]);
+        float4 xv6 = *reinterpret_cast<device const float4*>(&x[xo + 24]);
+        float4 xv7 = *reinterpret_cast<device const float4*>(&x[xo + 28]);
+
+        uint bo = g * Q4_BLOCK_BYTES;
+        for (uint r = 0; r < ROWS; ++r) {
+            if (!valid[r]) continue;
+            float scale = float(*reinterpret_cast<device const half*>(&rptr[r][bo]));
+            acc[r] += q4_dot_vec_fast(&rptr[r][bo + 2],
+                                      xv0, xv1, xv2, xv3, xv4, xv5, xv6, xv7) * scale;
+        }
+    }
+
+    for (uint r = 0; r < ROWS; ++r) {
+        float s = simd_sum(acc[r]);
+        if (lane == 0 && valid[r]) {
+            uint row = base_row + r;
+            y[row] = gelu_pytorch_tanh(s) * context[row];
+        }
+    }
+}
+
+kernel void ple_matvec_gelu_q4(
+    device const uchar* W [[buffer(0)]],
+    device const float* x [[buffer(1)]],
+    device const float* context [[buffer(2)]],
+    device float* y [[buffer(3)]],
+    constant uint& M [[buffer(4)]],
+    constant uint& K [[buffer(5)]],
+    uint tgid [[threadgroup_position_in_grid]],
+    uint sgid [[simdgroup_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]]
+) {
+    matvec_q4_gelu_mul_body<4>(W, x, context, y, M, K, tgid, sgid, lane, Q4F_SG);
+}
+
 // ROWS=1: 8 rows/threadgroup → 4× more SIMD groups in flight than ROWS=4.
 kernel void matvec_q4_r1(
     device const uchar* W_q4 [[buffer(0)]],
@@ -1018,6 +1173,81 @@ kernel void rmsnorm_add_save_residual(
 
     for (uint i = tid; i < dim; i += tg_size) {
         out[i] = residual_out[i] * inv_rms * weight[i];
+    }
+}
+
+// Gemma4 post-norm residual: acc[i] += (x[i] / rms) * weight[i]
+kernel void rmsnorm_acc(
+    device float* acc [[buffer(0)]],
+    device const float* x [[buffer(1)]],
+    device const float* weight [[buffer(2)]],
+    constant uint& dim [[buffer(3)]],
+    constant float& eps [[buffer(4)]],
+    uint tid [[thread_index_in_threadgroup]],
+    uint tg_size [[threads_per_threadgroup]]
+) {
+    threadgroup float shared_sum[256];
+
+    float partial_sum = 0.0f;
+    for (uint i = tid; i < dim; i += tg_size) {
+        float val = x[i];
+        partial_sum += val * val;
+    }
+    shared_sum[tid] = partial_sum;
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint stride = tg_size / 2; stride > 0; stride >>= 1) {
+        if (tid < stride) {
+            shared_sum[tid] += shared_sum[tid + stride];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    float inv_rms = rsqrt(shared_sum[0] / float(dim) + eps);
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint i = tid; i < dim; i += tg_size) {
+        acc[i] += x[i] * inv_rms * weight[i];
+    }
+}
+
+// acc/out split variant for batch decode (residual_buf + normed -> hidden_buf).
+kernel void rmsnorm_acc_out(
+    device const float* acc [[buffer(0)]],
+    device const float* x [[buffer(1)]],
+    device const float* weight [[buffer(2)]],
+    device float* out [[buffer(3)]],
+    constant uint& dim [[buffer(4)]],
+    constant float& eps [[buffer(5)]],
+    uint tid [[thread_index_in_threadgroup]],
+    uint tg_size [[threads_per_threadgroup]]
+) {
+    threadgroup float shared_sum[256];
+
+    float partial_sum = 0.0f;
+    for (uint i = tid; i < dim; i += tg_size) {
+        float val = x[i];
+        partial_sum += val * val;
+    }
+    shared_sum[tid] = partial_sum;
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint stride = tg_size / 2; stride > 0; stride >>= 1) {
+        if (tid < stride) {
+            shared_sum[tid] += shared_sum[tid + stride];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    float inv_rms = rsqrt(shared_sum[0] / float(dim) + eps);
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint i = tid; i < dim; i += tg_size) {
+        out[i] = acc[i] + x[i] * inv_rms * weight[i];
     }
 }
 
@@ -1859,13 +2089,7 @@ kernel void gelu_mul(
     uint gid [[thread_position_in_grid]]
 ) {
     if (gid >= n) return;
-    float x = gate[gid];
-    // sqrt(2/pi) ≈ 0.7978845608
-    float inner = 0.7978845608f * (x + 0.044715f * x * x * x);
-    // Clamp to prevent tanh overflow (tanh saturates at ±1 for |x| > ~10)
-    inner = clamp(inner, -10.0f, 10.0f);
-    float gelu = 0.5f * x * (1.0f + tanh(inner));
-    out[gid] = gelu * up[gid];
+    out[gid] = gelu_pytorch_tanh(gate[gid]) * up[gid];
 }
 
 // ─── Batched PLE GeLU * Context ─────────────────────────────────────────────
@@ -3724,9 +3948,8 @@ kernel void attention_flash_decode_q4_0(
     }
 }
 
-// ─── Flash decode Q4_0: head-dim specialized (Gemma4 sliding h128 / global h512) ─
-// h128 uses TILE_KV=128 so the full sliding window (≤128) fits in one tile —
-// one softmax pass and no outer tile loop for most decode steps.
+// ─── Flash decode Q4_0: head-dim specialized (Gemma4 sliding h256 / global h512) ─
+// h256 uses TILE_KV=256 so the sliding window (≤512) fits in two tiles.
 
 template<uint HEAD_DIM>
 inline void flash_zero_output_hd(
@@ -3993,6 +4216,39 @@ kernel void attention_flash_decode_q4_0_h128(
         shared_q, shared_scores, shared_exp, shared_update);
 }
 
+kernel void attention_flash_decode_q4_0_h256(
+    device const float* Q [[buffer(0)]],
+    device const uchar* K_cache [[buffer(1)]],
+    device const uchar* V_cache [[buffer(2)]],
+    device float* output [[buffer(3)]],
+    constant uint& num_heads [[buffer(4)]],
+    constant uint& num_kv_heads [[buffer(5)]],
+    constant uint& num_kv_groups [[buffer(6)]],
+    constant uint& head_dim [[buffer(7)]],
+    constant uint& kv_seq [[buffer(8)]],
+    constant uint& capacity [[buffer(9)]],
+    constant float& scale [[buffer(10)]],
+    constant uint& kv_start [[buffer(11)]],
+    constant uint& groups_per_row [[buffer(12)]],
+    constant uint& row_bytes [[buffer(13)]],
+    uint tid [[thread_index_in_threadgroup]],
+    uint tgid [[threadgroup_position_in_grid]],
+    uint sgid [[simdgroup_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]]
+) {
+    (void)num_kv_heads;
+    (void)head_dim;
+    (void)groups_per_row;
+    threadgroup float shared_q[256];
+    threadgroup float shared_scores[256];
+    threadgroup float shared_exp[256];
+    threadgroup float shared_update[4];
+    flash_decode_q4_0_hd_body<256, 256>(
+        Q, K_cache, V_cache, output, tgid, num_heads, num_kv_groups, capacity, row_bytes,
+        kv_seq, kv_start, scale, tid, sgid, lane,
+        shared_q, shared_scores, shared_exp, shared_update);
+}
+
 kernel void attention_flash_decode_q4_0_h512(
     device const float* Q [[buffer(0)]],
     device const uchar* K_cache [[buffer(1)]],
@@ -4230,6 +4486,41 @@ kernel void attention_flash_decode_fused_q4_0_h128(
     threadgroup float shared_exp[128];
     threadgroup float shared_update[4];
     flash_decode_fused_q4_0_hd_body<128, 128>(
+        Q, K_f32, V_f32, K_cache, V_cache, output, tgid, num_heads, num_kv_groups,
+        capacity, row_bytes, groups_per_row, kv_seq, kv_start, cur_seq, scale,
+        tid, sgid, lane, shared_q, shared_scores, shared_exp, shared_update);
+}
+
+kernel void attention_flash_decode_fused_q4_0_h256(
+    device const float* Q [[buffer(0)]],
+    device const float* K_f32 [[buffer(1)]],
+    device const float* V_f32 [[buffer(2)]],
+    device float* output [[buffer(3)]],
+    device uchar* K_cache [[buffer(4)]],
+    device uchar* V_cache [[buffer(5)]],
+    constant uint& num_heads [[buffer(6)]],
+    constant uint& num_kv_heads [[buffer(7)]],
+    constant uint& num_kv_groups [[buffer(8)]],
+    constant uint& head_dim [[buffer(9)]],
+    constant uint& kv_seq [[buffer(10)]],
+    constant uint& capacity [[buffer(11)]],
+    constant float& scale [[buffer(12)]],
+    constant uint& kv_start [[buffer(13)]],
+    constant uint& groups_per_row [[buffer(14)]],
+    constant uint& row_bytes [[buffer(15)]],
+    constant uint& cur_seq [[buffer(16)]],
+    uint tid [[thread_index_in_threadgroup]],
+    uint tgid [[threadgroup_position_in_grid]],
+    uint sgid [[simdgroup_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]]
+) {
+    (void)num_kv_heads;
+    (void)head_dim;
+    threadgroup float shared_q[256];
+    threadgroup float shared_scores[256];
+    threadgroup float shared_exp[256];
+    threadgroup float shared_update[4];
+    flash_decode_fused_q4_0_hd_body<256, 256>(
         Q, K_f32, V_f32, K_cache, V_cache, output, tgid, num_heads, num_kv_groups,
         capacity, row_bytes, groups_per_row, kv_seq, kv_start, cur_seq, scale,
         tid, sgid, lane, shared_q, shared_scores, shared_exp, shared_update);
