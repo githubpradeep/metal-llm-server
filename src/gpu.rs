@@ -37,6 +37,43 @@ impl BufferView {
     }
 }
 
+/// Q4 matvec kernel used on the batch-1 decode path. Selectable at runtime via
+/// the `MATVEC_KERNEL` env var (`r1` | `r2` | `r4`/`fast` | `splitk`) so the
+/// best variant for the model's matvec shapes can be chosen from measurement
+/// without a rebuild. Defaults to `Fast` (the previous behavior).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DecodeMatvecKernel {
+    R1,
+    R2,
+    Fast,
+    R8,
+    SplitK,
+}
+
+impl DecodeMatvecKernel {
+    pub fn from_env() -> Self {
+        match std::env::var("MATVEC_KERNEL").as_deref() {
+            Ok("r1") | Ok("R1") => DecodeMatvecKernel::R1,
+            Ok("r2") | Ok("R2") => DecodeMatvecKernel::R2,
+            Ok("r8") | Ok("R8") => DecodeMatvecKernel::R8,
+            Ok("splitk") | Ok("SplitK") | Ok("SPLITK") => DecodeMatvecKernel::SplitK,
+            _ => DecodeMatvecKernel::Fast,
+        }
+    }
+
+    /// Output rows each SIMD group owns for the row-parallel variants. Unused
+    /// for SplitK (which uses one threadgroup per row).
+    pub fn rows_per_sg(self) -> u64 {
+        match self {
+            DecodeMatvecKernel::R1 => 1,
+            DecodeMatvecKernel::R2 => 2,
+            DecodeMatvecKernel::Fast => 4,
+            DecodeMatvecKernel::R8 => 8,
+            DecodeMatvecKernel::SplitK => 4,
+        }
+    }
+}
+
 /// Metal GPU context holding device, command queue, and compiled pipelines.
 pub struct MetalContext {
     pub device: Device,
@@ -44,6 +81,13 @@ pub struct MetalContext {
     pub matvec_pipeline: ComputePipelineState,
     pub matvec_f16_pipeline: ComputePipelineState,
     pub matvec_q4_pipeline: ComputePipelineState,
+    pub matvec_q4_fast_pipeline: ComputePipelineState,
+    pub matvec_q4_r1_pipeline: ComputePipelineState,
+    pub matvec_q4_r2_pipeline: ComputePipelineState,
+    pub matvec_q4_r8_pipeline: ComputePipelineState,
+    pub matvec_q4_splitk_pipeline: ComputePipelineState,
+    /// Decode Q4 matvec variant selected via the MATVEC_KERNEL env var.
+    pub decode_matvec_kernel: DecodeMatvecKernel,
     pub projection_f16_batch_pipeline: ComputePipelineState,
     pub projection_q4_batch_pipeline: ComputePipelineState,
     pub projection_f16_batch_tiled_pipeline: ComputePipelineState,
@@ -96,6 +140,7 @@ pub struct MetalContext {
     pub attention_causal_strided_q4_0_pipeline: ComputePipelineState,
     pub embed_gather_bf16_pipeline: ComputePipelineState,
     pub embed_gather_bf16_batch_pipeline: ComputePipelineState,
+    pub sample_token_pipeline: ComputePipelineState,
 }
 
 impl MetalContext {
@@ -125,6 +170,12 @@ impl MetalContext {
         let matvec_pipeline = get_fn("matvec");
         let matvec_f16_pipeline = get_fn("matvec_f16");
         let matvec_q4_pipeline = get_fn("matvec_q4");
+        let matvec_q4_fast_pipeline = get_fn("matvec_q4_fast");
+        let matvec_q4_r1_pipeline = get_fn("matvec_q4_r1");
+        let matvec_q4_r2_pipeline = get_fn("matvec_q4_r2");
+        let matvec_q4_r8_pipeline = get_fn("matvec_q4_r8");
+        let matvec_q4_splitk_pipeline = get_fn("matvec_q4_splitk");
+        let decode_matvec_kernel = DecodeMatvecKernel::from_env();
         let projection_f16_batch_pipeline = get_fn("projection_f16_batch");
         let projection_q4_batch_pipeline = get_fn("projection_q4_batch");
         let projection_f16_batch_tiled_pipeline = get_fn("projection_f16_batch_tiled");
@@ -178,6 +229,7 @@ impl MetalContext {
         let attention_causal_strided_q4_0_pipeline = get_fn("attention_causal_strided_q4_0");
         let embed_gather_bf16_pipeline = get_fn("embed_gather_bf16");
         let embed_gather_bf16_batch_pipeline = get_fn("embed_gather_bf16_batch");
+        let sample_token_pipeline = get_fn("sample_token");
 
         MetalContext {
             device,
@@ -185,6 +237,12 @@ impl MetalContext {
             matvec_pipeline,
             matvec_f16_pipeline,
             matvec_q4_pipeline,
+            matvec_q4_fast_pipeline,
+            matvec_q4_r1_pipeline,
+            matvec_q4_r2_pipeline,
+            matvec_q4_r8_pipeline,
+            matvec_q4_splitk_pipeline,
+            decode_matvec_kernel,
             projection_f16_batch_pipeline,
             projection_q4_batch_pipeline,
             projection_f16_batch_tiled_pipeline,
@@ -237,6 +295,7 @@ impl MetalContext {
             attention_causal_strided_q4_0_pipeline,
             embed_gather_bf16_pipeline,
             embed_gather_bf16_batch_pipeline,
+            sample_token_pipeline,
         }
     }
 
@@ -376,6 +435,151 @@ impl MetalContext {
         unsafe {
             std::ptr::copy_nonoverlapping(data.as_ptr(), ptr, data.len());
         }
+    }
+
+    pub fn read_u32(buf: &Buffer) -> u32 {
+        let ptr = buf.contents() as *const u32;
+        unsafe { *ptr }
+    }
+
+    /// Microbenchmark: separates fixed per-dispatch / per-commit overhead from
+    /// true Q4 matvec bandwidth. No model needed (uses dummy buffers).
+    /// Dispatch one Q4 matvec with an explicit kernel variant (bypasses the
+    /// MATVEC_KERNEL selection so the benchmark can compare variants directly).
+    fn encode_matvec_q4_variant(
+        &self,
+        encoder: &ComputeCommandEncoderRef,
+        variant: DecodeMatvecKernel,
+        w: &Buffer,
+        x: &Buffer,
+        y: &Buffer,
+        m: u32,
+        k: u32,
+    ) {
+        const SG_PER_TG: u64 = 8;
+        let pipeline = match variant {
+            DecodeMatvecKernel::R1 => &self.matvec_q4_r1_pipeline,
+            DecodeMatvecKernel::R2 => &self.matvec_q4_r2_pipeline,
+            DecodeMatvecKernel::Fast => &self.matvec_q4_fast_pipeline,
+            DecodeMatvecKernel::R8 => &self.matvec_q4_r8_pipeline,
+            DecodeMatvecKernel::SplitK => &self.matvec_q4_splitk_pipeline,
+        };
+        encoder.set_compute_pipeline_state(pipeline);
+        encoder.set_buffer(0, Some(w), 0);
+        encoder.set_buffer(1, Some(x), 0);
+        encoder.set_buffer(2, Some(y), 0);
+        encoder.set_bytes(3, 4, &m as *const u32 as *const _);
+        encoder.set_bytes(4, 4, &k as *const u32 as *const _);
+        let num_tgs = match variant {
+            DecodeMatvecKernel::SplitK => MTLSize::new(m as u64, 1, 1),
+            v => {
+                let rows_per_tg = SG_PER_TG * v.rows_per_sg();
+                MTLSize::new((m as u64 + rows_per_tg - 1) / rows_per_tg, 1, 1)
+            }
+        };
+        encoder.dispatch_thread_groups(num_tgs, MTLSize::new(SG_PER_TG * 32, 1, 1));
+    }
+
+    pub fn bench_matvec(&self) {
+        use std::time::Instant;
+        let reps = 50;
+        let packed = 30;
+        // (M, K, label) representative of the E4B per-token decode matvecs.
+        let shapes: &[(u32, u32, &str)] = &[
+            (2560, 2560, "q/o      hidden x hidden"),
+            (2048, 2560, "kv/proj  ~2k    x hidden"),
+            (16384, 2560, "gate/up  inter  x hidden"),
+            (2560, 16384, "down     hidden x inter"),
+            (262144, 2560, "lm_head  vocab  x hidden"),
+        ];
+        let variants = [
+            ("r1", DecodeMatvecKernel::R1),
+            ("r2", DecodeMatvecKernel::R2),
+            ("fast/4", DecodeMatvecKernel::Fast),
+            ("r8", DecodeMatvecKernel::R8),
+            ("splitk", DecodeMatvecKernel::SplitK),
+        ];
+
+        println!("\n=== matvec_q4 microbenchmark (packed {}/cmdbuf, GB/s) ===", packed);
+        println!("Per-op kernel bandwidth; higher is better. Bytes = weights only.");
+        println!("M1 Pro peak ~200 GB/s.\n");
+        print!("{:<28} {:>8}", "shape", "MB");
+        for (name, _) in variants.iter() {
+            print!(" {:>8}", name);
+        }
+        println!();
+
+        for &(m, k, label) in shapes {
+            let num_groups = (k / 32) as u64;
+            let wbytes = (m as u64) * num_groups * 18;
+            let w = self
+                .device
+                .new_buffer(wbytes, MTLResourceOptions::StorageModeShared);
+            let x = self.buffer_empty(k as usize);
+            let y = self.buffer_empty(m as usize);
+            let mb = wbytes as f64 / 1e6;
+
+            let mut bws = [0.0f64; 5];
+            for (vi, (_, variant)) in variants.iter().enumerate() {
+                // warmup
+                for _ in 0..5 {
+                    let cmd = self.queue.new_command_buffer();
+                    let enc = cmd.new_compute_command_encoder();
+                    self.encode_matvec_q4_variant(enc, *variant, &w, &x, &y, m, k);
+                    enc.end_encoding();
+                    cmd.commit();
+                    cmd.wait_until_completed();
+                }
+                let t = Instant::now();
+                for _ in 0..reps {
+                    let cmd = self.queue.new_command_buffer();
+                    let enc = cmd.new_compute_command_encoder();
+                    for _ in 0..packed {
+                        self.encode_matvec_q4_variant(enc, *variant, &w, &x, &y, m, k);
+                    }
+                    enc.end_encoding();
+                    cmd.commit();
+                    cmd.wait_until_completed();
+                }
+                let per_op_ms = t.elapsed().as_secs_f64() * 1e3 / reps as f64 / packed as f64;
+                bws[vi] = mb / per_op_ms; // MB/ms == GB/s
+            }
+
+            print!("{:<28} {:>8.2}", label, mb);
+            for bw in bws.iter() {
+                print!(" {:>8.0}", bw);
+            }
+            println!();
+        }
+        println!(
+            "\nPick the per-shape winner. Set MATVEC_KERNEL=r1|r2|fast|r8|splitk for the\n\
+             decode path, or we wire per-shape selection once the numbers are in.\n"
+        );
+    }
+
+    /// Fused logit softcap + temperature + min-p sampling on the GPU.
+    /// Writes only the sampled token id (u32) into `out_token_buf`.
+    pub fn encode_sample(
+        &self,
+        encoder: &ComputeCommandEncoderRef,
+        logits_buf: &Buffer,
+        out_token_buf: &Buffer,
+        vocab_size: u32,
+        cap: f32,
+        temperature: f32,
+        min_p: f32,
+        seed: u32,
+    ) {
+        encoder.set_compute_pipeline_state(&self.sample_token_pipeline);
+        encoder.set_buffer(0, Some(logits_buf), 0);
+        encoder.set_buffer(1, Some(out_token_buf), 0);
+        encoder.set_bytes(2, 4, &vocab_size as *const u32 as *const _);
+        encoder.set_bytes(3, 4, &cap as *const f32 as *const _);
+        encoder.set_bytes(4, 4, &temperature as *const f32 as *const _);
+        encoder.set_bytes(5, 4, &min_p as *const f32 as *const _);
+        encoder.set_bytes(6, 4, &seed as *const u32 as *const _);
+        // Single threadgroup of 256 threads (matches SAMPLE_TG in the shader).
+        encoder.dispatch_thread_groups(MTLSize::new(1, 1, 1), MTLSize::new(256, 1, 1));
     }
 
     pub fn encode_embed_gather_bf16(
@@ -634,16 +838,35 @@ impl MetalContext {
         m: u32,
         k: u32,
     ) {
-        encoder.set_compute_pipeline_state(&self.matvec_q4_pipeline);
+        // All variants launch 8 SIMD groups (256 threads) per threadgroup.
+        // The row-parallel variants (r1/r2/fast) differ only in how many output
+        // rows each SIMD group owns; split-K uses one threadgroup per row.
+        const SG_PER_TG: u64 = 8;
+        let kernel = self.decode_matvec_kernel;
+        let pipeline = match kernel {
+            DecodeMatvecKernel::R1 => &self.matvec_q4_r1_pipeline,
+            DecodeMatvecKernel::R2 => &self.matvec_q4_r2_pipeline,
+            DecodeMatvecKernel::Fast => &self.matvec_q4_fast_pipeline,
+            DecodeMatvecKernel::R8 => &self.matvec_q4_r8_pipeline,
+            DecodeMatvecKernel::SplitK => &self.matvec_q4_splitk_pipeline,
+        };
+        encoder.set_compute_pipeline_state(pipeline);
         encoder.set_buffer(0, Some(w_buf), w_offset);
         encoder.set_buffer(1, Some(x_buf), x_offset);
         encoder.set_buffer(2, Some(y_buf), y_offset);
         encoder.set_bytes(3, 4, &m as *const u32 as *const _);
         encoder.set_bytes(4, 4, &k as *const u32 as *const _);
-        // 2 SIMD groups (64 threads) per TG, each TG handles 4 rows
-        let n_rows_per_tg = 4u64;
-        let num_tgs = MTLSize::new((m as u64 + n_rows_per_tg - 1) / n_rows_per_tg, 1, 1);
-        let tg_size = MTLSize::new(64, 1, 1); // 2 SIMD groups × 32 threads
+
+        let num_tgs = match kernel {
+            // One threadgroup per output row.
+            DecodeMatvecKernel::SplitK => MTLSize::new(m as u64, 1, 1),
+            // Each threadgroup produces SG_PER_TG * rows_per_sg output rows.
+            _ => {
+                let rows_per_tg = SG_PER_TG * kernel.rows_per_sg();
+                MTLSize::new((m as u64 + rows_per_tg - 1) / rows_per_tg, 1, 1)
+            }
+        };
+        let tg_size = MTLSize::new(SG_PER_TG * 32, 1, 1); // 8 SIMD groups × 32 threads
         encoder.dispatch_thread_groups(num_tgs, tg_size);
     }
 

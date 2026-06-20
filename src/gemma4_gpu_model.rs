@@ -14,6 +14,18 @@ use crate::kv_pool::{KvCachePool, KvPoolError, KvSlot, KvSlotView};
 
 const DEFAULT_MAX_PREFILL_SEQ: usize = 128;
 const DEFAULT_MAX_DECODE_BATCH: usize = 4;
+
+/// Cumulative per-phase GPU time (ms) and token count for PROFILE_PHASES.
+#[derive(Clone, Copy)]
+struct PhaseState {
+    sums: [f64; 4],
+    count: u64,
+}
+
+thread_local! {
+    static PHASE_STATE: std::cell::Cell<PhaseState> =
+        std::cell::Cell::new(PhaseState { sums: [0.0; 4], count: 0 });
+}
 /// Metal `setBuffer` offset alignment on Apple GPUs.
 const WEIGHT_BLOB_ALIGN: usize = 256;
 const WEIGHT_CACHE_MAGIC_LEN: usize = 4;
@@ -42,6 +54,13 @@ fn configured_max_prefill_seq(kv_capacity: u32) -> usize {
 
 /// Gemma 4 E4B GPU-resident model with persistent KV cache on Metal.
 /// All operations for one token are encoded into a SINGLE command buffer.
+/// Result of a single decode forward pass: either the full (softcapped) logit
+/// vector (CPU sampling path) or the GPU-sampled token id (fused fast path).
+enum DecodeOutput {
+    Logits(Vec<f32>),
+    Token(usize),
+}
+
 pub struct Gemma4GpuModel {
     pub ctx: MetalContext,
     pub config: Gemma4TextConfig,
@@ -74,6 +93,7 @@ pub struct Gemma4GpuModel {
     pub gelu_buf: Buffer,
     pub down_buf: Buffer,
     pub logits_buf: Buffer,
+    pub sample_out_buf: Buffer, // [1] u32: GPU-sampled token id (decode fast path)
     pub prefill_scratch: PrefillScratch,
     pub decode_batch_scratch: DecodeBatchScratch,
 
@@ -812,6 +832,7 @@ impl Gemma4GpuModel {
         let gelu_buf = ctx.buffer_empty(intermediate_size);
         let down_buf = ctx.buffer_empty(hidden_size);
         let logits_buf = ctx.buffer_empty(vocab_size);
+        let sample_out_buf = ctx.buffer_empty_u32(1);
         // PLE scratch
         let ple_embed_buf = ctx.buffer_empty(ple_dim);
         let ple_gated_buf = ctx.buffer_empty(ple_dim);
@@ -938,6 +959,7 @@ impl Gemma4GpuModel {
             gelu_buf,
             down_buf,
             logits_buf,
+            sample_out_buf,
             prefill_scratch,
             decode_batch_scratch,
             ple_embed_buf,
@@ -1480,6 +1502,7 @@ impl Gemma4GpuModel {
         let gelu_buf = ctx.buffer_empty(intermediate_size);
         let down_buf = ctx.buffer_empty(hidden_size);
         let logits_buf = ctx.buffer_empty(vocab_size);
+        let sample_out_buf = ctx.buffer_empty_u32(1);
         let ple_embed_buf = ctx.buffer_empty(ple_dim);
         let ple_gated_buf = ctx.buffer_empty(ple_dim);
         let ple_normed_buf = ctx.buffer_empty(ple_dim);
@@ -1608,6 +1631,7 @@ impl Gemma4GpuModel {
             gelu_buf,
             down_buf,
             logits_buf,
+            sample_out_buf,
             prefill_scratch,
             decode_batch_scratch,
             ple_embed_buf,
@@ -1785,6 +1809,41 @@ impl Gemma4GpuModel {
 
     /// Forward one token through the entire model. One command buffer per layer.
     pub fn forward_single_token(&mut self, token_id: usize) -> Vec<f32> {
+        match self.forward_single_token_inner(token_id, None) {
+            DecodeOutput::Logits(logits) => logits,
+            DecodeOutput::Token(_) => unreachable!("None sample mode must return logits"),
+        }
+    }
+
+    /// Fused decode step: runs the full forward pass and GPU-side sampling in a
+    /// single command buffer, returning the sampled token id. Only 4 bytes are
+    /// read back (the token), avoiding the full-vocab logits readback + CPU
+    /// softmax that `forward_single_token` incurs.
+    pub fn forward_single_token_sample(
+        &mut self,
+        token_id: usize,
+        temperature: f32,
+        min_p: f32,
+        seed: u32,
+    ) -> usize {
+        match self.forward_single_token_inner(token_id, Some((temperature, min_p, seed))) {
+            DecodeOutput::Token(token) => token,
+            DecodeOutput::Logits(_) => unreachable!("sample mode must return a token"),
+        }
+    }
+
+    fn forward_single_token_inner(
+        &mut self,
+        token_id: usize,
+        sample: Option<(f32, f32, u32)>,
+    ) -> DecodeOutput {
+        let __profile = std::env::var("PROFILE_DECODE").is_ok();
+        // When set, splits the token into per-phase command buffers and times
+        // each phase's commit→wait (wall clock). Each phase is its own command
+        // buffer dominated by GPU execution, so the numbers isolate where the
+        // floor is; they include a small fixed sync per phase (note in output).
+        let __pp = std::env::var("PROFILE_PHASES").is_ok();
+        let __t0 = std::time::Instant::now();
         let hidden_size = self.config.hidden_size;
         let num_heads = self.config.num_attention_heads;
         let num_kv_heads = self.config.num_key_value_heads;
@@ -1887,34 +1946,43 @@ impl Gemma4GpuModel {
             );
         }
 
-        let cmd = self.ctx.queue.new_command_buffer();
+        let __t_prep = std::time::Instant::now();
+        // `mut` so the phase profiler can flush and re-open command buffers at
+        // phase boundaries. With PROFILE_PHASES unset these stay a single cmd +
+        // single encoder for the whole token (the Lever-B fast path).
+        let mut cmd = self.ctx.queue.new_command_buffer();
 
-        // ─── PLE pre-pass: encode into the same command buffer ───
+        // Single compute encoder for the entire forward pass. Serial dispatches
+        // within one encoder are ordered with memory coherence, so this is
+        // equivalent to the previous per-layer encoders but avoids ~44
+        // encoder-boundary drains per token.
+        let mut encoder = cmd.new_compute_command_encoder();
+
+        // ─── PLE pre-pass ───
+        // Produces the per-layer PLE inputs contiguously in ple_context_proj_buf;
+        // each layer reads its slice directly (byte offset = layer_idx * ple_dim
+        // * 4), so the previous 42 per-layer copy-out dispatches are gone.
         {
-            let ple_enc = cmd.new_compute_command_encoder();
-
-            // Step 2a: context_proj = per_layer_model_projection @ embed (GPU matvec)
+            // Step 2a: context_proj = per_layer_model_projection @ embed
             self.ctx.encode_matvec_q4_view(
-                ple_enc,
+                encoder,
                 &self.per_layer_model_projection_weight,
                 &self.hidden_buf,
                 &self.ple_context_proj_buf,
                 ple_total_dim as u32,
                 hidden_size as u32,
             );
-
             // Step 2b: context_proj *= 1/sqrt(hidden_size)
             self.ctx.encode_vec_scale(
-                ple_enc,
+                encoder,
                 &self.ple_context_proj_buf,
                 &self.ple_combined_buf,
                 ple_total_dim as u32,
                 context_proj_scale,
             );
-
-            // Step 2c: RMSNorm per layer (42 chunks of 256)
+            // Step 2c: RMSNorm per layer
             self.ctx.encode_rmsnorm_per_head_view(
-                ple_enc,
+                encoder,
                 &self.ple_combined_buf,
                 &self.per_layer_projection_norm_weight,
                 &self.ple_context_proj_buf,
@@ -1922,37 +1990,32 @@ impl Gemma4GpuModel {
                 ple_dim as u32,
                 eps,
             );
-
             // Step 3: combined = (context_proj + token_identity) * 1/sqrt(2)
             self.ctx.encode_vec_add(
-                ple_enc,
+                encoder,
                 &self.ple_context_proj_buf,
                 &self.ple_token_id_buf,
                 &self.ple_combined_buf,
                 ple_total_dim as u32,
             );
             self.ctx.encode_vec_scale(
-                ple_enc,
+                encoder,
                 &self.ple_combined_buf,
                 &self.ple_context_proj_buf,
                 ple_total_dim as u32,
                 ple_input_scale,
             );
+        }
 
-            // Copy per-layer slices from ple_context_proj_buf to per_layer_ple_bufs
-            // (GPU-to-GPU copy, avoids CPU readback)
-            for i in 0..actual_num_layers {
-                let offset = (i * ple_dim * 4) as u64; // byte offset
-                ple_enc.set_compute_pipeline_state(&self.ctx.buf_copy_pipeline);
-                ple_enc.set_buffer(0, Some(&self.ple_context_proj_buf), offset);
-                ple_enc.set_buffer(1, Some(&self.per_layer_ple_bufs[i]), 0);
-                let n = ple_dim as u32;
-                ple_enc.set_bytes(2, 4, &n as *const u32 as *const _);
-                ple_enc
-                    .dispatch_threads(MTLSize::new(ple_dim as u64, 1, 1), MTLSize::new(256, 1, 1));
-            }
-
-            ple_enc.end_encoding();
+        // Phase boundary: PLE pre-pass (profiling only).
+        if __pp {
+            encoder.end_encoding();
+            let __pt = std::time::Instant::now();
+            cmd.commit();
+            cmd.wait_until_completed();
+            Self::phase_accum(0, __pt.elapsed().as_secs_f64() * 1e3);
+            cmd = self.ctx.queue.new_command_buffer();
+            encoder = cmd.new_compute_command_encoder();
         }
 
         for layer_idx in 0..actual_num_layers {
@@ -1964,16 +2027,10 @@ impl Gemma4GpuModel {
             // Gemma4 uses attention_scale = 1.0 (QK norm handles scaling)
             let scale = 1.0f32;
 
-            let encoder = cmd.new_compute_command_encoder();
-
             // ─── Attention Block ───
-            // Save residual
-            self.ctx.encode_copy(
-                encoder,
-                &self.hidden_buf,
-                &self.residual_buf,
-                hidden_size as u32,
-            );
+            // Residual is the current hidden_buf, which is not overwritten until
+            // the residual add below, so no separate "save residual" copy is
+            // needed; the add reads hidden in place.
 
             // Pre-attention norm
             self.ctx.encode_rmsnorm_view(
@@ -2262,23 +2319,29 @@ impl Gemma4GpuModel {
                 eps,
             );
 
-            // Residual add: hidden = residual + normed_attn_output
+            // Residual add (in place): hidden = hidden + normed_attn_output
             self.ctx.encode_vec_add(
                 encoder,
-                &self.residual_buf,
+                &self.hidden_buf,
                 &self.normed_buf,
                 &self.hidden_buf,
                 hidden_size as u32,
             );
 
+            // Phase boundary: attention block (profiling only).
+            if __pp {
+                encoder.end_encoding();
+                let __pt = std::time::Instant::now();
+                cmd.commit();
+                cmd.wait_until_completed();
+                Self::phase_accum(1, __pt.elapsed().as_secs_f64() * 1e3);
+                cmd = self.ctx.queue.new_command_buffer();
+                encoder = cmd.new_compute_command_encoder();
+            }
+
             // ─── MLP Block ───
-            // Save residual
-            self.ctx.encode_copy(
-                encoder,
-                &self.hidden_buf,
-                &self.residual_buf,
-                hidden_size as u32,
-            );
+            // hidden_buf is the residual; it is only read (by the pre-FF norm)
+            // until the residual add below, so no save-residual copy is needed.
 
             // Pre-feedforward norm
             self.ctx.encode_rmsnorm_view(
@@ -2363,23 +2426,18 @@ impl Gemma4GpuModel {
                 eps,
             );
 
-            // Residual add: hidden = residual + normed_mlp_output
+            // Residual add (in place): hidden = hidden + normed_mlp_output
             self.ctx.encode_vec_add(
                 encoder,
-                &self.residual_buf,
+                &self.hidden_buf,
                 &self.normed_buf,
                 &self.hidden_buf,
                 hidden_size as u32,
             );
 
             // ─── Per-Layer Embedding (PLE) — after MLP, before layer_scalar ───
-            // Save residual for PLE
-            self.ctx.encode_copy(
-                encoder,
-                &self.hidden_buf,
-                &self.residual_buf,
-                hidden_size as u32,
-            );
+            // hidden_buf is the residual; it is only read (by the input gate
+            // matvec) until the residual add below, so no save copy is needed.
             // Gate: ple_gated = per_layer_input_gate(hidden) → [ple_dim]
             self.ctx.encode_matvec_f16_view(
                 encoder,
@@ -2390,13 +2448,17 @@ impl Gemma4GpuModel {
                 hidden_size as u32,
             );
             // GeLU activation (PLE uses GeLU, not the model's hidden_activation)
-            // Reuse gelu_mul with up=ple_embed (element-wise multiply after gelu)
-            // gelu_mul does: out = gelu(gate) * up
-            self.ctx.encode_gelu_mul(
+            // gelu_mul does: out = gelu(gate) * up. The "up" operand is this
+            // layer's PLE slice, read in place from ple_context_proj_buf at
+            // byte offset layer_idx * ple_dim * 4 (no per-layer copy needed).
+            self.ctx.encode_gelu_mul_at(
                 encoder,
                 &self.ple_gated_buf,
-                &self.per_layer_ple_bufs[layer_idx],
+                0,
+                &self.ple_context_proj_buf,
+                (layer_idx * ple_dim * 4) as u64,
                 &self.ple_normed_buf,
+                0,
                 ple_dim as u32,
             );
             // Project back: ple_projected = per_layer_projection(ple_normed) → [hidden]
@@ -2417,41 +2479,42 @@ impl Gemma4GpuModel {
                 hidden_size as u32,
                 eps,
             );
-            // Residual: hidden = hidden + ple_output
+            // Residual (in place): hidden = hidden + ple_output
             self.ctx.encode_vec_add(
                 encoder,
-                &self.residual_buf,
+                &self.hidden_buf,
                 &self.o_out_buf,
                 &self.hidden_buf,
                 hidden_size as u32,
             );
 
-            // Layer scalar: hidden *= layer_scalar (prevents signal growth across layers)
-            // Use residual_buf as temp to avoid in-place read/write race
+            // Layer scalar (in place): hidden *= layer_scalar. vec_scale is a
+            // pure elementwise map (dst[i] = scale * src[i]), so src == dst is
+            // race-free and the temp copy is unnecessary.
             self.ctx.encode_vec_scale(
                 encoder,
                 &self.hidden_buf,
-                &self.residual_buf,
+                &self.hidden_buf,
                 hidden_size as u32,
                 layer.layer_scalar,
             );
-            self.ctx.encode_copy(
-                encoder,
-                &self.residual_buf,
-                &self.hidden_buf,
-                hidden_size as u32,
-            );
 
-            encoder.end_encoding();
+            // Phase boundary: MLP + PLE block (profiling only).
+            if __pp {
+                encoder.end_encoding();
+                let __pt = std::time::Instant::now();
+                cmd.commit();
+                cmd.wait_until_completed();
+                Self::phase_accum(2, __pt.elapsed().as_secs_f64() * 1e3);
+                cmd = self.ctx.queue.new_command_buffer();
+                encoder = cmd.new_compute_command_encoder();
+            }
         }
 
-        // Commit all layer work
-        cmd.commit();
-        cmd.wait_until_completed();
-
-        // Final norm
-        let cmd = self.ctx.queue.new_command_buffer();
-        let encoder = cmd.new_compute_command_encoder();
+        // ─── Final norm + LM head (+ optional sampling) — same encoder ───
+        // Reuses the single forward-pass encoder so the whole token is one
+        // encoder + one command buffer (one CPU↔GPU round-trip per token).
+        let cap = self.config.final_logit_softcapping;
         self.ctx.encode_rmsnorm_view(
             encoder,
             &self.hidden_buf,
@@ -2460,43 +2523,136 @@ impl Gemma4GpuModel {
             hidden_size as u32,
             eps,
         );
-        encoder.end_encoding();
-
-        // Submit and wait
-        cmd.commit();
-        cmd.wait_until_completed();
-
-        // Compute logits using GPU (tied embeddings = embed_tokens as lm_head)
-        // Use matvec_f16: embed_tokens_f16 is (vocab_size, hidden_size) in bf16
-        let cmd2 = self.ctx.queue.new_command_buffer();
-        let enc2 = cmd2.new_compute_command_encoder();
+        // Logits via tied embeddings (Q4 lm_head): logits = lm_head @ normed
         self.ctx.encode_matvec_q4_view(
-            enc2,
+            encoder,
             &self.lm_head_buf,
             &self.normed_buf,
             &self.logits_buf,
             vocab_size as u32,
             hidden_size as u32,
         );
-        enc2.end_encoding();
-        cmd2.commit();
-        cmd2.wait_until_completed();
 
-        let mut logits = MetalContext::read_buffer(&self.logits_buf, vocab_size);
+        let output = match sample {
+            Some((temperature, min_p, seed)) => {
+                // GPU-side softcap + min-p sampling; read back only the token id.
+                self.ctx.encode_sample(
+                    encoder,
+                    &self.logits_buf,
+                    &self.sample_out_buf,
+                    vocab_size as u32,
+                    cap,
+                    temperature,
+                    min_p,
+                    seed,
+                );
+                encoder.end_encoding();
+                let __t_encode = std::time::Instant::now();
+                cmd.commit();
+                cmd.wait_until_completed();
+                let __t_gpu = std::time::Instant::now();
+                if __pp {
+                    Self::phase_accum(3, (__t_gpu - __t_encode).as_secs_f64() * 1e3);
+                    Self::phase_end_token();
+                }
+                let tok = MetalContext::read_u32(&self.sample_out_buf) as usize;
+                if __profile {
+                    Self::profile_record(__t0, __t_prep, __t_encode, __t_gpu);
+                }
+                DecodeOutput::Token(tok)
+            }
+            None => {
+                encoder.end_encoding();
+                let __t_encode = std::time::Instant::now();
+                cmd.commit();
+                cmd.wait_until_completed();
+                let __t_gpu = std::time::Instant::now();
+                if __pp {
+                    Self::phase_accum(3, (__t_gpu - __t_encode).as_secs_f64() * 1e3);
+                    Self::phase_end_token();
+                }
 
-        // Logit softcapping: logits = cap * tanh(logits / cap)
-        // Clamp input to tanh to prevent NaN from overflow (same issue as GeLU)
-        let cap = self.config.final_logit_softcapping;
-        for l in logits.iter_mut() {
-            let x = (*l / cap).clamp(-10.0, 10.0);
-            *l = cap * x.tanh();
-        }
+                let mut logits = MetalContext::read_buffer(&self.logits_buf, vocab_size);
+                // Logit softcapping: logits = cap * tanh(logits / cap)
+                // Clamp input to tanh to prevent NaN from overflow.
+                for l in logits.iter_mut() {
+                    let x = (*l / cap).clamp(-10.0, 10.0);
+                    *l = cap * x.tanh();
+                }
+                if __profile {
+                    Self::profile_record(__t0, __t_prep, __t_encode, __t_gpu);
+                }
+                DecodeOutput::Logits(logits)
+            }
+        };
 
         // Update state
         self.total_tokens += 1;
         self.kv_seq_len += 1;
 
-        logits
+        output
+    }
+
+    // Per-phase GPU-time accumulators (PROFILE_PHASES). Index: 0=prepass,
+    // 1=attention, 2=mlp+ple, 3=head. Sums + token count live in a module-level
+    // thread-local (PHASE_STATE) so both helpers share the same window.
+    fn phase_accum(idx: usize, ms: f64) {
+        PHASE_STATE.with(|s| {
+            let mut v = s.get();
+            v.sums[idx] += ms;
+            s.set(v);
+        });
+    }
+
+    fn phase_end_token() {
+        PHASE_STATE.with(|s| {
+            let mut v = s.get();
+            v.count += 1;
+            s.set(v);
+            if v.count % 16 == 0 {
+                let c = v.count as f64;
+                let s0 = v.sums[0] / c;
+                let s1 = v.sums[1] / c;
+                let s2 = v.sums[2] / c;
+                let s3 = v.sums[3] / c;
+                eprintln!(
+                    "[phase profile] n={} avg/token commit->wait ms (incl per-phase sync): prepass={:.2} attention={:.2} mlp_ple={:.2} head={:.2} sum={:.2}",
+                    v.count, s0, s1, s2, s3, s0 + s1 + s2 + s3
+                );
+            }
+        });
+    }
+
+    fn profile_record(
+        t0: std::time::Instant,
+        t_prep: std::time::Instant,
+        t_encode: std::time::Instant,
+        t_gpu: std::time::Instant,
+    ) {
+        use std::cell::Cell;
+        thread_local! {
+            static ACC: Cell<(f64, f64, f64, f64, u64)> = Cell::new((0.0, 0.0, 0.0, 0.0, 0));
+        }
+        let prep = (t_prep - t0).as_secs_f64() * 1e3;
+        let encode = (t_encode - t_prep).as_secs_f64() * 1e3;
+        let gpu = (t_gpu - t_encode).as_secs_f64() * 1e3;
+        let read = t_gpu.elapsed().as_secs_f64() * 1e3;
+        ACC.with(|a| {
+            let (mut p, mut e, mut g, mut r, mut n) = a.get();
+            p += prep;
+            e += encode;
+            g += gpu;
+            r += read;
+            n += 1;
+            if n % 16 == 0 {
+                let nf = n as f64;
+                eprintln!(
+                    "[decode profile] n={} avg/token: cpu_prep={:.2}ms encode={:.2}ms gpu_wait={:.2}ms readback={:.2}ms total={:.2}ms",
+                    n, p / nf, e / nf, g / nf, r / nf, (p + e + g + r) / nf
+                );
+            }
+            a.set((p, e, g, r, n));
+        });
     }
 
     pub fn num_items(&self) -> usize {

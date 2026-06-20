@@ -20,10 +20,17 @@ mod server;
 
 use std::io::{self, Write};
 use std::time::Instant;
+use rand::Rng;
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     let use_gpu = args.iter().any(|a| a == "--gpu");
+
+    if args.iter().any(|a| a == "--bench-matvec") {
+        let ctx = gpu::MetalContext::new();
+        ctx.bench_matvec();
+        return;
+    }
 
     let model_dir = args.iter()
         .filter(|a| !a.starts_with("--") && *a != &args[0])
@@ -77,7 +84,7 @@ fn main() {
 
             let gen_start = Instant::now();
             generate_gemma4_gpu(
-                "<start_of_turn>user\n A train leaves at 8:15 AM and arrives at 11:47 AM. How long was the journey?<end_of_turn>\n<start_of_turn>model\n",
+                "<start_of_turn>user\n Write a short essay about the benefits of exercise. Include an introduction, 3 key points, and a conclusion.<end_of_turn>\n<start_of_turn>model\n",
                 &tokenizer,
                 &mut gpu_model,
                 1000,
@@ -192,7 +199,7 @@ fn generate_gemma4_gpu(
 
     // Prefill
     let token_ids: Vec<usize> = input_ids.iter().map(|&t| t as usize).collect();
-    let mut logits = model.forward_prefill(&token_ids);
+    let logits = model.forward_prefill(&token_ids);
 
     // Decode loop
     let start_time = Instant::now();
@@ -201,9 +208,12 @@ fn generate_gemma4_gpu(
     // Gemma4 stop tokens: <eos> (1), <end_of_turn> (107)
     let eos_tokens: &[usize] = &[1, 106];
 
-    for _ in 0..max_tokens {
-        let next_token = sampling::min_p_sampling(&logits, 0.1);
+    // First token sampled from prefill logits (CPU); subsequent tokens use the
+    // fused GPU sampling path (single command buffer, only token id read back).
+    let mut next_token = sampling::min_p_sampling(&logits, 0.1);
+    let mut rng = rand::thread_rng();
 
+    for _ in 0..max_tokens {
         // Stop at EOS or end-of-turn
         if eos_tokens.contains(&next_token) {
             break;
@@ -214,7 +224,8 @@ fn generate_gemma4_gpu(
         io::stdout().flush().unwrap();
         tokens_generated += 1;
 
-        logits = model.forward_single_token(next_token);
+        let seed: u32 = rng.gen();
+        next_token = model.forward_single_token_sample(next_token, 0.7, 0.1, seed);
     }
 
     let elapsed = start_time.elapsed().as_secs_f64();

@@ -198,6 +198,249 @@ kernel void matvec_q4(
     }
 }
 
+// ─── Q4_0 Matrix-Vector Multiply (vectorized dequant, high occupancy) ───────
+// Faster replacement for matvec_q4 used on the batch-1 decode path.
+//
+// Two changes vs matvec_q4:
+//   1) Vectorized 4-bit unpack. Instead of 32 scalar nibble extracts per group,
+//      each 4-byte chunk (8 weights) is unpacked into two float4 via vector
+//      int ops and dotted against deinterleaved x. This cuts the dequant ALU
+//      work that was making the kernel compute-bound.
+//   2) Larger threadgroups (8 SIMD groups = 256 threads) with each SIMD group
+//      owning Q4F_ROWS output rows. More threads/threadgroup keeps more device
+//      memory requests in flight (better latency hiding => higher bandwidth),
+//      and x is reused from registers across the rows a SIMD group owns.
+//
+// Q4_0 layout per 32-weight group: [f16 scale][16 bytes of packed nibble pairs].
+// Within a byte: low nibble -> even x index, high nibble -> odd x index.
+
+constant uint Q4F_SG   = 8;   // SIMD groups per threadgroup
+constant uint Q4F_ROWS = 4;   // output rows per SIMD group
+
+inline float q4_dot_vec_fast(device const uchar* q,
+                             float4 xv0, float4 xv1, float4 xv2, float4 xv3,
+                             float4 xv4, float4 xv5, float4 xv6, float4 xv7) {
+    float4 acc4 = float4(0.0f);
+
+    // chunk 0: bytes 0-3 -> x[0..7]
+    {
+        packed_uchar4 qp = *reinterpret_cast<device const packed_uchar4*>(q + 0);
+        uint4 qi = uint4(qp[0], qp[1], qp[2], qp[3]);
+        float4 flo = float4(int4(qi & 0xF) - 8);
+        float4 fhi = float4(int4(qi >> 4) - 8);
+        acc4 += flo * float4(xv0.xz, xv1.xz) + fhi * float4(xv0.yw, xv1.yw);
+    }
+    // chunk 1: bytes 4-7 -> x[8..15]
+    {
+        packed_uchar4 qp = *reinterpret_cast<device const packed_uchar4*>(q + 4);
+        uint4 qi = uint4(qp[0], qp[1], qp[2], qp[3]);
+        float4 flo = float4(int4(qi & 0xF) - 8);
+        float4 fhi = float4(int4(qi >> 4) - 8);
+        acc4 += flo * float4(xv2.xz, xv3.xz) + fhi * float4(xv2.yw, xv3.yw);
+    }
+    // chunk 2: bytes 8-11 -> x[16..23]
+    {
+        packed_uchar4 qp = *reinterpret_cast<device const packed_uchar4*>(q + 8);
+        uint4 qi = uint4(qp[0], qp[1], qp[2], qp[3]);
+        float4 flo = float4(int4(qi & 0xF) - 8);
+        float4 fhi = float4(int4(qi >> 4) - 8);
+        acc4 += flo * float4(xv4.xz, xv5.xz) + fhi * float4(xv4.yw, xv5.yw);
+    }
+    // chunk 3: bytes 12-15 -> x[24..31]
+    {
+        packed_uchar4 qp = *reinterpret_cast<device const packed_uchar4*>(q + 12);
+        uint4 qi = uint4(qp[0], qp[1], qp[2], qp[3]);
+        float4 flo = float4(int4(qi & 0xF) - 8);
+        float4 fhi = float4(int4(qi >> 4) - 8);
+        acc4 += flo * float4(xv6.xz, xv7.xz) + fhi * float4(xv6.yw, xv7.yw);
+    }
+
+    return acc4.x + acc4.y + acc4.z + acc4.w;
+}
+
+// Templated body: each SIMD group owns ROWS output rows; SG_PER_TG SIMD groups
+// per threadgroup. Lowering ROWS increases the number of independent row-workers
+// (SIMD groups) in flight and cuts per-thread register pressure, which raises
+// occupancy and memory-level parallelism for the small/medium M matvecs that
+// dominate decode. Higher ROWS amortizes the x loads across rows (cheap, since x
+// is tiny and cached) but starves the GPU when M is small. The right value is
+// shape-dependent, so we expose ROWS=1/2/4 and select per the MATVEC_ROWS env.
+template <uint ROWS>
+inline void matvec_q4_fast_body(
+    device const uchar* W_q4,
+    device const float* x,
+    device float* y,
+    uint M,
+    uint K,
+    uint tgid,
+    uint sgid,
+    uint lane,
+    uint sg_per_tg
+) {
+    uint base_row = tgid * (sg_per_tg * ROWS) + sgid * ROWS;
+    uint num_groups = K / Q4_GROUP_SIZE;
+    uint row_bytes = num_groups * Q4_BLOCK_BYTES;
+
+    float acc[ROWS];
+    bool valid[ROWS];
+    device const uchar* rptr[ROWS];
+    for (uint r = 0; r < ROWS; ++r) {
+        acc[r] = 0.0f;
+        uint row = base_row + r;
+        valid[r] = row < M;
+        rptr[r] = W_q4 + row * row_bytes;
+    }
+
+    for (uint g = lane; g < num_groups; g += SIMD_SIZE) {
+        uint xo = g * Q4_GROUP_SIZE;
+        float4 xv0 = *reinterpret_cast<device const float4*>(&x[xo]);
+        float4 xv1 = *reinterpret_cast<device const float4*>(&x[xo + 4]);
+        float4 xv2 = *reinterpret_cast<device const float4*>(&x[xo + 8]);
+        float4 xv3 = *reinterpret_cast<device const float4*>(&x[xo + 12]);
+        float4 xv4 = *reinterpret_cast<device const float4*>(&x[xo + 16]);
+        float4 xv5 = *reinterpret_cast<device const float4*>(&x[xo + 20]);
+        float4 xv6 = *reinterpret_cast<device const float4*>(&x[xo + 24]);
+        float4 xv7 = *reinterpret_cast<device const float4*>(&x[xo + 28]);
+
+        uint bo = g * Q4_BLOCK_BYTES;
+        for (uint r = 0; r < ROWS; ++r) {
+            if (!valid[r]) continue;
+            float scale = float(*reinterpret_cast<device const half*>(&rptr[r][bo]));
+            acc[r] += q4_dot_vec_fast(&rptr[r][bo + 2],
+                                      xv0, xv1, xv2, xv3, xv4, xv5, xv6, xv7) * scale;
+        }
+    }
+
+    for (uint r = 0; r < ROWS; ++r) {
+        float s = simd_sum(acc[r]);
+        if (lane == 0 && valid[r]) {
+            y[base_row + r] = s;
+        }
+    }
+}
+
+// ROWS=4: 32 rows/threadgroup (current default geometry).
+kernel void matvec_q4_fast(
+    device const uchar* W_q4 [[buffer(0)]],
+    device const float* x [[buffer(1)]],
+    device float* y [[buffer(2)]],
+    constant uint& M [[buffer(3)]],
+    constant uint& K [[buffer(4)]],
+    uint tgid [[threadgroup_position_in_grid]],
+    uint sgid [[simdgroup_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]]
+) {
+    matvec_q4_fast_body<4>(W_q4, x, y, M, K, tgid, sgid, lane, Q4F_SG);
+}
+
+// ROWS=1: 8 rows/threadgroup → 4× more SIMD groups in flight than ROWS=4.
+kernel void matvec_q4_r1(
+    device const uchar* W_q4 [[buffer(0)]],
+    device const float* x [[buffer(1)]],
+    device float* y [[buffer(2)]],
+    constant uint& M [[buffer(3)]],
+    constant uint& K [[buffer(4)]],
+    uint tgid [[threadgroup_position_in_grid]],
+    uint sgid [[simdgroup_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]]
+) {
+    matvec_q4_fast_body<1>(W_q4, x, y, M, K, tgid, sgid, lane, Q4F_SG);
+}
+
+// ROWS=2: 16 rows/threadgroup → 2× more SIMD groups in flight than ROWS=4.
+kernel void matvec_q4_r2(
+    device const uchar* W_q4 [[buffer(0)]],
+    device const float* x [[buffer(1)]],
+    device float* y [[buffer(2)]],
+    constant uint& M [[buffer(3)]],
+    constant uint& K [[buffer(4)]],
+    uint tgid [[threadgroup_position_in_grid]],
+    uint sgid [[simdgroup_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]]
+) {
+    matvec_q4_fast_body<2>(W_q4, x, y, M, K, tgid, sgid, lane, Q4F_SG);
+}
+
+// ROWS=8: 64 rows/threadgroup. Each thread carries 8 independent row
+// accumulators → more in-flight loads per thread (ILP) to hide memory latency,
+// which is the limiter here (kernel sits at ~67% of M1 Pro's 200 GB/s peak and
+// scales up with ROWS). Costs registers; benchmark to confirm it doesn't spill.
+kernel void matvec_q4_r8(
+    device const uchar* W_q4 [[buffer(0)]],
+    device const float* x [[buffer(1)]],
+    device float* y [[buffer(2)]],
+    constant uint& M [[buffer(3)]],
+    constant uint& K [[buffer(4)]],
+    uint tgid [[threadgroup_position_in_grid]],
+    uint sgid [[simdgroup_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]]
+) {
+    matvec_q4_fast_body<8>(W_q4, x, y, M, K, tgid, sgid, lane, Q4F_SG);
+}
+
+// ─── Split-K Q4_0 Matrix-Vector Multiply ────────────────────────────────────
+// One threadgroup (Q4F_SG SIMD groups = 256 threads) cooperates on a SINGLE
+// output row, splitting the K reduction across all 256 threads and combining
+// the partials in threadgroup memory. This keeps the GPU full when M is small
+// but K is large (e.g. down_proj: M=hidden, K=intermediate), where the
+// row-parallel kernels above launch too few threadgroups. Useless for small K
+// (most threads idle), so it is selected per-shape, not unconditionally.
+kernel void matvec_q4_splitk(
+    device const uchar* W_q4 [[buffer(0)]],
+    device const float* x [[buffer(1)]],
+    device float* y [[buffer(2)]],
+    constant uint& M [[buffer(3)]],
+    constant uint& K [[buffer(4)]],
+    uint tgid [[threadgroup_position_in_grid]],
+    uint tid [[thread_index_in_threadgroup]],
+    uint sgid [[simdgroup_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]],
+    uint nthreads [[threads_per_threadgroup]]
+) {
+    uint row = tgid;
+    if (row >= M) return;
+
+    uint num_groups = K / Q4_GROUP_SIZE;
+    uint row_bytes = num_groups * Q4_BLOCK_BYTES;
+    device const uchar* rptr = W_q4 + row * row_bytes;
+
+    float acc = 0.0f;
+    // Each thread processes a strided set of 32-weight groups across the row.
+    for (uint g = tid; g < num_groups; g += nthreads) {
+        uint xo = g * Q4_GROUP_SIZE;
+        float4 xv0 = *reinterpret_cast<device const float4*>(&x[xo]);
+        float4 xv1 = *reinterpret_cast<device const float4*>(&x[xo + 4]);
+        float4 xv2 = *reinterpret_cast<device const float4*>(&x[xo + 8]);
+        float4 xv3 = *reinterpret_cast<device const float4*>(&x[xo + 12]);
+        float4 xv4 = *reinterpret_cast<device const float4*>(&x[xo + 16]);
+        float4 xv5 = *reinterpret_cast<device const float4*>(&x[xo + 20]);
+        float4 xv6 = *reinterpret_cast<device const float4*>(&x[xo + 24]);
+        float4 xv7 = *reinterpret_cast<device const float4*>(&x[xo + 28]);
+
+        uint bo = g * Q4_BLOCK_BYTES;
+        float scale = float(*reinterpret_cast<device const half*>(&rptr[bo]));
+        acc += q4_dot_vec_fast(&rptr[bo + 2],
+                               xv0, xv1, xv2, xv3, xv4, xv5, xv6, xv7) * scale;
+    }
+
+    // Reduce 256 partials → 1: simd_sum within each SIMD group, then combine
+    // the per-SIMD-group results (≤ 8) through threadgroup memory.
+    threadgroup float partials[Q4F_SG];
+    float s = simd_sum(acc);
+    if (lane == 0) {
+        partials[sgid] = s;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tid == 0) {
+        float total = 0.0f;
+        uint groups = nthreads / SIMD_SIZE;
+        for (uint i = 0; i < groups; ++i) {
+            total += partials[i];
+        }
+        y[row] = total;
+    }
+}
+
 // ─── Batched f16 Projection for Prefill ─────────────────────────────────────
 // Computes Y = X * W^T where X is (S, K), W is (M, K), Y is (S, M).
 // Each threadgroup handles four output rows for one sequence position.
@@ -2826,4 +3069,95 @@ kernel void transpose_hsd_to_shd(
     // Output index: (s, h, d)
     uint out_idx = (s * num_heads + h) * head_dim + d;
     output[out_idx] = input[gid];
+}
+
+// ─── Fused logit softcap + min-p sampling (single threadgroup) ──────────────
+// Applies final logit softcapping, temperature, and min-p filtering, then draws
+// a sample using the Gumbel-max trick (argmax of e_i + g_i). This keeps the
+// sampled token on the GPU so the CPU only reads back 4 bytes instead of the
+// full vocab logits, and avoids a CPU-side softmax over the vocabulary.
+//
+// Gumbel-max: sampling i ~ softmax(e) is equivalent to argmax_i(e_i + g_i),
+// g_i = -log(-log(u_i)). min-p keeps tokens with prob >= min_p * max_prob,
+// which in shifted-logit space is e_i >= log(min_p) (e_max = 0).
+
+#define SAMPLE_TG 256
+
+inline float sample_rng_uniform(uint seed, uint idx) {
+    // Cheap hash → uniform in the open interval (0, 1).
+    uint h = seed ^ (idx * 2654435761u);
+    h ^= h >> 16; h *= 0x7feb352du;
+    h ^= h >> 15; h *= 0x846ca68bu;
+    h ^= h >> 16;
+    return (float(h) + 0.5f) / 4294967296.0f;
+}
+
+kernel void sample_token(
+    device const float* logits [[buffer(0)]],
+    device uint* out_token [[buffer(1)]],
+    constant uint& V [[buffer(2)]],
+    constant float& cap [[buffer(3)]],
+    constant float& temperature [[buffer(4)]],
+    constant float& min_p [[buffer(5)]],
+    constant uint& seed [[buffer(6)]],
+    uint tid [[thread_position_in_threadgroup]],
+    uint nthreads [[threads_per_threadgroup]]
+) {
+    threadgroup float s_max[SAMPLE_TG];
+    threadgroup float s_key[SAMPLE_TG];
+    threadgroup uint  s_idx[SAMPLE_TG];
+
+    bool greedy = temperature < 1e-6f;
+    float inv_temp = greedy ? 1.0f : (1.0f / temperature);
+
+    // Phase 1: maximum softcapped logit (for numerical stability + min-p ref).
+    float local_max = -INFINITY;
+    for (uint i = tid; i < V; i += nthreads) {
+        float x = clamp(logits[i] / cap, -10.0f, 10.0f);
+        local_max = max(local_max, cap * tanh(x));
+    }
+    s_max[tid] = local_max;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint s = nthreads >> 1; s > 0; s >>= 1) {
+        if (tid < s) s_max[tid] = max(s_max[tid], s_max[tid + s]);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    float gmax = s_max[0];
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // Phase 2: Gumbel-max over the min-p-filtered set.
+    float log_min_p = (min_p > 0.0f) ? log(min_p) : -INFINITY;
+    float best_key = -INFINITY;
+    uint best_idx = 0;
+    for (uint i = tid; i < V; i += nthreads) {
+        float x = clamp(logits[i] / cap, -10.0f, 10.0f);
+        float sl = cap * tanh(x);
+        float key;
+        if (greedy) {
+            key = sl;
+        } else {
+            float e = (sl - gmax) * inv_temp;
+            if (e < log_min_p) continue;
+            float u = sample_rng_uniform(seed, i);
+            float g = -log(-log(u));
+            key = e + g;
+        }
+        if (key > best_key) {
+            best_key = key;
+            best_idx = i;
+        }
+    }
+    s_key[tid] = best_key;
+    s_idx[tid] = best_idx;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint s = nthreads >> 1; s > 0; s >>= 1) {
+        if (tid < s) {
+            if (s_key[tid + s] > s_key[tid]) {
+                s_key[tid] = s_key[tid + s];
+                s_idx[tid] = s_idx[tid + s];
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    if (tid == 0) out_token[0] = s_idx[0];
 }
