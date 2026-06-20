@@ -578,6 +578,133 @@ kernel void matvec_q4_interleaved_gelu(
     matvec_q4_interleaved_gelu_body<4>(W, x, y, M, K, tgid, sgid, lane, Q4F_SG);
 }
 
+// ─── Fused pre-attn RMSNorm + Q4 Q/K/V projections (decode) ─────────────────
+// inv_rms is computed once via rmsnorm_inv_rms; these kernels matvec with
+// x[i] = hidden[i] * weight[i] * inv_rms without a normed scratch buffer.
+
+template <uint ROWS>
+inline void matvec_q4_rmsnorm_hidden_body(
+    device const uchar* W_q4,
+    device const float* hidden,
+    device const float* weight,
+    float inv_rms,
+    device float* y,
+    uint M,
+    uint K,
+    uint tgid,
+    uint sgid,
+    uint lane,
+    uint sg_per_tg
+) {
+    uint base_row = tgid * (sg_per_tg * ROWS) + sgid * ROWS;
+    uint num_groups = K / Q4_GROUP_SIZE;
+    uint row_bytes = num_groups * Q4_BLOCK_BYTES;
+
+    float acc[ROWS];
+    bool valid[ROWS];
+    device const uchar* rptr[ROWS];
+    for (uint r = 0; r < ROWS; ++r) {
+        acc[r] = 0.0f;
+        uint row = base_row + r;
+        valid[r] = row < M;
+        rptr[r] = W_q4 + row * row_bytes;
+    }
+
+    for (uint g = lane; g < num_groups; g += SIMD_SIZE) {
+        uint xo = g * Q4_GROUP_SIZE;
+        float4 h0 = *reinterpret_cast<device const float4*>(&hidden[xo]);
+        float4 h1 = *reinterpret_cast<device const float4*>(&hidden[xo + 4]);
+        float4 h2 = *reinterpret_cast<device const float4*>(&hidden[xo + 8]);
+        float4 h3 = *reinterpret_cast<device const float4*>(&hidden[xo + 12]);
+        float4 h4 = *reinterpret_cast<device const float4*>(&hidden[xo + 16]);
+        float4 h5 = *reinterpret_cast<device const float4*>(&hidden[xo + 20]);
+        float4 h6 = *reinterpret_cast<device const float4*>(&hidden[xo + 24]);
+        float4 h7 = *reinterpret_cast<device const float4*>(&hidden[xo + 28]);
+        float4 w0 = *reinterpret_cast<device const float4*>(&weight[xo]);
+        float4 w1 = *reinterpret_cast<device const float4*>(&weight[xo + 4]);
+        float4 w2 = *reinterpret_cast<device const float4*>(&weight[xo + 8]);
+        float4 w3 = *reinterpret_cast<device const float4*>(&weight[xo + 12]);
+        float4 w4 = *reinterpret_cast<device const float4*>(&weight[xo + 16]);
+        float4 w5 = *reinterpret_cast<device const float4*>(&weight[xo + 20]);
+        float4 w6 = *reinterpret_cast<device const float4*>(&weight[xo + 24]);
+        float4 w7 = *reinterpret_cast<device const float4*>(&weight[xo + 28]);
+        float4 xv0 = h0 * w0 * inv_rms;
+        float4 xv1 = h1 * w1 * inv_rms;
+        float4 xv2 = h2 * w2 * inv_rms;
+        float4 xv3 = h3 * w3 * inv_rms;
+        float4 xv4 = h4 * w4 * inv_rms;
+        float4 xv5 = h5 * w5 * inv_rms;
+        float4 xv6 = h6 * w6 * inv_rms;
+        float4 xv7 = h7 * w7 * inv_rms;
+
+        uint bo = g * Q4_BLOCK_BYTES;
+        for (uint r = 0; r < ROWS; ++r) {
+            if (!valid[r]) continue;
+            float scale = float(*reinterpret_cast<device const half*>(&rptr[r][bo]));
+            acc[r] += q4_dot_vec_fast(&rptr[r][bo + 2],
+                                      xv0, xv1, xv2, xv3, xv4, xv5, xv6, xv7) * scale;
+        }
+    }
+
+    for (uint r = 0; r < ROWS; ++r) {
+        float s = simd_sum(acc[r]);
+        if (lane == 0 && valid[r]) {
+            y[base_row + r] = s;
+        }
+    }
+}
+
+kernel void matvec_q_rmsnorm_inv_q4(
+    device const float* hidden [[buffer(0)]],
+    device const float* weight [[buffer(1)]],
+    device const float* inv_rms_ptr [[buffer(2)]],
+    device const uchar* Wq [[buffer(3)]],
+    device float* q_out [[buffer(4)]],
+    constant uint& M_q [[buffer(5)]],
+    constant uint& K [[buffer(6)]],
+    uint tgid [[threadgroup_position_in_grid]],
+    uint sgid [[simdgroup_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]]
+) {
+    float inv_rms = *inv_rms_ptr;
+    matvec_q4_rmsnorm_hidden_body<4>(
+        Wq, hidden, weight, inv_rms, q_out, M_q, K, tgid, sgid, lane, Q4F_SG);
+}
+
+kernel void matvec_qkv_rmsnorm_inv_q4(
+    device const float* hidden [[buffer(0)]],
+    device const float* weight [[buffer(1)]],
+    device const float* inv_rms_ptr [[buffer(2)]],
+    device const uchar* Wq [[buffer(3)]],
+    device const uchar* Wk [[buffer(4)]],
+    device const uchar* Wv [[buffer(5)]],
+    device float* q_out [[buffer(6)]],
+    device float* k_out [[buffer(7)]],
+    device float* v_out [[buffer(8)]],
+    constant uint& M_q [[buffer(9)]],
+    constant uint& M_kv [[buffer(10)]],
+    constant uint& K [[buffer(11)]],
+    uint tgid [[threadgroup_position_in_grid]],
+    uint sgid [[simdgroup_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]]
+) {
+    float inv_rms = *inv_rms_ptr;
+    uint rows_per_tg = Q4F_SG * 4u;
+    uint q_tgs = (M_q + rows_per_tg - 1u) / rows_per_tg;
+    uint kv_tgs = (M_kv + rows_per_tg - 1u) / rows_per_tg;
+
+    if (tgid < q_tgs) {
+        matvec_q4_rmsnorm_hidden_body<4>(
+            Wq, hidden, weight, inv_rms, q_out, M_q, K, tgid, sgid, lane, Q4F_SG);
+    } else if (tgid < q_tgs + kv_tgs) {
+        matvec_q4_rmsnorm_hidden_body<4>(
+            Wk, hidden, weight, inv_rms, k_out, M_kv, K, tgid - q_tgs, sgid, lane, Q4F_SG);
+    } else if (tgid < q_tgs + 2u * kv_tgs) {
+        matvec_q4_rmsnorm_hidden_body<4>(
+            Wv, hidden, weight, inv_rms, v_out, M_kv, K, tgid - q_tgs - kv_tgs, sgid, lane, Q4F_SG);
+    }
+}
+
 // Writes only 1/inv_rms — avoids materializing the full normed hidden vector.
 kernel void rmsnorm_inv_rms(
     device const float* x [[buffer(0)]],

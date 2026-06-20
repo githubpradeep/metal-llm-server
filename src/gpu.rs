@@ -248,6 +248,18 @@ pub fn metal_n_cb() -> u32 {
     }
 }
 
+/// Fuse pre-attn RMSNorm + Q4 Q/K/V projections into one dispatch (default on).
+/// Set FUSED_QKV=0 to use separate rmsnorm + matvec dispatches.
+pub fn fused_qkv_enabled() -> bool {
+    !matches!(
+        std::env::var("FUSED_QKV").as_deref(),
+        Ok("0") | Ok("false") | Ok("FALSE")
+    )
+}
+
+/// Output rows per Q4 fast matvec threadgroup (8 simdgroups × 4 rows).
+const Q4_MATVEC_ROWS_PER_TG: u32 = 32;
+
 fn attention_threadgroup_size(flash: bool) -> MTLSize {
     if flash {
         MTLSize::new(256, 1, 1)
@@ -276,6 +288,8 @@ pub struct MetalContext {
     pub matvec_q4_interleaved_gelu_hidden_pipeline: ComputePipelineState,
     pub matvec_q4_interleaved_gelu_f16_pipeline: ComputePipelineState,
     pub matvec_ggml_q4_f16x_pipeline: ComputePipelineState,
+    pub matvec_q_rmsnorm_inv_q4_pipeline: ComputePipelineState,
+    pub matvec_qkv_rmsnorm_inv_q4_pipeline: ComputePipelineState,
     pub ple_matvec_gelu_q4_pipeline: ComputePipelineState,
     pub matvec_ggml_q4_pipeline: ComputePipelineState,
     pub matvec_ggml_ext_q4_nx4_pipeline: ComputePipelineState,
@@ -413,6 +427,8 @@ impl MetalContext {
             get_fn("matvec_q4_interleaved_gelu_hidden");
         let matvec_q4_interleaved_gelu_f16_pipeline = get_fn("matvec_q4_interleaved_gelu_f16");
         let matvec_ggml_q4_f16x_pipeline = get_fn("matvec_ggml_q4_0_f16x");
+        let matvec_q_rmsnorm_inv_q4_pipeline = get_fn("matvec_q_rmsnorm_inv_q4");
+        let matvec_qkv_rmsnorm_inv_q4_pipeline = get_fn("matvec_qkv_rmsnorm_inv_q4");
         let ple_matvec_gelu_q4_pipeline = get_fn("ple_matvec_gelu_q4");
         let matvec_ggml_q4_pipeline = get_fn("matvec_ggml_q4_0");
         let matvec_ggml_ext_q4_nx4_pipeline = get_fn("matvec_ggml_ext_q4_nx4_r4");
@@ -567,6 +583,9 @@ impl MetalContext {
             if fused_rmsnorm_acc_enabled() {
                 println!("  Fused post-attn/post-MLP RMSNorm+residual (FUSED_RMSNORM_ACC=0 to disable)");
             }
+            if fused_qkv_enabled() {
+                println!("  Fused pre-attn RMSNorm + Q4 Q/K/V projections (FUSED_QKV=0 to disable)");
+            }
         }
 
         MetalContext {
@@ -588,6 +607,8 @@ impl MetalContext {
             matvec_q4_interleaved_gelu_hidden_pipeline,
             matvec_q4_interleaved_gelu_f16_pipeline,
             matvec_ggml_q4_f16x_pipeline,
+            matvec_q_rmsnorm_inv_q4_pipeline,
+            matvec_qkv_rmsnorm_inv_q4_pipeline,
             ple_matvec_gelu_q4_pipeline,
             matvec_ggml_q4_pipeline,
             matvec_ggml_ext_q4_nx4_pipeline,
@@ -1434,6 +1455,74 @@ impl MetalContext {
         let rows_per_tg = SG_PER_TG * 4;
         let num_tgs = MTLSize::new((m as u64 + rows_per_tg - 1) / rows_per_tg, 1, 1);
         let tg_size = MTLSize::new(SG_PER_TG * 32, 1, 1);
+        encoder.dispatch_thread_groups(num_tgs, tg_size);
+    }
+
+    /// Fused pre-attn RMSNorm + Q4 Q projection (shared-KV layers).
+    /// inv_rms once + Q matvec; skips normed scratch.
+    pub fn encode_rmsnorm_q_q4_view(
+        &self,
+        encoder: &ComputeCommandEncoderRef,
+        hidden: &Buffer,
+        norm_weight: &BufferView,
+        inv_rms_buf: &Buffer,
+        q_weight: &BufferView,
+        q_out: &Buffer,
+        m_q: u32,
+        k: u32,
+        eps: f32,
+    ) {
+        self.encode_rmsnorm_inv_rms_at_view(encoder, hidden, 0, inv_rms_buf, 0, k, eps);
+        encoder.set_compute_pipeline_state(&self.matvec_q_rmsnorm_inv_q4_pipeline);
+        encoder.set_buffer(0, Some(hidden), 0);
+        encoder.set_buffer(1, Some(&norm_weight.buffer), norm_weight.offset);
+        encoder.set_buffer(2, Some(inv_rms_buf), 0);
+        encoder.set_buffer(3, Some(&q_weight.buffer), q_weight.offset);
+        encoder.set_buffer(4, Some(q_out), 0);
+        encoder.set_bytes(5, 4, &m_q as *const u32 as *const _);
+        encoder.set_bytes(6, 4, &k as *const u32 as *const _);
+        let num_tgs = MTLSize::new((m_q as u64 + Q4_MATVEC_ROWS_PER_TG as u64 - 1) / Q4_MATVEC_ROWS_PER_TG as u64, 1, 1);
+        let tg_size = MTLSize::new(256, 1, 1);
+        encoder.dispatch_thread_groups(num_tgs, tg_size);
+    }
+
+    /// Fused pre-attn RMSNorm + Q4 Q/K/V projections (has_kv layers).
+    pub fn encode_rmsnorm_qkv_q4_view(
+        &self,
+        encoder: &ComputeCommandEncoderRef,
+        hidden: &Buffer,
+        norm_weight: &BufferView,
+        inv_rms_buf: &Buffer,
+        q_weight: &BufferView,
+        k_weight: &BufferView,
+        v_weight: &BufferView,
+        q_out: &Buffer,
+        k_out: &Buffer,
+        v_out: &Buffer,
+        m_q: u32,
+        m_kv: u32,
+        k: u32,
+        eps: f32,
+    ) {
+        self.encode_rmsnorm_inv_rms_at_view(encoder, hidden, 0, inv_rms_buf, 0, k, eps);
+        encoder.set_compute_pipeline_state(&self.matvec_qkv_rmsnorm_inv_q4_pipeline);
+        encoder.set_buffer(0, Some(hidden), 0);
+        encoder.set_buffer(1, Some(&norm_weight.buffer), norm_weight.offset);
+        encoder.set_buffer(2, Some(inv_rms_buf), 0);
+        encoder.set_buffer(3, Some(&q_weight.buffer), q_weight.offset);
+        encoder.set_buffer(4, Some(&k_weight.buffer), k_weight.offset);
+        encoder.set_buffer(5, Some(&v_weight.buffer), v_weight.offset);
+        encoder.set_buffer(6, Some(q_out), 0);
+        encoder.set_buffer(7, Some(k_out), 0);
+        encoder.set_buffer(8, Some(v_out), 0);
+        encoder.set_bytes(9, 4, &m_q as *const u32 as *const _);
+        encoder.set_bytes(10, 4, &m_kv as *const u32 as *const _);
+        encoder.set_bytes(11, 4, &k as *const u32 as *const _);
+        let q_tgs = (m_q + Q4_MATVEC_ROWS_PER_TG - 1) / Q4_MATVEC_ROWS_PER_TG;
+        let kv_tgs = (m_kv + Q4_MATVEC_ROWS_PER_TG - 1) / Q4_MATVEC_ROWS_PER_TG;
+        let total_tgs = q_tgs + 2 * kv_tgs;
+        let num_tgs = MTLSize::new(total_tgs as u64, 1, 1);
+        let tg_size = MTLSize::new(256, 1, 1);
         encoder.dispatch_thread_groups(num_tgs, tg_size);
     }
 

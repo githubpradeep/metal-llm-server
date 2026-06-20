@@ -2360,6 +2360,39 @@ impl Gemma4GpuModel {
             // needed; the add reads hidden in place.
 
             if !__ablate.skip_attn() {
+            // Pre-attention norm + Q/K/V projections (fused when Q4 + FUSED_QKV=1).
+            if !layer.use_f16 && crate::gpu::fused_qkv_enabled() {
+                if layer.has_kv {
+                    self.ctx.encode_rmsnorm_qkv_q4_view(
+                        encoder,
+                        &self.hidden_buf,
+                        &layer.input_layernorm_weight,
+                        &self.inv_rms_buf,
+                        &layer.q_proj,
+                        &layer.k_proj,
+                        &layer.v_proj,
+                        &self.q_buf,
+                        &self.k_buf,
+                        &self.v_buf,
+                        q_out as u32,
+                        kv_out as u32,
+                        hidden_size as u32,
+                        eps,
+                    );
+                } else {
+                    self.ctx.encode_rmsnorm_q_q4_view(
+                        encoder,
+                        &self.hidden_buf,
+                        &layer.input_layernorm_weight,
+                        &self.inv_rms_buf,
+                        &layer.q_proj,
+                        &self.q_buf,
+                        q_out as u32,
+                        hidden_size as u32,
+                        eps,
+                    );
+                }
+            } else {
             // Pre-attention norm
             self.ctx.encode_rmsnorm_view(
                 encoder,
@@ -2390,34 +2423,6 @@ impl Gemma4GpuModel {
                     hidden_size as u32,
                 );
             }
-
-            // QK Norm on Q
-            self.ctx.encode_rmsnorm_per_head_view(
-                encoder,
-                &self.q_buf,
-                &layer.q_norm_weight,
-                &self.q_normed_buf,
-                num_heads as u32,
-                head_dim as u32,
-                eps,
-            );
-
-            // Apply rotary to Q (full head_dim — non-rotary dims have cos=1, sin=0 for pass-through)
-            let rope_off = self.decode_rope_byte_offset(layer_idx);
-            self.ctx.encode_rotary_at(
-                encoder,
-                &self.q_normed_buf,
-                0,
-                &self.k_normed_buf,
-                0,
-                &self.decode_rope_cos_packed,
-                rope_off,
-                &self.decode_rope_sin_packed,
-                rope_off,
-                num_heads as u32,
-                0,
-                head_dim as u32,
-            );
 
             // K, V only for non-shared layers
             if layer.has_kv {
@@ -2450,8 +2455,39 @@ impl Gemma4GpuModel {
                         hidden_size as u32,
                     );
                 }
+            }
+            } // !fused_qkv fallback
 
-                // K norm + rotary (full head_dim — non-rotary dims pass through)
+            // QK Norm on Q
+            self.ctx.encode_rmsnorm_per_head_view(
+                encoder,
+                &self.q_buf,
+                &layer.q_norm_weight,
+                &self.q_normed_buf,
+                num_heads as u32,
+                head_dim as u32,
+                eps,
+            );
+
+            // Apply rotary to Q (full head_dim — non-rotary dims have cos=1, sin=0 for pass-through)
+            let rope_off = self.decode_rope_byte_offset(layer_idx);
+            self.ctx.encode_rotary_at(
+                encoder,
+                &self.q_normed_buf,
+                0,
+                &self.k_normed_buf,
+                0,
+                &self.decode_rope_cos_packed,
+                rope_off,
+                &self.decode_rope_sin_packed,
+                rope_off,
+                num_heads as u32,
+                0,
+                head_dim as u32,
+            );
+
+            // K norm + rotary (K/V matvecs fused above when FUSED_QKV=1)
+            if layer.has_kv {
                 self.ctx.encode_rmsnorm_per_head_view(
                     encoder,
                     &self.k_buf,
