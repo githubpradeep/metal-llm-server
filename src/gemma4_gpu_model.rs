@@ -11,6 +11,7 @@ use serde::Deserialize;
 use crate::gemma4_config::{Gemma4TextConfig, KvCacheType};
 use crate::gpu::{BufferView, MetalContext};
 use crate::kv_pool::{KvCachePool, KvPoolError, KvSlot, KvSlotView};
+use crate::mega_decode::{mega_kernel_enabled, MegaDecodeGraph, MegaScratchBuffers};
 
 const DEFAULT_MAX_PREFILL_SEQ: usize = 128;
 const DEFAULT_MAX_DECODE_BATCH: usize = 4;
@@ -29,6 +30,60 @@ thread_local! {
 /// Metal `setBuffer` offset alignment on Apple GPUs.
 const WEIGHT_BLOB_ALIGN: usize = 256;
 const WEIGHT_CACHE_MAGIC_LEN: usize = 4;
+
+/// GPU RoPE params for one layer (must match `RopeLayerParams` in llama.metal).
+#[repr(C)]
+struct RopeLayerParams {
+    theta: f32,
+    factor: f32,
+    head_dim: u32,
+    rope_angles: u32,
+}
+
+fn build_rope_layer_params(config: &Gemma4TextConfig, num_layers: usize) -> Vec<RopeLayerParams> {
+    let mut params = Vec::with_capacity(num_layers);
+    for layer_idx in 0..num_layers {
+        let head_dim = config.layer_head_dim(layer_idx) as u32;
+        let is_full = config.is_full_attention(layer_idx);
+        let theta = if is_full {
+            config.full_rope_theta() as f32
+        } else {
+            config.sliding_rope_theta() as f32
+        };
+        let factor = if is_full {
+            config.full_rope_factor() as f32
+        } else {
+            config.sliding_rope_factor() as f32
+        };
+        let rotary_dim = if is_full {
+            (head_dim as f64 * config.full_partial_rotary_factor()) as u32
+        } else {
+            head_dim
+        };
+        params.push(RopeLayerParams {
+            theta,
+            factor,
+            head_dim,
+            rope_angles: rotary_dim / 2,
+        });
+    }
+    params
+}
+
+fn alloc_decode_rope_buffers(
+    ctx: &MetalContext,
+    config: &Gemma4TextConfig,
+    num_layers: usize,
+    max_head_dim: usize,
+) -> (Buffer, Buffer, Buffer) {
+    let params = build_rope_layer_params(config, num_layers);
+    let cos = ctx.buffer_empty(num_layers * max_head_dim);
+    let sin = ctx.buffer_empty(num_layers * max_head_dim);
+    let params_bytes =
+        unsafe { std::slice::from_raw_parts(params.as_ptr() as *const u8, params.len() * 16) };
+    let params_buf = ctx.buffer_from_bytes(params_bytes);
+    (cos, sin, params_buf)
+}
 
 fn weight_section_pad(section_offset: usize) -> usize {
     (WEIGHT_BLOB_ALIGN - (section_offset % WEIGHT_BLOB_ALIGN)) % WEIGHT_BLOB_ALIGN
@@ -55,10 +110,19 @@ fn configured_max_prefill_seq(kv_capacity: u32) -> usize {
 /// Gemma 4 E4B GPU-resident model with persistent KV cache on Metal.
 /// All operations for one token are encoded into a SINGLE command buffer.
 /// Result of a single decode forward pass: either the full (softcapped) logit
-/// vector (CPU sampling path) or the GPU-sampled token id (fused fast path).
+/// vector (CPU sampling path), the GPU-sampled token id (fused fast path), or
+/// KV-only advance (prefill intermediate tokens).
 enum DecodeOutput {
+    Advanced,
     Logits(Vec<f32>),
     Token(usize),
+}
+
+enum DecodeMode {
+    /// Update KV cache only; skip final norm, lm_head, and logit readback.
+    Advance,
+    Logits,
+    Sample(f32, f32, u32),
 }
 
 pub struct Gemma4GpuModel {
@@ -121,9 +185,12 @@ pub struct Gemma4GpuModel {
     pub cos_buf: Buffer,
     pub sin_buf: Buffer,
 
-    // Per-layer persistent buffers (reused every token, contents overwritten)
-    pub per_layer_cos_bufs: Vec<Buffer>,
-    pub per_layer_sin_bufs: Vec<Buffer>,
+    // Packed decode RoPE cos/sin (filled on GPU each token) + static layer params.
+    pub decode_rope_cos_packed: Buffer,
+    pub decode_rope_sin_packed: Buffer,
+    pub rope_layer_params_buf: Buffer,
+    pub rope_max_head_dim: usize,
+
     pub per_layer_prefill_cos_bufs: Vec<Buffer>,
     pub per_layer_prefill_sin_bufs: Vec<Buffer>,
     pub per_layer_decode_batch_cos_bufs: Vec<Buffer>,
@@ -139,6 +206,9 @@ pub struct Gemma4GpuModel {
     weights_mmap_offset: Option<usize>,
     embed_decode_scratch: Vec<f32>,
     ple_decode_scratch: Vec<f32>,
+
+    /// Single-dispatch decode graph (MEGA_KERNEL=1).
+    mega_graph: Option<MegaDecodeGraph>,
 }
 
 pub struct PrefillScratch {
@@ -444,7 +514,7 @@ impl Gemma4GpuModel {
         if embed_cache_path.exists() && Self::is_split_weights_cache(&cache_path) {
             println!("  Found split Q4 cache, loading...");
             println!(
-                "  (Delete model.q4cache + model.embed.cache to re-quantize o_proj/PLE to Q4 on middle layers.)"
+                "  (Delete model.q4cache + model.embed.cache to re-quantize with all-Q4 weights.)"
             );
             return Self::load_from_split_cache(model_dir, &embed_cache_path, &cache_path);
         }
@@ -731,46 +801,43 @@ impl Gemma4GpuModel {
                 .remove("self_attn.k_norm.weight")
                 .expect("k_norm missing");
 
-            // Mixed quantization: first 3 layers and last 3 layers stay f16 for all
-            // projections; middle layers use Q4_0 (including o_proj and PLE).
-            let is_sensitive_layer = layer_idx < 3 || layer_idx >= (num_layers - 3);
-
+            // All layers Q4_0 (matches llama.cpp GGUF; delete model.q4cache to refresh old f16 caches).
             let layer = Gemma4GpuLayer {
-                q_proj: BufferView::from_buffer(if is_sensitive_layer {
-                    ctx.buffer_from_f32_as_f16(&q_proj_data)
-                } else {
-                    ctx.buffer_from_f32_as_q4(&q_proj_data, q_out, hidden_size)
-                }),
-                k_proj: BufferView::from_buffer(if is_sensitive_layer {
-                    ctx.buffer_from_f32_as_f16(&k_proj_data)
-                } else {
-                    ctx.buffer_from_f32_as_q4(&k_proj_data, kv_out, hidden_size)
-                }),
-                v_proj: BufferView::from_buffer(if is_sensitive_layer {
-                    ctx.buffer_from_f32_as_f16(&v_proj_data)
-                } else {
-                    ctx.buffer_from_f32_as_q4(&v_proj_data, kv_out, hidden_size)
-                }),
-                o_proj: BufferView::from_buffer(if is_sensitive_layer {
-                    ctx.buffer_from_f32_as_f16(&o_proj_data)
-                } else {
-                    ctx.buffer_from_f32_as_q4(&o_proj_data, hidden_size, q_out)
-                }),
-                gate_proj: BufferView::from_buffer(if is_sensitive_layer {
-                    ctx.buffer_from_f32_as_f16(&gate_proj_data)
-                } else {
-                    ctx.buffer_from_f32_as_q4(&gate_proj_data, intermediate_size, hidden_size)
-                }),
-                up_proj: BufferView::from_buffer(if is_sensitive_layer {
-                    ctx.buffer_from_f32_as_f16(&up_proj_data)
-                } else {
-                    ctx.buffer_from_f32_as_q4(&up_proj_data, intermediate_size, hidden_size)
-                }),
-                down_proj: BufferView::from_buffer(if is_sensitive_layer {
-                    ctx.buffer_from_f32_as_f16(&down_proj_data)
-                } else {
-                    ctx.buffer_from_f32_as_q4(&down_proj_data, hidden_size, intermediate_size)
-                }),
+                q_proj: BufferView::from_buffer(ctx.buffer_from_f32_as_q4(
+                    &q_proj_data,
+                    q_out,
+                    hidden_size,
+                )),
+                k_proj: BufferView::from_buffer(ctx.buffer_from_f32_as_q4(
+                    &k_proj_data,
+                    kv_out,
+                    hidden_size,
+                )),
+                v_proj: BufferView::from_buffer(ctx.buffer_from_f32_as_q4(
+                    &v_proj_data,
+                    kv_out,
+                    hidden_size,
+                )),
+                o_proj: BufferView::from_buffer(ctx.buffer_from_f32_as_q4(
+                    &o_proj_data,
+                    hidden_size,
+                    q_out,
+                )),
+                gate_proj: BufferView::from_buffer(ctx.buffer_from_f32_as_q4(
+                    &gate_proj_data,
+                    intermediate_size,
+                    hidden_size,
+                )),
+                up_proj: BufferView::from_buffer(ctx.buffer_from_f32_as_q4(
+                    &up_proj_data,
+                    intermediate_size,
+                    hidden_size,
+                )),
+                down_proj: BufferView::from_buffer(ctx.buffer_from_f32_as_q4(
+                    &down_proj_data,
+                    hidden_size,
+                    intermediate_size,
+                )),
 
                 input_layernorm_weight: BufferView::from_buffer(ctx.buffer_from_slice(&input_ln)),
                 post_attention_layernorm_weight: BufferView::from_buffer(ctx.buffer_from_slice(&post_attn_ln)),
@@ -778,16 +845,16 @@ impl Gemma4GpuModel {
                 post_feedforward_layernorm_weight: BufferView::from_buffer(ctx.buffer_from_slice(&post_ff_ln)),
                 post_per_layer_input_norm_weight: BufferView::from_buffer(ctx.buffer_from_slice(&post_ple_norm)),
 
-                per_layer_input_gate_weight: BufferView::from_buffer(if is_sensitive_layer {
-                    ctx.buffer_from_f32_as_f16(&ple_gate_data)
-                } else {
-                    ctx.buffer_from_f32_as_q4(&ple_gate_data, ple_dim, hidden_size)
-                }),
-                per_layer_projection_weight: BufferView::from_buffer(if is_sensitive_layer {
-                    ctx.buffer_from_f32_as_f16(&ple_proj_data)
-                } else {
-                    ctx.buffer_from_f32_as_q4(&ple_proj_data, hidden_size, ple_dim)
-                }),
+                per_layer_input_gate_weight: BufferView::from_buffer(ctx.buffer_from_f32_as_q4(
+                    &ple_gate_data,
+                    ple_dim,
+                    hidden_size,
+                )),
+                per_layer_projection_weight: BufferView::from_buffer(ctx.buffer_from_f32_as_q4(
+                    &ple_proj_data,
+                    hidden_size,
+                    ple_dim,
+                )),
                 layer_scalar,
 
                 q_norm_weight: BufferView::from_buffer(ctx.buffer_from_slice(&q_norm_data)),
@@ -799,7 +866,7 @@ impl Gemma4GpuModel {
                 head_dim,
                 q_out_dim: q_out,
                 kv_out_dim: kv_out,
-                use_f16: is_sensitive_layer,
+                use_f16: false,
             };
 
             layers.push(layer);
@@ -915,9 +982,9 @@ impl Gemma4GpuModel {
         let cos_buf = ctx.buffer_empty(max_head_dim);
         let sin_buf = ctx.buffer_empty(max_head_dim);
 
-        // Per-layer persistent buffers for cos/sin/ple (allocated once, overwritten each token)
-        let mut per_layer_cos_bufs = Vec::with_capacity(num_layers);
-        let mut per_layer_sin_bufs = Vec::with_capacity(num_layers);
+        // Per-layer prefill/batch RoPE buffers (decode uses packed GPU fill).
+        let (decode_rope_cos_packed, decode_rope_sin_packed, rope_layer_params_buf) =
+            alloc_decode_rope_buffers(&ctx, &config, num_layers, max_head_dim);
         let mut per_layer_prefill_cos_bufs = Vec::with_capacity(num_layers);
         let mut per_layer_prefill_sin_bufs = Vec::with_capacity(num_layers);
         let mut per_layer_decode_batch_cos_bufs = Vec::with_capacity(num_layers);
@@ -928,8 +995,6 @@ impl Gemma4GpuModel {
         let mut per_layer_ple_bufs = Vec::with_capacity(num_layers);
         for i in 0..num_layers {
             let hd = config.layer_head_dim(i);
-            per_layer_cos_bufs.push(ctx.buffer_empty(hd));
-            per_layer_sin_bufs.push(ctx.buffer_empty(hd));
             per_layer_prefill_cos_bufs.push(ctx.buffer_empty(max_prefill_seq * hd));
             per_layer_prefill_sin_bufs.push(ctx.buffer_empty(max_prefill_seq * hd));
             per_layer_decode_batch_cos_bufs.push(ctx.buffer_empty(DEFAULT_MAX_DECODE_BATCH * hd));
@@ -942,6 +1007,9 @@ impl Gemma4GpuModel {
             per_layer_ple_bufs.push(ctx.buffer_empty(ple_dim));
         }
 
+        println!("  Decode RoPE: GPU fill (rope_fill_decode kernel)");
+        println!("  Weights: all {} layers Q4_0", num_layers);
+
         println!(
             "  Parallel prefill scratch: max_seq={}",
             prefill_scratch.max_seq_len
@@ -952,7 +1020,7 @@ impl Gemma4GpuModel {
         );
         println!("  Gemma4 model loaded successfully (Q4_0 quantized on Metal)");
 
-        Gemma4GpuModel {
+        let mut model = Gemma4GpuModel {
             ctx,
             config,
             embed_tables,
@@ -993,8 +1061,10 @@ impl Gemma4GpuModel {
             kv_cache_type,
             cos_buf,
             sin_buf,
-            per_layer_cos_bufs,
-            per_layer_sin_bufs,
+            decode_rope_cos_packed,
+            decode_rope_sin_packed,
+            rope_layer_params_buf,
+            rope_max_head_dim: max_head_dim,
             per_layer_prefill_cos_bufs,
             per_layer_prefill_sin_bufs,
             per_layer_decode_batch_cos_bufs,
@@ -1007,7 +1077,15 @@ impl Gemma4GpuModel {
             weights_mmap_offset: None,
             embed_decode_scratch: vec![0.0f32; hidden_size],
             ple_decode_scratch: vec![0.0f32; num_layers * ple_dim],
-        }
+            mega_graph: None,
+        };
+
+        model.attach_mega_graph_if_enabled();
+        model
+    }
+
+    fn decode_rope_byte_offset(&self, layer_idx: usize) -> u64 {
+        (layer_idx * self.rope_max_head_dim * std::mem::size_of::<f32>()) as u64
     }
 
     /// Save split cache: model.embed.cache (CPU mmap) + model.q4cache (GPU weights).
@@ -1584,8 +1662,8 @@ impl Gemma4GpuModel {
         let cos_buf = ctx.buffer_empty(max_head_dim);
         let sin_buf = ctx.buffer_empty(max_head_dim);
 
-        let mut per_layer_cos_bufs = Vec::with_capacity(num_layers);
-        let mut per_layer_sin_bufs = Vec::with_capacity(num_layers);
+        let (decode_rope_cos_packed, decode_rope_sin_packed, rope_layer_params_buf) =
+            alloc_decode_rope_buffers(&ctx, &config, num_layers, max_head_dim);
         let mut per_layer_prefill_cos_bufs = Vec::with_capacity(num_layers);
         let mut per_layer_prefill_sin_bufs = Vec::with_capacity(num_layers);
         let mut per_layer_decode_batch_cos_bufs = Vec::with_capacity(num_layers);
@@ -1596,8 +1674,6 @@ impl Gemma4GpuModel {
         let mut per_layer_ple_bufs = Vec::with_capacity(num_layers);
         for i in 0..num_layers {
             let hd = config.layer_head_dim(i);
-            per_layer_cos_bufs.push(ctx.buffer_empty(hd));
-            per_layer_sin_bufs.push(ctx.buffer_empty(hd));
             per_layer_prefill_cos_bufs.push(ctx.buffer_empty(max_prefill_seq * hd));
             per_layer_prefill_sin_bufs.push(ctx.buffer_empty(max_prefill_seq * hd));
             per_layer_decode_batch_cos_bufs.push(ctx.buffer_empty(DEFAULT_MAX_DECODE_BATCH * hd));
@@ -1608,6 +1684,12 @@ impl Gemma4GpuModel {
                 .push(ctx.buffer_empty_u32(DEFAULT_MAX_DECODE_BATCH));
             per_layer_decode_batch_kv_len_bufs.push(ctx.buffer_empty_u32(DEFAULT_MAX_DECODE_BATCH));
             per_layer_ple_bufs.push(ctx.buffer_empty(ple_dim));
+        }
+
+        if layers.iter().any(|l| l.use_f16) {
+            eprintln!(
+                "  Warning: weights cache has f16 layers (0-2, 39-41); delete model.q4cache for all-Q4"
+            );
         }
 
         println!(
@@ -1624,7 +1706,7 @@ impl Gemma4GpuModel {
             load_start.elapsed().as_secs_f64()
         );
 
-        Gemma4GpuModel {
+        let mut model = Gemma4GpuModel {
             ctx,
             config,
             embed_tables,
@@ -1665,8 +1747,10 @@ impl Gemma4GpuModel {
             kv_cache_type,
             cos_buf,
             sin_buf,
-            per_layer_cos_bufs,
-            per_layer_sin_bufs,
+            decode_rope_cos_packed,
+            decode_rope_sin_packed,
+            rope_layer_params_buf,
+            rope_max_head_dim: max_head_dim,
             per_layer_prefill_cos_bufs,
             per_layer_prefill_sin_bufs,
             per_layer_decode_batch_cos_bufs,
@@ -1679,6 +1763,27 @@ impl Gemma4GpuModel {
             weights_mmap_offset,
             embed_decode_scratch: vec![0.0f32; hidden_size],
             ple_decode_scratch: vec![0.0f32; num_layers * ple_dim],
+            mega_graph: None,
+        };
+        model.attach_mega_graph_if_enabled();
+        model
+    }
+
+    fn attach_mega_graph_if_enabled(&mut self) {
+        if !mega_kernel_enabled() {
+            return;
+        }
+        match MegaDecodeGraph::build(self) {
+            Ok(graph) => {
+                println!(
+                    "  Mega decode enabled ({} ops, single command buffer)",
+                    graph.ops.len()
+                );
+                self.mega_graph = Some(graph);
+            }
+            Err(e) => {
+                eprintln!("  MEGA_KERNEL=1 but mega graph build failed: {e}");
+            }
         }
     }
 
@@ -1824,9 +1929,19 @@ impl Gemma4GpuModel {
 
     /// Forward one token through the entire model. One command buffer per layer.
     pub fn forward_single_token(&mut self, token_id: usize) -> Vec<f32> {
-        match self.forward_single_token_inner(token_id, None) {
+        match self.forward_single_token_inner(token_id, DecodeMode::Logits) {
             DecodeOutput::Logits(logits) => logits,
-            DecodeOutput::Token(_) => unreachable!("None sample mode must return logits"),
+            DecodeOutput::Token(_) | DecodeOutput::Advanced => {
+                unreachable!("Logits mode must return logits")
+            }
+        }
+    }
+
+    /// KV-only prefill step: runs layers but skips lm_head and logit readback.
+    pub fn forward_advance(&mut self, token_id: usize) {
+        match self.forward_single_token_inner(token_id, DecodeMode::Advance) {
+            DecodeOutput::Advanced => {}
+            _ => unreachable!("Advance mode must return Advanced"),
         }
     }
 
@@ -1841,16 +1956,19 @@ impl Gemma4GpuModel {
         min_p: f32,
         seed: u32,
     ) -> usize {
-        match self.forward_single_token_inner(token_id, Some((temperature, min_p, seed))) {
+        match self.forward_single_token_inner(
+            token_id,
+            DecodeMode::Sample(temperature, min_p, seed),
+        ) {
             DecodeOutput::Token(token) => token,
-            DecodeOutput::Logits(_) => unreachable!("sample mode must return a token"),
+            _ => unreachable!("Sample mode must return a token"),
         }
     }
 
     fn forward_single_token_inner(
         &mut self,
         token_id: usize,
-        sample: Option<(f32, f32, u32)>,
+        mode: DecodeMode,
     ) -> DecodeOutput {
         let __profile = std::env::var("PROFILE_DECODE").is_ok();
         // When set, splits the token into per-phase command buffers and times
@@ -1883,84 +2001,13 @@ impl Gemma4GpuModel {
         MetalContext::write_buffer(&self.ple_token_id_buf, &self.ple_decode_scratch);
 
         let kv_seq = self.kv_seq_len;
+        let pos = self.total_tokens as f32;
 
         // ─── PLE: Compute per-layer inputs on GPU ───
         let ple_input_scale = std::f32::consts::FRAC_1_SQRT_2; // 1/sqrt(2)
         let context_proj_scale = 1.0 / (hidden_size as f32).sqrt();
 
-        // Precompute all rotary cos/sin per layer (CPU, trivial)
-        let pos = self.total_tokens as f32;
-        let mut rotary_cos_per_layer: Vec<Vec<f32>> = Vec::with_capacity(self.layers.len());
-        let mut rotary_sin_per_layer: Vec<Vec<f32>> = Vec::with_capacity(self.layers.len());
-
-        for layer_idx in 0..self.layers.len() {
-            let layer = &self.layers[layer_idx];
-            let head_dim = layer.head_dim;
-            let is_full = layer.is_full_attention;
-
-            let rope_theta = if is_full {
-                self.config.full_rope_theta()
-            } else {
-                self.config.sliding_rope_theta()
-            };
-
-            let rope_factor = if is_full {
-                self.config.full_rope_factor()
-            } else {
-                self.config.sliding_rope_factor()
-            };
-
-            let rotary_dim = if is_full {
-                (head_dim as f64 * self.config.full_partial_rotary_factor()) as usize
-            } else {
-                head_dim
-            };
-
-            // Proportional RoPE: compute rope_angles frequencies using head_dim as denominator
-            // then pad with zeros for non-rotary dimensions.
-            // Reference: _compute_proportional_rope_parameters in modeling_rope_utils.py
-            let rope_angles = rotary_dim / 2; // = partial_rotary_factor * head_dim / 2
-            let half_dim = head_dim / 2;
-            let mut cos_data = vec![0.0f32; head_dim];
-            let mut sin_data = vec![0.0f32; head_dim];
-            for i in 0..rope_angles {
-                // inv_freq = 1 / (theta ^ (2i / head_dim)) / factor
-                let inv_freq = 1.0
-                    / (rope_theta.powf(i as f64 * 2.0 / head_dim as f64) as f32)
-                    / rope_factor as f32;
-                let angle = pos * inv_freq;
-                cos_data[i] = angle.cos();
-                cos_data[i + half_dim] = angle.cos();
-                sin_data[i] = angle.sin();
-                sin_data[i + half_dim] = angle.sin();
-            }
-            // Non-rotary angles (nope_angles) remain 0 in inv_freq → cos=1, sin=0
-            // cos_data[rope_angles..half_dim] and cos_data[half_dim+rope_angles..head_dim] stay 0
-            // But for the rotary kernel, we need cos=1 for pass-through dimensions
-            for i in rope_angles..half_dim {
-                cos_data[i] = 1.0;
-                cos_data[i + half_dim] = 1.0;
-                // sin stays 0.0 (already initialized)
-            }
-
-            rotary_cos_per_layer.push(cos_data);
-            rotary_sin_per_layer.push(sin_data);
-        }
-
-        // ═══ ENCODE ALL LAYERS INTO A SINGLE COMMAND BUFFER ═══
-        // Write per-layer cos/sin data into persistent buffers
         let actual_num_layers = self.layers.len();
-        for layer_idx in 0..actual_num_layers {
-            MetalContext::write_buffer(
-                &self.per_layer_cos_bufs[layer_idx],
-                &rotary_cos_per_layer[layer_idx],
-            );
-            MetalContext::write_buffer(
-                &self.per_layer_sin_bufs[layer_idx],
-                &rotary_sin_per_layer[layer_idx],
-            );
-        }
-
         let __t_prep = std::time::Instant::now();
         // `mut` so the phase profiler can flush and re-open command buffers at
         // phase boundaries. With PROFILE_PHASES unset these stay a single cmd +
@@ -1972,6 +2019,92 @@ impl Gemma4GpuModel {
         // equivalent to the previous per-layer encoders but avoids ~44
         // encoder-boundary drains per token.
         let mut encoder = cmd.new_compute_command_encoder();
+
+        // GPU RoPE table fill for all layers (replaces CPU sin/cos + write_buffer).
+        self.ctx.encode_rope_fill_decode(
+            &encoder,
+            &self.decode_rope_cos_packed,
+            &self.decode_rope_sin_packed,
+            &self.rope_layer_params_buf,
+            actual_num_layers as u32,
+            self.rope_max_head_dim as u32,
+            pos,
+        );
+
+        if self.mega_graph.is_some() && !__pp && !matches!(mode, DecodeMode::Advance) {
+            let cap = self.config.final_logit_softcapping;
+            let sliding = self.config.sliding_window as u32;
+            let sample = match mode {
+                DecodeMode::Sample(t, mp, s) => Some((t, mp, s)),
+                DecodeMode::Logits => None,
+                DecodeMode::Advance => unreachable!(),
+            };
+            let scratch = MegaScratchBuffers {
+                hidden: &self.hidden_buf,
+                normed: &self.normed_buf,
+                q: &self.q_buf,
+                k: &self.k_buf,
+                v: &self.v_buf,
+                q_normed: &self.q_normed_buf,
+                k_normed: &self.k_normed_buf,
+                gate: &self.gate_buf,
+                attn_out: &self.attn_out_buf,
+                o_out: &self.o_out_buf,
+                up: &self.up_buf,
+                gelu: &self.gelu_buf,
+                down: &self.down_buf,
+                ple_ctx: &self.ple_context_proj_buf,
+                ple_tmp: &self.ple_combined_buf,
+                ple_tok: &self.ple_token_id_buf,
+                logits: &self.logits_buf,
+                sample_out: &self.sample_out_buf,
+            };
+            let layers = &self.layers;
+            let mega = self.mega_graph.as_mut().unwrap();
+            mega.encode(
+                &self.ctx,
+                &encoder,
+                layers,
+                sliding,
+                &scratch,
+                &self.k_cache,
+                &self.v_cache,
+                &self.decode_rope_cos_packed,
+                &self.decode_rope_sin_packed,
+                self.rope_max_head_dim,
+                kv_seq,
+                sample,
+            );
+            encoder.end_encoding();
+            let __t_encode = std::time::Instant::now();
+            cmd.commit();
+            cmd.wait_until_completed();
+            let __t_gpu = std::time::Instant::now();
+            let output = match mode {
+                DecodeMode::Sample(..) => {
+                    let tok = MetalContext::read_u32(&self.sample_out_buf) as usize;
+                    if __profile {
+                        Self::profile_record(__t0, __t_prep, __t_encode, __t_gpu);
+                    }
+                    DecodeOutput::Token(tok)
+                }
+                DecodeMode::Logits => {
+                    let mut logits = MetalContext::read_buffer(&self.logits_buf, vocab_size);
+                    for l in logits.iter_mut() {
+                        let x = (*l / cap).clamp(-10.0, 10.0);
+                        *l = cap * x.tanh();
+                    }
+                    if __profile {
+                        Self::profile_record(__t0, __t_prep, __t_encode, __t_gpu);
+                    }
+                    DecodeOutput::Logits(logits)
+                }
+                DecodeMode::Advance => unreachable!(),
+            };
+            self.total_tokens += 1;
+            self.kv_seq_len += 1;
+            return output;
+        }
 
         // ─── PLE pre-pass ───
         // Produces the per-layer PLE inputs contiguously in ple_context_proj_buf;
@@ -2090,12 +2223,17 @@ impl Gemma4GpuModel {
             );
 
             // Apply rotary to Q (full head_dim — non-rotary dims have cos=1, sin=0 for pass-through)
-            self.ctx.encode_rotary(
+            let rope_off = self.decode_rope_byte_offset(layer_idx);
+            self.ctx.encode_rotary_at(
                 encoder,
                 &self.q_normed_buf,
+                0,
                 &self.k_normed_buf,
-                &self.per_layer_cos_bufs[layer_idx],
-                &self.per_layer_sin_bufs[layer_idx],
+                0,
+                &self.decode_rope_cos_packed,
+                rope_off,
+                &self.decode_rope_sin_packed,
+                rope_off,
                 num_heads as u32,
                 0,
                 head_dim as u32,
@@ -2121,18 +2259,12 @@ impl Gemma4GpuModel {
                         hidden_size as u32,
                     );
                 } else {
-                    self.ctx.encode_matvec_q4_view(
+                    self.ctx.encode_matvec_q4_dual_view(
                         encoder,
                         &layer.k_proj,
-                        &self.normed_buf,
-                        &self.k_buf,
-                        kv_out as u32,
-                        hidden_size as u32,
-                    );
-                    self.ctx.encode_matvec_q4_view(
-                        encoder,
                         &layer.v_proj,
                         &self.normed_buf,
+                        &self.k_buf,
                         &self.v_buf,
                         kv_out as u32,
                         hidden_size as u32,
@@ -2149,12 +2281,17 @@ impl Gemma4GpuModel {
                     head_dim as u32,
                     eps,
                 );
-                self.ctx.encode_rotary(
+                let rope_off = self.decode_rope_byte_offset(layer_idx);
+                self.ctx.encode_rotary_at(
                     encoder,
                     &self.q_buf,
+                    0,
                     &self.k_normed_buf,
-                    &self.per_layer_cos_bufs[layer_idx],
-                    &self.per_layer_sin_bufs[layer_idx],
+                    0,
+                    &self.decode_rope_cos_packed,
+                    rope_off,
+                    &self.decode_rope_sin_packed,
+                    rope_off,
                     0,
                     num_kv_heads as u32,
                     head_dim as u32,
@@ -2387,18 +2524,12 @@ impl Gemma4GpuModel {
                     hidden_size as u32,
                 );
             } else {
-                self.ctx.encode_matvec_q4_view(
+                self.ctx.encode_matvec_q4_dual_view(
                     encoder,
                     &layer.gate_proj,
-                    &self.normed_buf,
-                    &self.gate_buf,
-                    intermediate_size as u32,
-                    hidden_size as u32,
-                );
-                self.ctx.encode_matvec_q4_view(
-                    encoder,
                     &layer.up_proj,
                     &self.normed_buf,
+                    &self.gate_buf,
                     &self.up_buf,
                     intermediate_size as u32,
                     hidden_size as u32,
@@ -2526,6 +2657,20 @@ impl Gemma4GpuModel {
             }
         }
 
+        if matches!(mode, DecodeMode::Advance) {
+            encoder.end_encoding();
+            let __t_encode = std::time::Instant::now();
+            cmd.commit();
+            cmd.wait_until_completed();
+            let __t_gpu = std::time::Instant::now();
+            if __profile {
+                Self::profile_record(__t0, __t_prep, __t_encode, __t_gpu);
+            }
+            self.total_tokens += 1;
+            self.kv_seq_len += 1;
+            return DecodeOutput::Advanced;
+        }
+
         // ─── Final norm + LM head (+ optional sampling) — same encoder ───
         // Reuses the single forward-pass encoder so the whole token is one
         // encoder + one command buffer (one CPU↔GPU round-trip per token).
@@ -2548,8 +2693,8 @@ impl Gemma4GpuModel {
             hidden_size as u32,
         );
 
-        let output = match sample {
-            Some((temperature, min_p, seed)) => {
+        let output = match mode {
+            DecodeMode::Sample(temperature, min_p, seed) => {
                 // GPU-side softcap + min-p sampling; read back only the token id.
                 self.ctx.encode_sample(
                     encoder,
@@ -2576,7 +2721,7 @@ impl Gemma4GpuModel {
                 }
                 DecodeOutput::Token(tok)
             }
-            None => {
+            DecodeMode::Logits => {
                 encoder.end_encoding();
                 let __t_encode = std::time::Instant::now();
                 cmd.commit();
@@ -2599,6 +2744,7 @@ impl Gemma4GpuModel {
                 }
                 DecodeOutput::Logits(logits)
             }
+            DecodeMode::Advance => unreachable!(),
         };
 
         // Update state
@@ -5228,13 +5374,44 @@ impl Gemma4GpuModel {
         Ok(outputs)
     }
 
-    /// Batched prefill: process all prompt tokens sequentially.
+    /// Batched prefill: intermediate tokens skip lm_head; only the last token
+    /// computes logits (avoids N× full-vocab readback during prompt processing).
     pub fn forward_prefill(&mut self, token_ids: &[usize]) -> Vec<f32> {
-        let mut logits = Vec::new();
-        for &tid in token_ids {
-            logits = self.forward_single_token(tid);
+        if token_ids.is_empty() {
+            return Vec::new();
         }
-        logits
+        if token_ids.len() == 1 {
+            return self.forward_single_token(token_ids[0]);
+        }
+        for &tid in &token_ids[..token_ids.len() - 1] {
+            self.forward_advance(tid);
+        }
+        self.forward_single_token(*token_ids.last().unwrap())
+    }
+
+    /// Prefill with GPU sampling on the last prompt token (4-byte readback only).
+    pub fn forward_prefill_sample_last(
+        &mut self,
+        token_ids: &[usize],
+        temperature: f32,
+        min_p: f32,
+        seed: u32,
+    ) -> usize {
+        if token_ids.is_empty() {
+            return 0;
+        }
+        if token_ids.len() == 1 {
+            return self.forward_single_token_sample(token_ids[0], temperature, min_p, seed);
+        }
+        for &tid in &token_ids[..token_ids.len() - 1] {
+            self.forward_advance(tid);
+        }
+        self.forward_single_token_sample(
+            *token_ids.last().unwrap(),
+            temperature,
+            min_p,
+            seed,
+        )
     }
 
     pub fn forward_single_token_with_kv_slot(

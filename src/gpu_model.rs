@@ -201,15 +201,27 @@ impl GpuLlamaModel {
             // Rotary embeddings
             self.ctx.encode_rotary(encoder, &self.q_buf, &self.k_buf, &self.cos_buf, &self.sin_buf, num_heads as u32, num_kv_heads as u32, head_dim as u32);
 
-            // Append K, V to GPU cache
-            self.ctx.encode_kv_append(encoder, &self.k_buf, &self.k_cache[layer_idx], num_kv_heads as u32, head_dim as u32, self.kv_capacity, kv_seq);
-            self.ctx.encode_kv_append(encoder, &self.v_buf, &self.v_cache[layer_idx], num_kv_heads as u32, head_dim as u32, self.kv_capacity, kv_seq);
-
-            // Attention (kv_seq + 1 because we just appended)
-            let attn_kv_seq = kv_seq + 1;
-            self.ctx.encode_attention(encoder, &self.q_buf, &self.k_cache[layer_idx], &self.v_cache[layer_idx], &self.attn_out_buf,
-                num_heads as u32, num_kv_heads as u32, num_kv_groups,
-                head_dim as u32, attn_kv_seq, self.kv_capacity, scale);
+            // Append K, V to GPU cache and compute attention (fused Q4_0 kernel)
+            let groups_per_row = head_dim / 32;
+            let row_bytes = groups_per_row * 18;
+            self.ctx.encode_kv_append_attention_q4_0(
+                encoder,
+                &self.q_buf,
+                &self.k_buf,
+                &self.v_buf,
+                &self.attn_out_buf,
+                &self.k_cache[layer_idx],
+                &self.v_cache[layer_idx],
+                num_heads as u32,
+                num_kv_heads as u32,
+                num_kv_groups,
+                head_dim as u32,
+                self.kv_capacity,
+                kv_seq,
+                scale,
+                groups_per_row as u32,
+                row_bytes as u32,
+            );
 
             // O projection
             self.ctx.encode_matvec_q4(encoder, &layer.o_proj, &self.attn_out_buf, &self.o_out_buf, hidden_size as u32, (num_heads * head_dim) as u32);
