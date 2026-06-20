@@ -443,6 +443,9 @@ impl Gemma4GpuModel {
 
         if embed_cache_path.exists() && Self::is_split_weights_cache(&cache_path) {
             println!("  Found split Q4 cache, loading...");
+            println!(
+                "  (Delete model.q4cache + model.embed.cache to re-quantize o_proj/PLE to Q4 on middle layers.)"
+            );
             return Self::load_from_split_cache(model_dir, &embed_cache_path, &cache_path);
         }
 
@@ -728,8 +731,8 @@ impl Gemma4GpuModel {
                 .remove("self_attn.k_norm.weight")
                 .expect("k_norm missing");
 
-            // Mixed quantization: first 3 layers, last 3 layers, and attention o_proj use f16
-            // Everything else uses Q4_0. This preserves quality on edge cases.
+            // Mixed quantization: first 3 layers and last 3 layers stay f16 for all
+            // projections; middle layers use Q4_0 (including o_proj and PLE).
             let is_sensitive_layer = layer_idx < 3 || layer_idx >= (num_layers - 3);
 
             let layer = Gemma4GpuLayer {
@@ -748,7 +751,11 @@ impl Gemma4GpuModel {
                 } else {
                     ctx.buffer_from_f32_as_q4(&v_proj_data, kv_out, hidden_size)
                 }),
-                o_proj: BufferView::from_buffer(ctx.buffer_from_f32_as_f16(&o_proj_data)),
+                o_proj: BufferView::from_buffer(if is_sensitive_layer {
+                    ctx.buffer_from_f32_as_f16(&o_proj_data)
+                } else {
+                    ctx.buffer_from_f32_as_q4(&o_proj_data, hidden_size, q_out)
+                }),
                 gate_proj: BufferView::from_buffer(if is_sensitive_layer {
                     ctx.buffer_from_f32_as_f16(&gate_proj_data)
                 } else {
@@ -771,8 +778,16 @@ impl Gemma4GpuModel {
                 post_feedforward_layernorm_weight: BufferView::from_buffer(ctx.buffer_from_slice(&post_ff_ln)),
                 post_per_layer_input_norm_weight: BufferView::from_buffer(ctx.buffer_from_slice(&post_ple_norm)),
 
-                per_layer_input_gate_weight: BufferView::from_buffer(ctx.buffer_from_f32_as_f16(&ple_gate_data)),
-                per_layer_projection_weight: BufferView::from_buffer(ctx.buffer_from_f32_as_f16(&ple_proj_data)),
+                per_layer_input_gate_weight: BufferView::from_buffer(if is_sensitive_layer {
+                    ctx.buffer_from_f32_as_f16(&ple_gate_data)
+                } else {
+                    ctx.buffer_from_f32_as_q4(&ple_gate_data, ple_dim, hidden_size)
+                }),
+                per_layer_projection_weight: BufferView::from_buffer(if is_sensitive_layer {
+                    ctx.buffer_from_f32_as_f16(&ple_proj_data)
+                } else {
+                    ctx.buffer_from_f32_as_q4(&ple_proj_data, hidden_size, ple_dim)
+                }),
                 layer_scalar,
 
                 q_norm_weight: BufferView::from_buffer(ctx.buffer_from_slice(&q_norm_data)),
@@ -2299,8 +2314,8 @@ impl Gemma4GpuModel {
                 }
             }
 
-            // O projection (always f16 for quality)
-            self.ctx.encode_matvec_f16_view(
+            // O projection (Q4 on middle layers, f16 on sensitive layers)
+            self.ctx.encode_matvec_auto_view(
                 encoder,
                 &layer.o_proj,
                 &self.attn_out_buf,
@@ -2439,7 +2454,7 @@ impl Gemma4GpuModel {
             // hidden_buf is the residual; it is only read (by the input gate
             // matvec) until the residual add below, so no save copy is needed.
             // Gate: ple_gated = per_layer_input_gate(hidden) → [ple_dim]
-            self.ctx.encode_matvec_f16_view(
+            self.ctx.encode_matvec_auto_view(
                 encoder,
                 &layer.per_layer_input_gate_weight,
                 &self.hidden_buf,
@@ -2462,7 +2477,7 @@ impl Gemma4GpuModel {
                 ple_dim as u32,
             );
             // Project back: ple_projected = per_layer_projection(ple_normed) → [hidden]
-            self.ctx.encode_matvec_f16_view(
+            self.ctx.encode_matvec_auto_view(
                 encoder,
                 &layer.per_layer_projection_weight,
                 &self.ple_normed_buf,
@@ -3463,7 +3478,7 @@ impl Gemma4GpuModel {
             num_heads as u32,
             head_dim as u32,
         );
-        self.ctx.encode_projection_f16_batch_view(
+        self.ctx.encode_projection_auto_batch_view(
             encoder,
             &layer.o_proj,
             &self.prefill_scratch.q_normed_buf,
@@ -3594,7 +3609,7 @@ impl Gemma4GpuModel {
             &self.prefill_scratch.residual_buf,
             total_hidden,
         );
-        self.ctx.encode_projection_f16_batch_view(
+        self.ctx.encode_projection_auto_batch_view(
             encoder,
             &layer.per_layer_input_gate_weight,
             &self.prefill_scratch.hidden_buf,
@@ -3613,7 +3628,7 @@ impl Gemma4GpuModel {
             ple_dim as u32,
             seq_len as u32,
         );
-        self.ctx.encode_projection_f16_batch_view(
+        self.ctx.encode_projection_auto_batch_view(
             encoder,
             &layer.per_layer_projection_weight,
             &self.prefill_scratch.up_buf,
@@ -3878,7 +3893,7 @@ impl Gemma4GpuModel {
             num_heads as u32,
             head_dim as u32,
         );
-        self.ctx.encode_projection_f16_batch_view(
+        self.ctx.encode_projection_auto_batch_view(
             encoder,
             &layer.o_proj,
             &self.prefill_scratch.q_normed_buf,
@@ -4009,7 +4024,7 @@ impl Gemma4GpuModel {
             &self.prefill_scratch.residual_buf,
             total_hidden,
         );
-        self.ctx.encode_projection_f16_batch_view(
+        self.ctx.encode_projection_auto_batch_view(
             encoder,
             &layer.per_layer_input_gate_weight,
             &self.prefill_scratch.hidden_buf,
@@ -4028,7 +4043,7 @@ impl Gemma4GpuModel {
             ple_dim as u32,
             total_seq_len as u32,
         );
-        self.ctx.encode_projection_f16_batch_view(
+        self.ctx.encode_projection_auto_batch_view(
             encoder,
             &layer.per_layer_projection_weight,
             &self.prefill_scratch.up_buf,
@@ -4281,7 +4296,7 @@ impl Gemma4GpuModel {
                 num_heads as u32,
                 head_dim as u32,
             );
-            self.ctx.encode_projection_f16_batch_view(
+            self.ctx.encode_projection_auto_batch_view(
                 encoder,
                 &layer.o_proj,
                 &self.prefill_scratch.q_normed_buf,
@@ -4412,7 +4427,7 @@ impl Gemma4GpuModel {
                 &self.prefill_scratch.residual_buf,
                 total_hidden,
             );
-            self.ctx.encode_projection_f16_batch_view(
+            self.ctx.encode_projection_auto_batch_view(
                 encoder,
                 &layer.per_layer_input_gate_weight,
                 &self.prefill_scratch.hidden_buf,
@@ -4431,7 +4446,7 @@ impl Gemma4GpuModel {
                 ple_dim as u32,
                 seq_len as u32,
             );
-            self.ctx.encode_projection_f16_batch_view(
+            self.ctx.encode_projection_auto_batch_view(
                 encoder,
                 &layer.per_layer_projection_weight,
                 &self.prefill_scratch.up_buf,
@@ -4928,7 +4943,7 @@ impl Gemma4GpuModel {
                     }
                 }
 
-                self.ctx.encode_matvec_f16_at_view(
+                self.ctx.encode_matvec_auto_at_view(
                     encoder,
                     &layer.o_proj,
                     &self.decode_batch_scratch.attn_out_buf,
@@ -5082,7 +5097,7 @@ impl Gemma4GpuModel {
                     offsets.hidden,
                     hidden_size as u32,
                 );
-                self.ctx.encode_matvec_f16_at_view(
+                self.ctx.encode_matvec_auto_at_view(
                     encoder,
                     &layer.per_layer_input_gate_weight,
                     &self.decode_batch_scratch.hidden_buf,
@@ -5102,7 +5117,7 @@ impl Gemma4GpuModel {
                     offsets.intermediate,
                     ple_dim as u32,
                 );
-                self.ctx.encode_matvec_f16_at_view(
+                self.ctx.encode_matvec_auto_at_view(
                     encoder,
                     &layer.per_layer_projection_weight,
                     &self.decode_batch_scratch.up_buf,

@@ -49,7 +49,7 @@ Still pending:
 - Move the single-command-buffer optimization into the multi-request batched
   prefill path.
 - Use or remove the experimental tiled projection kernels after benchmarking.
-- Add tiled/FlashAttention-style prefill attention.
+- Benchmark and tune the tiled FlashAttention-style attention kernels further.
 - Add deeper logits/top-k debug correctness checks.
 - Publish stable benchmark numbers with exact hardware, model, and runtime
   configuration.
@@ -259,7 +259,8 @@ docs/                       Architecture notes and blog posts
 - Multi-request batched prefill is real, but the latest single-command-buffer
   optimization is not yet applied to that path.
 - Tiled projection kernels are present but not currently used in the hot path.
-- Attention is not yet FlashAttention-style.
+- Decode and causal attention use tiled FlashAttention-style kernels by default
+  (`FLASH_ATTN=legacy` to revert to the older per-token attention path).
 
 ## Positioning
 

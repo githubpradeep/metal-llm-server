@@ -37,6 +37,13 @@ impl BufferView {
     }
 }
 
+/// True when a `[m, k]` weight buffer holds Q4_0 blocks (18 bytes / 32 weights).
+pub fn weight_buf_is_q4(view: &BufferView, m: u32, k: u32) -> bool {
+    let q4_bytes = (m as u64) * (k as u64 / 32) * 18;
+    // f16 would be m*k*2 — well above q4_bytes; allow section-alignment padding.
+    view.length <= q4_bytes + 256
+}
+
 /// Q4 matvec kernel used on the batch-1 decode path. Selectable at runtime via
 /// the `MATVEC_KERNEL` env var (`r1` | `r2` | `r4`/`fast` | `splitk`) so the
 /// best variant for the model's matvec shapes can be chosen from measurement
@@ -71,6 +78,21 @@ impl DecodeMatvecKernel {
             DecodeMatvecKernel::R8 => 8,
             DecodeMatvecKernel::SplitK => 4,
         }
+    }
+}
+
+fn flash_attention_enabled() -> bool {
+    !matches!(
+        std::env::var("FLASH_ATTN").as_deref(),
+        Ok("0") | Ok("false") | Ok("legacy") | Ok("LEGACY")
+    )
+}
+
+fn attention_threadgroup_size(flash: bool) -> MTLSize {
+    if flash {
+        MTLSize::new(256, 1, 1)
+    } else {
+        MTLSize::new(64, 1, 1)
     }
 }
 
@@ -141,6 +163,9 @@ pub struct MetalContext {
     pub embed_gather_bf16_pipeline: ComputePipelineState,
     pub embed_gather_bf16_batch_pipeline: ComputePipelineState,
     pub sample_token_pipeline: ComputePipelineState,
+    /// Tiled online-softmax attention (default). Set FLASH_ATTN=legacy to use
+    /// the older per-token / TILE_KV=4 kernels.
+    pub use_flash_attention: bool,
 }
 
 impl MetalContext {
@@ -176,6 +201,7 @@ impl MetalContext {
         let matvec_q4_r8_pipeline = get_fn("matvec_q4_r8");
         let matvec_q4_splitk_pipeline = get_fn("matvec_q4_splitk");
         let decode_matvec_kernel = DecodeMatvecKernel::from_env();
+        let use_flash_attention = flash_attention_enabled();
         let projection_f16_batch_pipeline = get_fn("projection_f16_batch");
         let projection_q4_batch_pipeline = get_fn("projection_q4_batch");
         let projection_f16_batch_tiled_pipeline = get_fn("projection_f16_batch_tiled");
@@ -210,9 +236,21 @@ impl MetalContext {
         let rmsnorm_per_head_noweight_pipeline = get_fn("rmsnorm_per_head_noweight");
         let rotary_partial_pipeline = get_fn("apply_rotary_partial");
         let attention_offset_pipeline = get_fn("attention_single_token_offset");
-        let attention_offset_f16_pipeline = get_fn("attention_single_token_offset_f16");
-        let attention_causal_f16_pipeline = get_fn("attention_causal_f16");
-        let attention_causal_strided_f16_pipeline = get_fn("attention_causal_strided_f16");
+        let attention_offset_f16_pipeline = get_fn(if use_flash_attention {
+            "attention_flash_decode_f16"
+        } else {
+            "attention_single_token_offset_f16"
+        });
+        let attention_causal_f16_pipeline = get_fn(if use_flash_attention {
+            "attention_flash_causal_f16"
+        } else {
+            "attention_causal_f16"
+        });
+        let attention_causal_strided_f16_pipeline = get_fn(if use_flash_attention {
+            "attention_flash_causal_strided_f16"
+        } else {
+            "attention_causal_strided_f16"
+        });
         let vec_scale_pipeline = get_fn("vec_scale");
 
         let kv_append_q8_0_pipeline = get_fn("kv_cache_append_q8_0");
@@ -224,12 +262,27 @@ impl MetalContext {
         let attention_offset_q8_0_pipeline = get_fn("attention_single_token_offset_q8_0");
         let attention_causal_q8_0_pipeline = get_fn("attention_causal_q8_0");
         let attention_causal_strided_q8_0_pipeline = get_fn("attention_causal_strided_q8_0");
-        let attention_offset_q4_0_pipeline = get_fn("attention_single_token_offset_q4_0");
-        let attention_causal_q4_0_pipeline = get_fn("attention_causal_q4_0");
-        let attention_causal_strided_q4_0_pipeline = get_fn("attention_causal_strided_q4_0");
+        let attention_offset_q4_0_pipeline = get_fn(if use_flash_attention {
+            "attention_flash_decode_q4_0"
+        } else {
+            "attention_single_token_offset_q4_0"
+        });
+        let attention_causal_q4_0_pipeline = get_fn(if use_flash_attention {
+            "attention_flash_causal_q4_0"
+        } else {
+            "attention_causal_q4_0"
+        });
+        let attention_causal_strided_q4_0_pipeline = get_fn(if use_flash_attention {
+            "attention_flash_causal_strided_q4_0"
+        } else {
+            "attention_causal_strided_q4_0"
+        });
         let embed_gather_bf16_pipeline = get_fn("embed_gather_bf16");
         let embed_gather_bf16_batch_pipeline = get_fn("embed_gather_bf16_batch");
         let sample_token_pipeline = get_fn("sample_token");
+        if use_flash_attention {
+            println!("  FlashAttention-style tiled kernels enabled (FLASH_ATTN=legacy to disable)");
+        }
 
         MetalContext {
             device,
@@ -296,6 +349,7 @@ impl MetalContext {
             embed_gather_bf16_pipeline,
             embed_gather_bf16_batch_pipeline,
             sample_token_pipeline,
+            use_flash_attention,
         }
     }
 
@@ -742,6 +796,62 @@ impl MetalContext {
             m,
             k,
         );
+    }
+
+    /// Matvec dispatching to Q4 or f16 based on the weight buffer layout.
+    pub fn encode_matvec_auto_view(
+        &self,
+        encoder: &ComputeCommandEncoderRef,
+        weight: &BufferView,
+        x_buf: &Buffer,
+        y_buf: &Buffer,
+        m: u32,
+        k: u32,
+    ) {
+        if weight_buf_is_q4(weight, m, k) {
+            self.encode_matvec_q4_view(encoder, weight, x_buf, y_buf, m, k);
+        } else {
+            self.encode_matvec_f16_view(encoder, weight, x_buf, y_buf, m, k);
+        }
+    }
+
+    pub fn encode_matvec_auto_at_view(
+        &self,
+        encoder: &ComputeCommandEncoderRef,
+        weight: &BufferView,
+        x_buf: &Buffer,
+        x_offset: u64,
+        y_buf: &Buffer,
+        y_offset: u64,
+        m: u32,
+        k: u32,
+    ) {
+        if weight_buf_is_q4(weight, m, k) {
+            self.encode_matvec_q4_at_view(
+                encoder, weight, x_buf, x_offset, y_buf, y_offset, m, k,
+            );
+        } else {
+            self.encode_matvec_f16_at_view(
+                encoder, weight, x_buf, x_offset, y_buf, y_offset, m, k,
+            );
+        }
+    }
+
+    pub fn encode_projection_auto_batch_view(
+        &self,
+        encoder: &ComputeCommandEncoderRef,
+        weight: &BufferView,
+        x_buf: &Buffer,
+        y_buf: &Buffer,
+        m: u32,
+        k: u32,
+        seq_len: u32,
+    ) {
+        if weight_buf_is_q4(weight, m, k) {
+            self.encode_projection_q4_batch_view(encoder, weight, x_buf, y_buf, m, k, seq_len);
+        } else {
+            self.encode_projection_f16_batch_view(encoder, weight, x_buf, y_buf, m, k, seq_len);
+        }
     }
 
     pub fn encode_matvec_f16_at(
@@ -1620,7 +1730,7 @@ impl MetalContext {
         encoder.set_bytes(9, 4, &k_cap as *const u32 as *const _);
         encoder.set_bytes(10, 4, &scale as *const f32 as *const _);
         encoder.set_bytes(11, 4, &kv_start as *const u32 as *const _);
-        let tg_size = MTLSize::new(64, 1, 1);
+        let tg_size = attention_threadgroup_size(self.use_flash_attention);
         encoder.dispatch_thread_groups(MTLSize::new(num_heads as u64, 1, 1), tg_size);
     }
 
@@ -1982,7 +2092,7 @@ impl MetalContext {
         encoder.set_bytes(11, 4, &q_len as *const u32 as *const _);
         encoder.set_bytes(12, 4, &q_start as *const u32 as *const _);
         encoder.set_bytes(13, 4, &attention_window as *const u32 as *const _);
-        let tg_size = MTLSize::new(64, 1, 1);
+        let tg_size = attention_threadgroup_size(self.use_flash_attention);
         let num_tgs = num_heads * q_len;
         encoder.dispatch_thread_groups(MTLSize::new(num_tgs as u64, 1, 1), tg_size);
     }
@@ -2024,7 +2134,7 @@ impl MetalContext {
         encoder.set_bytes(13, 4, &attention_window as *const u32 as *const _);
         encoder.set_bytes(14, 4, &q_stride as *const u32 as *const _);
         encoder.set_bytes(15, 4, &q_start_row as *const u32 as *const _);
-        let tg_size = MTLSize::new(64, 1, 1);
+        let tg_size = attention_threadgroup_size(self.use_flash_attention);
         let num_tgs = num_heads * q_len;
         encoder.dispatch_thread_groups(MTLSize::new(num_tgs as u64, 1, 1), tg_size);
     }
@@ -2383,7 +2493,7 @@ impl MetalContext {
         encoder.set_bytes(11, 4, &kv_start as *const u32 as *const _);
         encoder.set_bytes(12, 4, &groups_per_row as *const u32 as *const _);
         encoder.set_bytes(13, 4, &row_bytes as *const u32 as *const _);
-        let tg_size = MTLSize::new(64, 1, 1);
+        let tg_size = attention_threadgroup_size(self.use_flash_attention);
         encoder.dispatch_thread_groups(MTLSize::new(num_heads as u64, 1, 1), tg_size);
     }
 
@@ -2512,7 +2622,7 @@ impl MetalContext {
         encoder.set_bytes(13, 4, &attention_window as *const u32 as *const _);
         encoder.set_bytes(14, 4, &groups_per_row as *const u32 as *const _);
         encoder.set_bytes(15, 4, &row_bytes as *const u32 as *const _);
-        let tg_size = MTLSize::new(64, 1, 1);
+        let tg_size = attention_threadgroup_size(self.use_flash_attention);
         let num_tgs = num_heads * q_len;
         encoder.dispatch_thread_groups(MTLSize::new(num_tgs as u64, 1, 1), tg_size);
     }
@@ -2558,7 +2668,7 @@ impl MetalContext {
         encoder.set_bytes(15, 4, &q_start_row as *const u32 as *const _);
         encoder.set_bytes(16, 4, &groups_per_row as *const u32 as *const _);
         encoder.set_bytes(17, 4, &row_bytes as *const u32 as *const _);
-        let tg_size = MTLSize::new(64, 1, 1);
+        let tg_size = attention_threadgroup_size(self.use_flash_attention);
         let num_tgs = num_heads * q_len;
         encoder.dispatch_thread_groups(MTLSize::new(num_tgs as u64, 1, 1), tg_size);
     }
