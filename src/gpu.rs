@@ -133,30 +133,72 @@ fn flash_attention_enabled() -> bool {
     )
 }
 
-/// Head-dim specialized flash decode (Gemma4 h256/h512). Set ATTENTION_KERNEL=generic
-/// to force the runtime head_dim kernel. Set ATTENTION_KERNEL=ggml for llama.cpp FA.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum AttentionKernelMode {
+    /// Shared-KV (full-attn) layers → ggml FA; has_kv layers → fused specialized h256.
+    Auto,
+    Ggml,
+    Specialized,
+    Generic,
+}
+
+fn attention_kernel_mode() -> AttentionKernelMode {
+    match std::env::var("ATTENTION_KERNEL").as_deref() {
+        Ok("ggml") | Ok("GGML") => AttentionKernelMode::Ggml,
+        Ok("auto") | Ok("AUTO") => AttentionKernelMode::Auto,
+        Ok("specialized") | Ok("SPECIALIZED") => AttentionKernelMode::Specialized,
+        Ok("generic") | Ok("GENERIC") => AttentionKernelMode::Generic,
+        _ => AttentionKernelMode::Specialized,
+    }
+}
+
+/// llama.cpp flash_attn_ext_vec for this layer (default auto: shared-KV layers only).
+pub fn attention_use_ggml_for_layer(has_kv: bool) -> bool {
+    match attention_kernel_mode() {
+        AttentionKernelMode::Ggml => true,
+        AttentionKernelMode::Specialized | AttentionKernelMode::Generic => false,
+        AttentionKernelMode::Auto => !has_kv,
+    }
+}
+
+/// True when every layer uses ggml FA (ATTENTION_KERNEL=ggml).
 pub fn attention_use_ggml() -> bool {
-    matches!(
-        std::env::var("ATTENTION_KERNEL").as_deref(),
-        Ok("ggml") | Ok("GGML")
-    )
+    matches!(attention_kernel_mode(), AttentionKernelMode::Ggml)
 }
 
 fn attention_q4_hd_specialized() -> bool {
-    !matches!(
-        std::env::var("ATTENTION_KERNEL").as_deref(),
-        Ok("generic") | Ok("GENERIC") | Ok("ggml") | Ok("GGML")
+    matches!(
+        attention_kernel_mode(),
+        AttentionKernelMode::Specialized | AttentionKernelMode::Auto
     )
 }
 
 /// Fuse KV Q4_0 append into flash decode attention (default on). Set FUSED_KV_ATTN=0 to disable.
 pub fn fused_kv_attention_enabled() -> bool {
-    if attention_use_ggml() {
+    if matches!(attention_kernel_mode(), AttentionKernelMode::Ggml) {
         return false;
     }
     !matches!(
         std::env::var("FUSED_KV_ATTN").as_deref(),
         Ok("0") | Ok("false") | Ok("FALSE")
+    )
+}
+
+/// f16 GeLU scratch between gate∥up and down (halves activation bandwidth). Opt-in:
+/// ~neutral on M1 Pro e2e; enable with MLP_GELU_F16=1 to experiment.
+pub fn mlp_gelu_f16_enabled() -> bool {
+    matches!(
+        std::env::var("MLP_GELU_F16").as_deref(),
+        Ok("1") | Ok("true") | Ok("TRUE")
+    )
+}
+
+/// Fuse pre-FF RMSNorm into Q4 gate∥up+GeLU (skip normed scratch). Opt-in:
+/// extra inv_rms dispatch per layer regresses ~0.5 tok/s on M1 Pro vs separate rmsnorm.
+pub fn fused_rmsnorm_mlp_enabled() -> bool {
+    matches!(
+        std::env::var("FUSED_RMSNORM_MLP").as_deref(),
+        Ok("1") | Ok("true") | Ok("TRUE")
     )
 }
 
@@ -195,6 +237,17 @@ pub fn fused_rmsnorm_acc_enabled() -> bool {
     )
 }
 
+/// Number of command buffers per decode token. When >= 2, the layer loop is split
+/// so the CPU can encode CB[i+1] while the GPU runs CB[i] (llama.cpp GGML_METAL_N_CB).
+/// Default 2; set METAL_N_CB=1 to disable.
+pub fn metal_n_cb() -> u32 {
+    match std::env::var("METAL_N_CB").as_deref() {
+        Ok("1") => 1,
+        Ok(s) => s.parse::<u32>().unwrap_or(2).clamp(1, 8),
+        _ => 2,
+    }
+}
+
 fn attention_threadgroup_size(flash: bool) -> MTLSize {
     if flash {
         MTLSize::new(256, 1, 1)
@@ -219,6 +272,10 @@ pub struct MetalContext {
     pub matvec_q4_dual_pipeline: ComputePipelineState,
     pub matvec_q4_dual_gelu_pipeline: ComputePipelineState,
     pub matvec_q4_interleaved_gelu_pipeline: ComputePipelineState,
+    pub rmsnorm_inv_rms_pipeline: ComputePipelineState,
+    pub matvec_q4_interleaved_gelu_hidden_pipeline: ComputePipelineState,
+    pub matvec_q4_interleaved_gelu_f16_pipeline: ComputePipelineState,
+    pub matvec_ggml_q4_f16x_pipeline: ComputePipelineState,
     pub ple_matvec_gelu_q4_pipeline: ComputePipelineState,
     pub matvec_ggml_q4_pipeline: ComputePipelineState,
     pub matvec_ggml_ext_q4_nx4_pipeline: ComputePipelineState,
@@ -351,6 +408,11 @@ impl MetalContext {
         let matvec_q4_dual_pipeline = get_fn("matvec_q4_dual");
         let matvec_q4_dual_gelu_pipeline = get_fn("matvec_q4_dual_gelu");
         let matvec_q4_interleaved_gelu_pipeline = get_fn("matvec_q4_interleaved_gelu");
+        let rmsnorm_inv_rms_pipeline = get_fn("rmsnorm_inv_rms");
+        let matvec_q4_interleaved_gelu_hidden_pipeline =
+            get_fn("matvec_q4_interleaved_gelu_hidden");
+        let matvec_q4_interleaved_gelu_f16_pipeline = get_fn("matvec_q4_interleaved_gelu_f16");
+        let matvec_ggml_q4_f16x_pipeline = get_fn("matvec_ggml_q4_0_f16x");
         let ple_matvec_gelu_q4_pipeline = get_fn("ple_matvec_gelu_q4");
         let matvec_ggml_q4_pipeline = get_fn("matvec_ggml_q4_0");
         let matvec_ggml_ext_q4_nx4_pipeline = get_fn("matvec_ggml_ext_q4_nx4_r4");
@@ -469,16 +531,33 @@ impl MetalContext {
         let decode_mega_gemma4_pipeline = get_fn("decode_mega_gemma4_q4_0");
         if use_flash_attention {
             println!("  FlashAttention-style tiled kernels enabled (FLASH_ATTN=legacy to disable)");
-            if attention_use_ggml() {
-                println!("  Q4 decode attention: ggml flash_attn_ext_vec (ATTENTION_KERNEL=ggml)");
-            } else if attention_q4_hd_specialized() {
-                println!("  Q4 decode attention: h256/h512 specialized (ATTENTION_KERNEL=generic to disable)");
+            match attention_kernel_mode() {
+                AttentionKernelMode::Ggml => {
+                    println!("  Q4 decode attention: ggml flash_attn_ext_vec (ATTENTION_KERNEL=ggml)");
+                }
+                AttentionKernelMode::Auto => {
+                    println!(
+                        "  Q4 decode attention: auto — fused h256 (has_kv) + ggml h512 (ATTENTION_KERNEL=auto)"
+                    );
+                }
+                AttentionKernelMode::Specialized if attention_q4_hd_specialized() => {
+                    println!(
+                        "  Q4 decode attention: h256/h512 specialized + fused KV (ATTENTION_KERNEL=ggml|auto to try alternatives)"
+                    );
+                }
+                _ => {}
             }
             if fused_kv_attention_enabled() {
                 println!("  Fused KV append + Q4 flash attention (FUSED_KV_ATTN=0 to disable)");
             }
             if packed_mlp_gate_up_enabled() {
                 println!("  Interleaved gate∥up Q4 MLP weights (PACKED_MLP_GATE_UP=0 to disable)");
+            }
+            if mlp_gelu_f16_enabled() {
+                println!("  MLP f16 GeLU scratch gate→down (MLP_GELU_F16=1 enabled)");
+            }
+            if fused_rmsnorm_mlp_enabled() {
+                println!("  Fused pre-FF RMSNorm + gate∥up+GeLU (FUSED_RMSNORM_MLP=0 to disable)");
             }
             if fused_mlp_gelu_down_enabled() {
                 println!("  Fused MLP gate+up+GeLU+down pipeline (FUSED_MLP_GELU_DOWN=0 to disable)");
@@ -505,6 +584,10 @@ impl MetalContext {
             matvec_q4_dual_pipeline,
             matvec_q4_dual_gelu_pipeline,
             matvec_q4_interleaved_gelu_pipeline,
+            rmsnorm_inv_rms_pipeline,
+            matvec_q4_interleaved_gelu_hidden_pipeline,
+            matvec_q4_interleaved_gelu_f16_pipeline,
+            matvec_ggml_q4_f16x_pipeline,
             ple_matvec_gelu_q4_pipeline,
             matvec_ggml_q4_pipeline,
             matvec_ggml_ext_q4_nx4_pipeline,
@@ -1435,6 +1518,199 @@ impl MetalContext {
         encoder.dispatch_thread_groups(num_tgs, tg_size);
     }
 
+    pub fn encode_rmsnorm_inv_rms_at_view(
+        &self,
+        encoder: &ComputeCommandEncoderRef,
+        x_buf: &Buffer,
+        x_offset: u64,
+        inv_rms_buf: &Buffer,
+        inv_rms_offset: u64,
+        dim: u32,
+        eps: f32,
+    ) {
+        encoder.set_compute_pipeline_state(&self.rmsnorm_inv_rms_pipeline);
+        encoder.set_buffer(0, Some(x_buf), x_offset);
+        encoder.set_buffer(1, Some(inv_rms_buf), inv_rms_offset);
+        encoder.set_bytes(2, 4, &dim as *const u32 as *const _);
+        encoder.set_bytes(3, 4, &eps as *const f32 as *const _);
+        encoder.dispatch_thread_groups(MTLSize::new(1, 1, 1), MTLSize::new(256, 1, 1));
+    }
+
+    pub fn encode_matvec_q4_interleaved_gelu_hidden_at_view(
+        &self,
+        encoder: &ComputeCommandEncoderRef,
+        gate_up: &BufferView,
+        hidden_buf: &Buffer,
+        hidden_offset: u64,
+        weight: &BufferView,
+        inv_rms_buf: &Buffer,
+        inv_rms_offset: u64,
+        y_buf: &Buffer,
+        y_offset: u64,
+        m: u32,
+        k: u32,
+    ) {
+        encoder.set_compute_pipeline_state(&self.matvec_q4_interleaved_gelu_hidden_pipeline);
+        encoder.set_buffer(0, Some(&gate_up.buffer), gate_up.offset);
+        encoder.set_buffer(1, Some(hidden_buf), hidden_offset);
+        encoder.set_buffer(2, Some(&weight.buffer), weight.offset);
+        encoder.set_buffer(3, Some(inv_rms_buf), inv_rms_offset);
+        encoder.set_buffer(4, Some(y_buf), y_offset);
+        encoder.set_bytes(5, 4, &m as *const u32 as *const _);
+        encoder.set_bytes(6, 4, &k as *const u32 as *const _);
+        const SG_PER_TG: u64 = 8;
+        let rows_per_tg = SG_PER_TG * 4;
+        let num_tgs = MTLSize::new((m as u64 + rows_per_tg - 1) / rows_per_tg, 1, 1);
+        let tg_size = MTLSize::new(SG_PER_TG * 32, 1, 1);
+        encoder.dispatch_thread_groups(num_tgs, tg_size);
+    }
+
+    pub fn encode_matvec_q4_interleaved_gelu_f16_at_view(
+        &self,
+        encoder: &ComputeCommandEncoderRef,
+        gate_up: &BufferView,
+        x_buf: &Buffer,
+        x_offset: u64,
+        y_buf: &Buffer,
+        y_offset: u64,
+        m: u32,
+        k: u32,
+    ) {
+        encoder.set_compute_pipeline_state(&self.matvec_q4_interleaved_gelu_f16_pipeline);
+        encoder.set_buffer(0, Some(&gate_up.buffer), gate_up.offset);
+        encoder.set_buffer(1, Some(x_buf), x_offset);
+        encoder.set_buffer(2, Some(y_buf), y_offset);
+        encoder.set_bytes(3, 4, &m as *const u32 as *const _);
+        encoder.set_bytes(4, 4, &k as *const u32 as *const _);
+        const SG_PER_TG: u64 = 8;
+        let rows_per_tg = SG_PER_TG * 4;
+        let num_tgs = MTLSize::new((m as u64 + rows_per_tg - 1) / rows_per_tg, 1, 1);
+        let tg_size = MTLSize::new(SG_PER_TG * 32, 1, 1);
+        encoder.dispatch_thread_groups(num_tgs, tg_size);
+    }
+
+    pub fn encode_matvec_ggml_q4_f16x_at_view(
+        &self,
+        encoder: &ComputeCommandEncoderRef,
+        w_buf: &Buffer,
+        w_offset: u64,
+        x_buf: &Buffer,
+        x_offset: u64,
+        y_buf: &Buffer,
+        y_offset: u64,
+        m: u32,
+        k: u32,
+    ) {
+        use crate::ggml_gemv::{mul_mv_args, mul_mv_dispatch};
+
+        encoder.set_compute_pipeline_state(&self.matvec_ggml_q4_f16x_pipeline);
+        encoder.set_buffer(0, Some(w_buf), w_offset);
+        encoder.set_buffer(1, Some(x_buf), x_offset);
+        encoder.set_buffer(2, Some(y_buf), y_offset);
+        let args = mul_mv_args(m, k);
+        encoder.set_bytes(
+            3,
+            std::mem::size_of::<crate::ggml_gemv::GgmlMulMvArgs>() as u64,
+            &args as *const _ as *const _,
+        );
+        let (tg_x, tg_y, tg_z, tw, nsg) = mul_mv_dispatch(m, 1);
+        encoder.dispatch_thread_groups(
+            metal::MTLSize::new(tg_x, tg_y, tg_z),
+            metal::MTLSize::new(tw, nsg, 1),
+        );
+    }
+
+    /// Down matvec reading f16 activations (ggml Q4 weights).
+    fn encode_mlp_down_q4_at_view(
+        &self,
+        encoder: &ComputeCommandEncoderRef,
+        down: &BufferView,
+        gelu_buf: &Buffer,
+        gelu_offset: u64,
+        y_buf: &Buffer,
+        y_offset: u64,
+        hidden_size: u32,
+        intermediate_size: u32,
+    ) {
+        if mlp_gelu_f16_enabled() {
+            self.encode_matvec_ggml_q4_f16x_at_view(
+                encoder,
+                &down.buffer,
+                down.offset,
+                gelu_buf,
+                gelu_offset,
+                y_buf,
+                y_offset,
+                hidden_size,
+                intermediate_size,
+            );
+        } else {
+            self.encode_matvec_q4_at_view(
+                encoder,
+                down,
+                gelu_buf,
+                gelu_offset,
+                y_buf,
+                y_offset,
+                hidden_size,
+                intermediate_size,
+            );
+        }
+    }
+
+    /// Fused gate∥up+GeLU+down from post-attn hidden (no normed_buf round-trip).
+    pub fn encode_mlp_fused_q4_gelu_down_packed_from_hidden_at_view(
+        &self,
+        encoder: &ComputeCommandEncoderRef,
+        gate_up: &BufferView,
+        down: &BufferView,
+        ff_norm_weight: &BufferView,
+        hidden_buf: &Buffer,
+        hidden_offset: u64,
+        inv_rms_buf: &Buffer,
+        inv_rms_offset: u64,
+        gelu_buf: &Buffer,
+        gelu_offset: u64,
+        y_buf: &Buffer,
+        y_offset: u64,
+        hidden_size: u32,
+        intermediate_size: u32,
+        eps: f32,
+    ) {
+        self.encode_rmsnorm_inv_rms_at_view(
+            encoder,
+            hidden_buf,
+            hidden_offset,
+            inv_rms_buf,
+            inv_rms_offset,
+            hidden_size,
+            eps,
+        );
+        self.encode_matvec_q4_interleaved_gelu_hidden_at_view(
+            encoder,
+            gate_up,
+            hidden_buf,
+            hidden_offset,
+            ff_norm_weight,
+            inv_rms_buf,
+            inv_rms_offset,
+            gelu_buf,
+            gelu_offset,
+            intermediate_size,
+            hidden_size,
+        );
+        self.encode_mlp_down_q4_at_view(
+            encoder,
+            down,
+            gelu_buf,
+            gelu_offset,
+            y_buf,
+            y_offset,
+            hidden_size,
+            intermediate_size,
+        );
+    }
+
     /// Fused gate+up+GeLU+down Q4 MLP: dual_gelu into scratch, then down matvec
     /// (same command-buffer encoder, sequential dispatches — no gelu DRAM round-trip
     /// between separate Rust call sites).
@@ -1492,7 +1768,7 @@ impl MetalContext {
             intermediate_size,
             hidden_size,
         );
-        self.encode_matvec_q4_at_view(
+        self.encode_mlp_down_q4_at_view(
             encoder,
             down,
             gelu_buf,
@@ -1519,17 +1795,30 @@ impl MetalContext {
         hidden_size: u32,
         intermediate_size: u32,
     ) {
-        self.encode_matvec_q4_interleaved_gelu_at_view(
-            encoder,
-            gate_up,
-            x_buf,
-            x_offset,
-            gelu_buf,
-            gelu_offset,
-            intermediate_size,
-            hidden_size,
-        );
-        self.encode_matvec_q4_at_view(
+        if mlp_gelu_f16_enabled() {
+            self.encode_matvec_q4_interleaved_gelu_f16_at_view(
+                encoder,
+                gate_up,
+                x_buf,
+                x_offset,
+                gelu_buf,
+                gelu_offset,
+                intermediate_size,
+                hidden_size,
+            );
+        } else {
+            self.encode_matvec_q4_interleaved_gelu_at_view(
+                encoder,
+                gate_up,
+                x_buf,
+                x_offset,
+                gelu_buf,
+                gelu_offset,
+                intermediate_size,
+                hidden_size,
+            );
+        }
+        self.encode_mlp_down_q4_at_view(
             encoder,
             down,
             gelu_buf,
@@ -3840,6 +4129,240 @@ fn quantize_q4_0(data: &[f32], rows: usize, cols: usize) -> Vec<u8> {
     }
 
     output
+}
+
+/// Skip decode sections for bottleneck ablation (`PROFILE_ABLATE=attn|mlp|ple|head`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProfileAblate {
+    None,
+    Attn,
+    Mlp,
+    Ple,
+    Head,
+}
+
+impl ProfileAblate {
+    pub fn from_env() -> Self {
+        match std::env::var("PROFILE_ABLATE").as_deref() {
+            Ok("attn") | Ok("ATTN") | Ok("attention") => ProfileAblate::Attn,
+            Ok("mlp") | Ok("MLP") => ProfileAblate::Mlp,
+            Ok("ple") | Ok("PLE") => ProfileAblate::Ple,
+            Ok("head") | Ok("HEAD") | Ok("lm_head") => ProfileAblate::Head,
+            _ => ProfileAblate::None,
+        }
+    }
+
+    pub fn active(&self) -> bool {
+        !matches!(self, ProfileAblate::None)
+    }
+
+    pub fn skip_attn(&self) -> bool {
+        matches!(self, ProfileAblate::Attn)
+    }
+
+    pub fn skip_mlp(&self) -> bool {
+        matches!(self, ProfileAblate::Mlp)
+    }
+
+    pub fn skip_ple(&self) -> bool {
+        matches!(self, ProfileAblate::Ple)
+    }
+
+    pub fn skip_head(&self) -> bool {
+        matches!(self, ProfileAblate::Head)
+    }
+
+    pub fn log_once(&self) {
+        if !self.active() {
+            return;
+        }
+        static WARN: std::sync::Once = std::sync::Once::new();
+        WARN.call_once(|| {
+            eprintln!(
+                "  Ablation profiling: skipping {:?} (PROFILE_ABLATE)",
+                std::env::var("PROFILE_ABLATE").unwrap_or_default()
+            );
+        });
+    }
+}
+
+pub fn profile_gpu_enabled() -> bool {
+    std::env::var("PROFILE_GPU").is_ok()
+}
+
+/// Per-layer GPU timestamps inside a single command buffer (Metal counter samples).
+/// Sample layout: [0]=post-rope, [1]=post-ple-prepass, per-layer [attn,mlp,ple]×N, [head].
+pub struct GpuTimestampProfiler {
+    sample_buffer: CounterSampleBuffer,
+    resolve_buf: Buffer,
+    capacity: u32,
+    next: u32,
+    ns_per_tick: f64,
+}
+
+#[derive(Clone, Copy, Default)]
+struct GpuPhaseMs {
+    prepass: f64,
+    attn: f64,
+    mlp: f64,
+    ple: f64,
+    head: f64,
+    total: f64,
+}
+
+thread_local! {
+    static GPU_PHASE_ACC: std::cell::Cell<(GpuPhaseMs, u64)> =
+        std::cell::Cell::new((GpuPhaseMs::default(), 0));
+}
+
+impl GpuTimestampProfiler {
+    pub fn try_new(device: &Device, num_layers: u32) -> Option<Self> {
+        let counter_set = device.counter_sets().into_iter().find(|cs| {
+            cs.name().to_ascii_lowercase().contains("timestamp")
+        })?;
+        let capacity = 2 + num_layers * 3 + 1;
+        let desc = CounterSampleBufferDescriptor::new();
+        desc.set_counter_set(&counter_set);
+        desc.set_sample_count(capacity as u64);
+        desc.set_storage_mode(MTLStorageMode::Shared);
+        let sample_buffer = device
+            .new_counter_sample_buffer_with_descriptor(&desc)
+            .ok()?;
+        let resolve_bytes = (capacity as u64) * std::mem::size_of::<u64>() as u64;
+        let resolve_buf = device.new_buffer(
+            resolve_bytes,
+            MTLResourceOptions::StorageModeShared,
+        );
+        let mut cpu0 = 0u64;
+        let mut gpu0 = 0u64;
+        let mut cpu1 = 0u64;
+        let mut gpu1 = 0u64;
+        device.sample_timestamps(&mut cpu0, &mut gpu0);
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        device.sample_timestamps(&mut cpu1, &mut gpu1);
+        let cpu_delta = cpu1.saturating_sub(cpu0) as f64;
+        let gpu_delta = gpu1.saturating_sub(gpu0) as f64;
+        let ns_per_tick = if gpu_delta > 0.0 {
+            (cpu_delta * 1e6) / gpu_delta
+        } else {
+            1.0
+        };
+        // M1/M2 often expose a timestamp counter set but reject encoder sampling.
+        let queue = device.new_command_queue();
+        let probe_cmd = queue.new_command_buffer();
+        let probe_enc = probe_cmd.new_compute_command_encoder();
+        probe_enc.sample_counters_in_buffer(&sample_buffer, 0, true);
+        probe_enc.end_encoding();
+        probe_cmd.commit();
+        probe_cmd.wait_until_completed();
+        if probe_cmd.status() != MTLCommandBufferStatus::Completed {
+            static WARN: std::sync::Once = std::sync::Once::new();
+            WARN.call_once(|| {
+                eprintln!(
+                    "  PROFILE_GPU=1 disabled: sampleCountersInBuffer unsupported on this GPU"
+                );
+            });
+            return None;
+        }
+        Some(Self {
+            sample_buffer,
+            resolve_buf,
+            capacity,
+            next: 0,
+            ns_per_tick,
+        })
+    }
+
+    pub fn mark(&mut self, encoder: &ComputeCommandEncoderRef) {
+        if self.next >= self.capacity {
+            return;
+        }
+        encoder.sample_counters_in_buffer(
+            &self.sample_buffer,
+            self.next as NSUInteger,
+            true,
+        );
+        self.next += 1;
+    }
+
+    pub fn resolve(&self, cmd: &CommandBufferRef) {
+        let blit = cmd.new_blit_command_encoder();
+        blit.resolve_counters(
+            &self.sample_buffer,
+            NSRange {
+                location: 0,
+                length: self.next as u64,
+            },
+            &self.resolve_buf,
+            0,
+        );
+        blit.end_encoding();
+    }
+
+    pub fn ingest(&self, num_layers: u32) {
+        let n = self.next as usize;
+        if n < 3 {
+            return;
+        }
+        let ptr = self.resolve_buf.contents() as *const u64;
+        let ticks: Vec<f64> = (0..n)
+            .map(|i| unsafe { *ptr.add(i) } as f64 * self.ns_per_tick / 1e6)
+            .collect();
+        let delta = |a: usize, b: usize| {
+            if b < ticks.len() && a < ticks.len() && ticks[b] >= ticks[a] {
+                ticks[b] - ticks[a]
+            } else {
+                0.0
+            }
+        };
+        let prepass = delta(0, 1);
+        let mut attn = 0.0;
+        let mut mlp = 0.0;
+        let mut ple = 0.0;
+        for i in 0..num_layers {
+            let i = i as usize;
+            let attn_start = if i == 0 { 1 } else { 2 + (i - 1) * 3 + 2 };
+            let base = 2 + i * 3;
+            attn += delta(attn_start, base);
+            mlp += delta(base, base + 1);
+            ple += delta(base + 1, base + 2);
+        }
+        let head_start = 2 + (num_layers.saturating_sub(1) as usize) * 3 + 2;
+        let head = delta(head_start, n - 1);
+        let total = ticks.last().copied().unwrap_or(0.0) - ticks.first().copied().unwrap_or(0.0);
+        let phase = GpuPhaseMs {
+            prepass,
+            attn,
+            mlp,
+            ple,
+            head,
+            total,
+        };
+        GPU_PHASE_ACC.with(|c| {
+            let (mut sum, mut count) = c.get();
+            sum.prepass += phase.prepass;
+            sum.attn += phase.attn;
+            sum.mlp += phase.mlp;
+            sum.ple += phase.ple;
+            sum.head += phase.head;
+            sum.total += phase.total;
+            count += 1;
+            if count % 16 == 0 {
+                let nf = count as f64;
+                eprintln!(
+                    "[gpu profile] n={} avg ms/token (single cmdbuf): prepass={:.2} attn={:.2} mlp={:.2} ple={:.2} head={:.2} sum={:.2}",
+                    count,
+                    sum.prepass / nf,
+                    sum.attn / nf,
+                    sum.mlp / nf,
+                    sum.ple / nf,
+                    sum.head / nf,
+                    sum.total / nf,
+                );
+            }
+            c.set((sum, count));
+        });
+    }
 }
 
 #[cfg(test)]

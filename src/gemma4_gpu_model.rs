@@ -9,7 +9,7 @@ use safetensors::SafeTensors;
 use serde::Deserialize;
 
 use crate::gemma4_config::{Gemma4TextConfig, KvCacheType};
-use crate::gpu::{BufferView, MetalContext};
+use crate::gpu::{BufferView, GpuTimestampProfiler, MetalContext, ProfileAblate, profile_gpu_enabled};
 use crate::kv_pool::{KvCachePool, KvPoolError, KvSlot, KvSlotView};
 use crate::mega_decode::{mega_kernel_enabled, MegaDecodeGraph, MegaScratchBuffers};
 
@@ -158,6 +158,7 @@ pub struct Gemma4GpuModel {
     pub down_buf: Buffer,
     pub logits_buf: Buffer,
     pub sample_out_buf: Buffer, // [1] u32: GPU-sampled token id (decode fast path)
+    pub inv_rms_buf: Buffer,    // [1] f32: scratch for fused pre-FF RMSNorm + MLP
     pub prefill_scratch: PrefillScratch,
     pub decode_batch_scratch: DecodeBatchScratch,
 
@@ -247,6 +248,7 @@ pub struct DecodeBatchScratch {
     pub up_buf: Buffer,
     pub gelu_buf: Buffer,
     pub down_buf: Buffer,
+    pub inv_rms_buf: Buffer,
     pub logits_buf: Buffer,
     pub ple_context_proj_buf: Buffer,
     pub ple_token_id_buf: Buffer,
@@ -311,6 +313,7 @@ impl DecodeBatchScratch {
             up_buf: ctx.buffer_empty(max_batch_size * intermediate_size),
             gelu_buf: ctx.buffer_empty(max_batch_size * intermediate_size),
             down_buf: ctx.buffer_empty(max_batch_size * hidden_size),
+            inv_rms_buf: ctx.buffer_empty(max_batch_size),
             logits_buf: ctx.buffer_empty(max_batch_size * vocab_size),
             ple_context_proj_buf: ctx.buffer_empty(max_batch_size * num_layers * ple_dim),
             ple_token_id_buf: ctx.buffer_empty(max_batch_size * num_layers * ple_dim),
@@ -932,6 +935,7 @@ impl Gemma4GpuModel {
         let down_buf = ctx.buffer_empty(hidden_size);
         let logits_buf = ctx.buffer_empty(vocab_size);
         let sample_out_buf = ctx.buffer_empty_u32(1);
+        let inv_rms_buf = ctx.buffer_empty(1);
         // PLE scratch
         let ple_embed_buf = ctx.buffer_empty(ple_dim);
         let ple_gated_buf = ctx.buffer_empty(ple_dim);
@@ -1060,6 +1064,7 @@ impl Gemma4GpuModel {
             down_buf,
             logits_buf,
             sample_out_buf,
+            inv_rms_buf,
             prefill_scratch,
             decode_batch_scratch,
             ple_embed_buf,
@@ -1632,6 +1637,7 @@ impl Gemma4GpuModel {
         let down_buf = ctx.buffer_empty(hidden_size);
         let logits_buf = ctx.buffer_empty(vocab_size);
         let sample_out_buf = ctx.buffer_empty_u32(1);
+        let inv_rms_buf = ctx.buffer_empty(1);
         let ple_embed_buf = ctx.buffer_empty(ple_dim);
         let ple_gated_buf = ctx.buffer_empty(ple_dim);
         let ple_normed_buf = ctx.buffer_empty(ple_dim);
@@ -1765,6 +1771,7 @@ impl Gemma4GpuModel {
             down_buf,
             logits_buf,
             sample_out_buf,
+            inv_rms_buf,
             prefill_scratch,
             decode_batch_scratch,
             ple_embed_buf,
@@ -2109,6 +2116,17 @@ impl Gemma4GpuModel {
         // buffer dominated by GPU execution, so the numbers isolate where the
         // floor is; they include a small fixed sync per phase (note in output).
         let __pp = std::env::var("PROFILE_PHASES").is_ok();
+        let __ablate = ProfileAblate::from_env();
+        let layer_count = self.layers.len() as u32;
+        let mut __gpu_prof = if !__pp && !__ablate.active() && profile_gpu_enabled() {
+            GpuTimestampProfiler::try_new(&self.ctx.device, layer_count)
+        } else {
+            None
+        };
+        if __gpu_prof.is_some() {
+            eprintln!("  GPU timestamp profiling enabled (PROFILE_GPU=1)");
+        }
+        __ablate.log_once();
         let __t0 = std::time::Instant::now();
         let hidden_size = self.config.hidden_size;
         let num_heads = self.config.num_attention_heads;
@@ -2142,15 +2160,11 @@ impl Gemma4GpuModel {
 
         let actual_num_layers = self.layers.len();
         let __t_prep = std::time::Instant::now();
-        // `mut` so the phase profiler can flush and re-open command buffers at
-        // phase boundaries. With PROFILE_PHASES unset these stay a single cmd +
-        // single encoder for the whole token (the Lever-B fast path).
+        // `mut` so the phase profiler (or METAL_N_CB>=2) can flush and re-open
+        // command buffers mid-token. Default: rope+PLE+layers[0..mid] on CB0,
+        // layers[mid..]+head on CB1 — commit CB0 without wait so encode of CB1
+        // overlaps GPU execution of CB0.
         let mut cmd = self.ctx.queue.new_command_buffer();
-
-        // Single compute encoder for the entire forward pass. Serial dispatches
-        // within one encoder are ordered with memory coherence, so this is
-        // equivalent to the previous per-layer encoders but avoids ~44
-        // encoder-boundary drains per token.
         let mut encoder = cmd.new_compute_command_encoder();
 
         // GPU RoPE table fill for all layers (replaces CPU sin/cos + write_buffer).
@@ -2163,8 +2177,16 @@ impl Gemma4GpuModel {
             self.rope_max_head_dim as u32,
             pos,
         );
+        if let Some(p) = &mut __gpu_prof {
+            p.mark(&encoder);
+        }
 
-        if self.mega_graph.is_some() && !__pp && !matches!(mode, DecodeMode::Advance) {
+        if self.mega_graph.is_some()
+            && !__pp
+            && !__ablate.active()
+            && __gpu_prof.is_none()
+            && !matches!(mode, DecodeMode::Advance)
+        {
             let cap = self.config.final_logit_softcapping;
             let sliding = self.config.sliding_window as u32;
             let sample = match mode {
@@ -2243,7 +2265,7 @@ impl Gemma4GpuModel {
         // Produces the per-layer PLE inputs contiguously in ple_context_proj_buf;
         // each layer reads its slice directly (byte offset = layer_idx * ple_dim
         // * 4), so the previous 42 per-layer copy-out dispatches are gone.
-        {
+        if !__ablate.skip_ple() {
             // Step 2a: context_proj = per_layer_model_projection @ embed
             self.ctx.encode_matvec_q4_view(
                 encoder,
@@ -2287,6 +2309,9 @@ impl Gemma4GpuModel {
                 ple_input_scale,
             );
         }
+        if let Some(p) = &mut __gpu_prof {
+            p.mark(&encoder);
+        }
 
         // Phase boundary: PLE pre-pass (profiling only).
         if __pp {
@@ -2299,7 +2324,28 @@ impl Gemma4GpuModel {
             encoder = cmd.new_compute_command_encoder();
         }
 
+        let metal_n_cb = if !__pp && !__ablate.active() && __gpu_prof.is_none() {
+            crate::gpu::metal_n_cb()
+        } else {
+            1
+        };
+        let cb_layer_splits: Vec<usize> = if metal_n_cb >= 2 {
+            (1..metal_n_cb as usize)
+                .map(|i| actual_num_layers * i / metal_n_cb as usize)
+                .collect()
+        } else {
+            Vec::new()
+        };
+        let mut cb_split_idx = 0usize;
+
         for layer_idx in 0..actual_num_layers {
+            if cb_split_idx < cb_layer_splits.len() && layer_idx == cb_layer_splits[cb_split_idx] {
+                encoder.end_encoding();
+                cmd.commit();
+                cmd = self.ctx.queue.new_command_buffer();
+                encoder = cmd.new_compute_command_encoder();
+                cb_split_idx += 1;
+            }
             let layer = &self.layers[layer_idx];
             let head_dim = layer.head_dim;
             let q_out = layer.q_out_dim;
@@ -2313,6 +2359,7 @@ impl Gemma4GpuModel {
             // the residual add below, so no separate "save residual" copy is
             // needed; the add reads hidden in place.
 
+            if !__ablate.skip_attn() {
             // Pre-attention norm
             self.ctx.encode_rmsnorm_view(
                 encoder,
@@ -2568,7 +2615,9 @@ impl Gemma4GpuModel {
                 KvCacheType::Q4_0 => {
                     let groups_per_row = (head_dim / 32) as u32;
                     let row_bytes = groups_per_row * 18;
-                    if crate::gpu::attention_use_ggml() && self.ctx.use_flash_attention {
+                    if crate::gpu::attention_use_ggml_for_layer(layer.has_kv)
+                        && self.ctx.use_flash_attention
+                    {
                         self.ctx.encode_attention_ggml_q4_0(
                             encoder,
                             &self.q_normed_buf,
@@ -2667,6 +2716,10 @@ impl Gemma4GpuModel {
                     hidden_size as u32,
                 );
             }
+            } // !skip_attn
+            if let Some(p) = &mut __gpu_prof {
+                p.mark(&encoder);
+            }
 
             // Phase boundary: attention block (profiling only).
             if __pp {
@@ -2683,18 +2736,17 @@ impl Gemma4GpuModel {
             // hidden_buf is the residual; it is only read (by the pre-FF norm)
             // until the residual add below, so no save-residual copy is needed.
 
-            // Pre-feedforward norm
-            self.ctx.encode_rmsnorm_view(
-                encoder,
-                &self.hidden_buf,
-                &layer.pre_feedforward_layernorm_weight,
-                &self.normed_buf,
-                hidden_size as u32,
-                eps,
-            );
-
+            if !__ablate.skip_mlp() {
             // MLP: gate_proj, up_proj, GeLU activation, down_proj
             if layer.use_f16 {
+                self.ctx.encode_rmsnorm_view(
+                    encoder,
+                    &self.hidden_buf,
+                    &layer.pre_feedforward_layernorm_weight,
+                    &self.normed_buf,
+                    hidden_size as u32,
+                    eps,
+                );
                 self.ctx.encode_matvec_f16_view(
                     encoder,
                     &layer.gate_proj,
@@ -2727,12 +2779,46 @@ impl Gemma4GpuModel {
                     intermediate_size as u32,
                 );
             } else if crate::gpu::fused_mlp_gelu_down_enabled()
+                && crate::gpu::fused_rmsnorm_mlp_enabled()
+                && Self::use_packed_mlp_gate_up(layer)
                 && crate::gpu::weight_buf_is_q4(
                     &layer.gate_proj,
                     intermediate_size as u32,
                     hidden_size as u32,
                 )
             {
+                self.ctx.encode_mlp_fused_q4_gelu_down_packed_from_hidden_at_view(
+                    encoder,
+                    &layer.gate_up_proj,
+                    &layer.down_proj,
+                    &layer.pre_feedforward_layernorm_weight,
+                    &self.hidden_buf,
+                    0,
+                    &self.inv_rms_buf,
+                    0,
+                    &self.up_buf,
+                    0,
+                    &self.down_buf,
+                    0,
+                    hidden_size as u32,
+                    intermediate_size as u32,
+                    eps,
+                );
+            } else if crate::gpu::fused_mlp_gelu_down_enabled()
+                && crate::gpu::weight_buf_is_q4(
+                    &layer.gate_proj,
+                    intermediate_size as u32,
+                    hidden_size as u32,
+                )
+            {
+                self.ctx.encode_rmsnorm_view(
+                    encoder,
+                    &self.hidden_buf,
+                    &layer.pre_feedforward_layernorm_weight,
+                    &self.normed_buf,
+                    hidden_size as u32,
+                    eps,
+                );
                 if Self::use_packed_mlp_gate_up(layer) {
                     self.ctx.encode_mlp_fused_q4_gelu_down_packed_at_view(
                         encoder,
@@ -2740,7 +2826,7 @@ impl Gemma4GpuModel {
                         &layer.down_proj,
                         &self.normed_buf,
                         0,
-                        &self.gelu_buf,
+                        &self.up_buf,
                         0,
                         &self.down_buf,
                         0,
@@ -2763,6 +2849,14 @@ impl Gemma4GpuModel {
             } else if Self::use_packed_mlp_gate_up(layer)
                 || crate::gpu::fused_mlp_ple_enabled()
             {
+                self.ctx.encode_rmsnorm_view(
+                    encoder,
+                    &self.hidden_buf,
+                    &layer.pre_feedforward_layernorm_weight,
+                    &self.normed_buf,
+                    hidden_size as u32,
+                    eps,
+                );
                 self.encode_mlp_gate_up_gelu_q4_view(
                     encoder,
                     layer,
@@ -2780,6 +2874,14 @@ impl Gemma4GpuModel {
                     intermediate_size as u32,
                 );
             } else {
+                self.ctx.encode_rmsnorm_view(
+                    encoder,
+                    &self.hidden_buf,
+                    &layer.pre_feedforward_layernorm_weight,
+                    &self.normed_buf,
+                    hidden_size as u32,
+                    eps,
+                );
                 self.ctx.encode_matvec_q4_dual_view(
                     encoder,
                     &layer.gate_proj,
@@ -2834,8 +2936,13 @@ impl Gemma4GpuModel {
                     hidden_size as u32,
                 );
             }
+            } // !skip_mlp
+            if let Some(p) = &mut __gpu_prof {
+                p.mark(&encoder);
+            }
 
             // ─── Per-Layer Embedding (PLE) — after MLP, before layer_scalar ───
+            if !__ablate.skip_ple() {
             // hidden_buf is the residual; it is only read (by the input gate
             // matvec) until the residual add below, so no save copy is needed.
             // Gate: ple_gated = per_layer_input_gate(hidden) → [ple_dim]
@@ -2913,6 +3020,8 @@ impl Gemma4GpuModel {
                 );
             }
 
+            } // !skip_ple (per-layer)
+
             // Layer scalar (in place): hidden *= layer_scalar. vec_scale is a
             // pure elementwise map (dst[i] = scale * src[i]), so src == dst is
             // race-free and the temp copy is unnecessary.
@@ -2923,6 +3032,9 @@ impl Gemma4GpuModel {
                 hidden_size as u32,
                 layer.layer_scalar,
             );
+            if let Some(p) = &mut __gpu_prof {
+                p.mark(&encoder);
+            }
 
             // Phase boundary: MLP + PLE block (profiling only).
             if __pp {
@@ -2951,9 +3063,8 @@ impl Gemma4GpuModel {
         }
 
         // ─── Final norm + LM head (+ optional sampling) — same encoder ───
-        // Reuses the single forward-pass encoder so the whole token is one
-        // encoder + one command buffer (one CPU↔GPU round-trip per token).
         let cap = self.config.final_logit_softcapping;
+        if !__ablate.skip_head() {
         self.ctx.encode_rmsnorm_view(
             encoder,
             &self.hidden_buf,
@@ -2972,8 +3083,16 @@ impl Gemma4GpuModel {
             hidden_size as u32,
         );
 
+        } // !skip_head
+        if let Some(p) = &mut __gpu_prof {
+            p.mark(&encoder);
+        }
+
         let output = match mode {
             DecodeMode::Sample(temperature, min_p, seed) => {
+                if __ablate.skip_head() {
+                    MetalContext::write_u32_buffer(&self.sample_out_buf, &[0]);
+                } else {
                 // GPU-side softcap + min-p sampling; read back only the token id.
                 self.ctx.encode_sample(
                     encoder,
@@ -2985,11 +3104,18 @@ impl Gemma4GpuModel {
                     min_p,
                     seed,
                 );
+                }
                 encoder.end_encoding();
+                if let Some(p) = &__gpu_prof {
+                    p.resolve(&cmd);
+                }
                 let __t_encode = std::time::Instant::now();
                 cmd.commit();
                 cmd.wait_until_completed();
                 let __t_gpu = std::time::Instant::now();
+                if let Some(p) = &__gpu_prof {
+                    p.ingest(actual_num_layers as u32);
+                }
                 if __pp {
                     Self::phase_accum(3, (__t_gpu - __t_encode).as_secs_f64() * 1e3);
                     Self::phase_end_token();
@@ -3002,10 +3128,16 @@ impl Gemma4GpuModel {
             }
             DecodeMode::Logits => {
                 encoder.end_encoding();
+                if let Some(p) = &__gpu_prof {
+                    p.resolve(&cmd);
+                }
                 let __t_encode = std::time::Instant::now();
                 cmd.commit();
                 cmd.wait_until_completed();
                 let __t_gpu = std::time::Instant::now();
+                if let Some(p) = &__gpu_prof {
+                    p.ingest(actual_num_layers as u32);
+                }
                 if __pp {
                     Self::phase_accum(3, (__t_gpu - __t_encode).as_secs_f64() * 1e3);
                     Self::phase_end_token();
@@ -5350,7 +5482,9 @@ impl Gemma4GpuModel {
                     KvCacheType::Q4_0 => {
                         let groups_per_row = (head_dim / 32) as u32;
                         let row_bytes = groups_per_row * 18;
-                        if crate::gpu::attention_use_ggml() && self.ctx.use_flash_attention {
+                        if crate::gpu::attention_use_ggml_for_layer(layer.has_kv)
+                        && self.ctx.use_flash_attention
+                    {
                             self.ctx.encode_attention_ggml_q4_0_at(
                                 encoder,
                                 &self.decode_batch_scratch.q_normed_buf,
@@ -5476,17 +5610,17 @@ impl Gemma4GpuModel {
                     offsets.hidden,
                     hidden_size as u32,
                 );
-                self.ctx.encode_rmsnorm_at_view(
-                    encoder,
-                    &self.decode_batch_scratch.hidden_buf,
-                    offsets.hidden,
-                    &layer.pre_feedforward_layernorm_weight,
-                    &self.decode_batch_scratch.normed_buf,
-                    offsets.hidden,
-                    hidden_size as u32,
-                    eps,
-                );
                 if layer.use_f16 {
+                    self.ctx.encode_rmsnorm_at_view(
+                        encoder,
+                        &self.decode_batch_scratch.hidden_buf,
+                        offsets.hidden,
+                        &layer.pre_feedforward_layernorm_weight,
+                        &self.decode_batch_scratch.normed_buf,
+                        offsets.hidden,
+                        hidden_size as u32,
+                        eps,
+                    );
                     self.ctx.encode_matvec_f16_at_view(
                         encoder,
                         &layer.gate_proj,
@@ -5528,12 +5662,49 @@ impl Gemma4GpuModel {
                         intermediate_size as u32,
                     );
                 } else if crate::gpu::fused_mlp_gelu_down_enabled()
+                    && crate::gpu::fused_rmsnorm_mlp_enabled()
+                    && Self::use_packed_mlp_gate_up(layer)
                     && crate::gpu::weight_buf_is_q4(
                         &layer.gate_proj,
                         intermediate_size as u32,
                         hidden_size as u32,
                     )
                 {
+                    let inv_rms_off = offsets.hidden / hidden_size as u64;
+                    self.ctx.encode_mlp_fused_q4_gelu_down_packed_from_hidden_at_view(
+                        encoder,
+                        &layer.gate_up_proj,
+                        &layer.down_proj,
+                        &layer.pre_feedforward_layernorm_weight,
+                        &self.decode_batch_scratch.hidden_buf,
+                        offsets.hidden,
+                        &self.decode_batch_scratch.inv_rms_buf,
+                        inv_rms_off,
+                        &self.decode_batch_scratch.up_buf,
+                        offsets.intermediate,
+                        &self.decode_batch_scratch.down_buf,
+                        offsets.hidden,
+                        hidden_size as u32,
+                        intermediate_size as u32,
+                        eps,
+                    );
+                } else if crate::gpu::fused_mlp_gelu_down_enabled()
+                    && crate::gpu::weight_buf_is_q4(
+                        &layer.gate_proj,
+                        intermediate_size as u32,
+                        hidden_size as u32,
+                    )
+                {
+                    self.ctx.encode_rmsnorm_at_view(
+                        encoder,
+                        &self.decode_batch_scratch.hidden_buf,
+                        offsets.hidden,
+                        &layer.pre_feedforward_layernorm_weight,
+                        &self.decode_batch_scratch.normed_buf,
+                        offsets.hidden,
+                        hidden_size as u32,
+                        eps,
+                    );
                     if Self::use_packed_mlp_gate_up(layer) {
                         self.ctx.encode_mlp_fused_q4_gelu_down_packed_at_view(
                             encoder,
@@ -5541,7 +5712,7 @@ impl Gemma4GpuModel {
                             &layer.down_proj,
                             &self.decode_batch_scratch.normed_buf,
                             offsets.hidden,
-                            &self.decode_batch_scratch.gelu_buf,
+                            &self.decode_batch_scratch.up_buf,
                             offsets.intermediate,
                             &self.decode_batch_scratch.down_buf,
                             offsets.hidden,
@@ -5567,6 +5738,16 @@ impl Gemma4GpuModel {
                 } else if Self::use_packed_mlp_gate_up(layer)
                     || crate::gpu::fused_mlp_ple_enabled()
                 {
+                    self.ctx.encode_rmsnorm_at_view(
+                        encoder,
+                        &self.decode_batch_scratch.hidden_buf,
+                        offsets.hidden,
+                        &layer.pre_feedforward_layernorm_weight,
+                        &self.decode_batch_scratch.normed_buf,
+                        offsets.hidden,
+                        hidden_size as u32,
+                        eps,
+                    );
                     self.encode_mlp_gate_up_gelu_q4_at_view(
                         encoder,
                         layer,
@@ -5588,6 +5769,16 @@ impl Gemma4GpuModel {
                         intermediate_size as u32,
                     );
                 } else {
+                    self.ctx.encode_rmsnorm_at_view(
+                        encoder,
+                        &self.decode_batch_scratch.hidden_buf,
+                        offsets.hidden,
+                        &layer.pre_feedforward_layernorm_weight,
+                        &self.decode_batch_scratch.normed_buf,
+                        offsets.hidden,
+                        hidden_size as u32,
+                        eps,
+                    );
                     self.ctx.encode_matvec_q4_dual_at_view(
                         encoder,
                         &layer.gate_proj,

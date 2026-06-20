@@ -578,6 +578,216 @@ kernel void matvec_q4_interleaved_gelu(
     matvec_q4_interleaved_gelu_body<4>(W, x, y, M, K, tgid, sgid, lane, Q4F_SG);
 }
 
+// Writes only 1/inv_rms — avoids materializing the full normed hidden vector.
+kernel void rmsnorm_inv_rms(
+    device const float* x [[buffer(0)]],
+    device float* inv_rms_out [[buffer(1)]],
+    constant uint& dim [[buffer(2)]],
+    constant float& eps [[buffer(3)]],
+    uint tid [[thread_index_in_threadgroup]],
+    uint tg_size [[threads_per_threadgroup]]
+) {
+    threadgroup float shared_sum[256];
+
+    float partial_sum = 0.0f;
+    for (uint i = tid; i < dim; i += tg_size) {
+        float val = x[i];
+        partial_sum += val * val;
+    }
+    shared_sum[tid] = partial_sum;
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint stride = tg_size / 2; stride > 0; stride >>= 1) {
+        if (tid < stride) {
+            shared_sum[tid] += shared_sum[tid + stride];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    if (tid == 0) {
+        *inv_rms_out = rsqrt(shared_sum[0] / float(dim) + eps);
+    }
+}
+
+// Interleaved gate∥up+GeLU reading hidden + RMS weight + inv_rms (no normed scratch).
+template <uint ROWS>
+inline void matvec_q4_interleaved_gelu_hidden_body(
+    device const uchar* W,
+    device const float* hidden,
+    device const float* weight,
+    device const float* inv_rms_ptr,
+    device float* y,
+    uint M,
+    uint K,
+    uint tgid,
+    uint sgid,
+    uint lane,
+    uint sg_per_tg
+) {
+    float inv_rms = *inv_rms_ptr;
+    uint base_row = tgid * (sg_per_tg * ROWS) + sgid * ROWS;
+    uint num_groups = K / Q4_GROUP_SIZE;
+    uint row_bytes = num_groups * Q4_BLOCK_BYTES;
+    uint pair_bytes = row_bytes * 2;
+
+    float acc0[ROWS];
+    float acc1[ROWS];
+    bool valid[ROWS];
+    device const uchar* gptr[ROWS];
+    device const uchar* uptr[ROWS];
+    for (uint r = 0; r < ROWS; ++r) {
+        acc0[r] = 0.0f;
+        acc1[r] = 0.0f;
+        uint row = base_row + r;
+        valid[r] = row < M;
+        device const uchar* pair = W + row * pair_bytes;
+        gptr[r] = pair;
+        uptr[r] = pair + row_bytes;
+    }
+
+    for (uint g = lane; g < num_groups; g += SIMD_SIZE) {
+        uint xo = g * Q4_GROUP_SIZE;
+        float4 h0 = *reinterpret_cast<device const float4*>(&hidden[xo]);
+        float4 h1 = *reinterpret_cast<device const float4*>(&hidden[xo + 4]);
+        float4 h2 = *reinterpret_cast<device const float4*>(&hidden[xo + 8]);
+        float4 h3 = *reinterpret_cast<device const float4*>(&hidden[xo + 12]);
+        float4 h4 = *reinterpret_cast<device const float4*>(&hidden[xo + 16]);
+        float4 h5 = *reinterpret_cast<device const float4*>(&hidden[xo + 20]);
+        float4 h6 = *reinterpret_cast<device const float4*>(&hidden[xo + 24]);
+        float4 h7 = *reinterpret_cast<device const float4*>(&hidden[xo + 28]);
+        float4 w0 = *reinterpret_cast<device const float4*>(&weight[xo]);
+        float4 w1 = *reinterpret_cast<device const float4*>(&weight[xo + 4]);
+        float4 w2 = *reinterpret_cast<device const float4*>(&weight[xo + 8]);
+        float4 w3 = *reinterpret_cast<device const float4*>(&weight[xo + 12]);
+        float4 w4 = *reinterpret_cast<device const float4*>(&weight[xo + 16]);
+        float4 w5 = *reinterpret_cast<device const float4*>(&weight[xo + 20]);
+        float4 w6 = *reinterpret_cast<device const float4*>(&weight[xo + 24]);
+        float4 w7 = *reinterpret_cast<device const float4*>(&weight[xo + 28]);
+        float4 xv0 = h0 * w0 * inv_rms;
+        float4 xv1 = h1 * w1 * inv_rms;
+        float4 xv2 = h2 * w2 * inv_rms;
+        float4 xv3 = h3 * w3 * inv_rms;
+        float4 xv4 = h4 * w4 * inv_rms;
+        float4 xv5 = h5 * w5 * inv_rms;
+        float4 xv6 = h6 * w6 * inv_rms;
+        float4 xv7 = h7 * w7 * inv_rms;
+
+        uint bo = g * Q4_BLOCK_BYTES;
+        for (uint r = 0; r < ROWS; ++r) {
+            if (!valid[r]) continue;
+            float scale0 = float(*reinterpret_cast<device const half*>(&gptr[r][bo]));
+            acc0[r] += q4_dot_vec_fast(&gptr[r][bo + 2],
+                                        xv0, xv1, xv2, xv3, xv4, xv5, xv6, xv7) * scale0;
+            float scale1 = float(*reinterpret_cast<device const half*>(&uptr[r][bo]));
+            acc1[r] += q4_dot_vec_fast(&uptr[r][bo + 2],
+                                       xv0, xv1, xv2, xv3, xv4, xv5, xv6, xv7) * scale1;
+        }
+    }
+
+    for (uint r = 0; r < ROWS; ++r) {
+        float s0 = simd_sum(acc0[r]);
+        float s1 = simd_sum(acc1[r]);
+        if (lane == 0 && valid[r]) {
+            y[base_row + r] = gelu_pytorch_tanh(s0) * s1;
+        }
+    }
+}
+
+kernel void matvec_q4_interleaved_gelu_hidden(
+    device const uchar* W [[buffer(0)]],
+    device const float* hidden [[buffer(1)]],
+    device const float* weight [[buffer(2)]],
+    device const float* inv_rms [[buffer(3)]],
+    device float* y [[buffer(4)]],
+    constant uint& M [[buffer(5)]],
+    constant uint& K [[buffer(6)]],
+    uint tgid [[threadgroup_position_in_grid]],
+    uint sgid [[simdgroup_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]]
+) {
+    matvec_q4_interleaved_gelu_hidden_body<4>(
+        W, hidden, weight, inv_rms, y, M, K, tgid, sgid, lane, Q4F_SG);
+}
+
+// gate∥up+GeLU → f16 scratch (half activation bandwidth gate→down).
+template <uint ROWS>
+inline void matvec_q4_interleaved_gelu_f16_body(
+    device const uchar* W,
+    device const float* x,
+    device half* y,
+    uint M,
+    uint K,
+    uint tgid,
+    uint sgid,
+    uint lane,
+    uint sg_per_tg
+) {
+    uint base_row = tgid * (sg_per_tg * ROWS) + sgid * ROWS;
+    uint num_groups = K / Q4_GROUP_SIZE;
+    uint row_bytes = num_groups * Q4_BLOCK_BYTES;
+    uint pair_bytes = row_bytes * 2;
+
+    float acc0[ROWS];
+    float acc1[ROWS];
+    bool valid[ROWS];
+    device const uchar* gptr[ROWS];
+    device const uchar* uptr[ROWS];
+    for (uint r = 0; r < ROWS; ++r) {
+        acc0[r] = 0.0f;
+        acc1[r] = 0.0f;
+        uint row = base_row + r;
+        valid[r] = row < M;
+        device const uchar* pair = W + row * pair_bytes;
+        gptr[r] = pair;
+        uptr[r] = pair + row_bytes;
+    }
+
+    for (uint g = lane; g < num_groups; g += SIMD_SIZE) {
+        uint xo = g * Q4_GROUP_SIZE;
+        float4 xv0 = *reinterpret_cast<device const float4*>(&x[xo]);
+        float4 xv1 = *reinterpret_cast<device const float4*>(&x[xo + 4]);
+        float4 xv2 = *reinterpret_cast<device const float4*>(&x[xo + 8]);
+        float4 xv3 = *reinterpret_cast<device const float4*>(&x[xo + 12]);
+        float4 xv4 = *reinterpret_cast<device const float4*>(&x[xo + 16]);
+        float4 xv5 = *reinterpret_cast<device const float4*>(&x[xo + 20]);
+        float4 xv6 = *reinterpret_cast<device const float4*>(&x[xo + 24]);
+        float4 xv7 = *reinterpret_cast<device const float4*>(&x[xo + 28]);
+
+        uint bo = g * Q4_BLOCK_BYTES;
+        for (uint r = 0; r < ROWS; ++r) {
+            if (!valid[r]) continue;
+            float scale0 = float(*reinterpret_cast<device const half*>(&gptr[r][bo]));
+            acc0[r] += q4_dot_vec_fast(&gptr[r][bo + 2],
+                                        xv0, xv1, xv2, xv3, xv4, xv5, xv6, xv7) * scale0;
+            float scale1 = float(*reinterpret_cast<device const half*>(&uptr[r][bo]));
+            acc1[r] += q4_dot_vec_fast(&uptr[r][bo + 2],
+                                       xv0, xv1, xv2, xv3, xv4, xv5, xv6, xv7) * scale1;
+        }
+    }
+
+    for (uint r = 0; r < ROWS; ++r) {
+        float s0 = simd_sum(acc0[r]);
+        float s1 = simd_sum(acc1[r]);
+        if (lane == 0 && valid[r]) {
+            y[base_row + r] = half(gelu_pytorch_tanh(s0) * s1);
+        }
+    }
+}
+
+kernel void matvec_q4_interleaved_gelu_f16(
+    device const uchar* W [[buffer(0)]],
+    device const float* x [[buffer(1)]],
+    device half* y [[buffer(2)]],
+    constant uint& M [[buffer(3)]],
+    constant uint& K [[buffer(4)]],
+    uint tgid [[threadgroup_position_in_grid]],
+    uint sgid [[simdgroup_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]]
+) {
+    matvec_q4_interleaved_gelu_f16_body<4>(W, x, y, M, K, tgid, sgid, lane, Q4F_SG);
+}
+
 // PLE decode: gate Q4 matvec + GeLU(gate)*context slice in one dispatch.
 template <uint ROWS>
 inline void matvec_q4_gelu_mul_body(
@@ -4352,10 +4562,10 @@ kernel void attention_flash_decode_q4_0_h512(
     (void)head_dim;
     (void)groups_per_row;
     threadgroup float shared_q[512];
-    threadgroup float shared_scores[32];
-    threadgroup float shared_exp[32];
+    threadgroup float shared_scores[256];
+    threadgroup float shared_exp[256];
     threadgroup float shared_update[4];
-    flash_decode_q4_0_hd_body<512, 32>(
+    flash_decode_q4_0_hd_body<512, 256>(
         Q, K_cache, V_cache, output, tgid, num_heads, num_kv_groups, capacity, row_bytes,
         kv_seq, kv_start, scale, tid, sgid, lane,
         shared_q, shared_scores, shared_exp, shared_update);
@@ -4631,10 +4841,10 @@ kernel void attention_flash_decode_fused_q4_0_h512(
     (void)num_kv_heads;
     (void)head_dim;
     threadgroup float shared_q[512];
-    threadgroup float shared_scores[32];
-    threadgroup float shared_exp[32];
+    threadgroup float shared_scores[256];
+    threadgroup float shared_exp[256];
     threadgroup float shared_update[4];
-    flash_decode_fused_q4_0_hd_body<512, 32>(
+    flash_decode_fused_q4_0_hd_body<512, 256>(
         Q, K_f32, V_f32, K_cache, V_cache, output, tgid, num_heads, num_kv_groups,
         capacity, row_bytes, groups_per_row, kv_seq, kv_start, cur_seq, scale,
         tid, sgid, lane, shared_q, shared_scores, shared_exp, shared_update);

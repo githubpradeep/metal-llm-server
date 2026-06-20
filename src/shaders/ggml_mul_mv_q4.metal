@@ -163,6 +163,91 @@ kernel void matvec_ggml_q4_0(
         tgpig, tiisg, sgitg);
 }
 
+template<typename block_q_type, short NR0, short NSG, short NW>
+void mul_vec_q_n_f16x_impl(
+        device const void  * src0,
+        device const half  * src1,
+        device       float * dst,
+                   int64_t   ne00,
+                   int64_t   ne01,
+                   int64_t   ne02,
+                   int64_t   ne10,
+                   int64_t   ne12,
+                   int64_t   ne0,
+                   int64_t   ne1,
+                   uint      r2,
+                   uint      r3,
+                   uint3 tgpig, uint tiisg, uint sgitg) {
+    const int nb = ne00/QK4_0;
+
+    const int r0 = tgpig.x;
+    const int r1 = tgpig.y;
+    const int im = tgpig.z;
+
+    const int first_row = (r0 * NSG + sgitg) * NR0;
+
+    const uint i12 = im%ne12;
+    const uint i13 = im/ne12;
+
+    const uint offset0 = first_row * nb + (i12/r2)*(nb*ne01) + (i13/r3)*(nb*ne01*ne02);
+
+    device const block_q_type * x = (device const block_q_type *) src0 + offset0;
+    device const half         * y = (device const half         *) src1 + r1*ne10 + im*ne00*ne1;
+
+    float yl[16];
+    float sumf[NR0];
+    for (short row = 0; row < NR0; ++row) sumf[row] = 0.f;
+
+    const int ix = (tiisg/2);
+    const int il = (tiisg%2)*8;
+
+    device const half * yb = y + ix * QK4_0 + il;
+
+    for (int ib = ix; ib < nb; ib += NW/2) {
+        float sumy = 0;
+        for (int i = 0; i < 8; i += 2) {
+            sumy += float(yb[i]) + float(yb[i+1]);
+            yl[i+0] = float(yb[i+ 0]);
+            yl[i+1] = float(yb[i+ 1])/256.f;
+
+            sumy += float(yb[i+16]) + float(yb[i+17]);
+            yl[i+8] = float(yb[i+16])/16.f;
+            yl[i+9] = float(yb[i+17])/4096.f;
+        }
+
+        for (int row = 0; row < NR0; row++) {
+            sumf[row] += block_q_n_dot_y(x+ib+row*nb, sumy, yl, il);
+        }
+
+        yb += QK4_0 * 16;
+    }
+
+    for (int row = 0; row < NR0; ++row) {
+        const float tot = simd_sum(sumf[row]);
+        if (tiisg == 0 && first_row + row < ne01) {
+            dst[im*ne0*ne1 + r1*ne0 + first_row + row] = tot;
+        }
+    }
+}
+
+kernel void matvec_ggml_q4_0_f16x(
+    device const char * W [[buffer(0)]],
+    device const char * x [[buffer(1)]],
+    device char * y [[buffer(2)]],
+    constant ggml_mul_mv_args& args [[buffer(3)]],
+    uint3 tgpig [[threadgroup_position_in_grid]],
+    uint tiisg [[thread_index_in_simdgroup]],
+    uint sgitg [[simdgroup_index_in_threadgroup]]
+) {
+    mul_vec_q_n_f16x_impl<block_q4_0, 4, 2, 32>(
+        W, (device const half *)x, (device float *)y,
+        args.ne00, args.ne01, args.ne02,
+        args.ne10, args.ne12,
+        args.ne0, args.ne1,
+        uint(args.r2), uint(args.r3),
+        tgpig, tiisg, sgitg);
+}
+
 // ─── mul_mv_ext (batch matvec) ───────────────────────────────────────────────
 
 template <typename type4>
