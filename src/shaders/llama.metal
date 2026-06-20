@@ -499,6 +499,85 @@ kernel void matvec_q4_dual_gelu(
     matvec_q4_dual_gelu_body<4>(W0, W1, x, y, M, K, tgid, sgid, lane, Q4F_SG);
 }
 
+// gate+up rows interleaved as [gate_i][up_i] per intermediate index — better
+// cache locality than separate gate/up tensors (uzu-style packed up_projection).
+template <uint ROWS>
+inline void matvec_q4_interleaved_gelu_body(
+    device const uchar* W,
+    device const float* x,
+    device float* y,
+    uint M,
+    uint K,
+    uint tgid,
+    uint sgid,
+    uint lane,
+    uint sg_per_tg
+) {
+    uint base_row = tgid * (sg_per_tg * ROWS) + sgid * ROWS;
+    uint num_groups = K / Q4_GROUP_SIZE;
+    uint row_bytes = num_groups * Q4_BLOCK_BYTES;
+    uint pair_bytes = row_bytes * 2;
+
+    float acc0[ROWS];
+    float acc1[ROWS];
+    bool valid[ROWS];
+    device const uchar* gptr[ROWS];
+    device const uchar* uptr[ROWS];
+    for (uint r = 0; r < ROWS; ++r) {
+        acc0[r] = 0.0f;
+        acc1[r] = 0.0f;
+        uint row = base_row + r;
+        valid[r] = row < M;
+        device const uchar* pair = W + row * pair_bytes;
+        gptr[r] = pair;
+        uptr[r] = pair + row_bytes;
+    }
+
+    for (uint g = lane; g < num_groups; g += SIMD_SIZE) {
+        uint xo = g * Q4_GROUP_SIZE;
+        float4 xv0 = *reinterpret_cast<device const float4*>(&x[xo]);
+        float4 xv1 = *reinterpret_cast<device const float4*>(&x[xo + 4]);
+        float4 xv2 = *reinterpret_cast<device const float4*>(&x[xo + 8]);
+        float4 xv3 = *reinterpret_cast<device const float4*>(&x[xo + 12]);
+        float4 xv4 = *reinterpret_cast<device const float4*>(&x[xo + 16]);
+        float4 xv5 = *reinterpret_cast<device const float4*>(&x[xo + 20]);
+        float4 xv6 = *reinterpret_cast<device const float4*>(&x[xo + 24]);
+        float4 xv7 = *reinterpret_cast<device const float4*>(&x[xo + 28]);
+
+        uint bo = g * Q4_BLOCK_BYTES;
+        for (uint r = 0; r < ROWS; ++r) {
+            if (!valid[r]) continue;
+            float scale0 = float(*reinterpret_cast<device const half*>(&gptr[r][bo]));
+            acc0[r] += q4_dot_vec_fast(&gptr[r][bo + 2],
+                                        xv0, xv1, xv2, xv3, xv4, xv5, xv6, xv7) * scale0;
+            float scale1 = float(*reinterpret_cast<device const half*>(&uptr[r][bo]));
+            acc1[r] += q4_dot_vec_fast(&uptr[r][bo + 2],
+                                       xv0, xv1, xv2, xv3, xv4, xv5, xv6, xv7) * scale1;
+        }
+    }
+
+    for (uint r = 0; r < ROWS; ++r) {
+        float s0 = simd_sum(acc0[r]);
+        float s1 = simd_sum(acc1[r]);
+        if (lane == 0 && valid[r]) {
+            y[base_row + r] = gelu_pytorch_tanh(s0) * s1;
+        }
+    }
+}
+
+kernel void matvec_q4_interleaved_gelu(
+    device const uchar* W [[buffer(0)]],
+    device const float* x [[buffer(1)]],
+    device float* y [[buffer(2)]],
+    constant uint& M [[buffer(3)]],
+    constant uint& K [[buffer(4)]],
+    uint tgid [[threadgroup_position_in_grid]],
+    uint sgid [[simdgroup_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]]
+) {
+    matvec_q4_interleaved_gelu_body<4>(W, x, y, M, K, tgid, sgid, lane, Q4F_SG);
+}
+
 // PLE decode: gate Q4 matvec + GeLU(gate)*context slice in one dispatch.
 template <uint ROWS>
 inline void matvec_q4_gelu_mul_body(

@@ -170,6 +170,15 @@ pub fn fused_mlp_gelu_down_enabled() -> bool {
     )
 }
 
+/// Interleaved gate∥up Q4 weights + single-buffer GeLU matvec (default on).
+/// Set PACKED_MLP_GATE_UP=0 to use separate gate/up buffers.
+pub fn packed_mlp_gate_up_enabled() -> bool {
+    !matches!(
+        std::env::var("PACKED_MLP_GATE_UP").as_deref(),
+        Ok("0") | Ok("false") | Ok("FALSE")
+    )
+}
+
 /// Fuse gate+up+GeLU MLP and PLE gate+GeLU decode paths (default on). Set FUSED_MLP_PLE=0 to disable.
 pub fn fused_mlp_ple_enabled() -> bool {
     !matches!(
@@ -209,6 +218,7 @@ pub struct MetalContext {
     pub matvec_q4_splitk_pipeline: ComputePipelineState,
     pub matvec_q4_dual_pipeline: ComputePipelineState,
     pub matvec_q4_dual_gelu_pipeline: ComputePipelineState,
+    pub matvec_q4_interleaved_gelu_pipeline: ComputePipelineState,
     pub ple_matvec_gelu_q4_pipeline: ComputePipelineState,
     pub matvec_ggml_q4_pipeline: ComputePipelineState,
     pub matvec_ggml_ext_q4_nx4_pipeline: ComputePipelineState,
@@ -340,6 +350,7 @@ impl MetalContext {
         let matvec_q4_splitk_pipeline = get_fn("matvec_q4_splitk");
         let matvec_q4_dual_pipeline = get_fn("matvec_q4_dual");
         let matvec_q4_dual_gelu_pipeline = get_fn("matvec_q4_dual_gelu");
+        let matvec_q4_interleaved_gelu_pipeline = get_fn("matvec_q4_interleaved_gelu");
         let ple_matvec_gelu_q4_pipeline = get_fn("ple_matvec_gelu_q4");
         let matvec_ggml_q4_pipeline = get_fn("matvec_ggml_q4_0");
         let matvec_ggml_ext_q4_nx4_pipeline = get_fn("matvec_ggml_ext_q4_nx4_r4");
@@ -466,6 +477,9 @@ impl MetalContext {
             if fused_kv_attention_enabled() {
                 println!("  Fused KV append + Q4 flash attention (FUSED_KV_ATTN=0 to disable)");
             }
+            if packed_mlp_gate_up_enabled() {
+                println!("  Interleaved gate∥up Q4 MLP weights (PACKED_MLP_GATE_UP=0 to disable)");
+            }
             if fused_mlp_gelu_down_enabled() {
                 println!("  Fused MLP gate+up+GeLU+down pipeline (FUSED_MLP_GELU_DOWN=0 to disable)");
             } else if fused_mlp_ple_enabled() {
@@ -490,6 +504,7 @@ impl MetalContext {
             matvec_q4_splitk_pipeline,
             matvec_q4_dual_pipeline,
             matvec_q4_dual_gelu_pipeline,
+            matvec_q4_interleaved_gelu_pipeline,
             ple_matvec_gelu_q4_pipeline,
             matvec_ggml_q4_pipeline,
             matvec_ggml_ext_q4_nx4_pipeline,
@@ -1381,6 +1396,45 @@ impl MetalContext {
         encoder.dispatch_thread_groups(num_tgs, tg_size);
     }
 
+    /// Gate∥up interleaved Q4 matvec + GeLU(gate)*up — gate/up rows adjacent in memory.
+    pub fn encode_matvec_q4_interleaved_gelu_view(
+        &self,
+        encoder: &ComputeCommandEncoderRef,
+        gate_up: &BufferView,
+        x_buf: &Buffer,
+        y_buf: &Buffer,
+        m: u32,
+        k: u32,
+    ) {
+        self.encode_matvec_q4_interleaved_gelu_at_view(
+            encoder, gate_up, x_buf, 0, y_buf, 0, m, k,
+        );
+    }
+
+    pub fn encode_matvec_q4_interleaved_gelu_at_view(
+        &self,
+        encoder: &ComputeCommandEncoderRef,
+        gate_up: &BufferView,
+        x_buf: &Buffer,
+        x_offset: u64,
+        y_buf: &Buffer,
+        y_offset: u64,
+        m: u32,
+        k: u32,
+    ) {
+        encoder.set_compute_pipeline_state(&self.matvec_q4_interleaved_gelu_pipeline);
+        encoder.set_buffer(0, Some(&gate_up.buffer), gate_up.offset);
+        encoder.set_buffer(1, Some(x_buf), x_offset);
+        encoder.set_buffer(2, Some(y_buf), y_offset);
+        encoder.set_bytes(3, 4, &m as *const u32 as *const _);
+        encoder.set_bytes(4, 4, &k as *const u32 as *const _);
+        const SG_PER_TG: u64 = 8;
+        let rows_per_tg = SG_PER_TG * 4;
+        let num_tgs = MTLSize::new((m as u64 + rows_per_tg - 1) / rows_per_tg, 1, 1);
+        let tg_size = MTLSize::new(SG_PER_TG * 32, 1, 1);
+        encoder.dispatch_thread_groups(num_tgs, tg_size);
+    }
+
     /// Fused gate+up+GeLU+down Q4 MLP: dual_gelu into scratch, then down matvec
     /// (same command-buffer encoder, sequential dispatches — no gelu DRAM round-trip
     /// between separate Rust call sites).
@@ -1448,6 +1502,78 @@ impl MetalContext {
             hidden_size,
             intermediate_size,
         );
+    }
+
+    /// Fused interleaved gate∥up+GeLU+down Q4 MLP (packed weights).
+    pub fn encode_mlp_fused_q4_gelu_down_packed_at_view(
+        &self,
+        encoder: &ComputeCommandEncoderRef,
+        gate_up: &BufferView,
+        down: &BufferView,
+        x_buf: &Buffer,
+        x_offset: u64,
+        gelu_buf: &Buffer,
+        gelu_offset: u64,
+        y_buf: &Buffer,
+        y_offset: u64,
+        hidden_size: u32,
+        intermediate_size: u32,
+    ) {
+        self.encode_matvec_q4_interleaved_gelu_at_view(
+            encoder,
+            gate_up,
+            x_buf,
+            x_offset,
+            gelu_buf,
+            gelu_offset,
+            intermediate_size,
+            hidden_size,
+        );
+        self.encode_matvec_q4_at_view(
+            encoder,
+            down,
+            gelu_buf,
+            gelu_offset,
+            y_buf,
+            y_offset,
+            hidden_size,
+            intermediate_size,
+        );
+    }
+
+    /// Pack separate gate/up Q4 rows into interleaved [gate_i, up_i, …] layout.
+    pub fn pack_gate_up_interleaved_q4(
+        &self,
+        gate: &BufferView,
+        up: &BufferView,
+        m: u32,
+        k: u32,
+    ) -> BufferView {
+        assert_eq!(
+            gate.length, up.length,
+            "gate/up Q4 tensors must match for interleaved packing"
+        );
+        let row_bytes = (k as u64 / 32) * 18;
+        let pair_bytes = row_bytes * 2;
+        let expected_per_tensor = m as u64 * row_bytes;
+        let packed_bytes = m as u64 * pair_bytes;
+        assert!(
+            gate.length >= expected_per_tensor && up.length >= expected_per_tensor,
+            "gate/up buffer too small for interleaved pack (m={m} k={k} need={expected_per_tensor} gate={} up={})",
+            gate.length,
+            up.length
+        );
+        let gate_bytes = gate.as_bytes();
+        let up_bytes = up.as_bytes();
+        let mut packed = vec![0u8; packed_bytes as usize];
+        for i in 0..m as u64 {
+            let dst = (i * pair_bytes) as usize;
+            let src = (i * row_bytes) as usize;
+            let rb = row_bytes as usize;
+            packed[dst..dst + rb].copy_from_slice(&gate_bytes[src..src + rb]);
+            packed[dst + rb..dst + 2 * rb].copy_from_slice(&up_bytes[src..src + rb]);
+        }
+        BufferView::from_buffer(Self::buffer_from_slice_parallel(&self.device, &packed))
     }
 
     /// Fused PLE gate Q4 matvec + GeLU(gate)*context slice.

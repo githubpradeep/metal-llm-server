@@ -470,6 +470,8 @@ pub struct Gemma4GpuLayer {
     pub o_proj: BufferView,
     pub gate_proj: BufferView,
     pub up_proj: BufferView,
+    /// Interleaved [gate_i, up_i] Q4 rows for packed MLP matvec (decode).
+    pub gate_up_proj: BufferView,
     pub down_proj: BufferView,
 
     // 4 norms per layer (Gemma-style)
@@ -840,6 +842,7 @@ impl Gemma4GpuModel {
                     intermediate_size,
                     hidden_size,
                 )),
+                gate_up_proj: BufferView::from_buffer(ctx.buffer_empty(1)),
                 down_proj: BufferView::from_buffer(ctx.buffer_from_f32_as_q4(
                     &down_proj_data,
                     hidden_size,
@@ -899,6 +902,13 @@ impl Gemma4GpuModel {
         for i in 0..first_kv_shared {
             layers[i].kv_source_layer = i;
         }
+
+        let layers = Self::pack_layers_gate_up(
+            &ctx,
+            layers,
+            intermediate_size as u32,
+            hidden_size as u32,
+        );
 
         println!(
             "  KV sharing: layers 0-{} have own KV, layers {}-{} share",
@@ -1403,6 +1413,9 @@ impl Gemma4GpuModel {
                 o_proj,
                 gate_proj,
                 up_proj,
+                gate_up_proj: BufferView::from_buffer(
+                    device.new_buffer(1, MTLResourceOptions::StorageModeShared),
+                ),
                 down_proj,
                 input_layernorm_weight,
                 post_attention_layernorm_weight,
@@ -1588,6 +1601,12 @@ impl Gemma4GpuModel {
         load_start: Instant,
         load_label: &str,
     ) -> Self {
+        let layers = Self::pack_layers_gate_up(
+            &ctx,
+            layers,
+            config.intermediate_size as u32,
+            config.hidden_size as u32,
+        );
         let hidden_size = config.hidden_size;
         let num_heads = config.num_attention_heads;
         let num_kv_heads = config.num_key_value_heads;
@@ -1801,6 +1820,97 @@ impl Gemma4GpuModel {
             Err(e) => {
                 eprintln!("  MEGA_KERNEL=1 but mega graph build failed: {e}");
             }
+        }
+    }
+
+    /// Build interleaved gate∥up Q4 buffers for decode MLP (uzu-style packing).
+    fn pack_layers_gate_up(
+        ctx: &MetalContext,
+        mut layers: Vec<Gemma4GpuLayer>,
+        m: u32,
+        k: u32,
+    ) -> Vec<Gemma4GpuLayer> {
+        if !crate::gpu::packed_mlp_gate_up_enabled() {
+            for layer in layers.iter_mut() {
+                layer.gate_up_proj = BufferView::from_buffer(ctx.buffer_empty(1));
+            }
+            return layers;
+        }
+        let pack_start = std::time::Instant::now();
+        for layer in layers.iter_mut() {
+            if layer.use_f16 {
+                layer.gate_up_proj = BufferView::from_buffer(ctx.buffer_empty(1));
+            } else {
+                layer.gate_up_proj =
+                    ctx.pack_gate_up_interleaved_q4(&layer.gate_proj, &layer.up_proj, m, k);
+            }
+        }
+        println!(
+            "  Packed interleaved gate∥up Q4 weights in {:.2}s",
+            pack_start.elapsed().as_secs_f64()
+        );
+        layers
+    }
+
+    fn use_packed_mlp_gate_up(layer: &Gemma4GpuLayer) -> bool {
+        crate::gpu::packed_mlp_gate_up_enabled() && !layer.use_f16
+    }
+
+    fn encode_mlp_gate_up_gelu_q4_view(
+        &self,
+        encoder: &metal::ComputeCommandEncoderRef,
+        layer: &Gemma4GpuLayer,
+        x_buf: &metal::Buffer,
+        gelu_buf: &metal::Buffer,
+        intermediate_size: u32,
+        hidden_size: u32,
+    ) {
+        self.encode_mlp_gate_up_gelu_q4_at_view(
+            encoder,
+            layer,
+            x_buf,
+            0,
+            gelu_buf,
+            0,
+            intermediate_size,
+            hidden_size,
+        );
+    }
+
+    fn encode_mlp_gate_up_gelu_q4_at_view(
+        &self,
+        encoder: &metal::ComputeCommandEncoderRef,
+        layer: &Gemma4GpuLayer,
+        x_buf: &metal::Buffer,
+        x_offset: u64,
+        gelu_buf: &metal::Buffer,
+        gelu_offset: u64,
+        intermediate_size: u32,
+        hidden_size: u32,
+    ) {
+        if Self::use_packed_mlp_gate_up(layer) {
+            self.ctx.encode_matvec_q4_interleaved_gelu_at_view(
+                encoder,
+                &layer.gate_up_proj,
+                x_buf,
+                x_offset,
+                gelu_buf,
+                gelu_offset,
+                intermediate_size,
+                hidden_size,
+            );
+        } else {
+            self.ctx.encode_matvec_q4_dual_gelu_at_view(
+                encoder,
+                &layer.gate_proj,
+                &layer.up_proj,
+                x_buf,
+                x_offset,
+                gelu_buf,
+                gelu_offset,
+                intermediate_size,
+                hidden_size,
+            );
         }
     }
 
@@ -2623,47 +2733,70 @@ impl Gemma4GpuModel {
                     hidden_size as u32,
                 )
             {
-                self.ctx.encode_mlp_fused_q4_gelu_down_view(
+                if Self::use_packed_mlp_gate_up(layer) {
+                    self.ctx.encode_mlp_fused_q4_gelu_down_packed_at_view(
+                        encoder,
+                        &layer.gate_up_proj,
+                        &layer.down_proj,
+                        &self.normed_buf,
+                        0,
+                        &self.gelu_buf,
+                        0,
+                        &self.down_buf,
+                        0,
+                        hidden_size as u32,
+                        intermediate_size as u32,
+                    );
+                } else {
+                    self.ctx.encode_mlp_fused_q4_gelu_down_view(
+                        encoder,
+                        &layer.gate_proj,
+                        &layer.up_proj,
+                        &layer.down_proj,
+                        &self.normed_buf,
+                        &self.gelu_buf,
+                        &self.down_buf,
+                        hidden_size as u32,
+                        intermediate_size as u32,
+                    );
+                }
+            } else if Self::use_packed_mlp_gate_up(layer)
+                || crate::gpu::fused_mlp_ple_enabled()
+            {
+                self.encode_mlp_gate_up_gelu_q4_view(
                     encoder,
-                    &layer.gate_proj,
-                    &layer.up_proj,
-                    &layer.down_proj,
+                    layer,
                     &self.normed_buf,
+                    &self.gelu_buf,
+                    intermediate_size as u32,
+                    hidden_size as u32,
+                );
+                self.ctx.encode_matvec_q4_view(
+                    encoder,
+                    &layer.down_proj,
                     &self.gelu_buf,
                     &self.down_buf,
                     hidden_size as u32,
                     intermediate_size as u32,
                 );
             } else {
-                if crate::gpu::fused_mlp_ple_enabled() {
-                    self.ctx.encode_matvec_q4_dual_gelu_view(
-                        encoder,
-                        &layer.gate_proj,
-                        &layer.up_proj,
-                        &self.normed_buf,
-                        &self.gelu_buf,
-                        intermediate_size as u32,
-                        hidden_size as u32,
-                    );
-                } else {
-                    self.ctx.encode_matvec_q4_dual_view(
-                        encoder,
-                        &layer.gate_proj,
-                        &layer.up_proj,
-                        &self.normed_buf,
-                        &self.gate_buf,
-                        &self.up_buf,
-                        intermediate_size as u32,
-                        hidden_size as u32,
-                    );
-                    self.ctx.encode_gelu_mul(
-                        encoder,
-                        &self.gate_buf,
-                        &self.up_buf,
-                        &self.gelu_buf,
-                        intermediate_size as u32,
-                    );
-                }
+                self.ctx.encode_matvec_q4_dual_view(
+                    encoder,
+                    &layer.gate_proj,
+                    &layer.up_proj,
+                    &self.normed_buf,
+                    &self.gate_buf,
+                    &self.up_buf,
+                    intermediate_size as u32,
+                    hidden_size as u32,
+                );
+                self.ctx.encode_gelu_mul(
+                    encoder,
+                    &self.gate_buf,
+                    &self.up_buf,
+                    &self.gelu_buf,
+                    intermediate_size as u32,
+                );
                 self.ctx.encode_matvec_q4_view(
                     encoder,
                     &layer.down_proj,
@@ -5401,13 +5534,52 @@ impl Gemma4GpuModel {
                         hidden_size as u32,
                     )
                 {
-                    self.ctx.encode_mlp_fused_q4_gelu_down_at_view(
+                    if Self::use_packed_mlp_gate_up(layer) {
+                        self.ctx.encode_mlp_fused_q4_gelu_down_packed_at_view(
+                            encoder,
+                            &layer.gate_up_proj,
+                            &layer.down_proj,
+                            &self.decode_batch_scratch.normed_buf,
+                            offsets.hidden,
+                            &self.decode_batch_scratch.gelu_buf,
+                            offsets.intermediate,
+                            &self.decode_batch_scratch.down_buf,
+                            offsets.hidden,
+                            hidden_size as u32,
+                            intermediate_size as u32,
+                        );
+                    } else {
+                        self.ctx.encode_mlp_fused_q4_gelu_down_at_view(
+                            encoder,
+                            &layer.gate_proj,
+                            &layer.up_proj,
+                            &layer.down_proj,
+                            &self.decode_batch_scratch.normed_buf,
+                            offsets.hidden,
+                            &self.decode_batch_scratch.gelu_buf,
+                            offsets.intermediate,
+                            &self.decode_batch_scratch.down_buf,
+                            offsets.hidden,
+                            hidden_size as u32,
+                            intermediate_size as u32,
+                        );
+                    }
+                } else if Self::use_packed_mlp_gate_up(layer)
+                    || crate::gpu::fused_mlp_ple_enabled()
+                {
+                    self.encode_mlp_gate_up_gelu_q4_at_view(
                         encoder,
-                        &layer.gate_proj,
-                        &layer.up_proj,
-                        &layer.down_proj,
+                        layer,
                         &self.decode_batch_scratch.normed_buf,
                         offsets.hidden,
+                        &self.decode_batch_scratch.gelu_buf,
+                        offsets.intermediate,
+                        intermediate_size as u32,
+                        hidden_size as u32,
+                    );
+                    self.ctx.encode_matvec_q4_at_view(
+                        encoder,
+                        &layer.down_proj,
                         &self.decode_batch_scratch.gelu_buf,
                         offsets.intermediate,
                         &self.decode_batch_scratch.down_buf,
@@ -5416,43 +5588,29 @@ impl Gemma4GpuModel {
                         intermediate_size as u32,
                     );
                 } else {
-                    if crate::gpu::fused_mlp_ple_enabled() {
-                        self.ctx.encode_matvec_q4_dual_gelu_at_view(
-                            encoder,
-                            &layer.gate_proj,
-                            &layer.up_proj,
-                            &self.decode_batch_scratch.normed_buf,
-                            offsets.hidden,
-                            &self.decode_batch_scratch.gelu_buf,
-                            offsets.intermediate,
-                            intermediate_size as u32,
-                            hidden_size as u32,
-                        );
-                    } else {
-                        self.ctx.encode_matvec_q4_dual_at_view(
-                            encoder,
-                            &layer.gate_proj,
-                            &layer.up_proj,
-                            &self.decode_batch_scratch.normed_buf,
-                            offsets.hidden,
-                            &self.decode_batch_scratch.gate_buf,
-                            offsets.intermediate,
-                            &self.decode_batch_scratch.up_buf,
-                            offsets.intermediate,
-                            intermediate_size as u32,
-                            hidden_size as u32,
-                        );
-                        self.ctx.encode_gelu_mul_at(
-                            encoder,
-                            &self.decode_batch_scratch.gate_buf,
-                            offsets.intermediate,
-                            &self.decode_batch_scratch.up_buf,
-                            offsets.intermediate,
-                            &self.decode_batch_scratch.gelu_buf,
-                            offsets.intermediate,
-                            intermediate_size as u32,
-                        );
-                    }
+                    self.ctx.encode_matvec_q4_dual_at_view(
+                        encoder,
+                        &layer.gate_proj,
+                        &layer.up_proj,
+                        &self.decode_batch_scratch.normed_buf,
+                        offsets.hidden,
+                        &self.decode_batch_scratch.gate_buf,
+                        offsets.intermediate,
+                        &self.decode_batch_scratch.up_buf,
+                        offsets.intermediate,
+                        intermediate_size as u32,
+                        hidden_size as u32,
+                    );
+                    self.ctx.encode_gelu_mul_at(
+                        encoder,
+                        &self.decode_batch_scratch.gate_buf,
+                        offsets.intermediate,
+                        &self.decode_batch_scratch.up_buf,
+                        offsets.intermediate,
+                        &self.decode_batch_scratch.gelu_buf,
+                        offsets.intermediate,
+                        intermediate_size as u32,
+                    );
                     self.ctx.encode_matvec_q4_at_view(
                         encoder,
                         &layer.down_proj,
