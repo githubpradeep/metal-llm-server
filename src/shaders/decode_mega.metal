@@ -320,11 +320,11 @@ inline void mega_kv_append_q4(
         half scale_h = half(scale);
         *reinterpret_cast<device half*>(&cache[dst]) = scale_h;
         for (uint i = 0; i < 16; i++) {
-            float v0 = vals[i * 2];
-            float v1 = vals[i * 2 + 1];
-            int q0 = clamp(int(round(v0 * inv_scale)) + 8, 0, 15);
-            int q1 = clamp(int(round(v1 * inv_scale)) + 8, 0, 15);
-            cache[dst + 2 + i] = uchar(q0 | (q1 << 4));
+            float v_lo = vals[i];
+            float v_hi = vals[i + 16];
+            int q_lo = clamp(int(round(v_lo * inv_scale)) + 8, 0, 15);
+            int q_hi = clamp(int(round(v_hi * inv_scale)) + 8, 0, 15);
+            cache[dst + 2 + i] = uchar(q_lo | (q_hi << 4));
         }
     }
 }

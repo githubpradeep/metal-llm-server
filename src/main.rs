@@ -4,6 +4,8 @@ mod config;
 mod batch_engine;
 mod layers;
 mod cache;
+mod ggml_gemv;
+mod ggml_flash_attn;
 mod gpu;
 mod gpu_model;
 mod gemma4_config;
@@ -209,9 +211,13 @@ fn bench_decode_gemma4(
     model: &mut gemma4_gpu_model::Gemma4GpuModel,
     gen_tokens: usize,
 ) {
-    // Same plain prompt as a typical llama-cli bench (no chat template wrapper).
-    let prompt = "Write a short essay about the benefits of exercise. Include an introduction, 3 key points, and a conclusion.";
-    let encoding = tokenizer.encode(prompt, true).expect("Failed to encode");
+    // Plain prompt for token count; wrap in Gemma chat template so greedy decode
+    // does not immediately sample <end_of_turn> (happens without <start_of_turn>model).
+    let plain = "Write a short essay about the benefits of exercise. Include an introduction, 3 key points, and a conclusion.";
+    let prompt = format!(
+        "<start_of_turn>user\n{plain}<end_of_turn>\n<start_of_turn>model\n"
+    );
+    let encoding = tokenizer.encode(prompt.as_str(), true).expect("Failed to encode");
     let token_ids: Vec<usize> = encoding.get_ids().iter().map(|&t| t as usize).collect();
     let prompt_tokens = token_ids.len();
 

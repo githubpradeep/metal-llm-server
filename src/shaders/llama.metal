@@ -94,8 +94,8 @@ constant uint N_ROWS_PER_TG = 4;  // rows per threadgroup
 constant uint N_SIMDGROUPS = 2;   // SIMD groups per threadgroup
 
 // Helper: compute dot product of one Q4_0 group (32 weights) with an x chunk.
-// q points to 16 packed bytes. The 32 x values are passed as 8 float4s.
-// Uses packed_uchar4 loads so the 16 byte reads collapse to 4 vector loads.
+// q points to 16 packed bytes (GGUF layout: byte i = low nibble elem i, high nibble elem i+16).
+// The 32 x values are passed as 8 float4s: xv0-3 = elems 0-15, xv4-7 = elems 16-31.
 inline float q4_dot_vec(device const uchar* q,
                         float4 xv0, float4 xv1, float4 xv2, float4 xv3,
                         float4 xv4, float4 xv5, float4 xv6, float4 xv7) {
@@ -106,25 +106,25 @@ inline float q4_dot_vec(device const uchar* q,
     packed_uchar4 q2 = *reinterpret_cast<device const packed_uchar4*>(q + 8);
     packed_uchar4 q3 = *reinterpret_cast<device const packed_uchar4*>(q + 12);
 
-    local += float(int(q0[0] & 0xF) - 8) * xv0[0] + float(int(q0[0] >> 4) - 8) * xv0[1];
-    local += float(int(q0[1] & 0xF) - 8) * xv0[2] + float(int(q0[1] >> 4) - 8) * xv0[3];
-    local += float(int(q0[2] & 0xF) - 8) * xv1[0] + float(int(q0[2] >> 4) - 8) * xv1[1];
-    local += float(int(q0[3] & 0xF) - 8) * xv1[2] + float(int(q0[3] >> 4) - 8) * xv1[3];
+    local += float(int(q0[0] & 0xF) - 8) * xv0[0] + float(int(q0[0] >> 4) - 8) * xv4[0];
+    local += float(int(q0[1] & 0xF) - 8) * xv0[1] + float(int(q0[1] >> 4) - 8) * xv4[1];
+    local += float(int(q0[2] & 0xF) - 8) * xv0[2] + float(int(q0[2] >> 4) - 8) * xv4[2];
+    local += float(int(q0[3] & 0xF) - 8) * xv0[3] + float(int(q0[3] >> 4) - 8) * xv4[3];
 
-    local += float(int(q1[0] & 0xF) - 8) * xv2[0] + float(int(q1[0] >> 4) - 8) * xv2[1];
-    local += float(int(q1[1] & 0xF) - 8) * xv2[2] + float(int(q1[1] >> 4) - 8) * xv2[3];
-    local += float(int(q1[2] & 0xF) - 8) * xv3[0] + float(int(q1[2] >> 4) - 8) * xv3[1];
-    local += float(int(q1[3] & 0xF) - 8) * xv3[2] + float(int(q1[3] >> 4) - 8) * xv3[3];
+    local += float(int(q1[0] & 0xF) - 8) * xv1[0] + float(int(q1[0] >> 4) - 8) * xv5[0];
+    local += float(int(q1[1] & 0xF) - 8) * xv1[1] + float(int(q1[1] >> 4) - 8) * xv5[1];
+    local += float(int(q1[2] & 0xF) - 8) * xv1[2] + float(int(q1[2] >> 4) - 8) * xv5[2];
+    local += float(int(q1[3] & 0xF) - 8) * xv1[3] + float(int(q1[3] >> 4) - 8) * xv5[3];
 
-    local += float(int(q2[0] & 0xF) - 8) * xv4[0] + float(int(q2[0] >> 4) - 8) * xv4[1];
-    local += float(int(q2[1] & 0xF) - 8) * xv4[2] + float(int(q2[1] >> 4) - 8) * xv4[3];
-    local += float(int(q2[2] & 0xF) - 8) * xv5[0] + float(int(q2[2] >> 4) - 8) * xv5[1];
-    local += float(int(q2[3] & 0xF) - 8) * xv5[2] + float(int(q2[3] >> 4) - 8) * xv5[3];
+    local += float(int(q2[0] & 0xF) - 8) * xv2[0] + float(int(q2[0] >> 4) - 8) * xv6[0];
+    local += float(int(q2[1] & 0xF) - 8) * xv2[1] + float(int(q2[1] >> 4) - 8) * xv6[1];
+    local += float(int(q2[2] & 0xF) - 8) * xv2[2] + float(int(q2[2] >> 4) - 8) * xv6[2];
+    local += float(int(q2[3] & 0xF) - 8) * xv2[3] + float(int(q2[3] >> 4) - 8) * xv6[3];
 
-    local += float(int(q3[0] & 0xF) - 8) * xv6[0] + float(int(q3[0] >> 4) - 8) * xv6[1];
-    local += float(int(q3[1] & 0xF) - 8) * xv6[2] + float(int(q3[1] >> 4) - 8) * xv6[3];
-    local += float(int(q3[2] & 0xF) - 8) * xv7[0] + float(int(q3[2] >> 4) - 8) * xv7[1];
-    local += float(int(q3[3] & 0xF) - 8) * xv7[2] + float(int(q3[3] >> 4) - 8) * xv7[3];
+    local += float(int(q3[0] & 0xF) - 8) * xv3[0] + float(int(q3[0] >> 4) - 8) * xv7[0];
+    local += float(int(q3[1] & 0xF) - 8) * xv3[1] + float(int(q3[1] >> 4) - 8) * xv7[1];
+    local += float(int(q3[2] & 0xF) - 8) * xv3[2] + float(int(q3[2] >> 4) - 8) * xv7[2];
+    local += float(int(q3[3] & 0xF) - 8) * xv3[3] + float(int(q3[3] >> 4) - 8) * xv7[3];
 
     return local;
 }
@@ -211,8 +211,8 @@ kernel void matvec_q4(
 //      memory requests in flight (better latency hiding => higher bandwidth),
 //      and x is reused from registers across the rows a SIMD group owns.
 //
-// Q4_0 layout per 32-weight group: [f16 scale][16 bytes of packed nibble pairs].
-// Within a byte: low nibble -> even x index, high nibble -> odd x index.
+// Q4_0 layout per 32-weight group (GGUF): [f16 scale][16 bytes].
+// Byte i: low nibble = elem i, high nibble = elem i+16.
 
 constant uint Q4F_SG   = 8;   // SIMD groups per threadgroup
 constant uint Q4F_ROWS = 4;   // output rows per SIMD group
@@ -222,37 +222,37 @@ inline float q4_dot_vec_fast(device const uchar* q,
                              float4 xv4, float4 xv5, float4 xv6, float4 xv7) {
     float4 acc4 = float4(0.0f);
 
-    // chunk 0: bytes 0-3 -> x[0..7]
+    // chunk 0: bytes 0-3 -> x[0..3], x[16..19]
     {
         packed_uchar4 qp = *reinterpret_cast<device const packed_uchar4*>(q + 0);
         uint4 qi = uint4(qp[0], qp[1], qp[2], qp[3]);
         float4 flo = float4(int4(qi & 0xF) - 8);
         float4 fhi = float4(int4(qi >> 4) - 8);
-        acc4 += flo * float4(xv0.xz, xv1.xz) + fhi * float4(xv0.yw, xv1.yw);
+        acc4 += flo * xv0 + fhi * xv4;
     }
-    // chunk 1: bytes 4-7 -> x[8..15]
+    // chunk 1: bytes 4-7 -> x[4..7], x[20..23]
     {
         packed_uchar4 qp = *reinterpret_cast<device const packed_uchar4*>(q + 4);
         uint4 qi = uint4(qp[0], qp[1], qp[2], qp[3]);
         float4 flo = float4(int4(qi & 0xF) - 8);
         float4 fhi = float4(int4(qi >> 4) - 8);
-        acc4 += flo * float4(xv2.xz, xv3.xz) + fhi * float4(xv2.yw, xv3.yw);
+        acc4 += flo * xv1 + fhi * xv5;
     }
-    // chunk 2: bytes 8-11 -> x[16..23]
+    // chunk 2: bytes 8-11 -> x[8..11], x[24..27]
     {
         packed_uchar4 qp = *reinterpret_cast<device const packed_uchar4*>(q + 8);
         uint4 qi = uint4(qp[0], qp[1], qp[2], qp[3]);
         float4 flo = float4(int4(qi & 0xF) - 8);
         float4 fhi = float4(int4(qi >> 4) - 8);
-        acc4 += flo * float4(xv4.xz, xv5.xz) + fhi * float4(xv4.yw, xv5.yw);
+        acc4 += flo * xv2 + fhi * xv6;
     }
-    // chunk 3: bytes 12-15 -> x[24..31]
+    // chunk 3: bytes 12-15 -> x[12..15], x[28..31]
     {
         packed_uchar4 qp = *reinterpret_cast<device const packed_uchar4*>(q + 12);
         uint4 qi = uint4(qp[0], qp[1], qp[2], qp[3]);
         float4 flo = float4(int4(qi & 0xF) - 8);
         float4 fhi = float4(int4(qi >> 4) - 8);
-        acc4 += flo * float4(xv6.xz, xv7.xz) + fhi * float4(xv6.yw, xv7.yw);
+        acc4 += flo * xv3 + fhi * xv7;
     }
 
     return acc4.x + acc4.y + acc4.z + acc4.w;
@@ -460,18 +460,15 @@ kernel void matvec_q4_r8(
     matvec_q4_fast_body<8>(W_q4, x, y, M, K, tgid, sgid, lane, Q4F_SG);
 }
 
-// ─── llama.cpp / ane-infer Q4 GEMV (adapted to our nibble layout) ───────────
-// 4 simdgroups × 32 threads = 128 threads/threadgroup, 2 output rows/TG.
-// All simdgroups cooperatively reduce each row (see reference/ane-infer q4_gemv).
-// Our weights use interleaved nibbles (low→even x, high→odd x), not GGUF layout.
+// ─── llama.cpp / ane-infer Q4 GEMV (GGUF layout) ────────────────────────────
 
 constant uint LC4_SG = 4u;
 constant uint LC4_NR0 = 2u;
 constant uint LC4_NQ = 8u;
 
 inline float q4_dequant_elem(device const uchar* qs, int elem) {
-    int byte_idx = elem >> 1;
-    int is_high = elem & 1;
+    int byte_idx = elem & 15;
+    int is_high = (elem >> 4) & 1;
     uchar byte = qs[byte_idx];
     int nibble = is_high ? (byte >> 4) : (byte & 0x0F);
     return float(nibble) - 8.0f;
@@ -2318,11 +2315,11 @@ kernel void kv_cache_append_q4_0(
     *reinterpret_cast<device half*>(&cache[base_offset]) = scale_h;
 
     for (uint i = 0; i < 16; i++) {
-        float v0 = new_data[h * head_dim + g * 32 + i * 2];
-        float v1 = new_data[h * head_dim + g * 32 + i * 2 + 1];
-        int q0 = clamp(int(round(v0 * inv_scale)) + 8, 0, 15);
-        int q1 = clamp(int(round(v1 * inv_scale)) + 8, 0, 15);
-        cache[base_offset + 2 + i] = uchar(q0 | (q1 << 4));
+        float v_lo = new_data[h * head_dim + g * 32 + i];
+        float v_hi = new_data[h * head_dim + g * 32 + i + 16];
+        int q_lo = clamp(int(round(v_lo * inv_scale)) + 8, 0, 15);
+        int q_hi = clamp(int(round(v_hi * inv_scale)) + 8, 0, 15);
+        cache[base_offset + 2 + i] = uchar(q_lo | (q_hi << 4));
     }
 }
 
@@ -2454,11 +2451,11 @@ kernel void kv_cache_batch_append_q4_0(
     *reinterpret_cast<device half*>(&cache[base_offset]) = scale_h;
 
     for (uint i = 0; i < 16; i++) {
-        float v0 = new_data[h * seq_len * head_dim + s * head_dim + g * 32 + i * 2];
-        float v1 = new_data[h * seq_len * head_dim + s * head_dim + g * 32 + i * 2 + 1];
-        int q0 = clamp(int(round(v0 * inv_scale)) + 8, 0, 15);
-        int q1 = clamp(int(round(v1 * inv_scale)) + 8, 0, 15);
-        cache[base_offset + 2 + i] = uchar(q0 | (q1 << 4));
+        float v_lo = new_data[h * seq_len * head_dim + s * head_dim + g * 32 + i];
+        float v_hi = new_data[h * seq_len * head_dim + s * head_dim + g * 32 + i + 16];
+        int q_lo = clamp(int(round(v_lo * inv_scale)) + 8, 0, 15);
+        int q_hi = clamp(int(round(v_hi * inv_scale)) + 8, 0, 15);
+        cache[base_offset + 2 + i] = uchar(q_lo | (q_hi << 4));
     }
 }
 
@@ -2502,11 +2499,11 @@ kernel void kv_cache_batch_append_strided_q4_0(
     *reinterpret_cast<device half*>(&cache[base_offset]) = scale_h;
 
     for (uint i = 0; i < 16; i++) {
-        float v0 = new_data[h * source_seq_stride * head_dim + (source_start + s) * head_dim + g * 32 + i * 2];
-        float v1 = new_data[h * source_seq_stride * head_dim + (source_start + s) * head_dim + g * 32 + i * 2 + 1];
-        int q0 = clamp(int(round(v0 * inv_scale)) + 8, 0, 15);
-        int q1 = clamp(int(round(v1 * inv_scale)) + 8, 0, 15);
-        cache[base_offset + 2 + i] = uchar(q0 | (q1 << 4));
+        float v_lo = new_data[h * source_seq_stride * head_dim + (source_start + s) * head_dim + g * 32 + i];
+        float v_hi = new_data[h * source_seq_stride * head_dim + (source_start + s) * head_dim + g * 32 + i + 16];
+        int q_lo = clamp(int(round(v_lo * inv_scale)) + 8, 0, 15);
+        int q_hi = clamp(int(round(v_hi * inv_scale)) + 8, 0, 15);
+        cache[base_offset + 2 + i] = uchar(q_lo | (q_hi << 4));
     }
 }
 
@@ -2524,33 +2521,46 @@ inline float q8_0_read(device const uchar* cache, uint head_base, uint pos, uint
 
 inline float q4_0_read(device const uchar* cache, uint head_base, uint pos, uint row_bytes, uint d) {
     uint g = d / 32;
-    uint d_in_group = d % 32;
+    uint e = d % 32;
     uint offset = head_base + pos * row_bytes + g * 18;
     float scale = float(*reinterpret_cast<device const half*>(&cache[offset]));
-    uint byte_idx = d_in_group / 2;
-    uchar packed = cache[offset + 2 + byte_idx];
-    if (d_in_group & 1) {
-        return float(int(packed >> 4) - 8) * scale;
+    device const uchar* qs = cache + offset + 2;
+    if (e < 16) {
+        return float(int(qs[e] & 0xF) - 8) * scale;
     } else {
-        return float(int(packed & 0xF) - 8) * scale;
+        return float(int(qs[e - 16] >> 4) - 8) * scale;
     }
 }
 
 // Vectorized variant: reads 4 consecutive Q4_0 values starting at d (d must be a multiple of 4).
-// Each 32-element group is stored as 16 packed bytes, so 4 values span exactly 2 bytes.
 inline float4 q4_0_read4(device const uchar* cache, uint head_base, uint pos, uint row_bytes, uint d) {
     uint g = d / 32;
-    uint d_in_group = d % 32;
+    uint e = d % 32;
     uint offset = head_base + pos * row_bytes + g * 18;
     float scale = float(*reinterpret_cast<device const half*>(&cache[offset]));
-    uint byte_idx = d_in_group / 2;
-    uchar b0 = cache[offset + 2 + byte_idx];
-    uchar b1 = cache[offset + 2 + byte_idx + 1];
+    device const uchar* qs = cache + offset + 2;
+    if (e + 3 < 16) {
+        return float4(
+            float(int(qs[e + 0] & 0xF) - 8) * scale,
+            float(int(qs[e + 1] & 0xF) - 8) * scale,
+            float(int(qs[e + 2] & 0xF) - 8) * scale,
+            float(int(qs[e + 3] & 0xF) - 8) * scale
+        );
+    }
+    if (e >= 16 && e + 3 < 32) {
+        uint b = e - 16;
+        return float4(
+            float(int(qs[b + 0] >> 4) - 8) * scale,
+            float(int(qs[b + 1] >> 4) - 8) * scale,
+            float(int(qs[b + 2] >> 4) - 8) * scale,
+            float(int(qs[b + 3] >> 4) - 8) * scale
+        );
+    }
     return float4(
-        float(int(b0 & 0xF) - 8) * scale,
-        float(int(b0 >> 4) - 8) * scale,
-        float(int(b1 & 0xF) - 8) * scale,
-        float(int(b1 >> 4) - 8) * scale
+        q4_0_read(cache, head_base, pos, row_bytes, d),
+        q4_0_read(cache, head_base, pos, row_bytes, d + 1),
+        q4_0_read(cache, head_base, pos, row_bytes, d + 2),
+        q4_0_read(cache, head_base, pos, row_bytes, d + 3)
     );
 }
 
@@ -3533,6 +3543,109 @@ inline void flash_accum_v_f16(
     }
 }
 
+// ─── Fused KV append + flash decode helpers (Q4_0) ───────────────────────────
+// Token at cur_seq is read from f32 K/V; prior tokens from Q4 cache. Quantize
+// and write the new K/V row once per kv head at kernel end.
+
+inline void q4_0_append_group_f32(
+    device const float* src,
+    uint src_base,
+    device uchar* cache,
+    uint head_base,
+    uint pos,
+    uint row_bytes,
+    uint g
+) {
+    uint base_offset = head_base + pos * row_bytes + g * 18;
+    float max_abs = 0.0f;
+    for (uint d = 0; d < 32; d++) {
+        float a = fabs(src[src_base + g * 32 + d]);
+        if (a > max_abs) max_abs = a;
+    }
+    float scale = max_abs > 0.0f ? max_abs / 7.0f : 1.0f;
+    float inv_scale = 1.0f / scale;
+    *reinterpret_cast<device half*>(&cache[base_offset]) = half(scale);
+    for (uint i = 0; i < 16; i++) {
+        int q_lo = clamp(int(round(src[src_base + g * 32 + i] * inv_scale)) + 8, 0, 15);
+        int q_hi = clamp(int(round(src[src_base + g * 32 + i + 16] * inv_scale)) + 8, 0, 15);
+        cache[base_offset + 2 + i] = uchar(q_lo | (q_hi << 4));
+    }
+}
+
+inline float flash_dot_k_fused(
+    device const uchar* K_cache,
+    uint k_head_base,
+    uint pos,
+    uint row_bytes,
+    uint head_dim,
+    device const float* K_f32,
+    uint kv_h,
+    uint cur_seq,
+    threadgroup float* shared_q,
+    uint lane
+) {
+    if (pos == cur_seq) {
+        float partial = 0.0f;
+        uint kb = kv_h * head_dim;
+        for (uint d = lane * 4; d + 3 < head_dim; d += SIMD_SIZE * 4) {
+            float4 qv = float4(shared_q[d], shared_q[d + 1], shared_q[d + 2], shared_q[d + 3]);
+            float4 kv = float4(K_f32[kb + d], K_f32[kb + d + 1], K_f32[kb + d + 2], K_f32[kb + d + 3]);
+            partial += dot(qv, kv);
+        }
+        for (uint d = (head_dim / 4) * 4 + lane; d < head_dim; d += SIMD_SIZE) {
+            partial += shared_q[d] * K_f32[kb + d];
+        }
+        return partial;
+    }
+    return flash_dot_q4_k_cached(K_cache, k_head_base, pos, row_bytes, head_dim, shared_q, lane);
+}
+
+inline void flash_accum_v_q4_fused(
+    device float* output,
+    uint out_base,
+    device const uchar* V_cache,
+    uint v_head_base,
+    uint kv_start,
+    uint kv_tile,
+    uint tile_count,
+    uint row_bytes,
+    uint head_dim,
+    device const float* V_f32,
+    uint kv_h,
+    uint cur_seq,
+    threadgroup float* shared_exp,
+    float old_factor,
+    float inv_l,
+    uint tid,
+    uint tg_size
+) {
+    uint vb = kv_h * head_dim;
+    for (uint d = tid * 4; d + 3 < head_dim; d += tg_size * 4) {
+        float4 ov = *reinterpret_cast<device float4*>(&output[out_base + d]);
+        float4 acc = float4(0.0f);
+        for (uint kv_offset = 0; kv_offset < tile_count; kv_offset++) {
+            uint actual_pos = kv_start + kv_tile + kv_offset;
+            float4 vv = (actual_pos == cur_seq)
+                ? float4(V_f32[vb + d], V_f32[vb + d + 1], V_f32[vb + d + 2], V_f32[vb + d + 3])
+                : q4_0_read4(V_cache, v_head_base, actual_pos, row_bytes, d);
+            acc += shared_exp[kv_offset] * vv;
+        }
+        ov = ov * old_factor + acc * inv_l;
+        *reinterpret_cast<device float4*>(&output[out_base + d]) = ov;
+    }
+    for (uint d = (head_dim / 4) * 4 + tid; d < head_dim; d += tg_size) {
+        float acc = 0.0f;
+        for (uint kv_offset = 0; kv_offset < tile_count; kv_offset++) {
+            uint actual_pos = kv_start + kv_tile + kv_offset;
+            float vv = (actual_pos == cur_seq)
+                ? V_f32[vb + d]
+                : q4_0_read(V_cache, v_head_base, actual_pos, row_bytes, d);
+            acc += shared_exp[kv_offset] * vv;
+        }
+        output[out_base + d] = output[out_base + d] * old_factor + acc * inv_l;
+    }
+}
+
 // ─── Flash decode: single query token vs KV cache (Q4_0) ─────────────────────
 
 kernel void attention_flash_decode_q4_0(
@@ -3609,6 +3722,552 @@ kernel void attention_flash_decode_q4_0(
             tid, FLASH_TG_SIZE);
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
+}
+
+// ─── Flash decode Q4_0: head-dim specialized (Gemma4 sliding h128 / global h512) ─
+// h128 uses TILE_KV=128 so the full sliding window (≤128) fits in one tile —
+// one softmax pass and no outer tile loop for most decode steps.
+
+template<uint HEAD_DIM>
+inline void flash_zero_output_hd(
+    device float* output,
+    uint out_base,
+    uint tid,
+    uint tg_size
+) {
+    for (uint d = tid * 4; d + 3 < HEAD_DIM; d += tg_size * 4) {
+        *reinterpret_cast<device float4*>(&output[out_base + d]) = float4(0.0f);
+    }
+    for (uint d = (HEAD_DIM / 4) * 4 + tid; d < HEAD_DIM; d += tg_size) {
+        output[out_base + d] = 0.0f;
+    }
+}
+
+template<uint HEAD_DIM>
+inline void flash_load_q_hd(
+    device const float* Q,
+    uint q_offset,
+    threadgroup float* shared_q,
+    uint tid,
+    uint tg_size
+) {
+    for (uint d = tid; d < HEAD_DIM; d += tg_size) {
+        shared_q[d] = Q[q_offset + d];
+    }
+}
+
+template<uint HEAD_DIM>
+inline float flash_dot_q4_k_hd(
+    device const uchar* K_cache,
+    uint k_head_base,
+    uint pos,
+    uint row_bytes,
+    threadgroup float* shared_q,
+    uint lane
+) {
+    float partial = 0.0f;
+    for (uint d = lane * 4; d + 3 < HEAD_DIM; d += SIMD_SIZE * 4) {
+        float4 qv = float4(shared_q[d], shared_q[d + 1], shared_q[d + 2], shared_q[d + 3]);
+        float4 kv = q4_0_read4(K_cache, k_head_base, pos, row_bytes, d);
+        partial += dot(qv, kv);
+    }
+    for (uint d = (HEAD_DIM / 4) * 4 + lane; d < HEAD_DIM; d += SIMD_SIZE) {
+        partial += shared_q[d] * q4_0_read(K_cache, k_head_base, pos, row_bytes, d);
+    }
+    return partial;
+}
+
+template<uint HEAD_DIM>
+inline float flash_dot_k_fused_hd(
+    device const uchar* K_cache,
+    uint k_head_base,
+    uint pos,
+    uint row_bytes,
+    device const float* K_f32,
+    uint kv_h,
+    uint cur_seq,
+    threadgroup float* shared_q,
+    uint lane
+) {
+    if (pos == cur_seq) {
+        float partial = 0.0f;
+        uint kb = kv_h * HEAD_DIM;
+        for (uint d = lane * 4; d + 3 < HEAD_DIM; d += SIMD_SIZE * 4) {
+            float4 qv = float4(shared_q[d], shared_q[d + 1], shared_q[d + 2], shared_q[d + 3]);
+            float4 kv = float4(K_f32[kb + d], K_f32[kb + d + 1], K_f32[kb + d + 2], K_f32[kb + d + 3]);
+            partial += dot(qv, kv);
+        }
+        for (uint d = (HEAD_DIM / 4) * 4 + lane; d < HEAD_DIM; d += SIMD_SIZE) {
+            partial += shared_q[d] * K_f32[kb + d];
+        }
+        return partial;
+    }
+    return flash_dot_q4_k_hd<HEAD_DIM>(K_cache, k_head_base, pos, row_bytes, shared_q, lane);
+}
+
+template<uint HEAD_DIM, uint TILE_KV>
+inline void flash_accum_v_q4_fused_hd(
+    device float* output,
+    uint out_base,
+    device const uchar* V_cache,
+    uint v_head_base,
+    uint kv_start,
+    uint kv_tile,
+    uint tile_count,
+    uint row_bytes,
+    device const float* V_f32,
+    uint kv_h,
+    uint cur_seq,
+    threadgroup float* shared_exp,
+    float old_factor,
+    float inv_l,
+    uint tid,
+    uint tg_size
+) {
+    uint vb = kv_h * HEAD_DIM;
+    for (uint d = tid * 4; d + 3 < HEAD_DIM; d += tg_size * 4) {
+        float4 ov = *reinterpret_cast<device float4*>(&output[out_base + d]);
+        float4 acc = float4(0.0f);
+        for (uint kv_offset = 0; kv_offset < tile_count; kv_offset++) {
+            uint actual_pos = kv_start + kv_tile + kv_offset;
+            float4 vv = (actual_pos == cur_seq)
+                ? float4(V_f32[vb + d], V_f32[vb + d + 1], V_f32[vb + d + 2], V_f32[vb + d + 3])
+                : q4_0_read4(V_cache, v_head_base, actual_pos, row_bytes, d);
+            acc += shared_exp[kv_offset] * vv;
+        }
+        ov = ov * old_factor + acc * inv_l;
+        *reinterpret_cast<device float4*>(&output[out_base + d]) = ov;
+    }
+    for (uint d = (HEAD_DIM / 4) * 4 + tid; d < HEAD_DIM; d += tg_size) {
+        float acc = 0.0f;
+        for (uint kv_offset = 0; kv_offset < tile_count; kv_offset++) {
+            uint actual_pos = kv_start + kv_tile + kv_offset;
+            float vv = (actual_pos == cur_seq)
+                ? V_f32[vb + d]
+                : q4_0_read(V_cache, v_head_base, actual_pos, row_bytes, d);
+            acc += shared_exp[kv_offset] * vv;
+        }
+        output[out_base + d] = output[out_base + d] * old_factor + acc * inv_l;
+    }
+}
+
+template<uint HEAD_DIM, uint TILE_KV>
+inline void flash_accum_v_q4_hd(
+    device float* output,
+    uint out_base,
+    device const uchar* V_cache,
+    uint v_head_base,
+    uint kv_start,
+    uint kv_tile,
+    uint tile_count,
+    uint row_bytes,
+    threadgroup float* shared_exp,
+    float old_factor,
+    float inv_l,
+    uint tid,
+    uint tg_size
+) {
+    for (uint d = tid * 4; d + 3 < HEAD_DIM; d += tg_size * 4) {
+        float4 ov = *reinterpret_cast<device float4*>(&output[out_base + d]);
+        float4 acc = float4(0.0f);
+        for (uint kv_offset = 0; kv_offset < tile_count; kv_offset++) {
+            uint actual_pos = kv_start + kv_tile + kv_offset;
+            acc += shared_exp[kv_offset]
+                * q4_0_read4(V_cache, v_head_base, actual_pos, row_bytes, d);
+        }
+        ov = ov * old_factor + acc * inv_l;
+        *reinterpret_cast<device float4*>(&output[out_base + d]) = ov;
+    }
+    for (uint d = (HEAD_DIM / 4) * 4 + tid; d < HEAD_DIM; d += tg_size) {
+        float acc = 0.0f;
+        for (uint kv_offset = 0; kv_offset < tile_count; kv_offset++) {
+            uint actual_pos = kv_start + kv_tile + kv_offset;
+            acc += shared_exp[kv_offset]
+                * q4_0_read(V_cache, v_head_base, actual_pos, row_bytes, d);
+        }
+        output[out_base + d] = output[out_base + d] * old_factor + acc * inv_l;
+    }
+}
+
+template<uint HEAD_DIM, uint TILE_KV>
+void flash_decode_q4_0_hd_body(
+    device const float* Q,
+    device const uchar* K_cache,
+    device const uchar* V_cache,
+    device float* output,
+    uint h,
+    uint num_heads,
+    uint num_kv_groups,
+    uint capacity,
+    uint row_bytes,
+    uint kv_seq,
+    uint kv_start,
+    float scale,
+    uint tid,
+    uint sgid,
+    uint lane,
+    threadgroup float* shared_q,
+    threadgroup float* shared_scores,
+    threadgroup float* shared_exp,
+    threadgroup float* shared_update
+) {
+    if (h >= num_heads) return;
+
+    uint kv_h = h / num_kv_groups;
+    uint q_offset = h * HEAD_DIM;
+    uint k_head_base = kv_h * capacity * row_bytes;
+    uint v_head_base = kv_h * capacity * row_bytes;
+    uint num_simds = FLASH_TG_SIZE / SIMD_SIZE;
+
+    if (tid == 0) {
+        shared_update[0] = -INFINITY;
+        shared_update[1] = 0.0f;
+    }
+    flash_zero_output_hd<HEAD_DIM>(output, q_offset, tid, FLASH_TG_SIZE);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    flash_load_q_hd<HEAD_DIM>(Q, q_offset, shared_q, tid, FLASH_TG_SIZE);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint kv_tile = 0; kv_tile < kv_seq; kv_tile += TILE_KV) {
+        uint tile_count = min(TILE_KV, kv_seq - kv_tile);
+
+        for (uint wave = 0; wave < tile_count; wave += num_simds) {
+            uint kv_offset = wave + sgid;
+            if (kv_offset < tile_count) {
+                uint actual_pos = kv_start + kv_tile + kv_offset;
+                float partial = flash_dot_q4_k_hd<HEAD_DIM>(
+                    K_cache, k_head_base, actual_pos, row_bytes, shared_q, lane);
+                partial = simd_sum(partial);
+                if (lane == 0) {
+                    shared_scores[kv_offset] = partial * scale;
+                }
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        if (tid == 0) {
+            flash_softmax_tile(shared_scores, shared_exp, shared_update, tile_count);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        flash_accum_v_q4_hd<HEAD_DIM, TILE_KV>(
+            output, q_offset, V_cache, v_head_base,
+            kv_start, kv_tile, tile_count, row_bytes,
+            shared_exp, shared_update[2], shared_update[3],
+            tid, FLASH_TG_SIZE);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+}
+
+kernel void attention_flash_decode_q4_0_h128(
+    device const float* Q [[buffer(0)]],
+    device const uchar* K_cache [[buffer(1)]],
+    device const uchar* V_cache [[buffer(2)]],
+    device float* output [[buffer(3)]],
+    constant uint& num_heads [[buffer(4)]],
+    constant uint& num_kv_heads [[buffer(5)]],
+    constant uint& num_kv_groups [[buffer(6)]],
+    constant uint& head_dim [[buffer(7)]],
+    constant uint& kv_seq [[buffer(8)]],
+    constant uint& capacity [[buffer(9)]],
+    constant float& scale [[buffer(10)]],
+    constant uint& kv_start [[buffer(11)]],
+    constant uint& groups_per_row [[buffer(12)]],
+    constant uint& row_bytes [[buffer(13)]],
+    uint tid [[thread_index_in_threadgroup]],
+    uint tgid [[threadgroup_position_in_grid]],
+    uint sgid [[simdgroup_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]]
+) {
+    (void)num_kv_heads;
+    (void)head_dim;
+    (void)groups_per_row;
+    threadgroup float shared_q[128];
+    threadgroup float shared_scores[128];
+    threadgroup float shared_exp[128];
+    threadgroup float shared_update[4];
+    flash_decode_q4_0_hd_body<128, 128>(
+        Q, K_cache, V_cache, output, tgid, num_heads, num_kv_groups, capacity, row_bytes,
+        kv_seq, kv_start, scale, tid, sgid, lane,
+        shared_q, shared_scores, shared_exp, shared_update);
+}
+
+kernel void attention_flash_decode_q4_0_h512(
+    device const float* Q [[buffer(0)]],
+    device const uchar* K_cache [[buffer(1)]],
+    device const uchar* V_cache [[buffer(2)]],
+    device float* output [[buffer(3)]],
+    constant uint& num_heads [[buffer(4)]],
+    constant uint& num_kv_heads [[buffer(5)]],
+    constant uint& num_kv_groups [[buffer(6)]],
+    constant uint& head_dim [[buffer(7)]],
+    constant uint& kv_seq [[buffer(8)]],
+    constant uint& capacity [[buffer(9)]],
+    constant float& scale [[buffer(10)]],
+    constant uint& kv_start [[buffer(11)]],
+    constant uint& groups_per_row [[buffer(12)]],
+    constant uint& row_bytes [[buffer(13)]],
+    uint tid [[thread_index_in_threadgroup]],
+    uint tgid [[threadgroup_position_in_grid]],
+    uint sgid [[simdgroup_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]]
+) {
+    (void)num_kv_heads;
+    (void)head_dim;
+    (void)groups_per_row;
+    threadgroup float shared_q[512];
+    threadgroup float shared_scores[32];
+    threadgroup float shared_exp[32];
+    threadgroup float shared_update[4];
+    flash_decode_q4_0_hd_body<512, 32>(
+        Q, K_cache, V_cache, output, tgid, num_heads, num_kv_groups, capacity, row_bytes,
+        kv_seq, kv_start, scale, tid, sgid, lane,
+        shared_q, shared_scores, shared_exp, shared_update);
+}
+
+template<uint HEAD_DIM, uint TILE_KV>
+void flash_decode_fused_q4_0_hd_body(
+    device const float* Q,
+    device const float* K_f32,
+    device const float* V_f32,
+    device uchar* K_cache,
+    device uchar* V_cache,
+    device float* output,
+    uint h,
+    uint num_heads,
+    uint num_kv_groups,
+    uint capacity,
+    uint row_bytes,
+    uint groups_per_row,
+    uint kv_seq,
+    uint kv_start,
+    uint cur_seq,
+    float scale,
+    uint tid,
+    uint sgid,
+    uint lane,
+    threadgroup float* shared_q,
+    threadgroup float* shared_scores,
+    threadgroup float* shared_exp,
+    threadgroup float* shared_update
+) {
+    if (h >= num_heads) return;
+
+    uint kv_h = h / num_kv_groups;
+    uint q_offset = h * HEAD_DIM;
+    uint k_head_base = kv_h * capacity * row_bytes;
+    uint v_head_base = kv_h * capacity * row_bytes;
+    uint num_simds = FLASH_TG_SIZE / SIMD_SIZE;
+
+    if (tid == 0) {
+        shared_update[0] = -INFINITY;
+        shared_update[1] = 0.0f;
+    }
+    flash_zero_output_hd<HEAD_DIM>(output, q_offset, tid, FLASH_TG_SIZE);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    flash_load_q_hd<HEAD_DIM>(Q, q_offset, shared_q, tid, FLASH_TG_SIZE);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint kv_tile = 0; kv_tile < kv_seq; kv_tile += TILE_KV) {
+        uint tile_count = min(TILE_KV, kv_seq - kv_tile);
+
+        for (uint wave = 0; wave < tile_count; wave += num_simds) {
+            uint kv_offset = wave + sgid;
+            if (kv_offset < tile_count) {
+                uint actual_pos = kv_start + kv_tile + kv_offset;
+                float partial = flash_dot_k_fused_hd<HEAD_DIM>(
+                    K_cache, k_head_base, actual_pos, row_bytes,
+                    K_f32, kv_h, cur_seq, shared_q, lane);
+                partial = simd_sum(partial);
+                if (lane == 0) {
+                    shared_scores[kv_offset] = partial * scale;
+                }
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        if (tid == 0) {
+            flash_softmax_tile(shared_scores, shared_exp, shared_update, tile_count);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        flash_accum_v_q4_fused_hd<HEAD_DIM, TILE_KV>(
+            output, q_offset, V_cache, v_head_base,
+            kv_start, kv_tile, tile_count, row_bytes,
+            V_f32, kv_h, cur_seq,
+            shared_exp, shared_update[2], shared_update[3],
+            tid, FLASH_TG_SIZE);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    if ((h % num_kv_groups) == 0) {
+        uint src_base = kv_h * HEAD_DIM;
+        for (uint g = tid; g < groups_per_row; g += FLASH_TG_SIZE) {
+            q4_0_append_group_f32(K_f32, src_base, K_cache, k_head_base, cur_seq, row_bytes, g);
+            q4_0_append_group_f32(V_f32, src_base, V_cache, v_head_base, cur_seq, row_bytes, g);
+        }
+    }
+}
+
+kernel void attention_flash_decode_fused_q4_0(
+    device const float* Q [[buffer(0)]],
+    device const float* K_f32 [[buffer(1)]],
+    device const float* V_f32 [[buffer(2)]],
+    device float* output [[buffer(3)]],
+    device uchar* K_cache [[buffer(4)]],
+    device uchar* V_cache [[buffer(5)]],
+    constant uint& num_heads [[buffer(6)]],
+    constant uint& num_kv_heads [[buffer(7)]],
+    constant uint& num_kv_groups [[buffer(8)]],
+    constant uint& head_dim [[buffer(9)]],
+    constant uint& kv_seq [[buffer(10)]],
+    constant uint& capacity [[buffer(11)]],
+    constant float& scale [[buffer(12)]],
+    constant uint& kv_start [[buffer(13)]],
+    constant uint& groups_per_row [[buffer(14)]],
+    constant uint& row_bytes [[buffer(15)]],
+    constant uint& cur_seq [[buffer(16)]],
+    uint tid [[thread_index_in_threadgroup]],
+    uint tgid [[threadgroup_position_in_grid]],
+    uint sgid [[simdgroup_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]]
+) {
+    (void)num_kv_heads;
+    uint h = tgid;
+    if (h >= num_heads) return;
+
+    uint kv_h = h / num_kv_groups;
+    uint q_offset = h * head_dim;
+    uint k_head_base = kv_h * capacity * row_bytes;
+    uint v_head_base = kv_h * capacity * row_bytes;
+    uint num_simds = FLASH_TG_SIZE / SIMD_SIZE;
+
+    threadgroup float shared_q[FLASH_MAX_HEAD];
+    threadgroup float shared_scores[FLASH_TILE_KV];
+    threadgroup float shared_exp[FLASH_TILE_KV];
+    threadgroup float shared_update[4];
+
+    if (tid == 0) {
+        shared_update[0] = -INFINITY;
+        shared_update[1] = 0.0f;
+    }
+    flash_zero_output(output, q_offset, head_dim, tid, FLASH_TG_SIZE);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    flash_load_q(Q, q_offset, shared_q, head_dim, tid, FLASH_TG_SIZE);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint kv_tile = 0; kv_tile < kv_seq; kv_tile += FLASH_TILE_KV) {
+        uint tile_count = min(FLASH_TILE_KV, kv_seq - kv_tile);
+
+        for (uint wave = 0; wave < tile_count; wave += num_simds) {
+            uint kv_offset = wave + sgid;
+            if (kv_offset < tile_count) {
+                uint actual_pos = kv_start + kv_tile + kv_offset;
+                float partial = flash_dot_k_fused(
+                    K_cache, k_head_base, actual_pos, row_bytes, head_dim,
+                    K_f32, kv_h, cur_seq, shared_q, lane);
+                partial = simd_sum(partial);
+                if (lane == 0) {
+                    shared_scores[kv_offset] = partial * scale;
+                }
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        if (tid == 0) {
+            flash_softmax_tile(shared_scores, shared_exp, shared_update, tile_count);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        flash_accum_v_q4_fused(
+            output, q_offset, V_cache, v_head_base,
+            kv_start, kv_tile, tile_count, row_bytes, head_dim,
+            V_f32, kv_h, cur_seq,
+            shared_exp, shared_update[2], shared_update[3],
+            tid, FLASH_TG_SIZE);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    if ((h % num_kv_groups) == 0) {
+        uint src_base = kv_h * head_dim;
+        for (uint g = tid; g < groups_per_row; g += FLASH_TG_SIZE) {
+            q4_0_append_group_f32(K_f32, src_base, K_cache, k_head_base, cur_seq, row_bytes, g);
+            q4_0_append_group_f32(V_f32, src_base, V_cache, v_head_base, cur_seq, row_bytes, g);
+        }
+    }
+}
+
+kernel void attention_flash_decode_fused_q4_0_h128(
+    device const float* Q [[buffer(0)]],
+    device const float* K_f32 [[buffer(1)]],
+    device const float* V_f32 [[buffer(2)]],
+    device float* output [[buffer(3)]],
+    device uchar* K_cache [[buffer(4)]],
+    device uchar* V_cache [[buffer(5)]],
+    constant uint& num_heads [[buffer(6)]],
+    constant uint& num_kv_heads [[buffer(7)]],
+    constant uint& num_kv_groups [[buffer(8)]],
+    constant uint& head_dim [[buffer(9)]],
+    constant uint& kv_seq [[buffer(10)]],
+    constant uint& capacity [[buffer(11)]],
+    constant float& scale [[buffer(12)]],
+    constant uint& kv_start [[buffer(13)]],
+    constant uint& groups_per_row [[buffer(14)]],
+    constant uint& row_bytes [[buffer(15)]],
+    constant uint& cur_seq [[buffer(16)]],
+    uint tid [[thread_index_in_threadgroup]],
+    uint tgid [[threadgroup_position_in_grid]],
+    uint sgid [[simdgroup_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]]
+) {
+    (void)num_kv_heads;
+    (void)head_dim;
+    threadgroup float shared_q[128];
+    threadgroup float shared_scores[128];
+    threadgroup float shared_exp[128];
+    threadgroup float shared_update[4];
+    flash_decode_fused_q4_0_hd_body<128, 128>(
+        Q, K_f32, V_f32, K_cache, V_cache, output, tgid, num_heads, num_kv_groups,
+        capacity, row_bytes, groups_per_row, kv_seq, kv_start, cur_seq, scale,
+        tid, sgid, lane, shared_q, shared_scores, shared_exp, shared_update);
+}
+
+kernel void attention_flash_decode_fused_q4_0_h512(
+    device const float* Q [[buffer(0)]],
+    device const float* K_f32 [[buffer(1)]],
+    device const float* V_f32 [[buffer(2)]],
+    device float* output [[buffer(3)]],
+    device uchar* K_cache [[buffer(4)]],
+    device uchar* V_cache [[buffer(5)]],
+    constant uint& num_heads [[buffer(6)]],
+    constant uint& num_kv_heads [[buffer(7)]],
+    constant uint& num_kv_groups [[buffer(8)]],
+    constant uint& head_dim [[buffer(9)]],
+    constant uint& kv_seq [[buffer(10)]],
+    constant uint& capacity [[buffer(11)]],
+    constant float& scale [[buffer(12)]],
+    constant uint& kv_start [[buffer(13)]],
+    constant uint& groups_per_row [[buffer(14)]],
+    constant uint& row_bytes [[buffer(15)]],
+    constant uint& cur_seq [[buffer(16)]],
+    uint tid [[thread_index_in_threadgroup]],
+    uint tgid [[threadgroup_position_in_grid]],
+    uint sgid [[simdgroup_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]]
+) {
+    (void)num_kv_heads;
+    (void)head_dim;
+    threadgroup float shared_q[512];
+    threadgroup float shared_scores[32];
+    threadgroup float shared_exp[32];
+    threadgroup float shared_update[4];
+    flash_decode_fused_q4_0_hd_body<512, 32>(
+        Q, K_f32, V_f32, K_cache, V_cache, output, tgid, num_heads, num_kv_groups,
+        capacity, row_bytes, groups_per_row, kv_seq, kv_start, cur_seq, scale,
+        tid, sgid, lane, shared_q, shared_scores, shared_exp, shared_update);
 }
 
 // ─── Flash decode: single query token vs KV cache (f16) ──────────────────────
@@ -4037,182 +4696,6 @@ kernel void attention_flash_causal_strided_f16(
             0, kv_tile, tile_count,
             shared_exp, shared_update[2], shared_update[3],
             tid, FLASH_TG_SIZE);
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-    }
-}
-
-// ─── Fused KV Cache Append + Attention (Q4_0) ───────────────────────────────
-// Combines quantization and attention computation in a single kernel launch.
-// Takes f32 K, V as input (single token), quantizes to Q4_0, writes to cache,
-// then computes attention using the newly written K/V.
-// Eliminates separate kernel launch and global memory round-trip.
-//
-// Thread organization:
-//   - 256 threads (8 SIMD groups × 32 threads)
-//   - One threadgroup per head
-//   - Shared memory to load Q once
-//   - Processes 4 KV positions per tile (TILE_KV=4)
-//   - Uses same attention algorithm as attention_flash_decode_q4_0
-//
-// Cache layout: (num_kv_heads, capacity, groups_per_row * 18) for Q4_0
-
-constant uint TILE_KV = 4;
-
-kernel void kv_append_attention_q4_0(
-    device const float* Q,
-    device const float* K_f32,
-    device const float* V_f32,
-    device float* output,
-    device uchar* K_cache,
-    device uchar* V_cache,
-    constant uint& num_heads,
-    constant uint& num_kv_heads,
-    constant uint& num_kv_groups,
-    constant uint& head_dim,
-    constant uint& capacity,
-    constant uint& cur_seq,
-    constant float& scale,
-    constant uint& groups_per_row,
-    constant uint& row_bytes,
-    uint tid [[thread_index_in_threadgroup]],
-    uint tgid [[threadgroup_position_in_grid]],
-    uint sgid [[simdgroup_index_in_threadgroup]],
-    uint lane [[thread_index_in_simdgroup]]
-) {
-    uint h = tgid;
-    if (h >= num_heads) return;
-
-    uint kv_h = h / num_kv_groups;
-    uint q_offset = h * head_dim;
-    uint k_head_base = kv_h * capacity * row_bytes;
-    uint v_head_base = kv_h * capacity * row_bytes;
-    uint num_simds = 8;
-
-    threadgroup float shared_q[FLASH_MAX_HEAD];
-    threadgroup float shared_scores[TILE_KV * 4];
-    threadgroup float shared_exp[TILE_KV];
-    threadgroup float shared_update[4];
-
-    if (tid == 0) {
-        shared_update[0] = -INFINITY;
-        shared_update[1] = 0.0f;
-    }
-    for (uint d = tid * 4; d + 3 < head_dim; d += 256 * 4) {
-        *reinterpret_cast<device float4*>(&output[q_offset + d]) = float4(0.0f);
-    }
-    for (uint d = (head_dim / 4) * 4 + tid; d < head_dim; d += 256) {
-        output[q_offset + d] = 0.0f;
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-
-    flash_load_q(Q, q_offset, shared_q, head_dim, tid, 256);
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-
-    for (uint kv_tile = 0; kv_tile < 1; kv_tile += TILE_KV) {
-        uint tile_count = 1;
-
-        for (uint kv_offset = 0; kv_offset < tile_count; kv_offset++) {
-            uint actual_pos = cur_seq;
-
-            for (uint g = lane; g < groups_per_row; g += SIMD_SIZE) {
-                uint d_in_group = g * 32;
-                uint byte_idx = d_in_group / 2;
-                uint offset = k_head_base + actual_pos * row_bytes + g * 18;
-                float scale_k = float(*reinterpret_cast<device const half*>(&K_cache[offset]));
-                uchar packed = K_cache[offset + 2 + byte_idx];
-                float k0 = float(int(packed & 0xF) - 8) * scale_k;
-                float k1 = float(int(packed >> 4) - 8) * scale_k;
-                uint d0 = d_in_group + (d_in_group & 1 ? 1 : 0);
-                uint d1 = d_in_group + (d_in_group & 1 ? 0 : 1);
-                uint d = (d0 < head_dim) ? d0 : d1;
-                if (d < head_dim) {
-                    uint x_offset = kv_h * head_dim + d;
-                    float partial = shared_q[d] * K_f32[x_offset];
-                    if (lane == 0) {
-                        shared_scores[kv_offset * num_simds + sgid] = partial;
-                    }
-                }
-            }
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-
-        if (tid == 0) {
-            float m_old = shared_update[0];
-            float l_old = shared_update[1];
-            float m_new = m_old;
-
-            float tile_scores[TILE_KV];
-            for (uint kv_offset = 0; kv_offset < tile_count; kv_offset++) {
-                float s = 0.0f;
-                for (uint s_id = 0; s_id < num_simds; s_id++) {
-                    s += shared_scores[kv_offset * num_simds + s_id];
-                }
-                tile_scores[kv_offset] = s * scale;
-                m_new = max(m_new, tile_scores[kv_offset]);
-            }
-
-            float tile_sum = 0.0f;
-            for (uint kv_offset = 0; kv_offset < tile_count; kv_offset++) {
-                float e = exp(tile_scores[kv_offset] - m_new);
-                shared_exp[kv_offset] = e;
-                tile_sum += e;
-            }
-
-            float l_new = l_old * exp(m_old - m_new) + tile_sum;
-            shared_update[0] = m_new;
-            shared_update[1] = l_new;
-            shared_update[2] = l_new > 0.0f ? (l_old * exp(m_old - m_new)) / l_new : 0.0f;
-            shared_update[3] = l_new > 0.0f ? 1.0f / l_new : 0.0f;
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-
-        float old_factor = shared_update[2];
-        float inv_l_new = shared_update[3];
-
-        for (uint kv_offset = 0; kv_offset < tile_count; kv_offset++) {
-            uint actual_pos = cur_seq;
-
-            for (uint g = lane; g < groups_per_row; g += SIMD_SIZE) {
-                uint d_in_group = g * 32;
-                uint byte_idx = d_in_group / 2;
-                uint offset = v_head_base + actual_pos * row_bytes + g * 18;
-                float scale_v = float(*reinterpret_cast<device const half*>(&V_cache[offset]));
-                uchar packed = V_cache[offset + 2 + byte_idx];
-                float v0 = float(int(packed & 0xF) - 8) * scale_v;
-                float v1 = float(int(packed >> 4) - 8) * scale_v;
-                uint d0 = d_in_group + (d_in_group & 1 ? 1 : 0);
-                uint d1 = d_in_group + (d_in_group & 1 ? 0 : 1);
-                uint d = (d0 < head_dim) ? d0 : d1;
-                if (d < head_dim) {
-                    uint x_offset = kv_h * head_dim + d;
-                    float v_val = V_f32[x_offset];
-                    float partial = shared_exp[kv_offset] * v_val;
-                    if (lane == 0) {
-                        shared_scores[kv_offset * num_simds + sgid] = partial;
-                    }
-                }
-            }
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-
-        for (uint d = tid * 4; d + 3 < head_dim; d += 256 * 4) {
-            uint out_idx = q_offset + d;
-            float4 ov = *reinterpret_cast<device float4*>(&output[out_idx]);
-            float4 acc = float4(0.0f);
-            for (uint kv_offset = 0; kv_offset < tile_count; kv_offset++) {
-                acc += shared_scores[kv_offset * num_simds + sgid];
-            }
-            ov = ov * old_factor + acc * inv_l_new;
-            *reinterpret_cast<device float4*>(&output[out_idx]) = ov;
-        }
-        for (uint d = (head_dim / 4) * 4 + tid; d < head_dim; d += 256) {
-            uint out_idx = q_offset + d;
-            float acc = 0.0f;
-            for (uint kv_offset = 0; kv_offset < tile_count; kv_offset++) {
-                acc += shared_scores[kv_offset * num_simds + sgid];
-            }
-            output[out_idx] = output[out_idx] * old_factor + acc * inv_l_new;
-        }
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
 }

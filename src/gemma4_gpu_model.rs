@@ -511,6 +511,13 @@ impl Gemma4GpuModel {
         let cache_path = Path::new(model_dir).join("model.q4cache");
         let embed_cache_path = Path::new(model_dir).join("model.embed.cache");
 
+        if embed_cache_path.exists() && Self::is_stale_split_weights_cache(&cache_path) {
+            eprintln!(
+                "  Stale Q4 cache (old interleaved layout). Delete model.q4cache and model.embed.cache, then re-run to re-quantize with GGUF layout."
+            );
+            std::process::exit(1);
+        }
+
         if embed_cache_path.exists() && Self::is_split_weights_cache(&cache_path) {
             println!("  Found split Q4 cache, loading...");
             println!(
@@ -1126,7 +1133,7 @@ impl Gemma4GpuModel {
 
         use std::io::{Seek, Write};
         let mut file = fs::File::create(path).expect("Failed to create weights cache");
-        file.write_all(b"GQ4A").unwrap();
+        file.write_all(b"GQ4G").unwrap();
         let save_view = |f: &mut fs::File, view: &BufferView| {
             f.write_all(&view.length.to_le_bytes()).unwrap();
             let pos = f.stream_position().expect("stream position") as usize;
@@ -1197,7 +1204,7 @@ impl Gemma4GpuModel {
     ) {
         use std::io::{Seek, Write};
         let mut file = fs::File::create(path).expect("Failed to create weights cache");
-        file.write_all(b"GQ4A").unwrap();
+        file.write_all(b"GQ4G").unwrap();
 
         let write_blob = |file: &mut fs::File, mmap: &Mmap, offset: &mut usize| {
             let len = Self::read_u64_at(mmap, offset);
@@ -1545,6 +1552,16 @@ impl Gemma4GpuModel {
         }
         let mut magic = [0u8; 4];
         let mut file = file;
+        file.read_exact(&mut magic).is_ok() && magic == *b"GQ4G"
+    }
+
+    fn is_stale_split_weights_cache(path: &Path) -> bool {
+        use std::io::Read;
+        let mut file = match fs::File::open(path) {
+            Ok(file) => file,
+            Err(_) => return false,
+        };
+        let mut magic = [0u8; 4];
         file.read_exact(&mut magic).is_ok() && (magic == *b"GQ4W" || magic == *b"GQ4A")
     }
 
@@ -1822,9 +1839,15 @@ impl Gemma4GpuModel {
         weights_file
             .read_exact(&mut magic)
             .expect("read weights cache magic");
-        let aligned_layout = magic == *b"GQ4A";
-        if magic != *b"GQ4W" && !aligned_layout {
-            panic!("Invalid weights cache magic (expected GQ4W or GQ4A)");
+        let aligned_layout = magic == *b"GQ4G";
+        if magic == *b"GQ4W" || magic == *b"GQ4A" {
+            panic!(
+                "Stale weights cache (old interleaved Q4 layout). \
+                 Delete model.q4cache and model.embed.cache, then re-run to re-quantize."
+            );
+        }
+        if !aligned_layout {
+            panic!("Invalid weights cache magic (expected GQ4G)");
         }
 
         let mut offset = 4;
@@ -2350,24 +2373,28 @@ impl Gemma4GpuModel {
                         );
                     }
                     KvCacheType::Q4_0 => {
-                        self.ctx.encode_kv_append_q4_0(
-                            encoder,
-                            &self.k_normed_buf,
-                            &self.k_cache[layer_idx],
-                            num_kv_heads as u32,
-                            head_dim as u32,
-                            self.kv_capacity,
-                            kv_seq,
-                        );
-                        self.ctx.encode_kv_append_q4_0(
-                            encoder,
-                            &self.gate_buf,
-                            &self.v_cache[layer_idx],
-                            num_kv_heads as u32,
-                            head_dim as u32,
-                            self.kv_capacity,
-                            kv_seq,
-                        );
+                        if !(self.ctx.use_flash_attention
+                            && crate::gpu::fused_kv_attention_enabled())
+                        {
+                            self.ctx.encode_kv_append_q4_0(
+                                encoder,
+                                &self.k_normed_buf,
+                                &self.k_cache[layer_idx],
+                                num_kv_heads as u32,
+                                head_dim as u32,
+                                self.kv_capacity,
+                                kv_seq,
+                            );
+                            self.ctx.encode_kv_append_q4_0(
+                                encoder,
+                                &self.gate_buf,
+                                &self.v_cache[layer_idx],
+                                num_kv_heads as u32,
+                                head_dim as u32,
+                                self.kv_capacity,
+                                kv_seq,
+                            );
+                        }
                     }
                 }
             }
@@ -2431,23 +2458,65 @@ impl Gemma4GpuModel {
                 KvCacheType::Q4_0 => {
                     let groups_per_row = (head_dim / 32) as u32;
                     let row_bytes = groups_per_row * 18;
-                    self.ctx.encode_attention_with_offset_q4_0(
-                        encoder,
-                        &self.q_normed_buf,
-                        &self.k_cache[layer.kv_source_layer],
-                        &self.v_cache[layer.kv_source_layer],
-                        &self.attn_out_buf,
-                        num_heads as u32,
-                        num_kv_heads as u32,
-                        num_kv_groups,
-                        head_dim as u32,
-                        effective_kv_seq,
-                        self.kv_capacity,
-                        scale,
-                        kv_start,
-                        groups_per_row,
-                        row_bytes,
-                    );
+                    if crate::gpu::attention_use_ggml() && self.ctx.use_flash_attention {
+                        self.ctx.encode_attention_ggml_q4_0(
+                            encoder,
+                            &self.q_normed_buf,
+                            &self.k_cache[layer.kv_source_layer],
+                            &self.v_cache[layer.kv_source_layer],
+                            &self.attn_out_buf,
+                            num_heads as u32,
+                            num_kv_heads as u32,
+                            head_dim as u32,
+                            effective_kv_seq,
+                            self.kv_capacity,
+                            scale,
+                            kv_start,
+                            row_bytes,
+                        );
+                    } else if layer.has_kv
+                        && self.ctx.use_flash_attention
+                        && crate::gpu::fused_kv_attention_enabled()
+                    {
+                        self.ctx.encode_attention_fused_q4_0(
+                            encoder,
+                            &self.q_normed_buf,
+                            &self.k_normed_buf,
+                            &self.gate_buf,
+                            &self.attn_out_buf,
+                            &self.k_cache[layer.kv_source_layer],
+                            &self.v_cache[layer.kv_source_layer],
+                            num_heads as u32,
+                            num_kv_heads as u32,
+                            num_kv_groups,
+                            head_dim as u32,
+                            effective_kv_seq,
+                            self.kv_capacity,
+                            scale,
+                            kv_start,
+                            kv_seq,
+                            groups_per_row,
+                            row_bytes,
+                        );
+                    } else {
+                        self.ctx.encode_attention_with_offset_q4_0(
+                            encoder,
+                            &self.q_normed_buf,
+                            &self.k_cache[layer.kv_source_layer],
+                            &self.v_cache[layer.kv_source_layer],
+                            &self.attn_out_buf,
+                            num_heads as u32,
+                            num_kv_heads as u32,
+                            num_kv_groups,
+                            head_dim as u32,
+                            effective_kv_seq,
+                            self.kv_capacity,
+                            scale,
+                            kv_start,
+                            groups_per_row,
+                            row_bytes,
+                        );
+                    }
                 }
             }
 
@@ -4991,26 +5060,30 @@ impl Gemma4GpuModel {
                             );
                         }
                         KvCacheType::Q4_0 => {
-                            self.ctx.encode_kv_append_q4_0_at(
-                                encoder,
-                                &self.decode_batch_scratch.k_normed_buf,
-                                offsets.kv,
-                                k_cache,
-                                num_kv_heads as u32,
-                                head_dim as u32,
-                                kv_pool.capacity(),
-                                append_pos,
-                            );
-                            self.ctx.encode_kv_append_q4_0_at(
-                                encoder,
-                                &self.decode_batch_scratch.gate_buf,
-                                offsets.intermediate,
-                                v_cache,
-                                num_kv_heads as u32,
-                                head_dim as u32,
-                                kv_pool.capacity(),
-                                append_pos,
-                            );
+                            if !(self.ctx.use_flash_attention
+                                && crate::gpu::fused_kv_attention_enabled())
+                            {
+                                self.ctx.encode_kv_append_q4_0_at(
+                                    encoder,
+                                    &self.decode_batch_scratch.k_normed_buf,
+                                    offsets.kv,
+                                    k_cache,
+                                    num_kv_heads as u32,
+                                    head_dim as u32,
+                                    kv_pool.capacity(),
+                                    append_pos,
+                                );
+                                self.ctx.encode_kv_append_q4_0_at(
+                                    encoder,
+                                    &self.decode_batch_scratch.gate_buf,
+                                    offsets.intermediate,
+                                    v_cache,
+                                    num_kv_heads as u32,
+                                    head_dim as u32,
+                                    kv_pool.capacity(),
+                                    append_pos,
+                                );
+                            }
                         }
                     }
                 }
@@ -5067,25 +5140,75 @@ impl Gemma4GpuModel {
                     KvCacheType::Q4_0 => {
                         let groups_per_row = (head_dim / 32) as u32;
                         let row_bytes = groups_per_row * 18;
-                        self.ctx.encode_attention_with_offset_q4_0_at(
-                            encoder,
-                            &self.decode_batch_scratch.q_normed_buf,
-                            offsets.q,
-                            k_cache,
-                            v_cache,
-                            &self.decode_batch_scratch.attn_out_buf,
-                            offsets.q,
-                            num_heads as u32,
-                            num_kv_heads as u32,
-                            num_kv_groups,
-                            head_dim as u32,
-                            effective_kv_seq,
-                            kv_pool.capacity(),
-                            scale,
-                            kv_start,
-                            groups_per_row,
-                            row_bytes,
-                        );
+                        if crate::gpu::attention_use_ggml() && self.ctx.use_flash_attention {
+                            self.ctx.encode_attention_ggml_q4_0_at(
+                                encoder,
+                                &self.decode_batch_scratch.q_normed_buf,
+                                offsets.q,
+                                k_cache,
+                                0,
+                                v_cache,
+                                0,
+                                &self.decode_batch_scratch.attn_out_buf,
+                                offsets.q,
+                                num_heads as u32,
+                                num_kv_heads as u32,
+                                head_dim as u32,
+                                effective_kv_seq,
+                                kv_pool.capacity(),
+                                scale,
+                                kv_start,
+                                row_bytes,
+                            );
+                        } else if layer.has_kv
+                            && self.ctx.use_flash_attention
+                            && crate::gpu::fused_kv_attention_enabled()
+                        {
+                            self.ctx.encode_attention_fused_q4_0_at(
+                                encoder,
+                                &self.decode_batch_scratch.q_normed_buf,
+                                offsets.q,
+                                &self.decode_batch_scratch.k_normed_buf,
+                                offsets.kv,
+                                &self.decode_batch_scratch.gate_buf,
+                                offsets.intermediate,
+                                &self.decode_batch_scratch.attn_out_buf,
+                                offsets.q,
+                                k_cache,
+                                v_cache,
+                                num_heads as u32,
+                                num_kv_heads as u32,
+                                num_kv_groups,
+                                head_dim as u32,
+                                effective_kv_seq,
+                                kv_pool.capacity(),
+                                scale,
+                                kv_start,
+                                append_pos,
+                                groups_per_row,
+                                row_bytes,
+                            );
+                        } else {
+                            self.ctx.encode_attention_with_offset_q4_0_at(
+                                encoder,
+                                &self.decode_batch_scratch.q_normed_buf,
+                                offsets.q,
+                                k_cache,
+                                v_cache,
+                                &self.decode_batch_scratch.attn_out_buf,
+                                offsets.q,
+                                num_heads as u32,
+                                num_kv_heads as u32,
+                                num_kv_groups,
+                                head_dim as u32,
+                                effective_kv_seq,
+                                kv_pool.capacity(),
+                                scale,
+                                kv_start,
+                                groups_per_row,
+                                row_bytes,
+                            );
+                        }
                     }
                 }
 
