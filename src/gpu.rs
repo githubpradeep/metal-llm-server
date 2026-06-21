@@ -184,6 +184,18 @@ pub fn fused_kv_attention_enabled() -> bool {
     )
 }
 
+/// Fuse K-norm + RoPE + V-norm + KV append into Q4 flash decode (default on).
+/// Requires FUSED_Q_ATTN and FUSED_KV_ATTN. Set FUSED_K_ATTN=0 to use separate K-side dispatches.
+pub fn fused_k_attn_enabled() -> bool {
+    if !fused_q_attn_enabled() || !fused_kv_attention_enabled() {
+        return false;
+    }
+    !matches!(
+        std::env::var("FUSED_K_ATTN").as_deref(),
+        Ok("0") | Ok("false") | Ok("FALSE")
+    )
+}
+
 /// f16 GeLU scratch between gate∥up and down (halves activation bandwidth). Opt-in:
 /// ~neutral on M1 Pro e2e; enable with MLP_GELU_F16=1 to experiment.
 pub fn mlp_gelu_f16_enabled() -> bool {
@@ -370,6 +382,9 @@ pub struct MetalContext {
     pub attention_fused_qknorm_rope_q4_0_h256_pipeline: ComputePipelineState,
     pub attention_fused_qknorm_rope_q4_0_h128_pipeline: ComputePipelineState,
     pub attention_fused_qknorm_rope_q4_0_h512_pipeline: ComputePipelineState,
+    pub attention_full_fused_q4_0_h256_pipeline: ComputePipelineState,
+    pub attention_full_fused_q4_0_h128_pipeline: ComputePipelineState,
+    pub attention_full_fused_q4_0_h512_pipeline: ComputePipelineState,
     pub flash_attn_ggml_q4_h256_pipeline: ComputePipelineState,
     pub flash_attn_ggml_q4_h128_pipeline: ComputePipelineState,
     pub flash_attn_ggml_q4_h512_pipeline: ComputePipelineState,
@@ -555,6 +570,12 @@ impl MetalContext {
             get_fn("attention_flash_decode_fused_qknorm_rope_q4_0_h128");
         let attention_fused_qknorm_rope_q4_0_h512_pipeline =
             get_fn("attention_flash_decode_fused_qknorm_rope_q4_0_h512");
+        let attention_full_fused_q4_0_h256_pipeline =
+            get_fn("attention_flash_decode_full_fused_q4_0_h256");
+        let attention_full_fused_q4_0_h128_pipeline =
+            get_fn("attention_flash_decode_full_fused_q4_0_h128");
+        let attention_full_fused_q4_0_h512_pipeline =
+            get_fn("attention_flash_decode_full_fused_q4_0_h512");
         let flash_attn_ggml_q4_h256_pipeline = get_fn("flash_attn_ggml_q4_0_h256");
         let flash_attn_ggml_q4_h128_pipeline = get_fn("flash_attn_ggml_q4_0_h128");
         let flash_attn_ggml_q4_h512_pipeline = get_fn("flash_attn_ggml_q4_0_h512");
@@ -592,6 +613,11 @@ impl MetalContext {
             }
             if fused_kv_attention_enabled() {
                 println!("  Fused KV append + Q4 flash attention (FUSED_KV_ATTN=0 to disable)");
+            }
+            if fused_k_attn_enabled() {
+                println!(
+                    "  Fused K-norm + RoPE + V-norm + KV append into Q4 flash (FUSED_K_ATTN=0 to disable)"
+                );
             }
             if packed_mlp_gate_up_enabled() {
                 println!("  Interleaved gate∥up Q4 MLP weights (PACKED_MLP_GATE_UP=0 to disable)");
@@ -709,6 +735,9 @@ impl MetalContext {
             attention_fused_qknorm_rope_q4_0_h256_pipeline,
             attention_fused_qknorm_rope_q4_0_h128_pipeline,
             attention_fused_qknorm_rope_q4_0_h512_pipeline,
+            attention_full_fused_q4_0_h256_pipeline,
+            attention_full_fused_q4_0_h128_pipeline,
+            attention_full_fused_q4_0_h512_pipeline,
             flash_attn_ggml_q4_h256_pipeline,
             flash_attn_ggml_q4_h128_pipeline,
             flash_attn_ggml_q4_h512_pipeline,
@@ -3200,6 +3229,15 @@ impl MetalContext {
         }
     }
 
+    fn attention_full_fused_q4_0_pipeline_for(&self, head_dim: u32) -> &ComputePipelineState {
+        match head_dim {
+            256 => &self.attention_full_fused_q4_0_h256_pipeline,
+            128 => &self.attention_full_fused_q4_0_h128_pipeline,
+            512 => &self.attention_full_fused_q4_0_h512_pipeline,
+            _ => panic!("full fused flash attention unsupported head_dim {head_dim}"),
+        }
+    }
+
     fn flash_attn_ggml_pipeline_for(&self, head_dim: u32) -> &ComputePipelineState {
         match head_dim {
             256 => &self.flash_attn_ggml_q4_h256_pipeline,
@@ -3488,6 +3526,61 @@ impl MetalContext {
         encoder.set_bytes(18, 4, &row_bytes as *const u32 as *const _);
         encoder.set_bytes(19, 4, &cur_seq as *const u32 as *const _);
         encoder.set_bytes(20, 4, &eps as *const f32 as *const _);
+        let tg_size = attention_threadgroup_size(self.use_flash_attention);
+        encoder.dispatch_thread_groups(MTLSize::new(num_heads as u64, 1, 1), tg_size);
+    }
+
+    pub fn encode_attention_full_fused_q4_0(
+        &self,
+        encoder: &ComputeCommandEncoderRef,
+        q_raw_buf: &Buffer,
+        q_norm_weight: &BufferView,
+        cos_buf: &Buffer,
+        cos_offset: u64,
+        sin_buf: &Buffer,
+        sin_offset: u64,
+        k_raw_buf: &Buffer,
+        k_norm_weight: &BufferView,
+        v_raw_buf: &Buffer,
+        out_buf: &Buffer,
+        k_cache_buf: &Buffer,
+        v_cache_buf: &Buffer,
+        num_heads: u32,
+        num_kv_heads: u32,
+        num_kv_groups: u32,
+        head_dim: u32,
+        kv_seq: u32,
+        capacity: u32,
+        scale: f32,
+        kv_start: u32,
+        cur_seq: u32,
+        groups_per_row: u32,
+        row_bytes: u32,
+        eps: f32,
+    ) {
+        encoder.set_compute_pipeline_state(self.attention_full_fused_q4_0_pipeline_for(head_dim));
+        encoder.set_buffer(0, Some(q_raw_buf), 0);
+        encoder.set_buffer(1, Some(&q_norm_weight.buffer), q_norm_weight.offset);
+        encoder.set_buffer(2, Some(cos_buf), cos_offset);
+        encoder.set_buffer(3, Some(sin_buf), sin_offset);
+        encoder.set_buffer(4, Some(k_raw_buf), 0);
+        encoder.set_buffer(5, Some(&k_norm_weight.buffer), k_norm_weight.offset);
+        encoder.set_buffer(6, Some(v_raw_buf), 0);
+        encoder.set_buffer(7, Some(out_buf), 0);
+        encoder.set_buffer(8, Some(k_cache_buf), 0);
+        encoder.set_buffer(9, Some(v_cache_buf), 0);
+        encoder.set_bytes(10, 4, &num_heads as *const u32 as *const _);
+        encoder.set_bytes(11, 4, &num_kv_heads as *const u32 as *const _);
+        encoder.set_bytes(12, 4, &num_kv_groups as *const u32 as *const _);
+        encoder.set_bytes(13, 4, &head_dim as *const u32 as *const _);
+        encoder.set_bytes(14, 4, &kv_seq as *const u32 as *const _);
+        encoder.set_bytes(15, 4, &capacity as *const u32 as *const _);
+        encoder.set_bytes(16, 4, &scale as *const f32 as *const _);
+        encoder.set_bytes(17, 4, &kv_start as *const u32 as *const _);
+        encoder.set_bytes(18, 4, &groups_per_row as *const u32 as *const _);
+        encoder.set_bytes(19, 4, &row_bytes as *const u32 as *const _);
+        encoder.set_bytes(20, 4, &cur_seq as *const u32 as *const _);
+        encoder.set_bytes(21, 4, &eps as *const f32 as *const _);
         let tg_size = attention_threadgroup_size(self.use_flash_attention);
         encoder.dispatch_thread_groups(MTLSize::new(num_heads as u64, 1, 1), tg_size);
     }
