@@ -4395,6 +4395,52 @@ inline void flash_load_q_hd(
     }
 }
 
+// QK-norm + RoPE fused into flash Q load (one head per threadgroup).
+template<uint HEAD_DIM>
+inline void flash_load_q_qknorm_rope_hd(
+    device const float* Q_raw,
+    device const float* q_norm_weight,
+    device const float* cos_buf,
+    device const float* sin_buf,
+    float eps,
+    uint q_offset,
+    threadgroup float* shared_q,
+    threadgroup float* shared_tmp,
+    uint tid,
+    uint tg_size
+) {
+    float partial = 0.0f;
+    for (uint i = tid; i < HEAD_DIM; i += tg_size) {
+        float val = Q_raw[q_offset + i];
+        partial += val * val;
+    }
+    shared_tmp[tid] = partial;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint stride = tg_size / 2; stride > 0; stride >>= 1) {
+        if (tid < stride) {
+            shared_tmp[tid] += shared_tmp[tid + stride];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    float inv_rms = rsqrt(shared_tmp[0] / float(HEAD_DIM) + eps);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint d = tid; d < HEAD_DIM; d += tg_size) {
+        shared_q[d] = Q_raw[q_offset + d] * inv_rms * q_norm_weight[d];
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    uint half_dim = HEAD_DIM / 2u;
+    for (uint d = tid; d < half_dim; d += tg_size) {
+        float q1 = shared_q[d];
+        float q2 = shared_q[d + half_dim];
+        float c = cos_buf[d];
+        float s = sin_buf[d];
+        shared_q[d] = q1 * c - q2 * s;
+        shared_q[d + half_dim] = q2 * c + q1 * s;
+    }
+}
+
 template<uint HEAD_DIM>
 inline float flash_dot_q4_k_hd(
     device const uchar* K_cache,
@@ -4973,6 +5019,408 @@ kernel void attention_flash_decode_fused_q4_0_h512(
     threadgroup float shared_update[4];
     flash_decode_fused_q4_0_hd_body<512, 256>(
         Q, K_f32, V_f32, K_cache, V_cache, output, tgid, num_heads, num_kv_groups,
+        capacity, row_bytes, groups_per_row, kv_seq, kv_start, cur_seq, scale,
+        tid, sgid, lane, shared_q, shared_scores, shared_exp, shared_update);
+}
+
+template<uint HEAD_DIM, uint TILE_KV>
+void flash_decode_q4_0_qknorm_rope_hd_body(
+    device const float* Q_raw,
+    device const float* q_norm_weight,
+    device const float* cos_buf,
+    device const float* sin_buf,
+    float eps,
+    device const uchar* K_cache,
+    device const uchar* V_cache,
+    device float* output,
+    uint h,
+    uint num_heads,
+    uint num_kv_groups,
+    uint capacity,
+    uint row_bytes,
+    uint kv_seq,
+    uint kv_start,
+    float scale,
+    uint tid,
+    uint sgid,
+    uint lane,
+    threadgroup float* shared_q,
+    threadgroup float* shared_scores,
+    threadgroup float* shared_exp,
+    threadgroup float* shared_update
+) {
+    if (h >= num_heads) return;
+
+    uint kv_h = h / num_kv_groups;
+    uint q_offset = h * HEAD_DIM;
+    uint k_head_base = kv_h * capacity * row_bytes;
+    uint v_head_base = kv_h * capacity * row_bytes;
+    uint num_simds = FLASH_TG_SIZE / SIMD_SIZE;
+
+    if (tid == 0) {
+        shared_update[0] = -INFINITY;
+        shared_update[1] = 0.0f;
+    }
+    flash_zero_output_hd<HEAD_DIM>(output, q_offset, tid, FLASH_TG_SIZE);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    flash_load_q_qknorm_rope_hd<HEAD_DIM>(
+        Q_raw, q_norm_weight, cos_buf, sin_buf, eps, q_offset,
+        shared_q, shared_scores, tid, FLASH_TG_SIZE);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint kv_tile = 0; kv_tile < kv_seq; kv_tile += TILE_KV) {
+        uint tile_count = min(TILE_KV, kv_seq - kv_tile);
+
+        for (uint wave = 0; wave < tile_count; wave += num_simds) {
+            uint kv_offset = wave + sgid;
+            if (kv_offset < tile_count) {
+                uint actual_pos = kv_start + kv_tile + kv_offset;
+                float partial = flash_dot_q4_k_hd<HEAD_DIM>(
+                    K_cache, k_head_base, actual_pos, row_bytes, shared_q, lane);
+                partial = simd_sum(partial);
+                if (lane == 0) {
+                    shared_scores[kv_offset] = partial * scale;
+                }
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        if (tid == 0) {
+            flash_softmax_tile(shared_scores, shared_exp, shared_update, tile_count);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        flash_accum_v_q4_hd<HEAD_DIM, TILE_KV>(
+            output, q_offset, V_cache, v_head_base,
+            kv_start, kv_tile, tile_count, row_bytes,
+            shared_exp, shared_update[2], shared_update[3],
+            tid, FLASH_TG_SIZE);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+}
+
+kernel void attention_flash_decode_qknorm_rope_q4_0_h256(
+    device const float* Q_raw [[buffer(0)]],
+    device const float* q_norm_weight [[buffer(1)]],
+    device const float* cos_buf [[buffer(2)]],
+    device const float* sin_buf [[buffer(3)]],
+    device const uchar* K_cache [[buffer(4)]],
+    device const uchar* V_cache [[buffer(5)]],
+    device float* output [[buffer(6)]],
+    constant uint& num_heads [[buffer(7)]],
+    constant uint& num_kv_heads [[buffer(8)]],
+    constant uint& num_kv_groups [[buffer(9)]],
+    constant uint& head_dim [[buffer(10)]],
+    constant uint& kv_seq [[buffer(11)]],
+    constant uint& capacity [[buffer(12)]],
+    constant float& scale [[buffer(13)]],
+    constant uint& kv_start [[buffer(14)]],
+    constant uint& groups_per_row [[buffer(15)]],
+    constant uint& row_bytes [[buffer(16)]],
+    constant float& eps [[buffer(17)]],
+    uint tid [[thread_index_in_threadgroup]],
+    uint tgid [[threadgroup_position_in_grid]],
+    uint sgid [[simdgroup_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]]
+) {
+    (void)num_kv_heads;
+    (void)head_dim;
+    (void)groups_per_row;
+    threadgroup float shared_q[256];
+    threadgroup float shared_scores[256];
+    threadgroup float shared_exp[256];
+    threadgroup float shared_update[4];
+    flash_decode_q4_0_qknorm_rope_hd_body<256, 256>(
+        Q_raw, q_norm_weight, cos_buf, sin_buf, eps,
+        K_cache, V_cache, output, tgid, num_heads, num_kv_groups, capacity, row_bytes,
+        kv_seq, kv_start, scale, tid, sgid, lane,
+        shared_q, shared_scores, shared_exp, shared_update);
+}
+
+kernel void attention_flash_decode_qknorm_rope_q4_0_h128(
+    device const float* Q_raw [[buffer(0)]],
+    device const float* q_norm_weight [[buffer(1)]],
+    device const float* cos_buf [[buffer(2)]],
+    device const float* sin_buf [[buffer(3)]],
+    device const uchar* K_cache [[buffer(4)]],
+    device const uchar* V_cache [[buffer(5)]],
+    device float* output [[buffer(6)]],
+    constant uint& num_heads [[buffer(7)]],
+    constant uint& num_kv_heads [[buffer(8)]],
+    constant uint& num_kv_groups [[buffer(9)]],
+    constant uint& head_dim [[buffer(10)]],
+    constant uint& kv_seq [[buffer(11)]],
+    constant uint& capacity [[buffer(12)]],
+    constant float& scale [[buffer(13)]],
+    constant uint& kv_start [[buffer(14)]],
+    constant uint& groups_per_row [[buffer(15)]],
+    constant uint& row_bytes [[buffer(16)]],
+    constant float& eps [[buffer(17)]],
+    uint tid [[thread_index_in_threadgroup]],
+    uint tgid [[threadgroup_position_in_grid]],
+    uint sgid [[simdgroup_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]]
+) {
+    (void)num_kv_heads;
+    (void)head_dim;
+    (void)groups_per_row;
+    threadgroup float shared_q[128];
+    threadgroup float shared_scores[128];
+    threadgroup float shared_exp[128];
+    threadgroup float shared_update[4];
+    flash_decode_q4_0_qknorm_rope_hd_body<128, 128>(
+        Q_raw, q_norm_weight, cos_buf, sin_buf, eps,
+        K_cache, V_cache, output, tgid, num_heads, num_kv_groups, capacity, row_bytes,
+        kv_seq, kv_start, scale, tid, sgid, lane,
+        shared_q, shared_scores, shared_exp, shared_update);
+}
+
+kernel void attention_flash_decode_qknorm_rope_q4_0_h512(
+    device const float* Q_raw [[buffer(0)]],
+    device const float* q_norm_weight [[buffer(1)]],
+    device const float* cos_buf [[buffer(2)]],
+    device const float* sin_buf [[buffer(3)]],
+    device const uchar* K_cache [[buffer(4)]],
+    device const uchar* V_cache [[buffer(5)]],
+    device float* output [[buffer(6)]],
+    constant uint& num_heads [[buffer(7)]],
+    constant uint& num_kv_heads [[buffer(8)]],
+    constant uint& num_kv_groups [[buffer(9)]],
+    constant uint& head_dim [[buffer(10)]],
+    constant uint& kv_seq [[buffer(11)]],
+    constant uint& capacity [[buffer(12)]],
+    constant float& scale [[buffer(13)]],
+    constant uint& kv_start [[buffer(14)]],
+    constant uint& groups_per_row [[buffer(15)]],
+    constant uint& row_bytes [[buffer(16)]],
+    constant float& eps [[buffer(17)]],
+    uint tid [[thread_index_in_threadgroup]],
+    uint tgid [[threadgroup_position_in_grid]],
+    uint sgid [[simdgroup_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]]
+) {
+    (void)num_kv_heads;
+    (void)head_dim;
+    (void)groups_per_row;
+    threadgroup float shared_q[512];
+    threadgroup float shared_scores[256];
+    threadgroup float shared_exp[256];
+    threadgroup float shared_update[4];
+    flash_decode_q4_0_qknorm_rope_hd_body<512, 256>(
+        Q_raw, q_norm_weight, cos_buf, sin_buf, eps,
+        K_cache, V_cache, output, tgid, num_heads, num_kv_groups, capacity, row_bytes,
+        kv_seq, kv_start, scale, tid, sgid, lane,
+        shared_q, shared_scores, shared_exp, shared_update);
+}
+
+template<uint HEAD_DIM, uint TILE_KV>
+void flash_decode_fused_q4_0_qknorm_rope_hd_body(
+    device const float* Q_raw,
+    device const float* q_norm_weight,
+    device const float* cos_buf,
+    device const float* sin_buf,
+    float eps,
+    device const float* K_f32,
+    device const float* V_f32,
+    device uchar* K_cache,
+    device uchar* V_cache,
+    device float* output,
+    uint h,
+    uint num_heads,
+    uint num_kv_groups,
+    uint capacity,
+    uint row_bytes,
+    uint groups_per_row,
+    uint kv_seq,
+    uint kv_start,
+    uint cur_seq,
+    float scale,
+    uint tid,
+    uint sgid,
+    uint lane,
+    threadgroup float* shared_q,
+    threadgroup float* shared_scores,
+    threadgroup float* shared_exp,
+    threadgroup float* shared_update
+) {
+    if (h >= num_heads) return;
+
+    uint kv_h = h / num_kv_groups;
+    uint q_offset = h * HEAD_DIM;
+    uint k_head_base = kv_h * capacity * row_bytes;
+    uint v_head_base = kv_h * capacity * row_bytes;
+    uint num_simds = FLASH_TG_SIZE / SIMD_SIZE;
+
+    if (tid == 0) {
+        shared_update[0] = -INFINITY;
+        shared_update[1] = 0.0f;
+    }
+    flash_zero_output_hd<HEAD_DIM>(output, q_offset, tid, FLASH_TG_SIZE);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    flash_load_q_qknorm_rope_hd<HEAD_DIM>(
+        Q_raw, q_norm_weight, cos_buf, sin_buf, eps, q_offset,
+        shared_q, shared_scores, tid, FLASH_TG_SIZE);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint kv_tile = 0; kv_tile < kv_seq; kv_tile += TILE_KV) {
+        uint tile_count = min(TILE_KV, kv_seq - kv_tile);
+
+        for (uint wave = 0; wave < tile_count; wave += num_simds) {
+            uint kv_offset = wave + sgid;
+            if (kv_offset < tile_count) {
+                uint actual_pos = kv_start + kv_tile + kv_offset;
+                float partial = flash_dot_k_fused_hd<HEAD_DIM>(
+                    K_cache, k_head_base, actual_pos, row_bytes,
+                    K_f32, kv_h, cur_seq, shared_q, lane);
+                partial = simd_sum(partial);
+                if (lane == 0) {
+                    shared_scores[kv_offset] = partial * scale;
+                }
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        if (tid == 0) {
+            flash_softmax_tile(shared_scores, shared_exp, shared_update, tile_count);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        flash_accum_v_q4_fused_hd<HEAD_DIM, TILE_KV>(
+            output, q_offset, V_cache, v_head_base,
+            kv_start, kv_tile, tile_count, row_bytes,
+            V_f32, kv_h, cur_seq,
+            shared_exp, shared_update[2], shared_update[3],
+            tid, FLASH_TG_SIZE);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    if ((h % num_kv_groups) == 0) {
+        uint src_base = kv_h * HEAD_DIM;
+        for (uint g = tid; g < groups_per_row; g += FLASH_TG_SIZE) {
+            q4_0_append_group_f32(K_f32, src_base, K_cache, k_head_base, cur_seq, row_bytes, g);
+            q4_0_append_group_f32(V_f32, src_base, V_cache, v_head_base, cur_seq, row_bytes, g);
+        }
+    }
+}
+
+kernel void attention_flash_decode_fused_qknorm_rope_q4_0_h256(
+    device const float* Q_raw [[buffer(0)]],
+    device const float* q_norm_weight [[buffer(1)]],
+    device const float* cos_buf [[buffer(2)]],
+    device const float* sin_buf [[buffer(3)]],
+    device const float* K_f32 [[buffer(4)]],
+    device const float* V_f32 [[buffer(5)]],
+    device float* output [[buffer(6)]],
+    device uchar* K_cache [[buffer(7)]],
+    device uchar* V_cache [[buffer(8)]],
+    constant uint& num_heads [[buffer(9)]],
+    constant uint& num_kv_heads [[buffer(10)]],
+    constant uint& num_kv_groups [[buffer(11)]],
+    constant uint& head_dim [[buffer(12)]],
+    constant uint& kv_seq [[buffer(13)]],
+    constant uint& capacity [[buffer(14)]],
+    constant float& scale [[buffer(15)]],
+    constant uint& kv_start [[buffer(16)]],
+    constant uint& groups_per_row [[buffer(17)]],
+    constant uint& row_bytes [[buffer(18)]],
+    constant uint& cur_seq [[buffer(19)]],
+    constant float& eps [[buffer(20)]],
+    uint tid [[thread_index_in_threadgroup]],
+    uint tgid [[threadgroup_position_in_grid]],
+    uint sgid [[simdgroup_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]]
+) {
+    (void)num_kv_heads;
+    (void)head_dim;
+    threadgroup float shared_q[256];
+    threadgroup float shared_scores[256];
+    threadgroup float shared_exp[256];
+    threadgroup float shared_update[4];
+    flash_decode_fused_q4_0_qknorm_rope_hd_body<256, 256>(
+        Q_raw, q_norm_weight, cos_buf, sin_buf, eps,
+        K_f32, V_f32, K_cache, V_cache, output, tgid, num_heads, num_kv_groups,
+        capacity, row_bytes, groups_per_row, kv_seq, kv_start, cur_seq, scale,
+        tid, sgid, lane, shared_q, shared_scores, shared_exp, shared_update);
+}
+
+kernel void attention_flash_decode_fused_qknorm_rope_q4_0_h128(
+    device const float* Q_raw [[buffer(0)]],
+    device const float* q_norm_weight [[buffer(1)]],
+    device const float* cos_buf [[buffer(2)]],
+    device const float* sin_buf [[buffer(3)]],
+    device const float* K_f32 [[buffer(4)]],
+    device const float* V_f32 [[buffer(5)]],
+    device float* output [[buffer(6)]],
+    device uchar* K_cache [[buffer(7)]],
+    device uchar* V_cache [[buffer(8)]],
+    constant uint& num_heads [[buffer(9)]],
+    constant uint& num_kv_heads [[buffer(10)]],
+    constant uint& num_kv_groups [[buffer(11)]],
+    constant uint& head_dim [[buffer(12)]],
+    constant uint& kv_seq [[buffer(13)]],
+    constant uint& capacity [[buffer(14)]],
+    constant float& scale [[buffer(15)]],
+    constant uint& kv_start [[buffer(16)]],
+    constant uint& groups_per_row [[buffer(17)]],
+    constant uint& row_bytes [[buffer(18)]],
+    constant uint& cur_seq [[buffer(19)]],
+    constant float& eps [[buffer(20)]],
+    uint tid [[thread_index_in_threadgroup]],
+    uint tgid [[threadgroup_position_in_grid]],
+    uint sgid [[simdgroup_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]]
+) {
+    (void)num_kv_heads;
+    (void)head_dim;
+    threadgroup float shared_q[128];
+    threadgroup float shared_scores[128];
+    threadgroup float shared_exp[128];
+    threadgroup float shared_update[4];
+    flash_decode_fused_q4_0_qknorm_rope_hd_body<128, 128>(
+        Q_raw, q_norm_weight, cos_buf, sin_buf, eps,
+        K_f32, V_f32, K_cache, V_cache, output, tgid, num_heads, num_kv_groups,
+        capacity, row_bytes, groups_per_row, kv_seq, kv_start, cur_seq, scale,
+        tid, sgid, lane, shared_q, shared_scores, shared_exp, shared_update);
+}
+
+kernel void attention_flash_decode_fused_qknorm_rope_q4_0_h512(
+    device const float* Q_raw [[buffer(0)]],
+    device const float* q_norm_weight [[buffer(1)]],
+    device const float* cos_buf [[buffer(2)]],
+    device const float* sin_buf [[buffer(3)]],
+    device const float* K_f32 [[buffer(4)]],
+    device const float* V_f32 [[buffer(5)]],
+    device float* output [[buffer(6)]],
+    device uchar* K_cache [[buffer(7)]],
+    device uchar* V_cache [[buffer(8)]],
+    constant uint& num_heads [[buffer(9)]],
+    constant uint& num_kv_heads [[buffer(10)]],
+    constant uint& num_kv_groups [[buffer(11)]],
+    constant uint& head_dim [[buffer(12)]],
+    constant uint& kv_seq [[buffer(13)]],
+    constant uint& capacity [[buffer(14)]],
+    constant float& scale [[buffer(15)]],
+    constant uint& kv_start [[buffer(16)]],
+    constant uint& groups_per_row [[buffer(17)]],
+    constant uint& row_bytes [[buffer(18)]],
+    constant uint& cur_seq [[buffer(19)]],
+    constant float& eps [[buffer(20)]],
+    uint tid [[thread_index_in_threadgroup]],
+    uint tgid [[threadgroup_position_in_grid]],
+    uint sgid [[simdgroup_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]]
+) {
+    (void)num_kv_heads;
+    (void)head_dim;
+    threadgroup float shared_q[512];
+    threadgroup float shared_scores[256];
+    threadgroup float shared_exp[256];
+    threadgroup float shared_update[4];
+    flash_decode_fused_q4_0_qknorm_rope_hd_body<512, 256>(
+        Q_raw, q_norm_weight, cos_buf, sin_buf, eps,
+        K_f32, V_f32, K_cache, V_cache, output, tgid, num_heads, num_kv_groups,
         capacity, row_bytes, groups_per_row, kv_seq, kv_start, cur_seq, scale,
         tid, sgid, lane, shared_q, shared_scores, shared_exp, shared_update);
 }

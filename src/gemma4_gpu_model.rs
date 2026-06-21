@@ -2458,6 +2458,15 @@ impl Gemma4GpuModel {
             }
             } // !fused_qkv fallback
 
+            let use_fused_q_attn = !layer.use_f16
+                && matches!(self.kv_cache_type, KvCacheType::Q4_0)
+                && self.ctx.use_flash_attention
+                && crate::gpu::fused_q_attn_enabled()
+                && !crate::gpu::attention_use_ggml_for_layer(layer.has_kv)
+                && matches!(head_dim, 128 | 256 | 512);
+            let rope_off = self.decode_rope_byte_offset(layer_idx);
+
+            if !use_fused_q_attn {
             // QK Norm on Q
             self.ctx.encode_rmsnorm_per_head_view(
                 encoder,
@@ -2470,7 +2479,6 @@ impl Gemma4GpuModel {
             );
 
             // Apply rotary to Q (full head_dim — non-rotary dims have cos=1, sin=0 for pass-through)
-            let rope_off = self.decode_rope_byte_offset(layer_idx);
             self.ctx.encode_rotary_at(
                 encoder,
                 &self.q_normed_buf,
@@ -2485,6 +2493,7 @@ impl Gemma4GpuModel {
                 0,
                 head_dim as u32,
             );
+            } // !use_fused_q_attn
 
             // K norm + rotary (K/V matvecs fused above when FUSED_QKV=1)
             if layer.has_kv {
@@ -2651,7 +2660,58 @@ impl Gemma4GpuModel {
                 KvCacheType::Q4_0 => {
                     let groups_per_row = (head_dim / 32) as u32;
                     let row_bytes = groups_per_row * 18;
-                    if crate::gpu::attention_use_ggml_for_layer(layer.has_kv)
+                    if use_fused_q_attn && layer.has_kv && crate::gpu::fused_kv_attention_enabled() {
+                        self.ctx.encode_attention_fused_qknorm_rope_q4_0(
+                            encoder,
+                            &self.q_buf,
+                            &layer.q_norm_weight,
+                            &self.decode_rope_cos_packed,
+                            rope_off,
+                            &self.decode_rope_sin_packed,
+                            rope_off,
+                            &self.k_normed_buf,
+                            &self.gate_buf,
+                            &self.attn_out_buf,
+                            &self.k_cache[layer.kv_source_layer],
+                            &self.v_cache[layer.kv_source_layer],
+                            num_heads as u32,
+                            num_kv_heads as u32,
+                            num_kv_groups,
+                            head_dim as u32,
+                            effective_kv_seq,
+                            self.kv_capacity,
+                            scale,
+                            kv_start,
+                            kv_seq,
+                            groups_per_row,
+                            row_bytes,
+                            eps,
+                        );
+                    } else if use_fused_q_attn {
+                        self.ctx.encode_attention_qknorm_rope_q4_0(
+                            encoder,
+                            &self.q_buf,
+                            &layer.q_norm_weight,
+                            &self.decode_rope_cos_packed,
+                            rope_off,
+                            &self.decode_rope_sin_packed,
+                            rope_off,
+                            &self.k_cache[layer.kv_source_layer],
+                            &self.v_cache[layer.kv_source_layer],
+                            &self.attn_out_buf,
+                            num_heads as u32,
+                            num_kv_heads as u32,
+                            num_kv_groups,
+                            head_dim as u32,
+                            effective_kv_seq,
+                            self.kv_capacity,
+                            scale,
+                            kv_start,
+                            groups_per_row,
+                            row_bytes,
+                            eps,
+                        );
+                    } else if crate::gpu::attention_use_ggml_for_layer(layer.has_kv)
                         && self.ctx.use_flash_attention
                     {
                         self.ctx.encode_attention_ggml_q4_0(
