@@ -900,7 +900,7 @@ impl MetalContext {
     /// MATVEC_KERNEL selection so the benchmark can compare variants directly).
     fn encode_matvec_q4_variant(
         &self,
-        encoder: &ComputeCommandEncoderRef,
+        encoder: &metal::ComputeCommandEncoderRef,
         variant: DecodeMatvecKernel,
         w: &Buffer,
         x: &Buffer,
@@ -1032,7 +1032,7 @@ impl MetalContext {
     /// Writes only the sampled token id (u32) into `out_token_buf`.
     pub fn encode_sample(
         &self,
-        encoder: &ComputeCommandEncoderRef,
+        encoder: &metal::ComputeCommandEncoderRef,
         logits_buf: &Buffer,
         out_token_buf: &Buffer,
         vocab_size: u32,
@@ -1055,7 +1055,7 @@ impl MetalContext {
 
     pub fn encode_embed_gather_bf16(
         &self,
-        encoder: &ComputeCommandEncoderRef,
+        encoder: &metal::ComputeCommandEncoderRef,
         table_buf: &Buffer,
         token_id: u32,
         out_buf: &Buffer,
@@ -1075,7 +1075,7 @@ impl MetalContext {
 
     pub fn encode_embed_gather_bf16_batch(
         &self,
-        encoder: &ComputeCommandEncoderRef,
+        encoder: &metal::ComputeCommandEncoderRef,
         table_buf: &Buffer,
         token_ids_buf: &Buffer,
         out_buf: &Buffer,
@@ -1100,7 +1100,7 @@ impl MetalContext {
 
     pub fn encode_matvec(
         &self,
-        encoder: &ComputeCommandEncoderRef,
+        encoder: &metal::ComputeCommandEncoderRef,
         w_buf: &Buffer,
         x_buf: &Buffer,
         y_buf: &Buffer,
@@ -1112,7 +1112,7 @@ impl MetalContext {
 
     pub fn encode_matvec_view(
         &self,
-        encoder: &ComputeCommandEncoderRef,
+        encoder: &metal::ComputeCommandEncoderRef,
         weight: &BufferView,
         x_buf: &Buffer,
         y_buf: &Buffer,
@@ -1134,7 +1134,7 @@ impl MetalContext {
 
     pub fn encode_matvec_at(
         &self,
-        encoder: &ComputeCommandEncoderRef,
+        encoder: &metal::ComputeCommandEncoderRef,
         w_buf: &Buffer,
         w_offset: u64,
         x_buf: &Buffer,
@@ -1159,7 +1159,7 @@ impl MetalContext {
     /// f16 weight matvec: W is half precision, x and y are f32.
     pub fn encode_matvec_f16(
         &self,
-        encoder: &ComputeCommandEncoderRef,
+        encoder: &metal::ComputeCommandEncoderRef,
         w_buf: &Buffer,
         x_buf: &Buffer,
         y_buf: &Buffer,
@@ -1171,7 +1171,7 @@ impl MetalContext {
 
     pub fn encode_matvec_f16_view(
         &self,
-        encoder: &ComputeCommandEncoderRef,
+        encoder: &metal::ComputeCommandEncoderRef,
         weight: &BufferView,
         x_buf: &Buffer,
         y_buf: &Buffer,
@@ -1193,7 +1193,7 @@ impl MetalContext {
 
     pub fn encode_matvec_f16_at_view(
         &self,
-        encoder: &ComputeCommandEncoderRef,
+        encoder: &metal::ComputeCommandEncoderRef,
         weight: &BufferView,
         x_buf: &Buffer,
         x_offset: u64,
@@ -1218,7 +1218,7 @@ impl MetalContext {
     /// Matvec dispatching to Q4 or f16 based on the weight buffer layout.
     pub fn encode_matvec_auto_view(
         &self,
-        encoder: &ComputeCommandEncoderRef,
+        encoder: &metal::ComputeCommandEncoderRef,
         weight: &BufferView,
         x_buf: &Buffer,
         y_buf: &Buffer,
@@ -1234,7 +1234,7 @@ impl MetalContext {
 
     pub fn encode_matvec_auto_at_view(
         &self,
-        encoder: &ComputeCommandEncoderRef,
+        encoder: &metal::ComputeCommandEncoderRef,
         weight: &BufferView,
         x_buf: &Buffer,
         x_offset: u64,
@@ -1256,7 +1256,7 @@ impl MetalContext {
 
     pub fn encode_projection_auto_batch_view(
         &self,
-        encoder: &ComputeCommandEncoderRef,
+        encoder: &metal::ComputeCommandEncoderRef,
         weight: &BufferView,
         x_buf: &Buffer,
         y_buf: &Buffer,
@@ -1273,7 +1273,7 @@ impl MetalContext {
 
     pub fn encode_matvec_f16_at(
         &self,
-        encoder: &ComputeCommandEncoderRef,
+        encoder: &metal::ComputeCommandEncoderRef,
         w_buf: &Buffer,
         w_offset: u64,
         x_buf: &Buffer,
@@ -1297,7 +1297,7 @@ impl MetalContext {
     /// Q4_0 weight matvec: W is 4-bit quantized, x and y are f32.
     pub fn encode_matvec_q4(
         &self,
-        encoder: &ComputeCommandEncoderRef,
+        encoder: &metal::ComputeCommandEncoderRef,
         w_buf: &Buffer,
         x_buf: &Buffer,
         y_buf: &Buffer,
@@ -1309,7 +1309,7 @@ impl MetalContext {
 
     pub fn encode_matvec_q4_view(
         &self,
-        encoder: &ComputeCommandEncoderRef,
+        encoder: &metal::ComputeCommandEncoderRef,
         weight: &BufferView,
         x_buf: &Buffer,
         y_buf: &Buffer,
@@ -1331,7 +1331,7 @@ impl MetalContext {
 
     pub fn encode_matvec_q4_at_view(
         &self,
-        encoder: &ComputeCommandEncoderRef,
+        encoder: &metal::ComputeCommandEncoderRef,
         weight: &BufferView,
         x_buf: &Buffer,
         x_offset: u64,
@@ -1355,7 +1355,7 @@ impl MetalContext {
 
     pub fn encode_matvec_q4_at(
         &self,
-        encoder: &ComputeCommandEncoderRef,
+        encoder: &metal::ComputeCommandEncoderRef,
         w_buf: &Buffer,
         w_offset: u64,
         x_buf: &Buffer,
@@ -1397,7 +1397,7 @@ impl MetalContext {
 
     fn encode_matvec_ggml_at(
         &self,
-        encoder: &ComputeCommandEncoderRef,
+        encoder: &metal::ComputeCommandEncoderRef,
         w_buf: &Buffer,
         w_offset: u64,
         x_buf: &Buffer,
@@ -1480,7 +1480,7 @@ impl MetalContext {
     /// Fused dual Q4 matvec: y0=W0@x, y1=W1@x with one x load per K block (fast/4 geometry).
     pub fn encode_matvec_q4_dual_view(
         &self,
-        encoder: &ComputeCommandEncoderRef,
+        encoder: &metal::ComputeCommandEncoderRef,
         w0: &BufferView,
         w1: &BufferView,
         x_buf: &Buffer,
@@ -1496,7 +1496,7 @@ impl MetalContext {
 
     pub fn encode_matvec_q4_dual_at_view(
         &self,
-        encoder: &ComputeCommandEncoderRef,
+        encoder: &metal::ComputeCommandEncoderRef,
         w0: &BufferView,
         w1: &BufferView,
         x_buf: &Buffer,
@@ -1527,7 +1527,7 @@ impl MetalContext {
     /// inv_rms once + Q matvec; skips normed scratch.
     pub fn encode_rmsnorm_q_q4_view(
         &self,
-        encoder: &ComputeCommandEncoderRef,
+        encoder: &metal::ComputeCommandEncoderRef,
         hidden: &Buffer,
         norm_weight: &BufferView,
         inv_rms_buf: &Buffer,
@@ -1554,7 +1554,7 @@ impl MetalContext {
     /// Fused pre-attn RMSNorm + Q4 Q/K/V projections (has_kv layers).
     pub fn encode_rmsnorm_qkv_q4_view(
         &self,
-        encoder: &ComputeCommandEncoderRef,
+        encoder: &metal::ComputeCommandEncoderRef,
         hidden: &Buffer,
         norm_weight: &BufferView,
         inv_rms_buf: &Buffer,
@@ -1594,7 +1594,7 @@ impl MetalContext {
     /// Fused gate+up Q4 matvec + GeLU(gate)*up → single output (MLP decode).
     pub fn encode_matvec_q4_dual_gelu_view(
         &self,
-        encoder: &ComputeCommandEncoderRef,
+        encoder: &metal::ComputeCommandEncoderRef,
         w0: &BufferView,
         w1: &BufferView,
         x_buf: &Buffer,
@@ -1609,7 +1609,7 @@ impl MetalContext {
 
     pub fn encode_matvec_q4_dual_gelu_at_view(
         &self,
-        encoder: &ComputeCommandEncoderRef,
+        encoder: &metal::ComputeCommandEncoderRef,
         w0: &BufferView,
         w1: &BufferView,
         x_buf: &Buffer,
@@ -1636,7 +1636,7 @@ impl MetalContext {
     /// Gate∥up interleaved Q4 matvec + GeLU(gate)*up — gate/up rows adjacent in memory.
     pub fn encode_matvec_q4_interleaved_gelu_view(
         &self,
-        encoder: &ComputeCommandEncoderRef,
+        encoder: &metal::ComputeCommandEncoderRef,
         gate_up: &BufferView,
         x_buf: &Buffer,
         y_buf: &Buffer,
@@ -1650,7 +1650,7 @@ impl MetalContext {
 
     pub fn encode_matvec_q4_interleaved_gelu_at_view(
         &self,
-        encoder: &ComputeCommandEncoderRef,
+        encoder: &metal::ComputeCommandEncoderRef,
         gate_up: &BufferView,
         x_buf: &Buffer,
         x_offset: u64,
@@ -1674,7 +1674,7 @@ impl MetalContext {
 
     pub fn encode_rmsnorm_inv_rms_at_view(
         &self,
-        encoder: &ComputeCommandEncoderRef,
+        encoder: &metal::ComputeCommandEncoderRef,
         x_buf: &Buffer,
         x_offset: u64,
         inv_rms_buf: &Buffer,
@@ -1692,7 +1692,7 @@ impl MetalContext {
 
     pub fn encode_matvec_q4_interleaved_gelu_hidden_at_view(
         &self,
-        encoder: &ComputeCommandEncoderRef,
+        encoder: &metal::ComputeCommandEncoderRef,
         gate_up: &BufferView,
         hidden_buf: &Buffer,
         hidden_offset: u64,
@@ -1721,7 +1721,7 @@ impl MetalContext {
 
     pub fn encode_matvec_q4_interleaved_gelu_f16_at_view(
         &self,
-        encoder: &ComputeCommandEncoderRef,
+        encoder: &metal::ComputeCommandEncoderRef,
         gate_up: &BufferView,
         x_buf: &Buffer,
         x_offset: u64,
@@ -1745,7 +1745,7 @@ impl MetalContext {
 
     pub fn encode_matvec_ggml_q4_f16x_at_view(
         &self,
-        encoder: &ComputeCommandEncoderRef,
+        encoder: &metal::ComputeCommandEncoderRef,
         w_buf: &Buffer,
         w_offset: u64,
         x_buf: &Buffer,
@@ -1777,7 +1777,7 @@ impl MetalContext {
     /// Down matvec reading f16 activations (ggml Q4 weights).
     fn encode_mlp_down_q4_at_view(
         &self,
-        encoder: &ComputeCommandEncoderRef,
+        encoder: &metal::ComputeCommandEncoderRef,
         down: &BufferView,
         gelu_buf: &Buffer,
         gelu_offset: u64,
@@ -1815,7 +1815,7 @@ impl MetalContext {
     /// Fused gate∥up+GeLU+down from post-attn hidden (no normed_buf round-trip).
     pub fn encode_mlp_fused_q4_gelu_down_packed_from_hidden_at_view(
         &self,
-        encoder: &ComputeCommandEncoderRef,
+        encoder: &metal::ComputeCommandEncoderRef,
         gate_up: &BufferView,
         down: &BufferView,
         ff_norm_weight: &BufferView,
@@ -1870,7 +1870,7 @@ impl MetalContext {
     /// between separate Rust call sites).
     pub fn encode_mlp_fused_q4_gelu_down_view(
         &self,
-        encoder: &ComputeCommandEncoderRef,
+        encoder: &metal::ComputeCommandEncoderRef,
         gate: &BufferView,
         up: &BufferView,
         down: &BufferView,
@@ -1898,7 +1898,7 @@ impl MetalContext {
 
     pub fn encode_mlp_fused_q4_gelu_down_at_view(
         &self,
-        encoder: &ComputeCommandEncoderRef,
+        encoder: &metal::ComputeCommandEncoderRef,
         gate: &BufferView,
         up: &BufferView,
         down: &BufferView,
@@ -1937,7 +1937,7 @@ impl MetalContext {
     /// Fused interleaved gate∥up+GeLU+down Q4 MLP (packed weights).
     pub fn encode_mlp_fused_q4_gelu_down_packed_at_view(
         &self,
-        encoder: &ComputeCommandEncoderRef,
+        encoder: &metal::ComputeCommandEncoderRef,
         gate_up: &BufferView,
         down: &BufferView,
         x_buf: &Buffer,
@@ -2022,7 +2022,7 @@ impl MetalContext {
     /// Fused PLE gate Q4 matvec + GeLU(gate)*context slice.
     pub fn encode_ple_matvec_gelu_q4_view(
         &self,
-        encoder: &ComputeCommandEncoderRef,
+        encoder: &metal::ComputeCommandEncoderRef,
         gate_weight: &BufferView,
         hidden_buf: &Buffer,
         context_buf: &Buffer,
@@ -2047,7 +2047,7 @@ impl MetalContext {
 
     pub fn encode_ple_matvec_gelu_q4_at_view(
         &self,
-        encoder: &ComputeCommandEncoderRef,
+        encoder: &metal::ComputeCommandEncoderRef,
         gate_weight: &BufferView,
         hidden_buf: &Buffer,
         hidden_offset: u64,
@@ -2074,7 +2074,7 @@ impl MetalContext {
 
     pub fn encode_projection_f16_batch(
         &self,
-        encoder: &ComputeCommandEncoderRef,
+        encoder: &metal::ComputeCommandEncoderRef,
         w_buf: &Buffer,
         x_buf: &Buffer,
         y_buf: &Buffer,
@@ -2101,7 +2101,7 @@ impl MetalContext {
 
     pub fn encode_projection_f16_batch_view(
         &self,
-        encoder: &ComputeCommandEncoderRef,
+        encoder: &metal::ComputeCommandEncoderRef,
         weight: &BufferView,
         x_buf: &Buffer,
         y_buf: &Buffer,
@@ -2128,7 +2128,7 @@ impl MetalContext {
 
     pub fn encode_projection_q4_batch(
         &self,
-        encoder: &ComputeCommandEncoderRef,
+        encoder: &metal::ComputeCommandEncoderRef,
         w_buf: &Buffer,
         x_buf: &Buffer,
         y_buf: &Buffer,
@@ -2155,7 +2155,7 @@ impl MetalContext {
 
     pub fn encode_projection_q4_batch_view(
         &self,
-        encoder: &ComputeCommandEncoderRef,
+        encoder: &metal::ComputeCommandEncoderRef,
         weight: &BufferView,
         x_buf: &Buffer,
         y_buf: &Buffer,
@@ -2182,7 +2182,7 @@ impl MetalContext {
 
     pub fn encode_rmsnorm(
         &self,
-        encoder: &ComputeCommandEncoderRef,
+        encoder: &metal::ComputeCommandEncoderRef,
         x_buf: &Buffer,
         weight_buf: &Buffer,
         out_buf: &Buffer,
@@ -2194,7 +2194,7 @@ impl MetalContext {
 
     pub fn encode_rmsnorm_at(
         &self,
-        encoder: &ComputeCommandEncoderRef,
+        encoder: &metal::ComputeCommandEncoderRef,
         x_buf: &Buffer,
         x_offset: u64,
         weight_buf: &Buffer,
@@ -2216,7 +2216,7 @@ impl MetalContext {
 
     pub fn encode_rmsnorm_view(
         &self,
-        encoder: &ComputeCommandEncoderRef,
+        encoder: &metal::ComputeCommandEncoderRef,
         x_buf: &Buffer,
         weight: &BufferView,
         out_buf: &Buffer,
@@ -2238,7 +2238,7 @@ impl MetalContext {
 
     pub fn encode_rmsnorm_at_view(
         &self,
-        encoder: &ComputeCommandEncoderRef,
+        encoder: &metal::ComputeCommandEncoderRef,
         x_buf: &Buffer,
         x_offset: u64,
         weight: &BufferView,
@@ -2264,7 +2264,7 @@ impl MetalContext {
     /// Computes: out = RMSNorm(a + b) * weight
     pub fn encode_rmsnorm_add(
         &self,
-        encoder: &ComputeCommandEncoderRef,
+        encoder: &metal::ComputeCommandEncoderRef,
         a_buf: &Buffer,
         b_buf: &Buffer,
         weight_buf: &Buffer,
@@ -2288,7 +2288,7 @@ impl MetalContext {
     /// a_buf and residual_out_buf may be the same buffer (in-place residual update).
     pub fn encode_rmsnorm_add_save_residual(
         &self,
-        encoder: &ComputeCommandEncoderRef,
+        encoder: &metal::ComputeCommandEncoderRef,
         a_buf: &Buffer,
         b_buf: &Buffer,
         weight_buf: &Buffer,
@@ -2312,7 +2312,7 @@ impl MetalContext {
     /// Fused RMSNorm(x)*weight accumulated into acc in place (Gemma4 post-norm residual).
     pub fn encode_rmsnorm_acc_view(
         &self,
-        encoder: &ComputeCommandEncoderRef,
+        encoder: &metal::ComputeCommandEncoderRef,
         acc_buf: &Buffer,
         x_buf: &Buffer,
         weight: &BufferView,
@@ -2326,7 +2326,7 @@ impl MetalContext {
 
     pub fn encode_rmsnorm_acc_at_view(
         &self,
-        encoder: &ComputeCommandEncoderRef,
+        encoder: &metal::ComputeCommandEncoderRef,
         acc_buf: &Buffer,
         acc_offset: u64,
         x_buf: &Buffer,
@@ -2348,7 +2348,7 @@ impl MetalContext {
     /// Fused RMSNorm(x)*weight + acc -> out (batch decode residual path).
     pub fn encode_rmsnorm_acc_out_at_view(
         &self,
-        encoder: &ComputeCommandEncoderRef,
+        encoder: &metal::ComputeCommandEncoderRef,
         acc_buf: &Buffer,
         acc_offset: u64,
         x_buf: &Buffer,
@@ -2373,7 +2373,7 @@ impl MetalContext {
     /// GPU-side RoPE table fill for all layers at one decode position.
     pub fn encode_rope_fill_decode(
         &self,
-        encoder: &ComputeCommandEncoderRef,
+        encoder: &metal::ComputeCommandEncoderRef,
         cos_packed: &Buffer,
         sin_packed: &Buffer,
         layer_params: &Buffer,
@@ -2393,7 +2393,7 @@ impl MetalContext {
 
     pub fn encode_rotary(
         &self,
-        encoder: &ComputeCommandEncoderRef,
+        encoder: &metal::ComputeCommandEncoderRef,
         q_buf: &Buffer,
         k_buf: &Buffer,
         cos_buf: &Buffer,
@@ -2420,7 +2420,7 @@ impl MetalContext {
 
     pub fn encode_rotary_at(
         &self,
-        encoder: &ComputeCommandEncoderRef,
+        encoder: &metal::ComputeCommandEncoderRef,
         q_buf: &Buffer,
         q_offset: u64,
         k_buf: &Buffer,
@@ -2449,7 +2449,7 @@ impl MetalContext {
 
     pub fn encode_kv_append(
         &self,
-        encoder: &ComputeCommandEncoderRef,
+        encoder: &metal::ComputeCommandEncoderRef,
         new_data: &Buffer,
         cache: &Buffer,
         num_kv_heads: u32,
@@ -2471,7 +2471,7 @@ impl MetalContext {
 
     pub fn encode_kv_append_f16(
         &self,
-        encoder: &ComputeCommandEncoderRef,
+        encoder: &metal::ComputeCommandEncoderRef,
         new_data: &Buffer,
         cache: &Buffer,
         num_kv_heads: u32,
@@ -2493,7 +2493,7 @@ impl MetalContext {
 
     pub fn encode_kv_append_f16_at(
         &self,
-        encoder: &ComputeCommandEncoderRef,
+        encoder: &metal::ComputeCommandEncoderRef,
         new_data: &Buffer,
         new_data_offset: u64,
         cache: &Buffer,
@@ -2516,7 +2516,7 @@ impl MetalContext {
 
     pub fn encode_attention(
         &self,
-        encoder: &ComputeCommandEncoderRef,
+        encoder: &metal::ComputeCommandEncoderRef,
         q_buf: &Buffer,
         k_cache_buf: &Buffer,
         v_cache_buf: &Buffer,
@@ -2547,7 +2547,7 @@ impl MetalContext {
 
     pub fn encode_silu_mul(
         &self,
-        encoder: &ComputeCommandEncoderRef,
+        encoder: &metal::ComputeCommandEncoderRef,
         gate_buf: &Buffer,
         up_buf: &Buffer,
         out_buf: &Buffer,
@@ -2563,7 +2563,7 @@ impl MetalContext {
 
     pub fn encode_gelu_mul(
         &self,
-        encoder: &ComputeCommandEncoderRef,
+        encoder: &metal::ComputeCommandEncoderRef,
         gate_buf: &Buffer,
         up_buf: &Buffer,
         out_buf: &Buffer,
@@ -2574,7 +2574,7 @@ impl MetalContext {
 
     pub fn encode_gelu_mul_at(
         &self,
-        encoder: &ComputeCommandEncoderRef,
+        encoder: &metal::ComputeCommandEncoderRef,
         gate_buf: &Buffer,
         gate_offset: u64,
         up_buf: &Buffer,
@@ -2593,7 +2593,7 @@ impl MetalContext {
 
     pub fn encode_vec_mul(
         &self,
-        encoder: &ComputeCommandEncoderRef,
+        encoder: &metal::ComputeCommandEncoderRef,
         a_buf: &Buffer,
         b_buf: &Buffer,
         out_buf: &Buffer,
@@ -2609,7 +2609,7 @@ impl MetalContext {
 
     pub fn encode_vec_add_scaled(
         &self,
-        encoder: &ComputeCommandEncoderRef,
+        encoder: &metal::ComputeCommandEncoderRef,
         a_buf: &Buffer,
         b_buf: &Buffer,
         out_buf: &Buffer,
@@ -2627,7 +2627,7 @@ impl MetalContext {
 
     pub fn encode_vec_scale(
         &self,
-        encoder: &ComputeCommandEncoderRef,
+        encoder: &metal::ComputeCommandEncoderRef,
         src_buf: &Buffer,
         dst_buf: &Buffer,
         n: u32,
@@ -2638,7 +2638,7 @@ impl MetalContext {
 
     pub fn encode_vec_scale_at(
         &self,
-        encoder: &ComputeCommandEncoderRef,
+        encoder: &metal::ComputeCommandEncoderRef,
         src_buf: &Buffer,
         src_offset: u64,
         dst_buf: &Buffer,
@@ -2656,7 +2656,7 @@ impl MetalContext {
 
     pub fn encode_rmsnorm_per_head(
         &self,
-        encoder: &ComputeCommandEncoderRef,
+        encoder: &metal::ComputeCommandEncoderRef,
         x_buf: &Buffer,
         weight_buf: &Buffer,
         out_buf: &Buffer,
@@ -2671,7 +2671,7 @@ impl MetalContext {
 
     pub fn encode_rmsnorm_per_head_view(
         &self,
-        encoder: &ComputeCommandEncoderRef,
+        encoder: &metal::ComputeCommandEncoderRef,
         x_buf: &Buffer,
         weight: &BufferView,
         out_buf: &Buffer,
@@ -2695,7 +2695,7 @@ impl MetalContext {
 
     pub fn encode_rmsnorm_per_head_at(
         &self,
-        encoder: &ComputeCommandEncoderRef,
+        encoder: &metal::ComputeCommandEncoderRef,
         x_buf: &Buffer,
         x_offset: u64,
         weight_buf: &Buffer,
@@ -2719,7 +2719,7 @@ impl MetalContext {
 
     pub fn encode_rmsnorm_per_head_at_view(
         &self,
-        encoder: &ComputeCommandEncoderRef,
+        encoder: &metal::ComputeCommandEncoderRef,
         x_buf: &Buffer,
         x_offset: u64,
         weight: &BufferView,
@@ -2745,7 +2745,7 @@ impl MetalContext {
 
     pub fn encode_rmsnorm_per_head_noweight(
         &self,
-        encoder: &ComputeCommandEncoderRef,
+        encoder: &metal::ComputeCommandEncoderRef,
         x_buf: &Buffer,
         out_buf: &Buffer,
         num_heads: u32,
@@ -2759,7 +2759,7 @@ impl MetalContext {
 
     pub fn encode_rmsnorm_per_head_noweight_at(
         &self,
-        encoder: &ComputeCommandEncoderRef,
+        encoder: &metal::ComputeCommandEncoderRef,
         x_buf: &Buffer,
         x_offset: u64,
         out_buf: &Buffer,
@@ -2780,7 +2780,7 @@ impl MetalContext {
 
     pub fn encode_rotary_partial(
         &self,
-        encoder: &ComputeCommandEncoderRef,
+        encoder: &metal::ComputeCommandEncoderRef,
         q_buf: &Buffer,
         k_buf: &Buffer,
         cos_buf: &Buffer,
@@ -2807,7 +2807,7 @@ impl MetalContext {
 
     pub fn encode_attention_with_offset(
         &self,
-        encoder: &ComputeCommandEncoderRef,
+        encoder: &metal::ComputeCommandEncoderRef,
         q_buf: &Buffer,
         k_cache_buf: &Buffer,
         v_cache_buf: &Buffer,
@@ -2840,7 +2840,7 @@ impl MetalContext {
 
     pub fn encode_attention_with_offset_f16(
         &self,
-        encoder: &ComputeCommandEncoderRef,
+        encoder: &metal::ComputeCommandEncoderRef,
         q_buf: &Buffer,
         k_cache_buf: &Buffer,
         v_cache_buf: &Buffer,
@@ -2875,7 +2875,7 @@ impl MetalContext {
 
     pub fn encode_attention_with_offset_f16_at(
         &self,
-        encoder: &ComputeCommandEncoderRef,
+        encoder: &metal::ComputeCommandEncoderRef,
         q_buf: &Buffer,
         q_offset: u64,
         k_cache_buf: &Buffer,
@@ -2910,7 +2910,7 @@ impl MetalContext {
 
     pub fn encode_vec_add(
         &self,
-        encoder: &ComputeCommandEncoderRef,
+        encoder: &metal::ComputeCommandEncoderRef,
         a_buf: &Buffer,
         b_buf: &Buffer,
         c_buf: &Buffer,
@@ -2921,7 +2921,7 @@ impl MetalContext {
 
     pub fn encode_vec_add_at(
         &self,
-        encoder: &ComputeCommandEncoderRef,
+        encoder: &metal::ComputeCommandEncoderRef,
         a_buf: &Buffer,
         a_offset: u64,
         b_buf: &Buffer,
@@ -2940,7 +2940,7 @@ impl MetalContext {
 
     pub fn encode_copy(
         &self,
-        encoder: &ComputeCommandEncoderRef,
+        encoder: &metal::ComputeCommandEncoderRef,
         src: &Buffer,
         dst: &Buffer,
         n: u32,
@@ -2950,7 +2950,7 @@ impl MetalContext {
 
     pub fn encode_copy_at(
         &self,
-        encoder: &ComputeCommandEncoderRef,
+        encoder: &metal::ComputeCommandEncoderRef,
         src: &Buffer,
         src_offset: u64,
         dst: &Buffer,
@@ -2968,7 +2968,7 @@ impl MetalContext {
 
     pub fn encode_matmul(
         &self,
-        encoder: &ComputeCommandEncoderRef,
+        encoder: &metal::ComputeCommandEncoderRef,
         a_buf: &Buffer,
         b_buf: &Buffer,
         c_buf: &Buffer,
@@ -2989,7 +2989,7 @@ impl MetalContext {
 
     pub fn encode_rmsnorm_batch(
         &self,
-        encoder: &ComputeCommandEncoderRef,
+        encoder: &metal::ComputeCommandEncoderRef,
         x_buf: &Buffer,
         weight_buf: &Buffer,
         out_buf: &Buffer,
@@ -3009,7 +3009,7 @@ impl MetalContext {
 
     pub fn encode_rmsnorm_batch_view(
         &self,
-        encoder: &ComputeCommandEncoderRef,
+        encoder: &metal::ComputeCommandEncoderRef,
         x_buf: &Buffer,
         weight: &BufferView,
         out_buf: &Buffer,
@@ -3029,7 +3029,7 @@ impl MetalContext {
 
     pub fn encode_rmsnorm_noweight_batch(
         &self,
-        encoder: &ComputeCommandEncoderRef,
+        encoder: &metal::ComputeCommandEncoderRef,
         x_buf: &Buffer,
         out_buf: &Buffer,
         dim: u32,
@@ -3047,7 +3047,7 @@ impl MetalContext {
 
     pub fn encode_silu_mul_batch(
         &self,
-        encoder: &ComputeCommandEncoderRef,
+        encoder: &metal::ComputeCommandEncoderRef,
         gate_buf: &Buffer,
         up_buf: &Buffer,
         out_buf: &Buffer,
@@ -3063,7 +3063,7 @@ impl MetalContext {
 
     pub fn encode_vec_add_batch(
         &self,
-        encoder: &ComputeCommandEncoderRef,
+        encoder: &metal::ComputeCommandEncoderRef,
         a_buf: &Buffer,
         b_buf: &Buffer,
         c_buf: &Buffer,
@@ -3079,7 +3079,7 @@ impl MetalContext {
 
     pub fn encode_rotary_batch(
         &self,
-        encoder: &ComputeCommandEncoderRef,
+        encoder: &metal::ComputeCommandEncoderRef,
         q_buf: &Buffer,
         k_buf: &Buffer,
         cos_buf: &Buffer,
@@ -3105,7 +3105,7 @@ impl MetalContext {
 
     pub fn encode_ple_gelu_mul_batch(
         &self,
-        encoder: &ComputeCommandEncoderRef,
+        encoder: &metal::ComputeCommandEncoderRef,
         gate_buf: &Buffer,
         context_buf: &Buffer,
         out_buf: &Buffer,
@@ -3128,7 +3128,7 @@ impl MetalContext {
 
     pub fn encode_kv_batch_append(
         &self,
-        encoder: &ComputeCommandEncoderRef,
+        encoder: &metal::ComputeCommandEncoderRef,
         new_data: &Buffer,
         cache: &Buffer,
         num_kv_heads: u32,
@@ -3151,7 +3151,7 @@ impl MetalContext {
 
     pub fn encode_kv_batch_append_f16(
         &self,
-        encoder: &ComputeCommandEncoderRef,
+        encoder: &metal::ComputeCommandEncoderRef,
         new_data: &Buffer,
         cache: &Buffer,
         num_kv_heads: u32,
@@ -3174,7 +3174,7 @@ impl MetalContext {
 
     pub fn encode_kv_batch_append_strided_f16(
         &self,
-        encoder: &ComputeCommandEncoderRef,
+        encoder: &metal::ComputeCommandEncoderRef,
         new_data: &Buffer,
         cache: &Buffer,
         num_kv_heads: u32,
@@ -3249,7 +3249,7 @@ impl MetalContext {
 
     pub fn encode_attention_ggml_q4_0(
         &self,
-        encoder: &ComputeCommandEncoderRef,
+        encoder: &metal::ComputeCommandEncoderRef,
         q_buf: &Buffer,
         k_cache_buf: &Buffer,
         v_cache_buf: &Buffer,
@@ -3286,7 +3286,7 @@ impl MetalContext {
 
     pub fn encode_attention_ggml_q4_0_at(
         &self,
-        encoder: &ComputeCommandEncoderRef,
+        encoder: &metal::ComputeCommandEncoderRef,
         q_buf: &Buffer,
         q_offset: u64,
         k_cache_buf: &Buffer,
@@ -3336,7 +3336,7 @@ impl MetalContext {
 
     pub fn encode_attention_fused_q4_0(
         &self,
-        encoder: &ComputeCommandEncoderRef,
+        encoder: &metal::ComputeCommandEncoderRef,
         q_buf: &Buffer,
         k_f32_buf: &Buffer,
         v_f32_buf: &Buffer,
@@ -3383,7 +3383,7 @@ impl MetalContext {
 
     pub fn encode_attention_fused_q4_0_at(
         &self,
-        encoder: &ComputeCommandEncoderRef,
+        encoder: &metal::ComputeCommandEncoderRef,
         q_buf: &Buffer,
         q_offset: u64,
         k_f32_buf: &Buffer,
@@ -3430,7 +3430,7 @@ impl MetalContext {
 
     pub fn encode_attention_qknorm_rope_q4_0(
         &self,
-        encoder: &ComputeCommandEncoderRef,
+        encoder: &metal::ComputeCommandEncoderRef,
         q_raw_buf: &Buffer,
         q_norm_weight: &BufferView,
         cos_buf: &Buffer,
@@ -3477,7 +3477,7 @@ impl MetalContext {
 
     pub fn encode_attention_fused_qknorm_rope_q4_0(
         &self,
-        encoder: &ComputeCommandEncoderRef,
+        encoder: &metal::ComputeCommandEncoderRef,
         q_raw_buf: &Buffer,
         q_norm_weight: &BufferView,
         cos_buf: &Buffer,
@@ -3532,7 +3532,7 @@ impl MetalContext {
 
     pub fn encode_attention_full_fused_q4_0(
         &self,
-        encoder: &ComputeCommandEncoderRef,
+        encoder: &metal::ComputeCommandEncoderRef,
         q_raw_buf: &Buffer,
         q_norm_weight: &BufferView,
         cos_buf: &Buffer,
@@ -3587,7 +3587,7 @@ impl MetalContext {
 
     pub fn encode_kv_append_attention_q4_0(
         &self,
-        encoder: &ComputeCommandEncoderRef,
+        encoder: &metal::ComputeCommandEncoderRef,
         q_buf: &Buffer,
         k_buf: &Buffer,
         v_buf: &Buffer,
@@ -3629,7 +3629,7 @@ impl MetalContext {
 
     pub fn encode_attention_causal(
         &self,
-        encoder: &ComputeCommandEncoderRef,
+        encoder: &metal::ComputeCommandEncoderRef,
         q_buf: &Buffer,
         k_cache_buf: &Buffer,
         v_cache_buf: &Buffer,
@@ -3663,7 +3663,7 @@ impl MetalContext {
 
     pub fn encode_attention_causal_f16(
         &self,
-        encoder: &ComputeCommandEncoderRef,
+        encoder: &metal::ComputeCommandEncoderRef,
         q_buf: &Buffer,
         k_cache_buf: &Buffer,
         v_cache_buf: &Buffer,
@@ -3701,7 +3701,7 @@ impl MetalContext {
 
     pub fn encode_attention_causal_strided_f16(
         &self,
-        encoder: &ComputeCommandEncoderRef,
+        encoder: &metal::ComputeCommandEncoderRef,
         q_buf: &Buffer,
         k_cache_buf: &Buffer,
         v_cache_buf: &Buffer,
@@ -3743,7 +3743,7 @@ impl MetalContext {
 
     pub fn encode_transpose_shd(
         &self,
-        encoder: &ComputeCommandEncoderRef,
+        encoder: &metal::ComputeCommandEncoderRef,
         input: &Buffer,
         output: &Buffer,
         seq_len: u32,
@@ -3762,7 +3762,7 @@ impl MetalContext {
 
     pub fn encode_transpose_hsd(
         &self,
-        encoder: &ComputeCommandEncoderRef,
+        encoder: &metal::ComputeCommandEncoderRef,
         input: &Buffer,
         output: &Buffer,
         seq_len: u32,
@@ -3781,7 +3781,7 @@ impl MetalContext {
 
     pub fn encode_kv_append_q8_0(
         &self,
-        encoder: &ComputeCommandEncoderRef,
+        encoder: &metal::ComputeCommandEncoderRef,
         new_data: &Buffer,
         cache: &Buffer,
         num_kv_heads: u32,
@@ -3803,7 +3803,7 @@ impl MetalContext {
 
     pub fn encode_kv_append_q8_0_at(
         &self,
-        encoder: &ComputeCommandEncoderRef,
+        encoder: &metal::ComputeCommandEncoderRef,
         new_data: &Buffer,
         new_data_offset: u64,
         cache: &Buffer,
@@ -3826,7 +3826,7 @@ impl MetalContext {
 
     pub fn encode_kv_append_q4_0(
         &self,
-        encoder: &ComputeCommandEncoderRef,
+        encoder: &metal::ComputeCommandEncoderRef,
         new_data: &Buffer,
         cache: &Buffer,
         num_kv_heads: u32,
@@ -3848,7 +3848,7 @@ impl MetalContext {
 
     pub fn encode_kv_append_q4_0_at(
         &self,
-        encoder: &ComputeCommandEncoderRef,
+        encoder: &metal::ComputeCommandEncoderRef,
         new_data: &Buffer,
         new_data_offset: u64,
         cache: &Buffer,
@@ -3871,7 +3871,7 @@ impl MetalContext {
 
     pub fn encode_kv_batch_append_q8_0(
         &self,
-        encoder: &ComputeCommandEncoderRef,
+        encoder: &metal::ComputeCommandEncoderRef,
         new_data: &Buffer,
         cache: &Buffer,
         num_kv_heads: u32,
@@ -3895,7 +3895,7 @@ impl MetalContext {
 
     pub fn encode_kv_batch_append_strided_q8_0(
         &self,
-        encoder: &ComputeCommandEncoderRef,
+        encoder: &metal::ComputeCommandEncoderRef,
         new_data: &Buffer,
         cache: &Buffer,
         num_kv_heads: u32,
@@ -3923,7 +3923,7 @@ impl MetalContext {
 
     pub fn encode_kv_batch_append_q4_0(
         &self,
-        encoder: &ComputeCommandEncoderRef,
+        encoder: &metal::ComputeCommandEncoderRef,
         new_data: &Buffer,
         cache: &Buffer,
         num_kv_heads: u32,
@@ -3947,7 +3947,7 @@ impl MetalContext {
 
     pub fn encode_kv_batch_append_strided_q4_0(
         &self,
-        encoder: &ComputeCommandEncoderRef,
+        encoder: &metal::ComputeCommandEncoderRef,
         new_data: &Buffer,
         cache: &Buffer,
         num_kv_heads: u32,
@@ -3975,7 +3975,7 @@ impl MetalContext {
 
     pub fn encode_attention_with_offset_q8_0(
         &self,
-        encoder: &ComputeCommandEncoderRef,
+        encoder: &metal::ComputeCommandEncoderRef,
         q_buf: &Buffer,
         k_cache_buf: &Buffer,
         v_cache_buf: &Buffer,
@@ -3999,7 +3999,7 @@ impl MetalContext {
 
     pub fn encode_attention_with_offset_q8_0_at(
         &self,
-        encoder: &ComputeCommandEncoderRef,
+        encoder: &metal::ComputeCommandEncoderRef,
         q_buf: &Buffer,
         q_offset: u64,
         k_cache_buf: &Buffer,
@@ -4038,7 +4038,7 @@ impl MetalContext {
 
     pub fn encode_attention_with_offset_q4_0(
         &self,
-        encoder: &ComputeCommandEncoderRef,
+        encoder: &metal::ComputeCommandEncoderRef,
         q_buf: &Buffer,
         k_cache_buf: &Buffer,
         v_cache_buf: &Buffer,
@@ -4074,7 +4074,7 @@ impl MetalContext {
 
     pub fn encode_attention_with_offset_q4_0_at(
         &self,
-        encoder: &ComputeCommandEncoderRef,
+        encoder: &metal::ComputeCommandEncoderRef,
         q_buf: &Buffer,
         q_offset: u64,
         k_cache_buf: &Buffer,
@@ -4113,7 +4113,7 @@ impl MetalContext {
 
     pub fn encode_attention_causal_q8_0(
         &self,
-        encoder: &ComputeCommandEncoderRef,
+        encoder: &metal::ComputeCommandEncoderRef,
         q_buf: &Buffer,
         k_cache_buf: &Buffer,
         v_cache_buf: &Buffer,
@@ -4155,7 +4155,7 @@ impl MetalContext {
 
     pub fn encode_attention_causal_strided_q8_0(
         &self,
-        encoder: &ComputeCommandEncoderRef,
+        encoder: &metal::ComputeCommandEncoderRef,
         q_buf: &Buffer,
         k_cache_buf: &Buffer,
         v_cache_buf: &Buffer,
@@ -4201,7 +4201,7 @@ impl MetalContext {
 
     pub fn encode_attention_causal_q4_0(
         &self,
-        encoder: &ComputeCommandEncoderRef,
+        encoder: &metal::ComputeCommandEncoderRef,
         q_buf: &Buffer,
         k_cache_buf: &Buffer,
         v_cache_buf: &Buffer,
@@ -4243,7 +4243,7 @@ impl MetalContext {
 
     pub fn encode_attention_causal_strided_q4_0(
         &self,
-        encoder: &ComputeCommandEncoderRef,
+        encoder: &metal::ComputeCommandEncoderRef,
         q_buf: &Buffer,
         k_cache_buf: &Buffer,
         v_cache_buf: &Buffer,
@@ -4611,7 +4611,7 @@ impl GpuTimestampProfiler {
         })
     }
 
-    pub fn mark(&mut self, encoder: &ComputeCommandEncoderRef) {
+    pub fn mark(&mut self, encoder: &metal::ComputeCommandEncoderRef) {
         if self.next >= self.capacity {
             return;
         }

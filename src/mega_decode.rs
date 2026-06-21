@@ -691,7 +691,7 @@ impl MegaDecodeGraph {
     pub fn encode(
         &mut self,
         ctx: &MetalContext,
-        encoder: &ComputeCommandEncoderRef,
+        encoder: &metal::ComputeCommandEncoderRef,
         layers: &[crate::gemma4_gpu_model::Gemma4GpuLayer],
         sliding_window: u32,
         buffers: &MegaScratchBuffers<'_>,

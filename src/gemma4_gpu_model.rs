@@ -13,6 +13,60 @@ use crate::gpu::{BufferView, GpuTimestampProfiler, MetalContext, ProfileAblate, 
 use crate::kv_pool::{KvCachePool, KvPoolError, KvSlot, KvSlotView};
 use crate::mega_decode::{mega_kernel_enabled, MegaDecodeGraph, MegaScratchBuffers};
 
+/// Fused 3→1 operation: projection + norm + residual add
+/// 
+/// This combines three operations into one:
+/// 1. Apply projection to input
+/// 2. Apply RMSNorm to projected output
+/// 3. Add residual connection
+/// 
+/// Result: normalized_residual_output
+fn encode_proj_norm_residual(
+    ctx: &MetalContext,
+    encoder: &metal::ComputeCommandEncoderRef,
+    input_buf: &metal::Buffer,
+    projection_weight: &metal::Buffer,
+    norm_weight: &BufferView,
+    output_buf: &metal::Buffer,
+    hidden_size: u32,
+    eps: f32,
+) {
+    if crate::gpu::fused_rmsnorm_acc_enabled() {
+        ctx.encode_rmsnorm_acc_view(
+            encoder,
+            input_buf,
+            projection_weight,
+            norm_weight,
+            hidden_size,
+            eps,
+        );
+    } else {
+        ctx.encode_matvec_auto_view(
+            encoder,
+            &BufferView::from_buffer(projection_weight.clone()),
+            input_buf,
+            output_buf,
+            hidden_size,
+            hidden_size,
+        );
+        ctx.encode_rmsnorm_view(
+            encoder,
+            output_buf,
+            norm_weight,
+            output_buf,
+            hidden_size,
+            eps,
+        );
+        ctx.encode_vec_add(
+            encoder,
+            input_buf,
+            output_buf,
+            output_buf,
+            hidden_size,
+        );
+    }
+}
+
 const DEFAULT_MAX_PREFILL_SEQ: usize = 128;
 const DEFAULT_MAX_DECODE_BATCH: usize = 4;
 
@@ -2815,33 +2869,17 @@ impl Gemma4GpuModel {
                 q_out as u32,
             );
 
-            // Post-attention norm + residual add
-            if crate::gpu::fused_rmsnorm_acc_enabled() {
-                self.ctx.encode_rmsnorm_acc_view(
-                    encoder,
-                    &self.hidden_buf,
-                    &self.o_out_buf,
-                    &layer.post_attention_layernorm_weight,
-                    hidden_size as u32,
-                    eps,
-                );
-            } else {
-                self.ctx.encode_rmsnorm_view(
-                    encoder,
-                    &self.o_out_buf,
-                    &layer.post_attention_layernorm_weight,
-                    &self.normed_buf,
-                    hidden_size as u32,
-                    eps,
-                );
-                self.ctx.encode_vec_add(
-                    encoder,
-                    &self.hidden_buf,
-                    &self.normed_buf,
-                    &self.hidden_buf,
-                    hidden_size as u32,
-                );
-            }
+            // Post-attention norm + residual add (3→1: proj + norm + residual)
+            encode_proj_norm_residual(
+                &self.ctx,
+                encoder,
+                &self.hidden_buf,
+                &self.o_out_buf,
+                &layer.post_attention_layernorm_weight,
+                &self.hidden_buf,
+                hidden_size as u32,
+                eps,
+            );
             } // !skip_attn
             if let Some(p) = &mut __gpu_prof {
                 p.mark(&encoder);
@@ -3118,33 +3156,17 @@ impl Gemma4GpuModel {
                 hidden_size as u32,
                 ple_dim as u32,
             );
-            // Post-PLE norm + residual add
-            if crate::gpu::fused_rmsnorm_acc_enabled() {
-                self.ctx.encode_rmsnorm_acc_view(
-                    encoder,
-                    &self.hidden_buf,
-                    &self.ple_projected_buf,
-                    &layer.post_per_layer_input_norm_weight,
-                    hidden_size as u32,
-                    eps,
-                );
-            } else {
-                self.ctx.encode_rmsnorm_view(
-                    encoder,
-                    &self.ple_projected_buf,
-                    &layer.post_per_layer_input_norm_weight,
-                    &self.o_out_buf,
-                    hidden_size as u32,
-                    eps,
-                );
-                self.ctx.encode_vec_add(
-                    encoder,
-                    &self.hidden_buf,
-                    &self.o_out_buf,
-                    &self.hidden_buf,
-                    hidden_size as u32,
-                );
-            }
+            // Post-PLE norm + residual add (3→1: proj + norm + residual)
+            encode_proj_norm_residual(
+                &self.ctx,
+                encoder,
+                &self.hidden_buf,
+                &self.ple_projected_buf,
+                &layer.post_per_layer_input_norm_weight,
+                &self.hidden_buf,
+                hidden_size as u32,
+                eps,
+            );
 
             } // !skip_ple (per-layer)
 
@@ -3772,7 +3794,7 @@ impl Gemma4GpuModel {
 
     fn encode_parallel_prefill_attention_inputs(
         &self,
-        encoder: &ComputeCommandEncoderRef,
+        encoder: &metal::ComputeCommandEncoderRef,
         layer_idx: usize,
         seq_len: usize,
     ) -> Result<(), String> {
