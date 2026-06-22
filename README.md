@@ -249,6 +249,30 @@ benchmarks/                 Regression, correctness, stress, fairness scripts
 docs/                       Architecture notes and blog posts
 ```
 
+## Performance Tuning
+
+Decode throughput on an Apple M1 Pro with Gemma4 E4B Q4_0 is ~29 tok/s out of
+ the box and ~31–32 tok/s with:
+
+```bash
+MLP_GATE_UP_GGML=1 cargo run --release -- --gpu "$MODEL_DIR"
+```
+
+`MLP_GATE_UP_GGML=1` replaces the packed interleaved MLP gate∥up+GeLU kernel
+with two separate ggml-style Q4 matvecs plus a GeLU multiply. It is opt-in
+because the extra dispatch can hurt on other shapes, but it helps this model.
+
+To reach llama.cpp-level single-request speeds (~40 tok/s on similar hardware)
+the remaining work is in the attention kernel: it currently dispatches one
+threadgroup per query head, so GQA groups read the same KV cache multiple times.
+A GQA-aware attention kernel (one threadgroup per KV head, computing all query
+heads in the group) plus further dispatch-reduction (e.g., a working mega-kernel
+or fusing O-projection/norm/residual) is the next step.
+
+For serving, use the existing decode batching: aggregate throughput scales with
+the number of concurrent requests because weights and KV are amortized across
+the batch.
+
 ## Known Limits
 
 - Alpha software. Expect sharp edges.

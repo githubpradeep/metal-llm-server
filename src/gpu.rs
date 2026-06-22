@@ -224,6 +224,17 @@ pub fn fused_mlp_gelu_down_enabled() -> bool {
     )
 }
 
+/// Use two separate ggml-style Q4 matvecs for gate and up (then a separate
+/// GeLU multiply) instead of the packed interleaved or dual_gelu kernels.
+/// Opt-in; can be faster when the ggml matvec bandwidth outweighs the extra
+/// dispatch overhead (MLP_GATE_UP_GGML=1).
+pub fn mlp_gate_up_ggml_enabled() -> bool {
+    matches!(
+        std::env::var("MLP_GATE_UP_GGML").as_deref(),
+        Ok("1") | Ok("true") | Ok("TRUE")
+    )
+}
+
 /// Interleaved gate∥up Q4 weights + single-buffer GeLU matvec (default on).
 /// Set PACKED_MLP_GATE_UP=0 to use separate gate/up buffers.
 pub fn packed_mlp_gate_up_enabled() -> bool {
@@ -348,6 +359,7 @@ pub struct MetalContext {
     pub transpose_shd_pipeline: ComputePipelineState,
     pub transpose_hsd_pipeline: ComputePipelineState,
     pub gelu_mul_pipeline: ComputePipelineState,
+    pub gelu_mul_f16_pipeline: ComputePipelineState,
     pub ple_gelu_mul_batch_pipeline: ComputePipelineState,
     pub vec_mul_pipeline: ComputePipelineState,
     pub vec_add_scaled_pipeline: ComputePipelineState,
@@ -513,6 +525,7 @@ impl MetalContext {
         let transpose_shd_pipeline = get_fn("transpose_shd_to_hsd");
         let transpose_hsd_pipeline = get_fn("transpose_hsd_to_shd");
         let gelu_mul_pipeline = get_fn("gelu_mul");
+        let gelu_mul_f16_pipeline = get_fn("gelu_mul_f16");
         let ple_gelu_mul_batch_pipeline = get_fn("ple_gelu_mul_batch");
         let vec_mul_pipeline = get_fn("vec_mul");
         let vec_add_scaled_pipeline = get_fn("vec_add_scaled");
@@ -625,6 +638,9 @@ impl MetalContext {
             if mlp_gelu_f16_enabled() {
                 println!("  MLP f16 GeLU scratch gate→down (MLP_GELU_F16=1 enabled)");
             }
+            if mlp_gate_up_ggml_enabled() {
+                println!("  MLP gate+up via separate ggml Q4 matvecs (MLP_GATE_UP_GGML=1)");
+            }
             if fused_rmsnorm_mlp_enabled() {
                 println!("  Fused pre-FF RMSNorm + gate∥up+GeLU (FUSED_RMSNORM_MLP=0 to disable)");
             }
@@ -701,6 +717,7 @@ impl MetalContext {
             transpose_shd_pipeline,
             transpose_hsd_pipeline,
             gelu_mul_pipeline,
+            gelu_mul_f16_pipeline,
             ple_gelu_mul_batch_pipeline,
             vec_mul_pipeline,
             vec_add_scaled_pipeline,
@@ -1984,6 +2001,52 @@ impl MetalContext {
         );
     }
 
+    /// Fused gate+up (separate ggml Q4 matvecs) + GeLU + down.
+    /// Uses gate_out/up_out scratch buffers.
+    pub fn encode_mlp_fused_q4_gelu_down_ggml_at_view(
+        &self,
+        encoder: &metal::ComputeCommandEncoderRef,
+        gate: &BufferView,
+        up: &BufferView,
+        down: &BufferView,
+        x_buf: &Buffer,
+        x_offset: u64,
+        gate_out: &Buffer,
+        up_out: &Buffer,
+        gelu_buf: &Buffer,
+        gelu_offset: u64,
+        y_buf: &Buffer,
+        y_offset: u64,
+        hidden_size: u32,
+        intermediate_size: u32,
+    ) {
+        self.encode_matvec_q4_at_view(
+            encoder, gate, x_buf, x_offset, gate_out, 0, intermediate_size, hidden_size,
+        );
+        self.encode_matvec_q4_at_view(
+            encoder, up, x_buf, x_offset, up_out, 0, intermediate_size, hidden_size,
+        );
+        if mlp_gelu_f16_enabled() {
+            self.encode_gelu_mul_f16_at(
+                encoder, gate_out, 0, up_out, 0, gelu_buf, gelu_offset, intermediate_size,
+            );
+        } else {
+            self.encode_gelu_mul_at(
+                encoder, gate_out, 0, up_out, 0, gelu_buf, gelu_offset, intermediate_size,
+            );
+        }
+        self.encode_mlp_down_q4_at_view(
+            encoder,
+            down,
+            gelu_buf,
+            gelu_offset,
+            y_buf,
+            y_offset,
+            hidden_size,
+            intermediate_size,
+        );
+    }
+
     /// Pack separate gate/up Q4 rows into interleaved [gate_i, up_i, …] layout.
     pub fn pack_gate_up_interleaved_q4(
         &self,
@@ -2584,6 +2647,25 @@ impl MetalContext {
         n: u32,
     ) {
         encoder.set_compute_pipeline_state(&self.gelu_mul_pipeline);
+        encoder.set_buffer(0, Some(gate_buf), gate_offset);
+        encoder.set_buffer(1, Some(up_buf), up_offset);
+        encoder.set_buffer(2, Some(out_buf), out_offset);
+        encoder.set_bytes(3, 4, &n as *const u32 as *const _);
+        encoder.dispatch_threads(MTLSize::new(n as u64, 1, 1), MTLSize::new(256, 1, 1));
+    }
+
+    pub fn encode_gelu_mul_f16_at(
+        &self,
+        encoder: &metal::ComputeCommandEncoderRef,
+        gate_buf: &Buffer,
+        gate_offset: u64,
+        up_buf: &Buffer,
+        up_offset: u64,
+        out_buf: &Buffer,
+        out_offset: u64,
+        n: u32,
+    ) {
+        encoder.set_compute_pipeline_state(&self.gelu_mul_f16_pipeline);
         encoder.set_buffer(0, Some(gate_buf), gate_offset);
         encoder.set_buffer(1, Some(up_buf), up_offset);
         encoder.set_buffer(2, Some(out_buf), out_offset);

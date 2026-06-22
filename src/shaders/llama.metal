@@ -2508,6 +2508,17 @@ kernel void gelu_mul(
     out[gid] = gelu_pytorch_tanh(gate[gid]) * up[gid];
 }
 
+kernel void gelu_mul_f16(
+    device const float* gate [[buffer(0)]],
+    device const float* up [[buffer(1)]],
+    device half* out [[buffer(2)]],
+    constant uint& n [[buffer(3)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    if (gid >= n) return;
+    out[gid] = half(gelu_pytorch_tanh(gate[gid]) * up[gid]);
+}
+
 // ─── Batched PLE GeLU * Context ─────────────────────────────────────────────
 // gate: (S, ple_dim), context: (S, num_layers, ple_dim), out: (S, ple_dim)
 

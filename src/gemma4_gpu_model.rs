@@ -2984,19 +2984,38 @@ impl Gemma4GpuModel {
                     eps,
                 );
                 if Self::use_packed_mlp_gate_up(layer) {
-                    self.ctx.encode_mlp_fused_q4_gelu_down_packed_at_view(
-                        encoder,
-                        &layer.gate_up_proj,
-                        &layer.down_proj,
-                        &self.normed_buf,
-                        0,
-                        &self.up_buf,
-                        0,
-                        &self.down_buf,
-                        0,
-                        hidden_size as u32,
-                        intermediate_size as u32,
-                    );
+                    if crate::gpu::mlp_gate_up_ggml_enabled() {
+                        self.ctx.encode_mlp_fused_q4_gelu_down_ggml_at_view(
+                            encoder,
+                            &layer.gate_proj,
+                            &layer.up_proj,
+                            &layer.down_proj,
+                            &self.normed_buf,
+                            0,
+                            &self.gate_buf,
+                            &self.up_buf,
+                            &self.gelu_buf,
+                            0,
+                            &self.down_buf,
+                            0,
+                            hidden_size as u32,
+                            intermediate_size as u32,
+                        );
+                    } else {
+                        self.ctx.encode_mlp_fused_q4_gelu_down_packed_at_view(
+                            encoder,
+                            &layer.gate_up_proj,
+                            &layer.down_proj,
+                            &self.normed_buf,
+                            0,
+                            &self.up_buf,
+                            0,
+                            &self.down_buf,
+                            0,
+                            hidden_size as u32,
+                            intermediate_size as u32,
+                        );
+                    }
                 } else {
                     self.ctx.encode_mlp_fused_q4_gelu_down_view(
                         encoder,
