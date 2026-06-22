@@ -235,6 +235,27 @@ pub fn mlp_gate_up_ggml_enabled() -> bool {
     )
 }
 
+/// Fused gate+up+GeLU Q4_0 kernel that writes the gelu scratch directly
+/// instead of using separate gate/up scratch buffers + a GeLU multiply
+/// dispatch. Enable with MLP_FUSED_GELU_GGML=1 (default on when gate+up ggml
+/// path is used).
+pub fn mlp_fused_gelu_ggml_enabled() -> bool {
+    match std::env::var("MLP_FUSED_GELU_GGML").as_deref() {
+        Ok("0") | Ok("false") | Ok("FALSE") => false,
+        _ => true,
+    }
+}
+
+/// Use the lower-register-pressure r2s4 fused gate+up+GeLU kernel. Default on
+/// for the fused ggml path; set MLP_FUSED_GELU_GGML_R2S4=0 to use the r4s2
+/// layout.
+pub fn mlp_fused_gelu_ggml_r2s4_enabled() -> bool {
+    match std::env::var("MLP_FUSED_GELU_GGML_R2S4").as_deref() {
+        Ok("0") | Ok("false") | Ok("FALSE") => false,
+        _ => true,
+    }
+}
+
 /// Use a single fused gate+up ggml Q4 matvec dispatch instead of two separate
 /// dispatches. Shares the x load between gate and up. Experimental: it can
 /// hurt bandwidth on some shapes because the two weight streams interleave;
@@ -336,6 +357,8 @@ pub struct MetalContext {
     pub ple_matvec_gelu_q4_pipeline: ComputePipelineState,
     pub matvec_ggml_q4_pipeline: ComputePipelineState,
     pub matvec_ggml_q4_dual_pipeline: ComputePipelineState,
+    pub matvec_ggml_q4_gelu_mul_pipeline: ComputePipelineState,
+    pub matvec_ggml_q4_gelu_mul_r2s4_pipeline: ComputePipelineState,
     pub matvec_ggml_ext_q4_nx4_pipeline: ComputePipelineState,
     pub matvec_ggml_ext_q4_nx8_pipeline: ComputePipelineState,
     pub matvec_ggml_ext_q4_nx16_pipeline: ComputePipelineState,
@@ -486,6 +509,8 @@ impl MetalContext {
         let ple_matvec_gelu_q4_pipeline = get_fn("ple_matvec_gelu_q4");
         let matvec_ggml_q4_pipeline = get_fn("matvec_ggml_q4_0");
         let matvec_ggml_q4_dual_pipeline = get_fn("matvec_ggml_q4_0_dual");
+        let matvec_ggml_q4_gelu_mul_pipeline = get_fn("matvec_ggml_q4_0_gelu_mul");
+        let matvec_ggml_q4_gelu_mul_r2s4_pipeline = get_fn("matvec_ggml_q4_0_gelu_mul_r2s4");
         let matvec_ggml_ext_q4_nx4_pipeline = get_fn("matvec_ggml_ext_q4_nx4_r4");
         let matvec_ggml_ext_q4_nx8_pipeline = get_fn("matvec_ggml_ext_q4_nx8_r4");
         let matvec_ggml_ext_q4_nx16_pipeline = get_fn("matvec_ggml_ext_q4_nx16_r4");
@@ -654,6 +679,12 @@ impl MetalContext {
             if mlp_gate_up_ggml_enabled() {
                 println!("  MLP gate+up via separate ggml Q4 matvecs (MLP_GATE_UP_GGML=1)");
             }
+            if mlp_fused_gelu_ggml_enabled() {
+                println!("  Fused gate+up+GeLU Q4_0 kernel (MLP_FUSED_GELU_GGML=0 to disable)");
+            }
+            if mlp_fused_gelu_ggml_r2s4_enabled() {
+                println!("  Fused gate+up+GeLU r2s4 layout (MLP_FUSED_GELU_GGML_R2S4=0 to disable)");
+            }
             if fused_rmsnorm_mlp_enabled() {
                 println!("  Fused pre-FF RMSNorm + gate∥up+GeLU (FUSED_RMSNORM_MLP=0 to disable)");
             }
@@ -697,6 +728,8 @@ impl MetalContext {
             ple_matvec_gelu_q4_pipeline,
             matvec_ggml_q4_pipeline,
             matvec_ggml_q4_dual_pipeline,
+            matvec_ggml_q4_gelu_mul_pipeline,
+            matvec_ggml_q4_gelu_mul_r2s4_pipeline,
             matvec_ggml_ext_q4_nx4_pipeline,
             matvec_ggml_ext_q4_nx8_pipeline,
             matvec_ggml_ext_q4_nx16_pipeline,
@@ -1461,6 +1494,56 @@ impl MetalContext {
         );
     }
 
+    /// Fused gate+up+GeLU Q4_0 GEMV: gelu = GeLU(W_gate @ x) * (W_up @ x).
+    /// Writes a single gelu scratch vector, avoiding separate gate/up outputs
+    /// and a follow-up GeLU multiply dispatch.
+    pub fn encode_matvec_ggml_q4_gelu_mul_at_view(
+        &self,
+        encoder: &metal::ComputeCommandEncoderRef,
+        gate: &BufferView,
+        up: &BufferView,
+        x_buf: &Buffer,
+        x_offset: u64,
+        gelu_out: &Buffer,
+        gelu_offset: u64,
+        m: u32,
+        k: u32,
+    ) {
+        use crate::ggml_gemv::mul_mv_args;
+        let args = mul_mv_args(m, k);
+        let r2s4 = mlp_fused_gelu_ggml_r2s4_enabled();
+        encoder.set_compute_pipeline_state(if r2s4 {
+            &self.matvec_ggml_q4_gelu_mul_r2s4_pipeline
+        } else {
+            &self.matvec_ggml_q4_gelu_mul_pipeline
+        });
+        encoder.set_buffer(0, Some(&gate.buffer), gate.offset);
+        encoder.set_buffer(1, Some(&up.buffer), up.offset);
+        encoder.set_buffer(2, Some(x_buf), x_offset);
+        encoder.set_buffer(3, Some(gelu_out), gelu_offset);
+        encoder.set_bytes(
+            4,
+            std::mem::size_of::<crate::ggml_gemv::GgmlMulMvArgs>() as u64,
+            &args as *const _ as *const _,
+        );
+        if r2s4 {
+            // NR0=2, NSG=4 => 8 rows per threadgroup, 4 simdgroups of 32 threads.
+            let rows_per_tg = 8u64;
+            let tg_x = ((m as u64 + rows_per_tg - 1) / rows_per_tg).max(1);
+            encoder.dispatch_thread_groups(
+                metal::MTLSize::new(tg_x, 1, 1),
+                metal::MTLSize::new(32, 4, 1),
+            );
+        } else {
+            use crate::ggml_gemv::mul_mv_dispatch;
+            let (tg_x, tg_y, tg_z, tw, nsg) = mul_mv_dispatch(m, 1);
+            encoder.dispatch_thread_groups(
+                metal::MTLSize::new(tg_x, tg_y, tg_z),
+                metal::MTLSize::new(tw, nsg, 1),
+            );
+        }
+    }
+
     fn encode_matvec_ggml_at(
         &self,
         encoder: &metal::ComputeCommandEncoderRef,
@@ -2051,7 +2134,10 @@ impl MetalContext {
     }
 
     /// Fused gate+up (separate ggml Q4 matvecs) + GeLU + down.
-    /// Uses gate_out/up_out scratch buffers.
+    /// By default uses a single kernel dispatch that computes GeLU(gate) * up
+    /// and writes the gelu scratch directly, removing gate_out/up_out scratch
+    /// buffers and a separate GeLU multiply dispatch. Set
+    /// MLP_FUSED_GELU_GGML=0 to fall back to the dual-matvec + GeLU path.
     pub fn encode_mlp_fused_q4_gelu_down_ggml_at_view(
         &self,
         encoder: &metal::ComputeCommandEncoderRef,
@@ -2069,36 +2155,50 @@ impl MetalContext {
         hidden_size: u32,
         intermediate_size: u32,
     ) {
-        if mlp_gate_up_dual_ggml_enabled() {
-            self.encode_matvec_q4_dual_ggml_at_view(
+        if mlp_fused_gelu_ggml_enabled() {
+            self.encode_matvec_ggml_q4_gelu_mul_at_view(
                 encoder,
                 gate,
                 up,
                 x_buf,
                 x_offset,
-                gate_out,
-                0,
-                up_out,
-                0,
+                gelu_buf,
+                gelu_offset,
                 intermediate_size,
                 hidden_size,
             );
         } else {
-            self.encode_matvec_q4_at_view(
-                encoder, gate, x_buf, x_offset, gate_out, 0, intermediate_size, hidden_size,
-            );
-            self.encode_matvec_q4_at_view(
-                encoder, up, x_buf, x_offset, up_out, 0, intermediate_size, hidden_size,
-            );
-        }
-        if mlp_gelu_f16_enabled() {
-            self.encode_gelu_mul_f16_at(
-                encoder, gate_out, 0, up_out, 0, gelu_buf, gelu_offset, intermediate_size,
-            );
-        } else {
-            self.encode_gelu_mul_at(
-                encoder, gate_out, 0, up_out, 0, gelu_buf, gelu_offset, intermediate_size,
-            );
+            if mlp_gate_up_dual_ggml_enabled() {
+                self.encode_matvec_q4_dual_ggml_at_view(
+                    encoder,
+                    gate,
+                    up,
+                    x_buf,
+                    x_offset,
+                    gate_out,
+                    0,
+                    up_out,
+                    0,
+                    intermediate_size,
+                    hidden_size,
+                );
+            } else {
+                self.encode_matvec_q4_at_view(
+                    encoder, gate, x_buf, x_offset, gate_out, 0, intermediate_size, hidden_size,
+                );
+                self.encode_matvec_q4_at_view(
+                    encoder, up, x_buf, x_offset, up_out, 0, intermediate_size, hidden_size,
+                );
+            }
+            if mlp_gelu_f16_enabled() {
+                self.encode_gelu_mul_f16_at(
+                    encoder, gate_out, 0, up_out, 0, gelu_buf, gelu_offset, intermediate_size,
+                );
+            } else {
+                self.encode_gelu_mul_at(
+                    encoder, gate_out, 0, up_out, 0, gelu_buf, gelu_offset, intermediate_size,
+                );
+            }
         }
         self.encode_mlp_down_q4_at_view(
             encoder,
