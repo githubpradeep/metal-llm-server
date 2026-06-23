@@ -2881,6 +2881,86 @@ kernel void attention_single_token_offset_f16(
     }
 }
 
+// ─── GQA-aware decode attention for f16 KV cache ─────────────────────────────
+// One threadgroup per KV head, one simdgroup (32 lanes) per query head in the
+// group. Each KV cache row is loaded once and reused for all query heads that
+// share it, cutting KV bandwidth by num_kv_groups. The per-head dot product is
+// reduced with simd_sum instead of a shared-memory tree.
+//
+// Requires num_kv_groups * 32 threads per threadgroup (max 4*32 = 128 for E4B)
+// and head_dim divisible by 32 and <= 512.
+
+kernel void attention_single_token_offset_f16_gqa(
+    device const float* Q [[buffer(0)]],
+    device const half* K_cache [[buffer(1)]],
+    device const half* V_cache [[buffer(2)]],
+    device float* output [[buffer(3)]],
+    constant uint& num_heads [[buffer(4)]],
+    constant uint& num_kv_heads [[buffer(5)]],
+    constant uint& num_kv_groups [[buffer(6)]],
+    constant uint& head_dim [[buffer(7)]],
+    constant uint& kv_seq [[buffer(8)]],
+    constant uint& k_cap [[buffer(9)]],
+    constant float& scale [[buffer(10)]],
+    constant uint& kv_start [[buffer(11)]],
+    ushort tid [[thread_index_in_threadgroup]],
+    uint tgid [[threadgroup_position_in_grid]]
+) {
+    const uint kv_h = tgid;
+    if (kv_h >= num_kv_heads) return;
+
+    const ushort lane = tid & 31u;
+    const ushort group = tid >> 5u;
+    if (group >= num_kv_groups) return;
+
+    const uint h = kv_h * num_kv_groups + group;
+    if (h >= num_heads) return;
+
+    const uint q_offset = h * head_dim;
+    const uint k_head_base = kv_h * k_cap * head_dim;
+    const uint v_head_base = kv_h * k_cap * head_dim;
+
+    // Per-lane accumulator for the dimensions this lane owns (head_dim/32 max 16).
+    float acc[16];
+    for (uint i = 0; i < head_dim / 32u; ++i) {
+        acc[i] = 0.0f;
+    }
+
+    float m = -INFINITY;
+    float l = 0.0f;
+
+    for (uint kv = 0; kv < kv_seq; ++kv) {
+        const uint actual_pos = kv_start + kv;
+        const uint k_offset = k_head_base + actual_pos * head_dim;
+
+        float dot = 0.0f;
+        for (uint d = lane; d < head_dim; d += 32u) {
+            dot += Q[q_offset + d] * float(K_cache[k_offset + d]);
+        }
+        dot = simd_sum(dot);
+
+        const float score = dot * scale;
+        const float new_m = max(m, score);
+        const float alpha = exp(m - new_m);
+        const float beta = exp(score - new_m);
+        const float new_l = l * alpha + beta;
+        const float old_factor = new_l > 0.0f ? (l * alpha) / new_l : 0.0f;
+        const float new_factor = new_l > 0.0f ? beta / new_l : 0.0f;
+        m = new_m;
+        l = new_l;
+
+        const uint v_offset = v_head_base + actual_pos * head_dim;
+        for (uint d = lane; d < head_dim; d += 32u) {
+            const uint idx = d / 32u;
+            acc[idx] = acc[idx] * old_factor + new_factor * float(V_cache[v_offset + d]);
+        }
+    }
+
+    for (uint d = lane; d < head_dim; d += 32u) {
+        output[q_offset + d] = acc[d / 32u];
+    }
+}
+
 // ─── Q8_0 KV Cache Append ────────────────────────────────────────────────────
 // Quantizes f32 K/V data to Q8_0 format and appends to quantized cache.
 // Q8_0 layout per group of 32: [2-byte f16 scale][32 int8 values] = 34 bytes per group
@@ -4926,6 +5006,260 @@ kernel void attention_flash_decode_q4_0_h512(
         Q, K_cache, V_cache, output, tgid, num_heads, num_kv_groups, capacity, row_bytes,
         kv_seq, kv_start, scale, tid, sgid, lane,
         shared_q, shared_scores, shared_exp, shared_update);
+}
+
+// ─── Tiled GQA-aware flash decode for Q4_0 KV cache ─────────────────────────
+// One threadgroup per KV head; all query heads sharing that KV head are
+// processed together.  Each query head gets (FLASH_TG_SIZE / SIMD_SIZE) /
+// num_kv_groups simdgroups.  The quantized K tile and V tile are each loaded
+// into threadgroup memory once per tile and reused by all query heads,
+// cutting KV cache device reads by num_kv_groups.
+
+constant uint GQA_MAX_GROUPS = 4;
+constant uint GQA_TILE_KV = 32;
+constant uint GQA_MAX_ROW_BYTES = (FLASH_MAX_HEAD / 32) * 18;
+
+inline void flash_zero_output_gqa(
+    device float* output,
+    uint out_base,
+    uint head_dim,
+    uint local_tid,
+    uint threads_per_head
+) {
+    for (uint d = local_tid * 4; d + 3 < head_dim; d += threads_per_head * 4) {
+        *reinterpret_cast<device float4*>(&output[out_base + d]) = float4(0.0f);
+    }
+    for (uint d = (head_dim / 4) * 4 + local_tid; d < head_dim; d += threads_per_head) {
+        output[out_base + d] = 0.0f;
+    }
+}
+
+inline void flash_load_q_gqa(
+    device const float* Q,
+    uint q_offset,
+    threadgroup float* shared_q,
+    uint head_dim,
+    uint local_tid,
+    uint threads_per_head
+) {
+    for (uint d = local_tid; d < head_dim; d += threads_per_head) {
+        shared_q[d] = Q[q_offset + d];
+    }
+}
+
+inline float q4_0_read_tg(threadgroup const uchar* qs, uint d) {
+    uint g = d / 32;
+    uint e = d % 32;
+    uint offset = g * 18;
+    float scale = float(*reinterpret_cast<threadgroup const half*>(&qs[offset]));
+    if (e < 16) {
+        return float(int(qs[offset + 2 + e] & 0xF) - 8) * scale;
+    } else {
+        return float(int(qs[offset + 2 + e - 16] >> 4) - 8) * scale;
+    }
+}
+
+inline float4 q4_0_read4_tg(threadgroup const uchar* qs, uint d) {
+    uint g = d / 32;
+    uint e = d % 32;
+    uint offset = g * 18;
+    float scale = float(*reinterpret_cast<threadgroup const half*>(&qs[offset]));
+    if (e + 3 < 16) {
+        return float4(
+            float(int(qs[offset + 2 + e + 0] & 0xF) - 8) * scale,
+            float(int(qs[offset + 2 + e + 1] & 0xF) - 8) * scale,
+            float(int(qs[offset + 2 + e + 2] & 0xF) - 8) * scale,
+            float(int(qs[offset + 2 + e + 3] & 0xF) - 8) * scale
+        );
+    }
+    if (e >= 16 && e + 3 < 32) {
+        uint b = e - 16;
+        return float4(
+            float(int(qs[offset + 2 + b + 0] >> 4) - 8) * scale,
+            float(int(qs[offset + 2 + b + 1] >> 4) - 8) * scale,
+            float(int(qs[offset + 2 + b + 2] >> 4) - 8) * scale,
+            float(int(qs[offset + 2 + b + 3] >> 4) - 8) * scale
+        );
+    }
+    return float4(
+        q4_0_read_tg(qs, d),
+        q4_0_read_tg(qs, d + 1),
+        q4_0_read_tg(qs, d + 2),
+        q4_0_read_tg(qs, d + 3)
+    );
+}
+
+inline float flash_dot_q4_k_tg(
+    threadgroup const uchar* k_row,
+    uint head_dim,
+    threadgroup float* shared_q,
+    uint lane
+) {
+    float partial = 0.0f;
+    for (uint d = lane * 4; d + 3 < head_dim; d += SIMD_SIZE * 4) {
+        float4 qv = float4(shared_q[d], shared_q[d + 1], shared_q[d + 2], shared_q[d + 3]);
+        float4 kv = q4_0_read4_tg(k_row, d);
+        partial += dot(qv, kv);
+    }
+    for (uint d = (head_dim / 4) * 4 + lane; d < head_dim; d += SIMD_SIZE) {
+        partial += shared_q[d] * q4_0_read_tg(k_row, d);
+    }
+    return partial;
+}
+
+inline void flash_load_kv_tile_q4(
+    device const uchar* cache,
+    uint head_base,
+    uint row_start,
+    uint tile_count,
+    uint row_bytes,
+    uint tid,
+    uint tg_size,
+    threadgroup uchar* shared_tile
+) {
+    uint total_bytes = tile_count * row_bytes;
+    uint base = head_base + row_start * row_bytes;
+    for (uint i = tid * 4; i + 3 < total_bytes; i += tg_size * 4) {
+        *reinterpret_cast<threadgroup uint*>(&shared_tile[i]) =
+            *reinterpret_cast<device const uint*>(&cache[base + i]);
+    }
+    for (uint i = (total_bytes / 4) * 4 + tid; i < total_bytes; i += tg_size) {
+        shared_tile[i] = cache[base + i];
+    }
+}
+
+inline void flash_accum_v_q4_tg(
+    device float* output,
+    uint out_base,
+    threadgroup const uchar* v_tile,
+    uint row_bytes,
+    uint head_dim,
+    uint tile_count,
+    threadgroup float* shared_exp,
+    float old_factor,
+    float inv_l,
+    uint local_tid,
+    uint threads_per_head
+) {
+    for (uint d = local_tid * 4; d + 3 < head_dim; d += threads_per_head * 4) {
+        uint out_idx = out_base + d;
+        float4 ov = *reinterpret_cast<device float4*>(&output[out_idx]);
+        float4 acc = float4(0.0f);
+        for (uint kv_offset = 0; kv_offset < tile_count; kv_offset++) {
+            acc += shared_exp[kv_offset] * q4_0_read4_tg(v_tile + kv_offset * row_bytes, d);
+        }
+        ov = ov * old_factor + acc * inv_l;
+        *reinterpret_cast<device float4*>(&output[out_idx]) = ov;
+    }
+    for (uint d = (head_dim / 4) * 4 + local_tid; d < head_dim; d += threads_per_head) {
+        uint out_idx = out_base + d;
+        float acc = 0.0f;
+        for (uint kv_offset = 0; kv_offset < tile_count; kv_offset++) {
+            acc += shared_exp[kv_offset] * q4_0_read_tg(v_tile + kv_offset * row_bytes, d);
+        }
+        output[out_idx] = output[out_idx] * old_factor + acc * inv_l;
+    }
+}
+
+kernel void attention_flash_decode_q4_0_gqa(
+    device const float* Q [[buffer(0)]],
+    device const uchar* K_cache [[buffer(1)]],
+    device const uchar* V_cache [[buffer(2)]],
+    device float* output [[buffer(3)]],
+    constant uint& num_heads [[buffer(4)]],
+    constant uint& num_kv_heads [[buffer(5)]],
+    constant uint& num_kv_groups [[buffer(6)]],
+    constant uint& head_dim [[buffer(7)]],
+    constant uint& kv_seq [[buffer(8)]],
+    constant uint& capacity [[buffer(9)]],
+    constant float& scale [[buffer(10)]],
+    constant uint& kv_start [[buffer(11)]],
+    constant uint& groups_per_row [[buffer(12)]],
+    constant uint& row_bytes [[buffer(13)]],
+    uint tid [[thread_index_in_threadgroup]],
+    uint tgid [[threadgroup_position_in_grid]],
+    uint sgid [[simdgroup_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]]
+) {
+    (void)groups_per_row;
+    const uint kv_h = tgid;
+    if (kv_h >= num_kv_heads) return;
+    if (num_kv_groups == 0 || num_kv_groups > GQA_MAX_GROUPS) return;
+
+    const uint num_simds_total = FLASH_TG_SIZE / SIMD_SIZE;
+    if (num_kv_groups > num_simds_total) return;
+    if (num_simds_total % num_kv_groups != 0) return;
+
+    const uint simds_per_head = num_simds_total / num_kv_groups;
+    const uint threads_per_head = simds_per_head * SIMD_SIZE;
+    const uint group = sgid / simds_per_head;
+    const uint local_sgid = sgid % simds_per_head;
+    const uint local_tid = local_sgid * SIMD_SIZE + lane;
+    const uint h = kv_h * num_kv_groups + group;
+    if (h >= num_heads) return;
+
+    const uint q_offset = h * head_dim;
+    const uint k_head_base = kv_h * capacity * row_bytes;
+    const uint v_head_base = kv_h * capacity * row_bytes;
+
+    threadgroup float shared_q[GQA_MAX_GROUPS * FLASH_MAX_HEAD];
+    threadgroup float shared_scores[GQA_MAX_GROUPS * GQA_TILE_KV];
+    threadgroup float shared_exp[GQA_TILE_KV];
+    threadgroup float shared_update[GQA_MAX_GROUPS * 4];
+    threadgroup uchar shared_kv_tile[GQA_TILE_KV * GQA_MAX_ROW_BYTES];
+
+    threadgroup float* q_head = shared_q + group * FLASH_MAX_HEAD;
+    threadgroup float* scores_head = shared_scores + group * GQA_TILE_KV;
+    threadgroup float* update_head = shared_update + group * 4;
+
+    if (local_tid == 0) {
+        update_head[0] = -INFINITY;
+        update_head[1] = 0.0f;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    flash_zero_output_gqa(output, q_offset, head_dim, local_tid, threads_per_head);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    flash_load_q_gqa(Q, q_offset, q_head, head_dim, local_tid, threads_per_head);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint kv_tile = 0; kv_tile < kv_seq; kv_tile += GQA_TILE_KV) {
+        uint tile_count = min(GQA_TILE_KV, kv_seq - kv_tile);
+        uint row_start = kv_start + kv_tile;
+
+        flash_load_kv_tile_q4(
+            K_cache, k_head_base, row_start, tile_count, row_bytes,
+            tid, FLASH_TG_SIZE, shared_kv_tile);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        for (uint wave = local_sgid; wave < tile_count; wave += simds_per_head) {
+            uint kv_offset = wave;
+            float partial = flash_dot_q4_k_tg(
+                shared_kv_tile + kv_offset * row_bytes, head_dim, q_head, lane);
+            partial = simd_sum(partial);
+            if (lane == 0) {
+                scores_head[kv_offset] = partial * scale;
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        if (local_tid == 0) {
+            flash_softmax_tile(scores_head, shared_exp, update_head, tile_count);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        flash_load_kv_tile_q4(
+            V_cache, v_head_base, row_start, tile_count, row_bytes,
+            tid, FLASH_TG_SIZE, shared_kv_tile);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        float old_factor = update_head[2];
+        float inv_l = update_head[3];
+        flash_accum_v_q4_tg(
+            output, q_offset, shared_kv_tile, row_bytes, head_dim,
+            tile_count, shared_exp, old_factor, inv_l, local_tid, threads_per_head);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
 }
 
 template<uint HEAD_DIM, uint TILE_KV>

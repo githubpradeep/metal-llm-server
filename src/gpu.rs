@@ -166,6 +166,33 @@ pub fn attention_use_ggml() -> bool {
     matches!(attention_kernel_mode(), AttentionKernelMode::Ggml)
 }
 
+/// Use the GQA-aware f16 decode attention kernel that processes all query heads
+/// sharing a KV head in one threadgroup. Experimental; the simple SIMD-reduction
+/// variant currently loses to the tiled flash-decode kernel, so it is opt-in
+/// via ATTENTION_GQA_F16=1 until a tiled GQA kernel is implemented.
+pub fn attention_gqa_f16_enabled(num_kv_groups: u32) -> bool {
+    if num_kv_groups <= 1 {
+        return false;
+    }
+    matches!(
+        std::env::var("ATTENTION_GQA_F16").as_deref(),
+        Ok("1") | Ok("true") | Ok("TRUE")
+    )
+}
+
+/// Use the tiled GQA-aware Q4_0 flash-decode kernel that processes all query
+/// heads sharing a KV head in one threadgroup. Experimental; opt-in via
+/// ATTENTION_GQA_Q4=1 until it is validated to beat the per-query-head kernel.
+pub fn attention_gqa_q4_0_enabled(num_kv_groups: u32) -> bool {
+    if num_kv_groups <= 1 {
+        return false;
+    }
+    matches!(
+        std::env::var("ATTENTION_GQA_Q4").as_deref(),
+        Ok("1") | Ok("true") | Ok("TRUE")
+    )
+}
+
 fn attention_q4_hd_specialized() -> bool {
     matches!(
         attention_kernel_mode(),
@@ -403,6 +430,7 @@ pub struct MetalContext {
     pub rotary_partial_pipeline: ComputePipelineState,
     pub attention_offset_pipeline: ComputePipelineState,
     pub attention_offset_f16_pipeline: ComputePipelineState,
+    pub attention_offset_f16_gqa_pipeline: ComputePipelineState,
     pub attention_causal_f16_pipeline: ComputePipelineState,
     pub attention_causal_strided_f16_pipeline: ComputePipelineState,
     pub vec_scale_pipeline: ComputePipelineState,
@@ -419,6 +447,7 @@ pub struct MetalContext {
     pub attention_offset_q4_0_h256_pipeline: ComputePipelineState,
     pub attention_offset_q4_0_h128_pipeline: ComputePipelineState,
     pub attention_offset_q4_0_h512_pipeline: ComputePipelineState,
+    pub attention_offset_q4_0_gqa_pipeline: ComputePipelineState,
     pub attention_fused_q4_0_pipeline: ComputePipelineState,
     pub attention_fused_q4_0_h256_pipeline: ComputePipelineState,
     pub attention_fused_q4_0_h128_pipeline: ComputePipelineState,
@@ -576,6 +605,7 @@ impl MetalContext {
         } else {
             "attention_single_token_offset_f16"
         });
+        let attention_offset_f16_gqa_pipeline = get_fn("attention_single_token_offset_f16_gqa");
         let attention_causal_f16_pipeline = get_fn(if use_flash_attention {
             "attention_flash_causal_f16"
         } else {
@@ -605,6 +635,7 @@ impl MetalContext {
         let attention_offset_q4_0_h256_pipeline = get_fn("attention_flash_decode_q4_0_h256");
         let attention_offset_q4_0_h128_pipeline = get_fn("attention_flash_decode_q4_0_h128");
         let attention_offset_q4_0_h512_pipeline = get_fn("attention_flash_decode_q4_0_h512");
+        let attention_offset_q4_0_gqa_pipeline = get_fn("attention_flash_decode_q4_0_gqa");
         let attention_fused_q4_0_pipeline = get_fn("attention_flash_decode_fused_q4_0");
         let attention_fused_q4_0_h256_pipeline = get_fn("attention_flash_decode_fused_q4_0_h256");
         let attention_fused_q4_0_h128_pipeline = get_fn("attention_flash_decode_fused_q4_0_h128");
@@ -668,6 +699,14 @@ impl MetalContext {
             if fused_k_attn_enabled() {
                 println!(
                     "  Fused K-norm + RoPE + V-norm + KV append into Q4 flash (FUSED_K_ATTN=0 to disable)"
+                );
+            }
+            if matches!(
+                std::env::var("ATTENTION_GQA_Q4").as_deref(),
+                Ok("1") | Ok("true") | Ok("TRUE")
+            ) {
+                println!(
+                    "  GQA-aware tiled Q4_0 flash-decode attention (ATTENTION_GQA_Q4=1)"
                 );
             }
             if packed_mlp_gate_up_enabled() {
@@ -773,6 +812,7 @@ impl MetalContext {
             rotary_partial_pipeline,
             attention_offset_pipeline,
             attention_offset_f16_pipeline,
+            attention_offset_f16_gqa_pipeline,
             attention_causal_f16_pipeline,
             attention_causal_strided_f16_pipeline,
             vec_scale_pipeline,
@@ -789,6 +829,7 @@ impl MetalContext {
             attention_offset_q4_0_h256_pipeline,
             attention_offset_q4_0_h128_pipeline,
             attention_offset_q4_0_h512_pipeline,
+            attention_offset_q4_0_gqa_pipeline,
             attention_fused_q4_0_pipeline,
             attention_fused_q4_0_h256_pipeline,
             attention_fused_q4_0_h128_pipeline,
@@ -3155,6 +3196,44 @@ impl MetalContext {
         encoder.dispatch_thread_groups(MTLSize::new(num_heads as u64, 1, 1), tg_size);
     }
 
+    /// GQA-aware f16 decode attention: one threadgroup per KV head, one
+    /// simdgroup per query head in the group. Reduces KV cache reads by
+    /// num_kv_groups compared to the per-query-head kernel.
+    pub fn encode_attention_with_offset_f16_gqa_at(
+        &self,
+        encoder: &metal::ComputeCommandEncoderRef,
+        q_buf: &Buffer,
+        q_offset: u64,
+        k_cache_buf: &Buffer,
+        v_cache_buf: &Buffer,
+        out_buf: &Buffer,
+        out_offset: u64,
+        num_heads: u32,
+        num_kv_heads: u32,
+        num_kv_groups: u32,
+        head_dim: u32,
+        kv_seq: u32,
+        k_cap: u32,
+        scale: f32,
+        kv_start: u32,
+    ) {
+        encoder.set_compute_pipeline_state(&self.attention_offset_f16_gqa_pipeline);
+        encoder.set_buffer(0, Some(q_buf), q_offset);
+        encoder.set_buffer(1, Some(k_cache_buf), 0);
+        encoder.set_buffer(2, Some(v_cache_buf), 0);
+        encoder.set_buffer(3, Some(out_buf), out_offset);
+        encoder.set_bytes(4, 4, &num_heads as *const u32 as *const _);
+        encoder.set_bytes(5, 4, &num_kv_heads as *const u32 as *const _);
+        encoder.set_bytes(6, 4, &num_kv_groups as *const u32 as *const _);
+        encoder.set_bytes(7, 4, &head_dim as *const u32 as *const _);
+        encoder.set_bytes(8, 4, &kv_seq as *const u32 as *const _);
+        encoder.set_bytes(9, 4, &k_cap as *const u32 as *const _);
+        encoder.set_bytes(10, 4, &scale as *const f32 as *const _);
+        encoder.set_bytes(11, 4, &kv_start as *const u32 as *const _);
+        let tg_size = MTLSize::new((num_kv_groups * 32) as u64, 1, 1);
+        encoder.dispatch_thread_groups(MTLSize::new(num_kv_heads as u64, 1, 1), tg_size);
+    }
+
     pub fn encode_vec_add(
         &self,
         encoder: &metal::ComputeCommandEncoderRef,
@@ -4356,6 +4435,72 @@ impl MetalContext {
         encoder.set_bytes(13, 4, &row_bytes as *const u32 as *const _);
         let tg_size = attention_threadgroup_size(self.use_flash_attention);
         encoder.dispatch_thread_groups(MTLSize::new(num_heads as u64, 1, 1), tg_size);
+    }
+
+    /// GQA-aware tiled Q4_0 flash decode: one threadgroup per KV head, all
+    /// query heads in the GQA group processed together.
+    pub fn encode_attention_with_offset_q4_0_gqa(
+        &self,
+        encoder: &metal::ComputeCommandEncoderRef,
+        q_buf: &Buffer,
+        k_cache_buf: &Buffer,
+        v_cache_buf: &Buffer,
+        out_buf: &Buffer,
+        num_heads: u32,
+        num_kv_heads: u32,
+        num_kv_groups: u32,
+        head_dim: u32,
+        kv_seq: u32,
+        capacity: u32,
+        scale: f32,
+        kv_start: u32,
+        groups_per_row: u32,
+        row_bytes: u32,
+    ) {
+        self.encode_attention_with_offset_q4_0_gqa_at(
+            encoder, q_buf, 0, k_cache_buf, v_cache_buf, out_buf, 0,
+            num_heads, num_kv_heads, num_kv_groups, head_dim, kv_seq, capacity,
+            scale, kv_start, groups_per_row, row_bytes,
+        );
+    }
+
+    pub fn encode_attention_with_offset_q4_0_gqa_at(
+        &self,
+        encoder: &metal::ComputeCommandEncoderRef,
+        q_buf: &Buffer,
+        q_offset: u64,
+        k_cache_buf: &Buffer,
+        v_cache_buf: &Buffer,
+        out_buf: &Buffer,
+        out_offset: u64,
+        num_heads: u32,
+        num_kv_heads: u32,
+        num_kv_groups: u32,
+        head_dim: u32,
+        kv_seq: u32,
+        capacity: u32,
+        scale: f32,
+        kv_start: u32,
+        groups_per_row: u32,
+        row_bytes: u32,
+    ) {
+        encoder.set_compute_pipeline_state(&self.attention_offset_q4_0_gqa_pipeline);
+        encoder.set_buffer(0, Some(q_buf), q_offset);
+        encoder.set_buffer(1, Some(k_cache_buf), 0);
+        encoder.set_buffer(2, Some(v_cache_buf), 0);
+        encoder.set_buffer(3, Some(out_buf), out_offset);
+        encoder.set_bytes(4, 4, &num_heads as *const u32 as *const _);
+        encoder.set_bytes(5, 4, &num_kv_heads as *const u32 as *const _);
+        encoder.set_bytes(6, 4, &num_kv_groups as *const u32 as *const _);
+        encoder.set_bytes(7, 4, &head_dim as *const u32 as *const _);
+        encoder.set_bytes(8, 4, &kv_seq as *const u32 as *const _);
+        encoder.set_bytes(9, 4, &capacity as *const u32 as *const _);
+        encoder.set_bytes(10, 4, &scale as *const f32 as *const _);
+        encoder.set_bytes(11, 4, &kv_start as *const u32 as *const _);
+        encoder.set_bytes(12, 4, &groups_per_row as *const u32 as *const _);
+        encoder.set_bytes(13, 4, &row_bytes as *const u32 as *const _);
+        let tg_size = attention_threadgroup_size(self.use_flash_attention);
+        encoder.dispatch_thread_groups(MTLSize::new(num_kv_heads as u64, 1, 1), tg_size);
     }
 
     pub fn encode_attention_causal_q8_0(
