@@ -1,0 +1,382 @@
+#include <metal_stdlib>
+using namespace metal;
+
+// TurboQuant rotation: Y = X @ M
+//
+// X : [rows, dim]   row-major f32   (each row is one head's vector for one token)
+// Y : [rows, dim]   row-major f32   (must not alias X)
+// M : [dim, dim]    row-major f32   (M[k*dim + c]) — Rᵀ for forward rotation,
+//                                    R for the inverse (un-rotation)
+//
+// One threadgroup per row. The row of X is staged in threadgroup memory and each
+// thread strides over the output columns computing a full dot product against a
+// column of M. `dim` is bounded by the model's max head dimension (<= 512), so the
+// staging buffer is a fixed 512 floats (2 KiB).
+kernel void turboquant_rotate(
+    device const float* X       [[buffer(0)]],
+    device float*       Y       [[buffer(1)]],
+    device const float* M       [[buffer(2)]],
+    constant uint&      dim     [[buffer(3)]],
+    uint  row     [[threadgroup_position_in_grid]],
+    uint  tid     [[thread_position_in_threadgroup]],
+    uint  tg_size [[threads_per_threadgroup]])
+{
+    threadgroup float xs[512];
+
+    const uint base = row * dim;
+
+    // Stage the input row.
+    for (uint k = tid; k < dim; k += tg_size) {
+        xs[k] = X[base + k];
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // Y[row, c] = sum_k xs[k] * M[k*dim + c]
+    for (uint c = tid; c < dim; c += tg_size) {
+        float acc = 0.0f;
+        uint mi = c;                 // M[0*dim + c]
+        for (uint k = 0; k < dim; k++) {
+            acc += xs[k] * M[mi];
+            mi += dim;               // step to M[(k+1)*dim + c]
+        }
+        Y[base + c] = acc;
+    }
+}
+
+// ─── TurboQuant V3 (2/3-bit Lloyd–Max) ───────────────────────────────────────
+//
+// Row layout in the cache (one row per (kv_head, token)):
+//   [ fp16 L2 norm | bit-packed per-coordinate codebook indices ]
+// Indices are packed LSB-first: coordinate d occupies bits [d*bits, d*bits+bits).
+// row_bytes = 2 + ceil(head_dim*bits/8) (always exact for head_dim % 32 == 0).
+
+#define TQ_MAX_KV 4096
+
+// Read the `bits`-wide packed index for coordinate `d` from a row's index bytes.
+inline uint tq_unpack(device const uchar* qs, uint d, uint bits, uint mask) {
+    uint bitpos = d * bits;
+    uint bi = bitpos >> 3;
+    uint wi = bitpos & 7u;
+    uint lo = qs[bi];
+    uint hi = (wi + bits > 8u) ? uint(qs[bi + 1]) : 0u;
+    return ((lo | (hi << 8)) >> wi) & mask;
+}
+
+// Quantize already-rotated vectors into the V3 layout. One thread per row
+// (= per kv head); decode only ever appends a single token, so rows is tiny.
+kernel void turboquant_quant_v3(
+    device const float* in        [[buffer(0)]],  // [rows, head_dim] rotated f32
+    device uchar*       cache     [[buffer(1)]],
+    device const float* centroids [[buffer(2)]],  // [2^bits]
+    constant uint&      head_dim  [[buffer(3)]],
+    constant uint&      capacity  [[buffer(4)]],
+    constant uint&      cur_seq   [[buffer(5)]],
+    constant uint&      bits      [[buffer(6)]],
+    constant uint&      row_bytes [[buffer(7)]],
+    constant uint&      rows      [[buffer(8)]],
+    device float*       window    [[buffer(9)]],  // [rows, rw, head_dim] f32 ring, or null
+    constant uint&      rw        [[buffer(10)]], // residual window length (0 = disabled)
+    uint gid [[thread_position_in_grid]])
+{
+    if (gid >= rows) return;
+    uint n_levels = 1u << bits;
+    uint base_in = gid * head_dim;
+
+    // Residual window: store this token's full-precision rotated vector in the ring
+    // slot for its absolute position. Read back exactly during recent-token attention.
+    if (rw > 0u) {
+        uint slot = cur_seq % rw;
+        device float* w = window + (gid * rw + slot) * head_dim;
+        for (uint d = 0; d < head_dim; d++) w[d] = in[base_in + d];
+    }
+
+    // L2 norm (rotation-invariant, so equals the original vector's norm).
+    float ss = 0.0f;
+    for (uint d = 0; d < head_dim; d++) {
+        float v = in[base_in + d];
+        ss += v * v;
+    }
+    float norm = sqrt(ss);
+    float inv = norm > 0.0f ? 1.0f / norm : 0.0f;
+
+    uint row_off = gid * capacity * row_bytes + cur_seq * row_bytes;
+    *reinterpret_cast<device half*>(&cache[row_off]) = half(norm);
+    device uchar* qs = cache + row_off + 2;
+
+    uint idx_bytes = row_bytes - 2;
+    for (uint i = 0; i < idx_bytes; i++) qs[i] = 0;
+
+    for (uint d = 0; d < head_dim; d++) {
+        float u = in[base_in + d] * inv;
+        // Nearest centroid (n_levels <= 16).
+        uint best = 0;
+        float bd = INFINITY;
+        for (uint i = 0; i < n_levels; i++) {
+            float dd = fabs(u - centroids[i]);
+            if (dd < bd) { bd = dd; best = i; }
+        }
+        uint bitpos = d * bits;
+        uint bi = bitpos >> 3;
+        uint wi = bitpos & 7u;
+        qs[bi] |= uchar((best << wi) & 0xFFu);
+        if (wi + bits > 8u) {
+            qs[bi + 1] |= uchar(best >> (8u - wi));
+        }
+    }
+}
+
+// Threadgroup reduction helpers (one partial per simdgroup, combined by lane 0).
+// `red` must hold at least ceil(tg_size/32) floats.
+inline float tq_tg_max(float v, threadgroup float* red, uint tid, uint tg_size,
+                        uint sg_id, uint sg_lane) {
+    float sg = simd_max(v);
+    if (sg_lane == 0) red[sg_id] = sg;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float m = -INFINITY;
+    uint nsg = (tg_size + 31u) / 32u;
+    for (uint i = 0; i < nsg; i++) m = max(m, red[i]);
+    return m;
+}
+inline float tq_tg_sum(float v, threadgroup float* red, uint tid, uint tg_size,
+                       uint sg_id, uint sg_lane) {
+    float sg = simd_sum(v);
+    if (sg_lane == 0) red[sg_id] = sg;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float s = 0.0f;
+    uint nsg = (tg_size + 31u) / 32u;
+    for (uint i = 0; i < nsg; i++) s += red[i];
+    return s;
+}
+
+// Fused rotate + quantize + residual-window store. One threadgroup per row
+// (= per kv head). Reads the *un-rotated* (qk-normed / RoPE'd) vector directly,
+// rotates it into the Haar frame in threadgroup memory, then computes the L2
+// norm, stores the full-precision rotated vector into the ring window, and packs
+// the Lloyd–Max indices — all without any intermediate global buffer.
+kernel void turboquant_rotate_quant_v3(
+    device const float* in_normed [[buffer(0)]],  // [rows, head_dim] un-rotated
+    device uchar*       cache     [[buffer(1)]],
+    device const float* centroids [[buffer(2)]],  // [2^bits]
+    constant uint&      head_dim  [[buffer(3)]],
+    constant uint&      capacity  [[buffer(4)]],
+    constant uint&      cur_seq   [[buffer(5)]],
+    constant uint&      bits      [[buffer(6)]],
+    constant uint&      row_bytes [[buffer(7)]],
+    constant uint&      rows      [[buffer(8)]],
+    device float*       window    [[buffer(9)]],   // [rows, rw, head_dim] f32 ring, or null
+    constant uint&      rw        [[buffer(10)]],
+    device const float* fwd       [[buffer(11)]],  // Rᵀ rotation matrix [head_dim, head_dim]
+    uint tid     [[thread_index_in_threadgroup]],
+    uint tg_size [[threads_per_threadgroup]],
+    uint sg_id   [[simdgroup_index_in_threadgroup]],
+    uint sg_lane [[thread_index_in_simdgroup]],
+    uint row     [[threadgroup_position_in_grid]])
+{
+    if (row >= rows) return;
+    uint n_levels = 1u << bits;
+    uint base_in = row * head_dim;
+
+    threadgroup float xs[512];     // staged input row
+    threadgroup float rot[512];    // rotated vector
+    threadgroup uint  idxs[512];   // per-coordinate centroid index
+    threadgroup float red[32];
+    threadgroup float tg_norm;
+
+    for (uint k = tid; k < head_dim; k += tg_size) xs[k] = in_normed[base_in + k];
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // rot[c] = sum_k xs[k] * fwd[k*dim + c]  (coalesced fwd reads across threads)
+    for (uint c = tid; c < head_dim; c += tg_size) {
+        float acc = 0.0f;
+        uint mi = c;
+        for (uint k = 0; k < head_dim; k++) { acc += xs[k] * fwd[mi]; mi += head_dim; }
+        rot[c] = acc;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // L2 norm via parallel reduction.
+    float local_ss = 0.0f;
+    for (uint d = tid; d < head_dim; d += tg_size) local_ss += rot[d] * rot[d];
+    float ss = tq_tg_sum(local_ss, red, tid, tg_size, sg_id, sg_lane);
+    if (tid == 0) tg_norm = sqrt(ss);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float norm = tg_norm;
+    float invn = norm > 0.0f ? 1.0f / norm : 0.0f;
+
+    // Full-precision residual window store (rotated vector).
+    if (rw > 0u) {
+        uint slot = cur_seq % rw;
+        device float* w = window + (row * rw + slot) * head_dim;
+        for (uint d = tid; d < head_dim; d += tg_size) w[d] = rot[d];
+    }
+
+    // Nearest centroid for each coordinate of the unit-normalized rotated vector.
+    for (uint d = tid; d < head_dim; d += tg_size) {
+        float u = rot[d] * invn;
+        uint best = 0;
+        float bd = INFINITY;
+        for (uint i = 0; i < n_levels; i++) {
+            float dd = fabs(u - centroids[i]);
+            if (dd < bd) { bd = dd; best = i; }
+        }
+        idxs[d] = best;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // Thread 0 writes the norm and bit-packs the indices (adjacent coords share a
+    // byte, so packing is serialized to avoid read-modify-write races).
+    uint row_off = row * capacity * row_bytes + cur_seq * row_bytes;
+    if (tid == 0) {
+        *reinterpret_cast<device half*>(&cache[row_off]) = half(norm);
+        device uchar* qs = cache + row_off + 2;
+        uint idx_bytes = row_bytes - 2;
+        for (uint i = 0; i < idx_bytes; i++) qs[i] = 0;
+        for (uint d = 0; d < head_dim; d++) {
+            uint best = idxs[d];
+            uint bitpos = d * bits;
+            uint bi = bitpos >> 3;
+            uint wi = bitpos & 7u;
+            qs[bi] |= uchar((best << wi) & 0xFFu);
+            if (wi + bits > 8u) qs[bi + 1] |= uchar(best >> (8u - wi));
+        }
+    }
+}
+
+// Single-token (decode) attention over the V3 cache, fully fused: one threadgroup
+// per query head rotates Q into the Haar frame, runs the attention (with parallel
+// softmax reductions), then un-rotates the output back to the model frame — no
+// intermediate global buffers. Q_in and `output` are both in the model frame.
+kernel void turboquant_attn_v3(
+    device const float* Q_in      [[buffer(0)]],  // [num_heads, head_dim] un-rotated
+    device const uchar* K_cache   [[buffer(1)]],
+    device const uchar* V_cache   [[buffer(2)]],
+    device float*       output    [[buffer(3)]],  // [num_heads, head_dim] model frame
+    constant uint&      num_heads     [[buffer(4)]],
+    constant uint&      num_kv_heads  [[buffer(5)]],
+    constant uint&      num_kv_groups [[buffer(6)]],
+    constant uint&      head_dim      [[buffer(7)]],
+    constant uint&      kv_seq        [[buffer(8)]],
+    constant uint&      capacity      [[buffer(9)]],
+    constant float&     scale         [[buffer(10)]],
+    constant uint&      kv_start      [[buffer(11)]],
+    constant uint&      bits          [[buffer(12)]],
+    constant uint&      row_bytes     [[buffer(13)]],
+    device const float* centroids     [[buffer(14)]],
+    device const float* Kwin          [[buffer(15)]],  // [num_kv_heads, rw, head_dim] f32
+    device const float* Vwin          [[buffer(16)]],
+    constant uint&      rw            [[buffer(17)]],   // residual window length (0 = disabled)
+    constant uint&      window_lo     [[buffer(18)]],   // smallest absolute pos served from window
+    device const float* fwd           [[buffer(19)]],   // Rᵀ — rotate Q into Haar frame
+    device const float* inv           [[buffer(20)]],   // R  — un-rotate output
+    uint tid     [[thread_index_in_threadgroup]],
+    uint tg_size [[threads_per_threadgroup]],
+    uint sg_id   [[simdgroup_index_in_threadgroup]],
+    uint sg_lane [[thread_index_in_simdgroup]],
+    uint tgid    [[threadgroup_position_in_grid]])
+{
+    uint h = tgid;
+    if (h >= num_heads) return;
+
+    uint kv_h = h / num_kv_groups;
+    uint q_off = h * head_dim;
+    uint kv_base = kv_h * capacity * row_bytes;
+    uint n_levels = 1u << bits;
+    uint mask = n_levels - 1u;
+
+    threadgroup float cen[16];
+    threadgroup float qrot[512];   // rotated query
+    threadgroup float orot[512];   // staging for Q row, then rotated output
+    threadgroup float scores[TQ_MAX_KV];
+    threadgroup float red[32];
+    threadgroup float tg_m;
+    threadgroup float tg_inv_l;
+
+    for (uint i = tid; i < n_levels; i += tg_size) cen[i] = centroids[i];
+
+    // Rotate Q into the Haar frame: qrot[c] = sum_k Q_in[k] * fwd[k*dim + c].
+    for (uint k = tid; k < head_dim; k += tg_size) orot[k] = Q_in[q_off + k];
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint c = tid; c < head_dim; c += tg_size) {
+        float acc = 0.0f;
+        uint mi = c;
+        for (uint k = 0; k < head_dim; k++) { acc += orot[k] * fwd[mi]; mi += head_dim; }
+        qrot[c] = acc;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    uint n_pos = (kv_seq > kv_start) ? (kv_seq - kv_start) : 0u;
+    n_pos = min(n_pos, (uint)TQ_MAX_KV);
+
+    // Pass 1: scores = scale * norm_k * <q_rot, dequant(k_rot)>. Recent positions
+    // (pos >= window_lo) are served from the full-precision residual window instead.
+    for (uint j = tid; j < n_pos; j += tg_size) {
+        uint pos = kv_start + j;
+        float sc;
+        if (rw > 0u && pos >= window_lo) {
+            device const float* kw = Kwin + (kv_h * rw + (pos % rw)) * head_dim;
+            float dot = 0.0f;
+            for (uint d = 0; d < head_dim; d++) dot += qrot[d] * kw[d];
+            sc = dot * scale;  // window stores full-magnitude rotated K (no separate norm)
+        } else {
+            uint row = kv_base + pos * row_bytes;
+            float norm = float(*reinterpret_cast<device const half*>(&K_cache[row]));
+            device const uchar* qs = K_cache + row + 2;
+            float dot = 0.0f;
+            for (uint d = 0; d < head_dim; d++) {
+                uint idx = tq_unpack(qs, d, bits, mask);
+                dot += qrot[d] * cen[idx];
+            }
+            sc = dot * scale * norm;
+        }
+        scores[j] = sc;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // Softmax max (parallel simdgroup reduction).
+    float local_m = -INFINITY;
+    for (uint j = tid; j < n_pos; j += tg_size) local_m = max(local_m, scores[j]);
+    float m = tq_tg_max(local_m, red, tid, tg_size, sg_id, sg_lane);
+    if (tid == 0) tg_m = m;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    m = tg_m;
+
+    for (uint j = tid; j < n_pos; j += tg_size) scores[j] = exp(scores[j] - m);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    float local_l = 0.0f;
+    for (uint j = tid; j < n_pos; j += tg_size) local_l += scores[j];
+    float l = tq_tg_sum(local_l, red, tid, tg_size, sg_id, sg_lane);
+    if (tid == 0) tg_inv_l = l > 0.0f ? 1.0f / l : 0.0f;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float inv_l = tg_inv_l;
+
+    // Pass 2: orot[d] = (sum_j w_j * v_j[d]) / l, recent positions from the window.
+    for (uint d = tid; d < head_dim; d += tg_size) {
+        float acc = 0.0f;
+        for (uint j = 0; j < n_pos; j++) {
+            uint pos = kv_start + j;
+            float vv;
+            if (rw > 0u && pos >= window_lo) {
+                device const float* vw = Vwin + (kv_h * rw + (pos % rw)) * head_dim;
+                vv = vw[d];
+            } else {
+                uint row = kv_base + pos * row_bytes;
+                float norm = float(*reinterpret_cast<device const half*>(&V_cache[row]));
+                device const uchar* qs = V_cache + row + 2;
+                uint idx = tq_unpack(qs, d, bits, mask);
+                vv = norm * cen[idx];
+            }
+            acc += scores[j] * vv;
+        }
+        orot[d] = acc * inv_l;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // Un-rotate the output back to the model frame: out[c] = sum_k orot[k]*inv[k*dim+c].
+    for (uint c = tid; c < head_dim; c += tg_size) {
+        float acc = 0.0f;
+        uint mi = c;
+        for (uint k = 0; k < head_dim; k++) { acc += orot[k] * inv[mi]; mi += head_dim; }
+        output[q_off + c] = acc;
+    }
+}

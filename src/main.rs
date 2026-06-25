@@ -17,6 +17,7 @@ mod model;
 mod quantize;
 mod sampling;
 mod scheduler;
+mod turboquant;
 mod weights;
 mod generation;
 mod server;

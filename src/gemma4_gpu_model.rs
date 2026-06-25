@@ -13,6 +13,95 @@ use crate::gpu::{BufferView, GpuTimestampProfiler, MetalContext, ProfileAblate, 
 use crate::kv_pool::{KvCachePool, KvPoolError, KvSlot, KvSlotView};
 use crate::mega_decode::{mega_kernel_enabled, MegaDecodeGraph, MegaScratchBuffers};
 
+/// Paths that do not yet implement TurboQuant rotation reject it with this message
+/// (rotation must be applied consistently across prefill and decode, so silently
+/// falling back to plain Q4_0 on some paths would corrupt the cache).
+const TURBOQUANT_UNSUPPORTED: &str = "TurboQuant KV cache is only supported on the \
+interactive single-token path (forward_single_token / forward_prefill_sample_last). \
+Use LLAMA_KV_CACHE_TYPE=q4_0 for batched/server/parallel-prefill paths.";
+
+/// Build TurboQuant rotation state (matrices + rotation scratch buffers).
+///
+/// Returns `None` rotation state for non-TurboQuant cache types, but always
+/// allocates the (tiny) scratch buffers so the struct fields are always valid.
+fn build_turboquant_state(
+    ctx: &MetalContext,
+    config: &Gemma4TextConfig,
+    kv_cache_type: KvCacheType,
+    kv_capacity: u32,
+) -> (
+    Option<crate::turboquant::TurboQuant>,
+    Buffer,
+    Buffer,
+    Buffer,
+    Buffer,
+    Vec<Buffer>,
+    Vec<Buffer>,
+    u32,
+) {
+    let max_head_dim = config.head_dim.max(config.global_head_dim);
+    let n_heads = config.num_attention_heads;
+    let n_kv_heads = config.num_key_value_heads;
+    let mk = |elems: usize| -> Buffer {
+        ctx.device.new_buffer(
+            (elems.max(1) * 4) as u64,
+            MTLResourceOptions::StorageModeShared,
+        )
+    };
+    let tq_q_rot = mk(n_heads * max_head_dim);
+    let tq_out = mk(n_heads * max_head_dim);
+    let tq_k_rot = mk(n_kv_heads * max_head_dim);
+    let tq_v_rot = mk(n_kv_heads * max_head_dim);
+
+    let mut tq_rw_k: Vec<Buffer> = Vec::new();
+    let mut tq_rw_v: Vec<Buffer> = Vec::new();
+    let mut tq_rw: u32 = 0;
+
+    let turboquant = if let KvCacheType::TurboQuant { bits } = kv_cache_type {
+        let mut dims: Vec<usize> = vec![config.head_dim, config.global_head_dim];
+        dims.sort_unstable();
+        dims.dedup();
+        let variant = if bits == 4 { "rotation + Q4_0" } else { "rotation + Lloyd-Max V3" };
+
+        // Residual window: keep the most recent `rw` tokens' rotated K/V in full
+        // precision (f32) per layer. Only the V3 (2/3-bit) path consults it; 4-bit
+        // reuses the Q4_0 kernels and leaves these buffers empty. The window is the
+        // documented fix for the low-bit "tail derail" (rw=0 → garbage at length).
+        if bits != 4 {
+            tq_rw = std::env::var("TURBOQUANT_RESIDUAL_WINDOW")
+                .ok()
+                .and_then(|v| v.parse::<u32>().ok())
+                .unwrap_or(128);
+            // Clamp to capacity so the ring never aliases an attended position.
+            tq_rw = tq_rw.min(kv_capacity);
+            if tq_rw > 0 {
+                let window_elems = n_kv_heads * tq_rw as usize * max_head_dim;
+                for _ in 0..config.num_hidden_layers {
+                    tq_rw_k.push(mk(window_elems));
+                    tq_rw_v.push(mk(window_elems));
+                }
+                let mb = (config.num_hidden_layers * window_elems * 4 * 2) as f64 / 1.0e6;
+                println!(
+                    "  TurboQuant: residual window {} tokens (fp32 K/V, ~{:.0} MB)",
+                    tq_rw, mb
+                );
+            }
+        }
+
+        println!(
+            "  TurboQuant: {}-bit ({}), Haar rotations + codebooks for head_dims {:?}",
+            bits, variant, dims
+        );
+        Some(crate::turboquant::TurboQuant::new(&ctx.device, &dims, bits))
+    } else {
+        None
+    };
+
+    (
+        turboquant, tq_q_rot, tq_k_rot, tq_v_rot, tq_out, tq_rw_k, tq_rw_v, tq_rw,
+    )
+}
+
 /// Fused 3→1 operation: projection + norm + residual add
 /// 
 /// This combines three operations into one:
@@ -235,6 +324,19 @@ pub struct Gemma4GpuModel {
     pub kv_seq_len: u32,
     pub kv_capacity: u32,
     pub kv_cache_type: KvCacheType,
+
+    // TurboQuant: per-head_dim Haar rotation matrices + rotation scratch buffers.
+    // `Some` only when `kv_cache_type == KvCacheType::TurboQuant`.
+    turboquant: Option<crate::turboquant::TurboQuant>,
+    tq_q_rot: Buffer, // [num_heads * max_head_dim] rotated query
+    tq_k_rot: Buffer, // [num_kv_heads * max_head_dim] rotated key
+    tq_v_rot: Buffer, // [num_kv_heads * max_head_dim] rotated value
+    tq_out: Buffer,   // [num_heads * max_head_dim] un-rotated attention output
+    // Residual window (V3 2/3-bit only): most recent `tq_rw` tokens' rotated K/V
+    // kept in full precision (f32), one ring buffer per layer. Empty when unused.
+    tq_rw_k: Vec<Buffer>,
+    tq_rw_v: Vec<Buffer>,
+    tq_rw: u32,
 
     // Rotary precomputed buffers (per-layer since sliding/full differ)
     pub cos_buf: Buffer,
@@ -1022,6 +1124,8 @@ impl Gemma4GpuModel {
                     .new_buffer(byte_len, MTLResourceOptions::StorageModeShared),
             );
         }
+        let (turboquant, tq_q_rot, tq_k_rot, tq_v_rot, tq_out, tq_rw_k, tq_rw_v, tq_rw) =
+            build_turboquant_state(&ctx, &config, kv_cache_type, kv_capacity);
         let f16_bytes = num_kv_heads * kv_capacity as usize * config.head_dim * 2 + num_kv_heads * kv_capacity as usize * config.global_head_dim * 2;
         let quant_bytes = num_kv_heads * kv_capacity as usize * kv_cache_type.bytes_per_row(config.head_dim) + num_kv_heads * kv_capacity as usize * kv_cache_type.bytes_per_row(config.global_head_dim);
         println!("  KV cache type: {}, est. memory per layer: {:.1} MB (vs f16: {:.1} MB, {:.0}% savings)",
@@ -1135,6 +1239,14 @@ impl Gemma4GpuModel {
             kv_seq_len: 0,
             kv_capacity,
             kv_cache_type,
+            turboquant,
+            tq_q_rot,
+            tq_k_rot,
+            tq_v_rot,
+            tq_out,
+            tq_rw_k,
+            tq_rw_v,
+            tq_rw,
             cos_buf,
             sin_buf,
             decode_rope_cos_packed,
@@ -1720,6 +1832,8 @@ impl Gemma4GpuModel {
                     .new_buffer(byte_len, MTLResourceOptions::StorageModeShared),
             );
         }
+        let (turboquant, tq_q_rot, tq_k_rot, tq_v_rot, tq_out, tq_rw_k, tq_rw_v, tq_rw) =
+            build_turboquant_state(&ctx, &config, kv_cache_type, kv_capacity);
         let f16_bytes = num_kv_heads * kv_capacity as usize * config.head_dim * 2
             + num_kv_heads * kv_capacity as usize * config.global_head_dim * 2;
         let quant_bytes = num_kv_heads * kv_capacity as usize * kv_cache_type.bytes_per_row(config.head_dim)
@@ -1842,6 +1956,14 @@ impl Gemma4GpuModel {
             kv_seq_len: 0,
             kv_capacity,
             kv_cache_type,
+            turboquant,
+            tq_q_rot,
+            tq_k_rot,
+            tq_v_rot,
+            tq_out,
+            tq_rw_k,
+            tq_rw_v,
+            tq_rw,
             cos_buf,
             sin_buf,
             decode_rope_cos_packed,
@@ -2654,6 +2776,101 @@ impl Gemma4GpuModel {
                             );
                         }
                     }
+                    KvCacheType::TurboQuant { bits } => {
+                        // TurboQuant: rotate K and V (post qk-norm / RoPE) into the
+                        // Haar frame, then quantize. 4-bit reuses the Q4_0 block
+                        // layout; 2/3-bit uses the Lloyd-Max V3 layout.
+                        let tq = self
+                            .turboquant
+                            .as_ref()
+                            .expect("turboquant rotation state");
+                        let fwd = tq.fwd(head_dim);
+                        if bits == 4 {
+                            // 4-bit: rotate into scratch, then reuse the Q4_0 append.
+                            self.ctx.encode_turboquant_rotate(
+                                encoder,
+                                &self.k_normed_buf,
+                                &self.tq_k_rot,
+                                fwd,
+                                num_kv_heads as u32,
+                                head_dim as u32,
+                            );
+                            self.ctx.encode_turboquant_rotate(
+                                encoder,
+                                &self.gate_buf,
+                                &self.tq_v_rot,
+                                fwd,
+                                num_kv_heads as u32,
+                                head_dim as u32,
+                            );
+                            self.ctx.encode_kv_append_q4_0(
+                                encoder,
+                                &self.tq_k_rot,
+                                &self.k_cache[layer_idx],
+                                num_kv_heads as u32,
+                                head_dim as u32,
+                                self.kv_capacity,
+                                kv_seq,
+                            );
+                            self.ctx.encode_kv_append_q4_0(
+                                encoder,
+                                &self.tq_v_rot,
+                                &self.v_cache[layer_idx],
+                                num_kv_heads as u32,
+                                head_dim as u32,
+                                self.kv_capacity,
+                                kv_seq,
+                            );
+                        } else {
+                            // 2/3-bit: single fused kernel per K/V does rotate +
+                            // norm + window store + bit-pack with no scratch buffer.
+                            let row_bytes =
+                                self.kv_cache_type.bytes_per_row(head_dim) as u32;
+                            let cen = tq.centroids(head_dim);
+                            // Residual window ring buffers (empty Vec when rw==0; in
+                            // that case pass a harmless placeholder the kernel ignores).
+                            let kwin = if self.tq_rw > 0 {
+                                &self.tq_rw_k[layer_idx]
+                            } else {
+                                &self.tq_k_rot
+                            };
+                            let vwin = if self.tq_rw > 0 {
+                                &self.tq_rw_v[layer_idx]
+                            } else {
+                                &self.tq_v_rot
+                            };
+                            self.ctx.encode_turboquant_rotate_quant_v3(
+                                encoder,
+                                &self.k_normed_buf,
+                                &self.k_cache[layer_idx],
+                                cen,
+                                num_kv_heads as u32,
+                                head_dim as u32,
+                                self.kv_capacity,
+                                kv_seq,
+                                bits as u32,
+                                row_bytes,
+                                kwin,
+                                self.tq_rw,
+                                fwd,
+                            );
+                            self.ctx.encode_turboquant_rotate_quant_v3(
+                                encoder,
+                                &self.gate_buf,
+                                &self.v_cache[layer_idx],
+                                cen,
+                                num_kv_heads as u32,
+                                head_dim as u32,
+                                self.kv_capacity,
+                                kv_seq,
+                                bits as u32,
+                                row_bytes,
+                                vwin,
+                                self.tq_rw,
+                                fwd,
+                            );
+                        }
+                    }
                 }
             }
 
@@ -2673,6 +2890,10 @@ impl Gemma4GpuModel {
             } else {
                 0u32
             };
+
+            // Buffer feeding the O-projection. TurboQuant redirects this to the
+            // un-rotated attention output; all other cache types use attn_out_buf.
+            let mut attn_src: &Buffer = &self.attn_out_buf;
 
             match self.kv_cache_type {
                 KvCacheType::F16 => {
@@ -2899,13 +3120,107 @@ impl Gemma4GpuModel {
                         );
                     }
                 }
+                KvCacheType::TurboQuant { bits } => {
+                    let tq = self
+                        .turboquant
+                        .as_ref()
+                        .expect("turboquant rotation state");
+                    if bits == 4 {
+                        // 4-bit: rotate Q into scratch, reuse the Q4_0 flash attention,
+                        // then un-rotate the output frame.
+                        self.ctx.encode_turboquant_rotate(
+                            encoder,
+                            &self.q_normed_buf,
+                            &self.tq_q_rot,
+                            tq.fwd(head_dim),
+                            num_heads as u32,
+                            head_dim as u32,
+                        );
+                        let groups_per_row = (head_dim / 32) as u32;
+                        let row_bytes = groups_per_row * 18;
+                        self.ctx.encode_attention_with_offset_q4_0(
+                            encoder,
+                            &self.tq_q_rot,
+                            &self.k_cache[layer.kv_source_layer],
+                            &self.v_cache[layer.kv_source_layer],
+                            &self.attn_out_buf,
+                            num_heads as u32,
+                            num_kv_heads as u32,
+                            num_kv_groups,
+                            head_dim as u32,
+                            effective_kv_seq,
+                            self.kv_capacity,
+                            scale,
+                            kv_start,
+                            groups_per_row,
+                            row_bytes,
+                        );
+                        self.ctx.encode_turboquant_rotate(
+                            encoder,
+                            &self.attn_out_buf,
+                            &self.tq_out,
+                            tq.inv(head_dim),
+                            num_heads as u32,
+                            head_dim as u32,
+                        );
+                        attn_src = &self.tq_out;
+                    } else {
+                        // 2/3-bit: one fused kernel rotates Q, runs attention (with the
+                        // residual window), and un-rotates the output straight into
+                        // attn_out_buf (model frame) — no scratch, no extra dispatches.
+                        let row_bytes = self.kv_cache_type.bytes_per_row(head_dim) as u32;
+                        // Recent absolute positions [attn_kv_seq - rw, attn_kv_seq) are
+                        // served from the full-precision residual window; older ones are
+                        // dequantized from the V3 cache.
+                        let window_lo = if self.tq_rw > 0 {
+                            kv_start.max(attn_kv_seq.saturating_sub(self.tq_rw))
+                        } else {
+                            0
+                        };
+                        let kwin = if self.tq_rw > 0 {
+                            &self.tq_rw_k[layer.kv_source_layer]
+                        } else {
+                            &self.q_normed_buf
+                        };
+                        let vwin = if self.tq_rw > 0 {
+                            &self.tq_rw_v[layer.kv_source_layer]
+                        } else {
+                            &self.q_normed_buf
+                        };
+                        self.ctx.encode_turboquant_attn_v3(
+                            encoder,
+                            &self.q_normed_buf,
+                            &self.k_cache[layer.kv_source_layer],
+                            &self.v_cache[layer.kv_source_layer],
+                            &self.attn_out_buf,
+                            tq.centroids(head_dim),
+                            num_heads as u32,
+                            num_kv_heads as u32,
+                            num_kv_groups,
+                            head_dim as u32,
+                            effective_kv_seq,
+                            self.kv_capacity,
+                            scale,
+                            kv_start,
+                            bits as u32,
+                            row_bytes,
+                            kwin,
+                            vwin,
+                            self.tq_rw,
+                            window_lo,
+                            tq.fwd(head_dim),
+                            tq.inv(head_dim),
+                        );
+                        // attn_src stays attn_out_buf (already in model frame).
+                    }
+                }
             }
 
             // O projection (Q4 on middle layers, f16 on sensitive layers)
             self.ctx.encode_matvec_auto_view(
                 encoder,
                 &layer.o_proj,
-                &self.attn_out_buf,
+                attn_src,
                 &self.o_out_buf,
                 hidden_size as u32,
                 q_out as u32,
@@ -4087,6 +4402,7 @@ impl Gemma4GpuModel {
                 .layer_v_cache(slot, layer_idx)
                 .map_err(|err| err.to_string())?;
             match self.kv_cache_type {
+                KvCacheType::TurboQuant { .. } => return Err(TURBOQUANT_UNSUPPORTED.to_string()),
                 KvCacheType::F16 => {
                     self.ctx.encode_kv_batch_append_f16(
                         encoder,
@@ -4163,6 +4479,7 @@ impl Gemma4GpuModel {
             .layer_v_cache(slot, layer.kv_source_layer)
             .map_err(|err| err.to_string())?;
         match self.kv_cache_type {
+            KvCacheType::TurboQuant { .. } => return Err(TURBOQUANT_UNSUPPORTED.to_string()),
             KvCacheType::F16 => {
                 self.ctx.encode_attention_causal_f16(
                     encoder,
@@ -4481,6 +4798,7 @@ impl Gemma4GpuModel {
                     .layer_v_cache(segment.slot, layer_idx)
                     .map_err(|err| err.to_string())?;
                 match self.kv_cache_type {
+                    KvCacheType::TurboQuant { .. } => return Err(TURBOQUANT_UNSUPPORTED.to_string()),
                     KvCacheType::F16 => {
                         self.ctx.encode_kv_batch_append_strided_f16(
                             encoder,
@@ -4571,6 +4889,7 @@ impl Gemma4GpuModel {
                 .layer_v_cache(segment.slot, layer.kv_source_layer)
                 .map_err(|err| err.to_string())?;
             match self.kv_cache_type {
+                KvCacheType::TurboQuant { .. } => return Err(TURBOQUANT_UNSUPPORTED.to_string()),
                 KvCacheType::F16 => {
                     self.ctx.encode_attention_causal_strided_f16(
                         encoder,
@@ -4905,6 +5224,7 @@ impl Gemma4GpuModel {
                     .layer_v_cache(slot, layer_idx)
                     .map_err(|err| err.to_string())?;
                 match self.kv_cache_type {
+                    KvCacheType::TurboQuant { .. } => return Err(TURBOQUANT_UNSUPPORTED.to_string()),
                     KvCacheType::F16 => {
                         self.ctx.encode_kv_batch_append_f16(
                             encoder,
@@ -4981,6 +5301,7 @@ impl Gemma4GpuModel {
                 .layer_v_cache(slot, layer.kv_source_layer)
                 .map_err(|err| err.to_string())?;
             match self.kv_cache_type {
+                KvCacheType::TurboQuant { .. } => return Err(TURBOQUANT_UNSUPPORTED.to_string()),
                 KvCacheType::F16 => {
                     self.ctx.encode_attention_causal_f16(
                         encoder,
@@ -5566,6 +5887,7 @@ impl Gemma4GpuModel {
                         .layer_v_cache(slot_view.slot, layer_idx)
                         .map_err(|err| err.to_string())?;
                     match self.kv_cache_type {
+                        KvCacheType::TurboQuant { .. } => return Err(TURBOQUANT_UNSUPPORTED.to_string()),
                         KvCacheType::F16 => {
                             self.ctx.encode_kv_append_f16_at(
                                 encoder,
@@ -5646,6 +5968,7 @@ impl Gemma4GpuModel {
                     .layer_v_cache(slot_view.slot, layer.kv_source_layer)
                     .map_err(|err| err.to_string())?;
                 match self.kv_cache_type {
+                    KvCacheType::TurboQuant { .. } => return Err(TURBOQUANT_UNSUPPORTED.to_string()),
                     KvCacheType::F16 => {
                         self.ctx.encode_attention_with_offset_f16_at(
                             encoder,

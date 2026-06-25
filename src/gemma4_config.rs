@@ -66,6 +66,21 @@ pub enum KvCacheType {
     F16,
     Q8_0,
     Q4_0,
+    /// TurboQuant: Haar-random rotation of each K/V vector before quantization.
+    /// The rotation spreads outlier channels so low-bit scalar quantization
+    /// becomes near information-theoretically optimal, and (because rotation
+    /// preserves inner products) attention only needs to rotate the query once.
+    ///
+    /// Two storage variants, selected by `bits`:
+    /// * `bits == 4`: rotated vectors stored in the **Q4_0 block layout**
+    ///   (18 bytes / 32 weights), reusing the fast Q4_0 append/attention kernels.
+    /// * `bits == 2 | 3`: the paper-correct **V3** layout — per-row fp16 L2 norm
+    ///   plus bit-packed per-coordinate **Lloyd–Max** codebook indices. This is
+    ///   the regime where TurboQuant beats Q4_0 (Q4_0 cannot go below 4 bits).
+    ///
+    /// Row layout for the V3 (2/3-bit) variant:
+    /// `[ fp16 norm | ceil(head_dim*bits/8) packed index bytes ]`.
+    TurboQuant { bits: u8 },
 }
 
 impl KvCacheType {
@@ -73,6 +88,16 @@ impl KvCacheType {
         match std::env::var("LLAMA_KV_CACHE_TYPE").as_deref() {
             Ok("q8_0") | Ok("Q8_0") => KvCacheType::Q8_0,
             Ok("q4_0") | Ok("Q4_0") => KvCacheType::Q4_0,
+            Ok("turboquant") | Ok("TurboQuant") | Ok("TURBOQUANT") | Ok("tq") => {
+                // TURBOQUANT_BITS selects the bit-width (2, 3, or 4). Default 4
+                // (fast affine path); 2/3 use the Lloyd–Max V3 path.
+                let bits = std::env::var("TURBOQUANT_BITS")
+                    .ok()
+                    .and_then(|s| s.trim().parse::<u8>().ok())
+                    .filter(|b| (2..=4).contains(b))
+                    .unwrap_or(4);
+                KvCacheType::TurboQuant { bits }
+            }
             _ => KvCacheType::F16,
         }
     }
@@ -83,6 +108,15 @@ impl KvCacheType {
             KvCacheType::F16 => head_dim * 2,
             KvCacheType::Q8_0 => (head_dim / 32) * 34,
             KvCacheType::Q4_0 => (head_dim / 32) * 18,
+            KvCacheType::TurboQuant { bits } => {
+                if *bits == 4 {
+                    // Q4_0 block layout (rotated vectors).
+                    (head_dim / 32) * 18
+                } else {
+                    // V3: fp16 norm + bit-packed Lloyd–Max indices.
+                    2 + (head_dim * (*bits as usize)) / 8
+                }
+            }
         }
     }
 }
@@ -93,6 +127,7 @@ impl std::fmt::Display for KvCacheType {
             KvCacheType::F16 => write!(f, "f16"),
             KvCacheType::Q8_0 => write!(f, "q8_0"),
             KvCacheType::Q4_0 => write!(f, "q4_0"),
+            KvCacheType::TurboQuant { bits } => write!(f, "turboquant-{}bit", bits),
         }
     }
 }

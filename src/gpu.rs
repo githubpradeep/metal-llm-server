@@ -440,6 +440,14 @@ pub struct MetalContext {
     pub kv_append_q4_0_pipeline: ComputePipelineState,
     pub kv_batch_append_q4_0_pipeline: ComputePipelineState,
     pub kv_batch_append_strided_q4_0_pipeline: ComputePipelineState,
+    /// TurboQuant: Y = X @ M batched `head_dim × head_dim` rotation.
+    pub turboquant_rotate_pipeline: ComputePipelineState,
+    /// TurboQuant V3 (2/3-bit): quantize rotated vectors to norm + packed indices.
+    pub turboquant_quant_v3_pipeline: ComputePipelineState,
+    /// TurboQuant V3 (2/3-bit): fused rotate + quantize + residual-window store.
+    pub turboquant_rotate_quant_v3_pipeline: ComputePipelineState,
+    /// TurboQuant V3 (2/3-bit): single-token attention with centroid dequant.
+    pub turboquant_attn_v3_pipeline: ComputePipelineState,
     pub attention_offset_q8_0_pipeline: ComputePipelineState,
     pub attention_causal_q8_0_pipeline: ComputePipelineState,
     pub attention_causal_strided_q8_0_pipeline: ComputePipelineState,
@@ -487,6 +495,8 @@ impl MetalContext {
         let ggml_path = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/shaders/ggml_mul_mv_q4.metal");
         let ggml_fa_path =
             Path::new(env!("CARGO_MANIFEST_DIR")).join("src/shaders/ggml_flash_attn.metal");
+        let turboquant_path =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("src/shaders/turboquant.metal");
         let mut shader_src =
             std::fs::read_to_string(&shader_path).expect("Failed to read Metal shader file");
         shader_src.push('\n');
@@ -500,6 +510,10 @@ impl MetalContext {
         shader_src.push('\n');
         shader_src.push_str(
             &std::fs::read_to_string(&ggml_fa_path).expect("Failed to read ggml_flash_attn.metal"),
+        );
+        shader_src.push('\n');
+        shader_src.push_str(
+            &std::fs::read_to_string(&turboquant_path).expect("Failed to read turboquant.metal"),
         );
 
         let options = CompileOptions::new();
@@ -622,6 +636,10 @@ impl MetalContext {
         let kv_batch_append_q8_0_pipeline = get_fn("kv_cache_batch_append_q8_0");
         let kv_batch_append_strided_q8_0_pipeline = get_fn("kv_cache_batch_append_strided_q8_0");
         let kv_append_q4_0_pipeline = get_fn("kv_cache_append_q4_0");
+        let turboquant_rotate_pipeline = get_fn("turboquant_rotate");
+        let turboquant_quant_v3_pipeline = get_fn("turboquant_quant_v3");
+        let turboquant_rotate_quant_v3_pipeline = get_fn("turboquant_rotate_quant_v3");
+        let turboquant_attn_v3_pipeline = get_fn("turboquant_attn_v3");
         let kv_batch_append_q4_0_pipeline = get_fn("kv_cache_batch_append_q4_0");
         let kv_batch_append_strided_q4_0_pipeline = get_fn("kv_cache_batch_append_strided_q4_0");
         let attention_offset_q8_0_pipeline = get_fn("attention_single_token_offset_q8_0");
@@ -820,6 +838,10 @@ impl MetalContext {
             kv_batch_append_q8_0_pipeline,
             kv_batch_append_strided_q8_0_pipeline,
             kv_append_q4_0_pipeline,
+            turboquant_rotate_pipeline,
+            turboquant_quant_v3_pipeline,
+            turboquant_rotate_quant_v3_pipeline,
+            turboquant_attn_v3_pipeline,
             kv_batch_append_q4_0_pipeline,
             kv_batch_append_strided_q4_0_pipeline,
             attention_offset_q8_0_pipeline,
@@ -4148,6 +4170,165 @@ impl MetalContext {
         encoder.set_bytes(4, 4, &capacity as *const u32 as *const _);
         encoder.set_bytes(5, 4, &cur_seq as *const u32 as *const _);
         encoder.dispatch_threads(MTLSize::new(total as u64, 1, 1), MTLSize::new(256, 1, 1));
+    }
+
+    /// TurboQuant rotation: `out = in @ rot_matrix`, one row per (head, token).
+    /// `in`/`out` are `[rows, head_dim]` row-major f32 and must not alias.
+    /// `rot_matrix` is `[head_dim, head_dim]` row-major (Rᵀ to rotate, R to invert).
+    pub fn encode_turboquant_rotate(
+        &self,
+        encoder: &metal::ComputeCommandEncoderRef,
+        in_buf: &Buffer,
+        out_buf: &Buffer,
+        rot_matrix: &Buffer,
+        rows: u32,
+        head_dim: u32,
+    ) {
+        encoder.set_compute_pipeline_state(&self.turboquant_rotate_pipeline);
+        encoder.set_buffer(0, Some(in_buf), 0);
+        encoder.set_buffer(1, Some(out_buf), 0);
+        encoder.set_buffer(2, Some(rot_matrix), 0);
+        encoder.set_bytes(3, 4, &head_dim as *const u32 as *const _);
+        // One threadgroup per row; threads stride over the head_dim columns.
+        let tg = head_dim.min(256).max(1);
+        encoder.dispatch_thread_groups(
+            MTLSize::new(rows as u64, 1, 1),
+            MTLSize::new(tg as u64, 1, 1),
+        );
+    }
+
+    /// TurboQuant V3 (2/3-bit): quantize already-rotated vectors into the cache
+    /// row layout (fp16 norm + bit-packed Lloyd–Max indices). One thread per row.
+    pub fn encode_turboquant_quant_v3(
+        &self,
+        encoder: &metal::ComputeCommandEncoderRef,
+        in_buf: &Buffer,
+        cache: &Buffer,
+        centroids: &Buffer,
+        rows: u32,
+        head_dim: u32,
+        capacity: u32,
+        cur_seq: u32,
+        bits: u32,
+        row_bytes: u32,
+        window: &Buffer,
+        rw: u32,
+    ) {
+        encoder.set_compute_pipeline_state(&self.turboquant_quant_v3_pipeline);
+        encoder.set_buffer(0, Some(in_buf), 0);
+        encoder.set_buffer(1, Some(cache), 0);
+        encoder.set_buffer(2, Some(centroids), 0);
+        encoder.set_bytes(3, 4, &head_dim as *const u32 as *const _);
+        encoder.set_bytes(4, 4, &capacity as *const u32 as *const _);
+        encoder.set_bytes(5, 4, &cur_seq as *const u32 as *const _);
+        encoder.set_bytes(6, 4, &bits as *const u32 as *const _);
+        encoder.set_bytes(7, 4, &row_bytes as *const u32 as *const _);
+        encoder.set_bytes(8, 4, &rows as *const u32 as *const _);
+        encoder.set_buffer(9, Some(window), 0);
+        encoder.set_bytes(10, 4, &rw as *const u32 as *const _);
+        let tg = rows.min(64).max(1);
+        encoder.dispatch_thread_groups(
+            MTLSize::new(((rows + tg - 1) / tg) as u64, 1, 1),
+            MTLSize::new(tg as u64, 1, 1),
+        );
+    }
+
+    /// TurboQuant V3 (2/3-bit): fused rotate + quantize + residual-window store.
+    /// Reads the un-rotated (qk-normed/RoPE'd) vector and the forward rotation
+    /// matrix; one threadgroup per row rotates, norms, packs and stores the window
+    /// with no intermediate global buffer.
+    pub fn encode_turboquant_rotate_quant_v3(
+        &self,
+        encoder: &metal::ComputeCommandEncoderRef,
+        in_normed: &Buffer,
+        cache: &Buffer,
+        centroids: &Buffer,
+        rows: u32,
+        head_dim: u32,
+        capacity: u32,
+        cur_seq: u32,
+        bits: u32,
+        row_bytes: u32,
+        window: &Buffer,
+        rw: u32,
+        fwd: &Buffer,
+    ) {
+        encoder.set_compute_pipeline_state(&self.turboquant_rotate_quant_v3_pipeline);
+        encoder.set_buffer(0, Some(in_normed), 0);
+        encoder.set_buffer(1, Some(cache), 0);
+        encoder.set_buffer(2, Some(centroids), 0);
+        encoder.set_bytes(3, 4, &head_dim as *const u32 as *const _);
+        encoder.set_bytes(4, 4, &capacity as *const u32 as *const _);
+        encoder.set_bytes(5, 4, &cur_seq as *const u32 as *const _);
+        encoder.set_bytes(6, 4, &bits as *const u32 as *const _);
+        encoder.set_bytes(7, 4, &row_bytes as *const u32 as *const _);
+        encoder.set_bytes(8, 4, &rows as *const u32 as *const _);
+        encoder.set_buffer(9, Some(window), 0);
+        encoder.set_bytes(10, 4, &rw as *const u32 as *const _);
+        encoder.set_buffer(11, Some(fwd), 0);
+        // One threadgroup per row; threads cooperate on the head_dim rotation.
+        let tg = head_dim.min(256).max(1);
+        encoder.dispatch_thread_groups(
+            MTLSize::new(rows as u64, 1, 1),
+            MTLSize::new(tg as u64, 1, 1),
+        );
+    }
+
+    /// TurboQuant V3 (2/3-bit): fused single-token attention. Rotates Q into the
+    /// Haar frame, dequantizes K/V (or reads the residual window), runs softmax,
+    /// and un-rotates the output — all in one kernel. `q_buf` and `out_buf` are in
+    /// the model frame; `fwd`/`inv` are the forward/inverse rotation matrices.
+    pub fn encode_turboquant_attn_v3(
+        &self,
+        encoder: &metal::ComputeCommandEncoderRef,
+        q_buf: &Buffer,
+        k_cache: &Buffer,
+        v_cache: &Buffer,
+        out_buf: &Buffer,
+        centroids: &Buffer,
+        num_heads: u32,
+        num_kv_heads: u32,
+        num_kv_groups: u32,
+        head_dim: u32,
+        kv_seq: u32,
+        capacity: u32,
+        scale: f32,
+        kv_start: u32,
+        bits: u32,
+        row_bytes: u32,
+        kwin: &Buffer,
+        vwin: &Buffer,
+        rw: u32,
+        window_lo: u32,
+        fwd: &Buffer,
+        inv: &Buffer,
+    ) {
+        encoder.set_compute_pipeline_state(&self.turboquant_attn_v3_pipeline);
+        encoder.set_buffer(0, Some(q_buf), 0);
+        encoder.set_buffer(1, Some(k_cache), 0);
+        encoder.set_buffer(2, Some(v_cache), 0);
+        encoder.set_buffer(3, Some(out_buf), 0);
+        encoder.set_bytes(4, 4, &num_heads as *const u32 as *const _);
+        encoder.set_bytes(5, 4, &num_kv_heads as *const u32 as *const _);
+        encoder.set_bytes(6, 4, &num_kv_groups as *const u32 as *const _);
+        encoder.set_bytes(7, 4, &head_dim as *const u32 as *const _);
+        encoder.set_bytes(8, 4, &kv_seq as *const u32 as *const _);
+        encoder.set_bytes(9, 4, &capacity as *const u32 as *const _);
+        encoder.set_bytes(10, 4, &scale as *const f32 as *const _);
+        encoder.set_bytes(11, 4, &kv_start as *const u32 as *const _);
+        encoder.set_bytes(12, 4, &bits as *const u32 as *const _);
+        encoder.set_bytes(13, 4, &row_bytes as *const u32 as *const _);
+        encoder.set_buffer(14, Some(centroids), 0);
+        encoder.set_buffer(15, Some(kwin), 0);
+        encoder.set_buffer(16, Some(vwin), 0);
+        encoder.set_bytes(17, 4, &rw as *const u32 as *const _);
+        encoder.set_bytes(18, 4, &window_lo as *const u32 as *const _);
+        encoder.set_buffer(19, Some(fwd), 0);
+        encoder.set_buffer(20, Some(inv), 0);
+        encoder.dispatch_thread_groups(
+            MTLSize::new(num_heads as u64, 1, 1),
+            MTLSize::new(256, 1, 1),
+        );
     }
 
     pub fn encode_kv_append_q4_0(
