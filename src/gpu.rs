@@ -4891,6 +4891,10 @@ impl MetalContext {
 }
 
 /// Convert f16 (IEEE 754 half-precision) to f32.
+pub fn bf16_to_f32(value: u16) -> f32 {
+    f32::from_bits((value as u32) << 16)
+}
+
 pub fn f16_to_f32(value: u16) -> f32 {
     let sign = ((value >> 15) as f32) * -2.0 + 1.0;
     let exp = (value >> 10) & 0x1F;
