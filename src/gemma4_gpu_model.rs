@@ -57,17 +57,18 @@ fn build_turboquant_state(
     let mut tq_rw_v: Vec<Buffer> = Vec::new();
     let mut tq_rw: u32 = 0;
 
-    let turboquant = if let KvCacheType::TurboQuant { bits } = kv_cache_type {
+    let turboquant = if let KvCacheType::TurboQuant { k_bits, v_bits } = kv_cache_type {
         let mut dims: Vec<usize> = vec![config.head_dim, config.global_head_dim];
         dims.sort_unstable();
         dims.dedup();
-        let variant = if bits == 4 { "rotation + Q4_0" } else { "rotation + Lloyd-Max V3" };
+        let affine = kv_cache_type.tq_affine();
+        let variant = if affine { "rotation + Q4_0" } else { "rotation + Lloyd-Max V3" };
 
         // Residual window: keep the most recent `rw` tokens' rotated K/V in full
-        // precision (f32) per layer. Only the V3 (2/3-bit) path consults it; 4-bit
-        // reuses the Q4_0 kernels and leaves these buffers empty. The window is the
-        // documented fix for the low-bit "tail derail" (rw=0 → garbage at length).
-        if bits != 4 {
+        // precision (f32) per layer. Only the V3 path consults it; the affine
+        // (both-4-bit) path reuses the Q4_0 kernels and leaves these empty. The
+        // window is the documented fix for the low-bit "tail derail".
+        if !affine {
             tq_rw = std::env::var("TURBOQUANT_RESIDUAL_WINDOW")
                 .ok()
                 .and_then(|v| v.parse::<u32>().ok())
@@ -89,10 +90,10 @@ fn build_turboquant_state(
         }
 
         println!(
-            "  TurboQuant: {}-bit ({}), Haar rotations + codebooks for head_dims {:?}",
-            bits, variant, dims
+            "  TurboQuant: K{}/V{} ({}), Haar rotations + codebooks for head_dims {:?}",
+            k_bits, v_bits, variant, dims
         );
-        Some(crate::turboquant::TurboQuant::new(&ctx.device, &dims, bits))
+        Some(crate::turboquant::TurboQuant::new(&ctx.device, &dims, k_bits, v_bits))
     } else {
         None
     };
@@ -1113,21 +1114,22 @@ impl Gemma4GpuModel {
         for i in 0..num_layers {
             let hd = config.layer_head_dim(i);
             assert!(hd % 32 == 0, "head_dim must be a multiple of 32 for quantized KV cache");
-            let bytes_per_row = kv_cache_type.bytes_per_row(hd);
-            let byte_len = (num_kv_heads * kv_capacity as usize * bytes_per_row) as u64;
+            // K and V may use different bit-widths (asymmetric TurboQuant).
+            let k_byte_len = (num_kv_heads * kv_capacity as usize * kv_cache_type.k_row_bytes(hd)) as u64;
+            let v_byte_len = (num_kv_heads * kv_capacity as usize * kv_cache_type.v_row_bytes(hd)) as u64;
             k_cache.push(
                 ctx.device
-                    .new_buffer(byte_len, MTLResourceOptions::StorageModeShared),
+                    .new_buffer(k_byte_len, MTLResourceOptions::StorageModeShared),
             );
             v_cache.push(
                 ctx.device
-                    .new_buffer(byte_len, MTLResourceOptions::StorageModeShared),
+                    .new_buffer(v_byte_len, MTLResourceOptions::StorageModeShared),
             );
         }
         let (turboquant, tq_q_rot, tq_k_rot, tq_v_rot, tq_out, tq_rw_k, tq_rw_v, tq_rw) =
             build_turboquant_state(&ctx, &config, kv_cache_type, kv_capacity);
         let f16_bytes = num_kv_heads * kv_capacity as usize * config.head_dim * 2 + num_kv_heads * kv_capacity as usize * config.global_head_dim * 2;
-        let quant_bytes = num_kv_heads * kv_capacity as usize * kv_cache_type.bytes_per_row(config.head_dim) + num_kv_heads * kv_capacity as usize * kv_cache_type.bytes_per_row(config.global_head_dim);
+        let quant_bytes = num_kv_heads * kv_capacity as usize * (kv_cache_type.k_row_bytes(config.head_dim) + kv_cache_type.v_row_bytes(config.head_dim)) / 2 + num_kv_heads * kv_capacity as usize * (kv_cache_type.k_row_bytes(config.global_head_dim) + kv_cache_type.v_row_bytes(config.global_head_dim)) / 2;
         println!("  KV cache type: {}, est. memory per layer: {:.1} MB (vs f16: {:.1} MB, {:.0}% savings)",
             kv_cache_type,
             quant_bytes as f64 / num_layers as f64 / 1024.0 / 1024.0,
@@ -1821,23 +1823,24 @@ impl Gemma4GpuModel {
         for i in 0..num_layers {
             let hd = config.layer_head_dim(i);
             assert!(hd % 32 == 0, "head_dim must be a multiple of 32 for quantized KV cache");
-            let bytes_per_row = kv_cache_type.bytes_per_row(hd);
-            let byte_len = (num_kv_heads * kv_capacity as usize * bytes_per_row) as u64;
+            // K and V may use different bit-widths (asymmetric TurboQuant).
+            let k_byte_len = (num_kv_heads * kv_capacity as usize * kv_cache_type.k_row_bytes(hd)) as u64;
+            let v_byte_len = (num_kv_heads * kv_capacity as usize * kv_cache_type.v_row_bytes(hd)) as u64;
             k_cache.push(
                 ctx.device
-                    .new_buffer(byte_len, MTLResourceOptions::StorageModeShared),
+                    .new_buffer(k_byte_len, MTLResourceOptions::StorageModeShared),
             );
             v_cache.push(
                 ctx.device
-                    .new_buffer(byte_len, MTLResourceOptions::StorageModeShared),
+                    .new_buffer(v_byte_len, MTLResourceOptions::StorageModeShared),
             );
         }
         let (turboquant, tq_q_rot, tq_k_rot, tq_v_rot, tq_out, tq_rw_k, tq_rw_v, tq_rw) =
             build_turboquant_state(&ctx, &config, kv_cache_type, kv_capacity);
         let f16_bytes = num_kv_heads * kv_capacity as usize * config.head_dim * 2
             + num_kv_heads * kv_capacity as usize * config.global_head_dim * 2;
-        let quant_bytes = num_kv_heads * kv_capacity as usize * kv_cache_type.bytes_per_row(config.head_dim)
-            + num_kv_heads * kv_capacity as usize * kv_cache_type.bytes_per_row(config.global_head_dim);
+        let quant_bytes = num_kv_heads * kv_capacity as usize * (kv_cache_type.k_row_bytes(config.head_dim) + kv_cache_type.v_row_bytes(config.head_dim)) / 2
+            + num_kv_heads * kv_capacity as usize * (kv_cache_type.k_row_bytes(config.global_head_dim) + kv_cache_type.v_row_bytes(config.global_head_dim)) / 2;
         println!(
             "  KV cache type: {}, est. memory per layer: {:.1} MB (vs f16: {:.1} MB, {:.0}% savings)",
             kv_cache_type,
@@ -2776,16 +2779,17 @@ impl Gemma4GpuModel {
                             );
                         }
                     }
-                    KvCacheType::TurboQuant { bits } => {
+                    KvCacheType::TurboQuant { k_bits, v_bits } => {
                         // TurboQuant: rotate K and V (post qk-norm / RoPE) into the
-                        // Haar frame, then quantize. 4-bit reuses the Q4_0 block
-                        // layout; 2/3-bit uses the Lloyd-Max V3 layout.
+                        // Haar frame, then quantize. Both-4-bit reuses the Q4_0 block
+                        // layout; otherwise each side uses the Lloyd-Max V3 layout at
+                        // its own bit-width (asymmetric K/V supported).
                         let tq = self
                             .turboquant
                             .as_ref()
                             .expect("turboquant rotation state");
                         let fwd = tq.fwd(head_dim);
-                        if bits == 4 {
+                        if self.kv_cache_type.tq_affine() {
                             // 4-bit: rotate into scratch, then reuse the Q4_0 append.
                             self.ctx.encode_turboquant_rotate(
                                 encoder,
@@ -2822,11 +2826,15 @@ impl Gemma4GpuModel {
                                 kv_seq,
                             );
                         } else {
-                            // 2/3-bit: single fused kernel per K/V does rotate +
-                            // norm + window store + bit-pack with no scratch buffer.
-                            let row_bytes =
-                                self.kv_cache_type.bytes_per_row(head_dim) as u32;
-                            let cen = tq.centroids(head_dim);
+                            // V3: single fused kernel per K/V does rotate + norm +
+                            // window store + bit-pack with no scratch buffer. K and V
+                            // use independent bit-widths, row sizes, and codebooks.
+                            let k_row_bytes =
+                                self.kv_cache_type.k_row_bytes(head_dim) as u32;
+                            let v_row_bytes =
+                                self.kv_cache_type.v_row_bytes(head_dim) as u32;
+                            let cen_k = tq.centroids_k(head_dim);
+                            let cen_v = tq.centroids_v(head_dim);
                             // Residual window ring buffers (empty Vec when rw==0; in
                             // that case pass a harmless placeholder the kernel ignores).
                             let kwin = if self.tq_rw > 0 {
@@ -2843,13 +2851,13 @@ impl Gemma4GpuModel {
                                 encoder,
                                 &self.k_normed_buf,
                                 &self.k_cache[layer_idx],
-                                cen,
+                                cen_k,
                                 num_kv_heads as u32,
                                 head_dim as u32,
                                 self.kv_capacity,
                                 kv_seq,
-                                bits as u32,
-                                row_bytes,
+                                k_bits as u32,
+                                k_row_bytes,
                                 kwin,
                                 self.tq_rw,
                                 fwd,
@@ -2858,13 +2866,13 @@ impl Gemma4GpuModel {
                                 encoder,
                                 &self.gate_buf,
                                 &self.v_cache[layer_idx],
-                                cen,
+                                cen_v,
                                 num_kv_heads as u32,
                                 head_dim as u32,
                                 self.kv_capacity,
                                 kv_seq,
-                                bits as u32,
-                                row_bytes,
+                                v_bits as u32,
+                                v_row_bytes,
                                 vwin,
                                 self.tq_rw,
                                 fwd,
@@ -3120,12 +3128,12 @@ impl Gemma4GpuModel {
                         );
                     }
                 }
-                KvCacheType::TurboQuant { bits } => {
+                KvCacheType::TurboQuant { k_bits, v_bits } => {
                     let tq = self
                         .turboquant
                         .as_ref()
                         .expect("turboquant rotation state");
-                    if bits == 4 {
+                    if self.kv_cache_type.tq_affine() {
                         // 4-bit: rotate Q into scratch, reuse the Q4_0 flash attention,
                         // then un-rotate the output frame.
                         self.ctx.encode_turboquant_rotate(
@@ -3165,10 +3173,12 @@ impl Gemma4GpuModel {
                         );
                         attn_src = &self.tq_out;
                     } else {
-                        // 2/3-bit: one fused kernel rotates Q, runs attention (with the
+                        // V3: one fused kernel rotates Q, runs attention (with the
                         // residual window), and un-rotates the output straight into
-                        // attn_out_buf (model frame) — no scratch, no extra dispatches.
-                        let row_bytes = self.kv_cache_type.bytes_per_row(head_dim) as u32;
+                        // attn_out_buf (model frame). K and V use independent
+                        // bit-widths, row sizes, and codebooks (asymmetric K/V).
+                        let k_row_bytes = self.kv_cache_type.k_row_bytes(head_dim) as u32;
+                        let v_row_bytes = self.kv_cache_type.v_row_bytes(head_dim) as u32;
                         // Recent absolute positions [attn_kv_seq - rw, attn_kv_seq) are
                         // served from the full-precision residual window; older ones are
                         // dequantized from the V3 cache.
@@ -3193,7 +3203,8 @@ impl Gemma4GpuModel {
                             &self.k_cache[layer.kv_source_layer],
                             &self.v_cache[layer.kv_source_layer],
                             &self.attn_out_buf,
-                            tq.centroids(head_dim),
+                            tq.centroids_k(head_dim),
+                            tq.centroids_v(head_dim),
                             num_heads as u32,
                             num_kv_heads as u32,
                             num_kv_groups,
@@ -3202,8 +3213,10 @@ impl Gemma4GpuModel {
                             self.kv_capacity,
                             scale,
                             kv_start,
-                            bits as u32,
-                            row_bytes,
+                            k_bits as u32,
+                            v_bits as u32,
+                            k_row_bytes,
+                            v_row_bytes,
                             kwin,
                             vwin,
                             self.tq_rw,

@@ -124,22 +124,26 @@ fn generate_rotation(dim: usize, seed: u64) -> Vec<f32> {
 struct RotationMatrices {
     fwd: Buffer,
     inv: Buffer,
-    /// Lloyd–Max centroids for this head dim at the active bit-width (V3 path).
-    /// `2^bits` f32 values scaled for unit-vector coordinates (std 1/sqrt(dim)).
-    centroids: Buffer,
+    /// Lloyd–Max centroids for the key cache (`2^k_bits` f32), scaled for
+    /// unit-vector coordinates (std 1/sqrt(dim)). V3 path only.
+    centroids_k: Buffer,
+    /// Lloyd–Max centroids for the value cache (`2^v_bits` f32). Equals
+    /// `centroids_k` when k_bits == v_bits.
+    centroids_v: Buffer,
 }
 
 /// Holds the GPU rotation matrices (and Lloyd–Max codebooks) for every distinct
 /// head dimension in the model.
 pub struct TurboQuant {
     by_dim: HashMap<usize, RotationMatrices>,
-    bits: u8,
+    k_bits: u8,
+    v_bits: u8,
 }
 
 impl TurboQuant {
     /// Build rotation matrices + Lloyd–Max codebooks for each distinct head
-    /// dimension. `bits` is the active KV bit-width (2, 3, or 4).
-    pub fn new(device: &Device, head_dims: &[usize], bits: u8) -> Self {
+    /// dimension. `k_bits`/`v_bits` are the key/value bit-widths (2, 3, or 4).
+    pub fn new(device: &Device, head_dims: &[usize], k_bits: u8, v_bits: u8) -> Self {
         let mut by_dim = HashMap::new();
         for &dim in head_dims {
             if by_dim.contains_key(&dim) {
@@ -159,9 +163,14 @@ impl TurboQuant {
             }
 
             // Lloyd–Max codebook for a unit vector's coordinate after rotation:
-            // std = 1/sqrt(dim). Used by the 2/3-bit V3 path.
+            // std = 1/sqrt(dim). Separate codebooks per side for asymmetric K/V.
             let sigma = 1.0 / (dim as f64).sqrt();
-            let centroids = lloyd_max_centroids(bits as u32, sigma, 200_000);
+            let cen_k = lloyd_max_centroids(k_bits as u32, sigma, 200_000);
+            let cen_v = if v_bits == k_bits {
+                cen_k.clone()
+            } else {
+                lloyd_max_centroids(v_bits as u32, sigma, 200_000)
+            };
 
             // Rotation matrices are stored as f32. Inner-product preservation
             // (q·k = (Rq)·(Rk)) relies on R being exactly orthogonal; fp16 erodes
@@ -169,31 +178,45 @@ impl TurboQuant {
             // at long contexts — so we keep full precision for all bit-widths.
             let fwd_buf = Self::upload(device, &fwd);
             let inv_buf = Self::upload(device, &r);
-            let cen_buf = Self::upload(device, &centroids);
+            let cen_k_buf = Self::upload(device, &cen_k);
+            let cen_v_buf = Self::upload(device, &cen_v);
             by_dim.insert(
                 dim,
                 RotationMatrices {
                     fwd: fwd_buf,
                     inv: inv_buf,
-                    centroids: cen_buf,
+                    centroids_k: cen_k_buf,
+                    centroids_v: cen_v_buf,
                 },
             );
         }
-        TurboQuant { by_dim, bits }
+        TurboQuant { by_dim, k_bits, v_bits }
     }
 
-    /// Active KV bit-width.
-    pub fn bits(&self) -> u8 {
-        self.bits
+    /// Key / value KV bit-widths.
+    pub fn k_bits(&self) -> u8 {
+        self.k_bits
+    }
+    pub fn v_bits(&self) -> u8 {
+        self.v_bits
     }
 
-    /// Lloyd–Max codebook buffer (`2^bits` f32) for the given head dimension.
-    pub fn centroids(&self, head_dim: usize) -> &Buffer {
+    /// Lloyd–Max codebook buffer for the key cache at the given head dimension.
+    pub fn centroids_k(&self, head_dim: usize) -> &Buffer {
         &self
             .by_dim
             .get(&head_dim)
             .unwrap_or_else(|| panic!("TurboQuant: no codebook for head_dim={head_dim}"))
-            .centroids
+            .centroids_k
+    }
+
+    /// Lloyd–Max codebook buffer for the value cache at the given head dimension.
+    pub fn centroids_v(&self, head_dim: usize) -> &Buffer {
+        &self
+            .by_dim
+            .get(&head_dim)
+            .unwrap_or_else(|| panic!("TurboQuant: no codebook for head_dim={head_dim}"))
+            .centroids_v
     }
 
     fn upload(device: &Device, data: &[f32]) -> Buffer {

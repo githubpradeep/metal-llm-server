@@ -259,15 +259,18 @@ kernel void turboquant_attn_v3(
     constant uint&      capacity      [[buffer(9)]],
     constant float&     scale         [[buffer(10)]],
     constant uint&      kv_start      [[buffer(11)]],
-    constant uint&      bits          [[buffer(12)]],
-    constant uint&      row_bytes     [[buffer(13)]],
-    device const float* centroids     [[buffer(14)]],
+    constant uint&      k_bits        [[buffer(12)]],
+    constant uint&      k_row_bytes   [[buffer(13)]],
+    device const float* k_centroids   [[buffer(14)]],
     device const float* Kwin          [[buffer(15)]],  // [num_kv_heads, rw, head_dim] f32
     device const float* Vwin          [[buffer(16)]],
     constant uint&      rw            [[buffer(17)]],   // residual window length (0 = disabled)
     constant uint&      window_lo     [[buffer(18)]],   // smallest absolute pos served from window
     device const float* fwd           [[buffer(19)]],   // Rᵀ — rotate Q into Haar frame
     device const float* inv           [[buffer(20)]],   // R  — un-rotate output
+    constant uint&      v_bits        [[buffer(21)]],
+    constant uint&      v_row_bytes   [[buffer(22)]],
+    device const float* v_centroids   [[buffer(23)]],
     uint tid     [[thread_index_in_threadgroup]],
     uint tg_size [[threads_per_threadgroup]],
     uint sg_id   [[simdgroup_index_in_threadgroup]],
@@ -279,11 +282,13 @@ kernel void turboquant_attn_v3(
 
     uint kv_h = h / num_kv_groups;
     uint q_off = h * head_dim;
-    uint kv_base = kv_h * capacity * row_bytes;
-    uint n_levels = 1u << bits;
-    uint mask = n_levels - 1u;
+    uint kv_base_k = kv_h * capacity * k_row_bytes;   // K and V rows may differ in size
+    uint kv_base_v = kv_h * capacity * v_row_bytes;
+    uint k_mask = (1u << k_bits) - 1u;
+    uint v_mask = (1u << v_bits) - 1u;
 
-    threadgroup float cen[16];
+    threadgroup float cen_k[16];   // key codebook (2^k_bits)
+    threadgroup float cen_v[16];   // value codebook (2^v_bits)
     threadgroup float qrot[512];   // rotated query
     threadgroup float orot[512];   // staging for Q row, then rotated output
     threadgroup float scores[TQ_MAX_KV];
@@ -291,7 +296,8 @@ kernel void turboquant_attn_v3(
     threadgroup float tg_m;
     threadgroup float tg_inv_l;
 
-    for (uint i = tid; i < n_levels; i += tg_size) cen[i] = centroids[i];
+    for (uint i = tid; i < (1u << k_bits); i += tg_size) cen_k[i] = k_centroids[i];
+    for (uint i = tid; i < (1u << v_bits); i += tg_size) cen_v[i] = v_centroids[i];
 
     // Rotate Q into the Haar frame: qrot[c] = sum_k Q_in[k] * fwd[k*dim + c].
     for (uint k = tid; k < head_dim; k += tg_size) orot[k] = Q_in[q_off + k];
@@ -318,13 +324,13 @@ kernel void turboquant_attn_v3(
             for (uint d = 0; d < head_dim; d++) dot += qrot[d] * kw[d];
             sc = dot * scale;  // window stores full-magnitude rotated K (no separate norm)
         } else {
-            uint row = kv_base + pos * row_bytes;
+            uint row = kv_base_k + pos * k_row_bytes;
             float norm = float(*reinterpret_cast<device const half*>(&K_cache[row]));
             device const uchar* qs = K_cache + row + 2;
             float dot = 0.0f;
             for (uint d = 0; d < head_dim; d++) {
-                uint idx = tq_unpack(qs, d, bits, mask);
-                dot += qrot[d] * cen[idx];
+                uint idx = tq_unpack(qs, d, k_bits, k_mask);
+                dot += qrot[d] * cen_k[idx];
             }
             sc = dot * scale * norm;
         }
@@ -360,11 +366,11 @@ kernel void turboquant_attn_v3(
                 device const float* vw = Vwin + (kv_h * rw + (pos % rw)) * head_dim;
                 vv = vw[d];
             } else {
-                uint row = kv_base + pos * row_bytes;
+                uint row = kv_base_v + pos * v_row_bytes;
                 float norm = float(*reinterpret_cast<device const half*>(&V_cache[row]));
                 device const uchar* qs = V_cache + row + 2;
-                uint idx = tq_unpack(qs, d, bits, mask);
-                vv = norm * cen[idx];
+                uint idx = tq_unpack(qs, d, v_bits, v_mask);
+                vv = norm * cen_v[idx];
             }
             acc += scores[j] * vv;
         }

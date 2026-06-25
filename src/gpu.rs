@@ -4285,7 +4285,8 @@ impl MetalContext {
         k_cache: &Buffer,
         v_cache: &Buffer,
         out_buf: &Buffer,
-        centroids: &Buffer,
+        k_centroids: &Buffer,
+        v_centroids: &Buffer,
         num_heads: u32,
         num_kv_heads: u32,
         num_kv_groups: u32,
@@ -4294,8 +4295,10 @@ impl MetalContext {
         capacity: u32,
         scale: f32,
         kv_start: u32,
-        bits: u32,
-        row_bytes: u32,
+        k_bits: u32,
+        v_bits: u32,
+        k_row_bytes: u32,
+        v_row_bytes: u32,
         kwin: &Buffer,
         vwin: &Buffer,
         rw: u32,
@@ -4316,15 +4319,18 @@ impl MetalContext {
         encoder.set_bytes(9, 4, &capacity as *const u32 as *const _);
         encoder.set_bytes(10, 4, &scale as *const f32 as *const _);
         encoder.set_bytes(11, 4, &kv_start as *const u32 as *const _);
-        encoder.set_bytes(12, 4, &bits as *const u32 as *const _);
-        encoder.set_bytes(13, 4, &row_bytes as *const u32 as *const _);
-        encoder.set_buffer(14, Some(centroids), 0);
+        encoder.set_bytes(12, 4, &k_bits as *const u32 as *const _);
+        encoder.set_bytes(13, 4, &k_row_bytes as *const u32 as *const _);
+        encoder.set_buffer(14, Some(k_centroids), 0);
         encoder.set_buffer(15, Some(kwin), 0);
         encoder.set_buffer(16, Some(vwin), 0);
         encoder.set_bytes(17, 4, &rw as *const u32 as *const _);
         encoder.set_bytes(18, 4, &window_lo as *const u32 as *const _);
         encoder.set_buffer(19, Some(fwd), 0);
         encoder.set_buffer(20, Some(inv), 0);
+        encoder.set_bytes(21, 4, &v_bits as *const u32 as *const _);
+        encoder.set_bytes(22, 4, &v_row_bytes as *const u32 as *const _);
+        encoder.set_buffer(23, Some(v_centroids), 0);
         encoder.dispatch_thread_groups(
             MTLSize::new(num_heads as u64, 1, 1),
             MTLSize::new(256, 1, 1),
