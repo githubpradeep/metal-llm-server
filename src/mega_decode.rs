@@ -5,8 +5,8 @@ use metal::*;
 use std::collections::HashMap;
 
 use crate::gemma4_config::{KvCacheType};
-use crate::gemma4_gpu_model::Gemma4GpuModel;
-use crate::gpu::{weight_buf_is_q4, BufferView, MetalContext};
+use crate::gemma4_gpu_model::{Gemma4GpuModel, WeightFormat};
+use crate::gpu::{weight_buf_is_q3, weight_buf_is_q4, BufferView, MetalContext};
 
 pub const MEGA_GRID_TGS: u32 = 512;
 
@@ -225,11 +225,16 @@ impl<'a> GraphBuilder<'a> {
         k: u32,
         in_buf: u32,
         out_buf: u32,
-        use_f16: bool,
+        weight_format: WeightFormat,
     ) {
-        let is_q4 = !use_f16 && weight_buf_is_q4(weight, m, k);
-        if is_q4 {
-            let w = self.weights.index_q4(self.device, weight);
+        let is_q4 = weight_format == WeightFormat::Q4_0 && weight_buf_is_q4(weight, m, k);
+        let is_q3 = weight_format == WeightFormat::Q3_0;
+        if is_q4 || is_q3 {
+            let w = if is_q4 {
+                self.weights.index_q4(self.device, weight)
+            } else {
+                self.weights.index_q4(self.device, weight) // reuse Q4 table for Q3 views
+            };
             self.push(MegaOpDesc {
                 op_type: op::MATVEC_Q4,
                 arg0: m,
@@ -483,7 +488,7 @@ impl MegaDecodeGraph {
             hidden,
             buf::HIDDEN,
             buf::PLE_CTX,
-            false,
+            WeightFormat::Q4_0,
         );
         builder.vec_scale(ple_total, context_proj_scale, buf::PLE_CTX, buf::PLE_TMP);
         builder.rmsnorm_per_head(
@@ -501,7 +506,7 @@ impl MegaDecodeGraph {
             let q_out_l = layer.q_out_dim as u32;
             let kv_out_l = layer.kv_out_dim as u32;
             let head_dim_l = layer.head_dim as u32;
-            let f16 = layer.use_f16;
+            let wf = layer.weight_format;
 
             builder.rmsnorm(
                 &layer.input_layernorm_weight,
@@ -509,7 +514,7 @@ impl MegaDecodeGraph {
                 buf::HIDDEN,
                 buf::NORMED,
             );
-            builder.matvec(&layer.q_proj, q_out_l, hidden, buf::NORMED, buf::Q, f16);
+            builder.matvec(&layer.q_proj, q_out_l, hidden, buf::NORMED, buf::Q, wf);
             builder.rmsnorm_per_head(
                 &layer.q_norm_weight,
                 num_heads,
@@ -520,8 +525,8 @@ impl MegaDecodeGraph {
             builder.rotary_q(li, buf::QN);
 
             if layer.has_kv {
-                builder.matvec(&layer.k_proj, kv_out_l, hidden, buf::NORMED, buf::K, f16);
-                builder.matvec(&layer.v_proj, kv_out_l, hidden, buf::NORMED, buf::V, f16);
+                builder.matvec(&layer.k_proj, kv_out_l, hidden, buf::NORMED, buf::K, wf);
+                builder.matvec(&layer.v_proj, kv_out_l, hidden, buf::NORMED, buf::V, wf);
                 builder.rmsnorm_per_head(
                     &layer.k_norm_weight,
                     num_kv,
@@ -536,7 +541,7 @@ impl MegaDecodeGraph {
             }
 
             builder.attention_q4(layer_idx, layer.kv_source_layer as u32);
-            builder.matvec(&layer.o_proj, hidden, q_out_l, buf::ATTN, buf::O, f16);
+            builder.matvec(&layer.o_proj, hidden, q_out_l, buf::ATTN, buf::O, wf);
             builder.rmsnorm(
                 &layer.post_attention_layernorm_weight,
                 hidden,
@@ -551,10 +556,10 @@ impl MegaDecodeGraph {
                 buf::HIDDEN,
                 buf::NORMED,
             );
-            builder.matvec(&layer.gate_proj, inter, hidden, buf::NORMED, buf::GATE, f16);
-            builder.matvec(&layer.up_proj, inter, hidden, buf::NORMED, buf::UP, f16);
+            builder.matvec(&layer.gate_proj, inter, hidden, buf::NORMED, buf::GATE, wf);
+            builder.matvec(&layer.up_proj, inter, hidden, buf::NORMED, buf::UP, wf);
             builder.gelu_mul(inter, buf::GATE, buf::UP, buf::GELU);
-            builder.matvec(&layer.down_proj, hidden, inter, buf::GELU, buf::DOWN, f16);
+            builder.matvec(&layer.down_proj, hidden, inter, buf::GELU, buf::DOWN, wf);
             builder.rmsnorm(
                 &layer.post_feedforward_layernorm_weight,
                 hidden,
@@ -563,14 +568,14 @@ impl MegaDecodeGraph {
             );
             builder.vec_add(hidden, buf::HIDDEN, buf::NORMED, buf::HIDDEN);
 
-            // PLE weights follow buffer layout (auto), not layer.use_f16.
+            // PLE weights follow buffer layout (auto), not layer.weight_format.
             builder.matvec(
                 &layer.per_layer_input_gate_weight,
                 ple_dim,
                 hidden,
                 buf::HIDDEN,
                 buf::K,
-                false,
+                WeightFormat::Q4_0,
             );
             builder.gelu_mul_at(ple_dim, li, buf::K, buf::PLE_CTX, buf::DOWN);
             builder.matvec(
@@ -579,7 +584,7 @@ impl MegaDecodeGraph {
                 ple_dim,
                 buf::DOWN,
                 buf::O,
-                false,
+                WeightFormat::Q4_0,
             );
             builder.rmsnorm(
                 &layer.post_per_layer_input_norm_weight,
@@ -603,7 +608,7 @@ impl MegaDecodeGraph {
             hidden,
             buf::NORMED,
             buf::LOGITS,
-            false,
+            WeightFormat::Q4_0,
         );
 
         let k_addrs: Vec<u64> = model.k_cache.iter().map(|b| b.gpu_address()).collect();
@@ -746,14 +751,27 @@ impl MegaDecodeGraph {
                 }
                 op::MATVEC_Q4 => {
                     let w = &self.weights.q4_views[op.weight_buf_idx as usize];
-                    ctx.encode_matvec_q4_view(
-                        encoder,
-                        w,
-                        buffers.buf(op.in_buf),
-                        buffers.buf(op.out_buf),
-                        op.arg0,
-                        op.arg1,
-                    );
+                    if weight_buf_is_q3(w, op.arg0, op.arg1) {
+                        ctx.encode_matvec_q3_at_view(
+                            encoder,
+                            w,
+                            buffers.buf(op.in_buf),
+                            0,
+                            buffers.buf(op.out_buf),
+                            0,
+                            op.arg0,
+                            op.arg1,
+                        );
+                    } else {
+                        ctx.encode_matvec_q4_view(
+                            encoder,
+                            w,
+                            buffers.buf(op.in_buf),
+                            buffers.buf(op.out_buf),
+                            op.arg0,
+                            op.arg1,
+                        );
+                    }
                 }
                 op::MATVEC_F16 => {
                     let w = &self.weights.f16_views[op.weight_buf_idx as usize];

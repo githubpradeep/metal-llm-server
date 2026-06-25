@@ -248,6 +248,349 @@ kernel void matvec_ggml_q4_0_f16x(
         tgpig, tiisg, sgitg);
 }
 
+// ─── Q3_0 (3-bit symmetric) kernels ─────────────────────────────────────────
+
+#define QK3_0 32
+
+// Forward declaration — defined later in this file, used by Q3 gelu template.
+inline float gelu_pytorch_tanh_q4(float x);
+
+struct block_q3_0 {
+    half    d;
+    uint8_t qs_low[8];   // low 2 bits: 4 weights per byte
+    uint8_t qs_high[4];  // high 1 bit: 8 weights per byte
+};
+
+inline float block_q3_n_dot_y(device const block_q3_0 * qb, thread const float * yl, int il) {
+    float d = qb->d;
+    // Process 16 weights: acc[0] for first 8 (yl[0..7]), acc[1] for second 8 (yl[8..15])
+    float2 acc = 0.f;
+
+    // il is 0 or 8 → selects which 16-weight subset (two 8-weight groups)
+    // For il=0:  weights 0-7 → qs_low[0..1] + qs_high[0]; weights 16-23 → qs_low[4..5] + qs_high[2]
+    // For il=8:  weights 8-15 → qs_low[2..3] + qs_high[1]; weights 24-31 → qs_low[6..7] + qs_high[3]
+    device const uint8_t * ql0 = qb->qs_low + il/4;      // first group (weights il .. il+7)
+    device const uint8_t * ql1 = qb->qs_low + il/4 + 4;  // second group (weights il+16 .. il+23)
+    device const uint8_t * qh0 = qb->qs_high + il/8;     // first group high bits
+    device const uint8_t * qh1 = qb->qs_high + il/8 + 2; // second group high bits
+
+    for (int i = 0; i < 4; i++) {
+        // First 4 weights of first group
+        int low0  = (ql0[0] >> (2*i)) & 0x3;
+        int high0 = (qh0[0] >> i) & 0x1;
+        // Next 4 weights of first group
+        int low1  = (ql0[1] >> (2*i)) & 0x3;
+        int high1 = (qh0[0] >> (i+4)) & 0x1;
+        int q0 = (low0  | (high0 << 2)) - 4;
+        int q1 = (low1  | (high1 << 2)) - 4;
+        acc[0] += yl[i]   * q0 + yl[i+4] * q1;
+
+        // First 4 weights of second group
+        int low2  = (ql1[0] >> (2*i)) & 0x3;
+        int high2 = (qh1[0] >> i) & 0x1;
+        // Next 4 weights of second group
+        int low3  = (ql1[1] >> (2*i)) & 0x3;
+        int high3 = (qh1[0] >> (i+4)) & 0x1;
+        int q2 = (low2  | (high2 << 2)) - 4;
+        int q3 = (low3  | (high3 << 2)) - 4;
+        acc[1] += yl[i+8] * q2 + yl[i+12] * q3;
+    }
+    return d * (acc[0] + acc[1]);
+}
+
+template<typename block_q_type, short NR0, short NSG, short NW>
+void mul_vec_q3_f32_impl(
+        device const void  * src0,
+        device const float * src1,
+        device       float * dst,
+                   int64_t   ne00,
+                   int64_t   ne01,
+                   int64_t   ne02,
+                   int64_t   ne10,
+                   int64_t   ne12,
+                   int64_t   ne0,
+                   int64_t   ne1,
+                   uint      r2,
+                   uint      r3,
+                   uint3 tgpig, uint tiisg, uint sgitg) {
+    const int nb = ne00/QK3_0;
+
+    const int r0 = tgpig.x;
+    const int r1 = tgpig.y;
+    const int im = tgpig.z;
+
+    const int first_row = (r0 * NSG + sgitg) * NR0;
+
+    const uint i12 = im%ne12;
+    const uint i13 = im/ne12;
+
+    const uint offset0 = first_row * nb + (i12/r2)*(nb*ne01) + (i13/r3)*(nb*ne01*ne02);
+
+    device const block_q_type * x = (device const block_q_type *) src0 + offset0;
+    device const float        * y = (device const float        *) src1 + r1*ne10 + im*ne00*ne1;
+
+    float yl[16];
+    float sumf[NR0];
+    for (short row = 0; row < NR0; ++row) sumf[row] = 0.f;
+
+    const int ix = (tiisg/2);
+    const int il = (tiisg%2)*8;
+
+    device const float * yb = y + ix * QK3_0 + il;
+
+    for (int ib = ix; ib < nb; ib += NW/2) {
+        for (int i = 0; i < 8; i += 2) {
+            yl[i+0] = yb[i+ 0];
+            yl[i+1] = yb[i+ 1];
+            yl[i+8] = yb[i+16];
+            yl[i+9] = yb[i+17];
+        }
+
+        for (int row = 0; row < NR0; row++) {
+            sumf[row] += block_q3_n_dot_y(x+ib+row*nb, yl, il);
+        }
+
+        yb += QK3_0 * 16;
+    }
+
+    for (int row = 0; row < NR0; ++row) {
+        const float tot = simd_sum(sumf[row]);
+        if (tiisg == 0 && first_row + row < ne01) {
+            dst[im*ne0*ne1 + r1*ne0 + first_row + row] = tot;
+        }
+    }
+}
+
+template<typename block_q_type, short NR0, short NSG, short NW>
+void mul_vec_dual_q3_f32_impl(
+        device const void  * src0_a,
+        device const void  * src0_b,
+        device const float * src1,
+        device       float * dst_a,
+        device       float * dst_b,
+                   int64_t   ne00,
+                   int64_t   ne01,
+                   int64_t   ne02,
+                   int64_t   ne10,
+                   int64_t   ne12,
+                   int64_t   ne0,
+                   int64_t   ne1,
+                   uint      r2,
+                   uint      r3,
+                   uint3 tgpig, uint tiisg, uint sgitg) {
+    const int nb = ne00/QK3_0;
+
+    const int r0 = tgpig.x;
+    const int r1 = tgpig.y;
+    const int im = tgpig.z;
+
+    const int first_row = (r0 * NSG + sgitg) * NR0;
+
+    const uint i12 = im%ne12;
+    const uint i13 = im/ne12;
+
+    const uint offset0 = first_row * nb + (i12/r2)*(nb*ne01) + (i13/r3)*(nb*ne01*ne02);
+
+    device const block_q_type * x_a = (device const block_q_type *) src0_a + offset0;
+    device const block_q_type * x_b = (device const block_q_type *) src0_b + offset0;
+    device const float        * y   = (device const float        *) src1 + r1*ne10 + im*ne00*ne1;
+
+    float yl[16];
+    float sumf_a[NR0];
+    float sumf_b[NR0];
+    for (short row = 0; row < NR0; ++row) {
+        sumf_a[row] = 0.f;
+        sumf_b[row] = 0.f;
+    }
+
+    const int ix = (tiisg/2);
+    const int il = (tiisg%2)*8;
+
+    device const float * yb = y + ix * QK3_0 + il;
+
+    for (int ib = ix; ib < nb; ib += NW/2) {
+        for (int i = 0; i < 8; i += 2) {
+            yl[i+0] = yb[i+ 0];
+            yl[i+1] = yb[i+ 1];
+            yl[i+8] = yb[i+16];
+            yl[i+9] = yb[i+17];
+        }
+
+        for (int row = 0; row < NR0; row++) {
+            sumf_a[row] += block_q3_n_dot_y(x_a+ib+row*nb, yl, il);
+            sumf_b[row] += block_q3_n_dot_y(x_b+ib+row*nb, yl, il);
+        }
+
+        yb += QK3_0 * 16;
+    }
+
+    for (int row = 0; row < NR0; ++row) {
+        const int row_idx = first_row + row;
+        const bool valid = row_idx < ne01;
+        const float tot_a = simd_sum(sumf_a[row]);
+        const float tot_b = simd_sum(sumf_b[row]);
+        if (tiisg == 0 && valid) {
+            const uint64_t dst_off = (uint64_t)im*ne0*ne1 + (uint64_t)r1*ne0 + (uint64_t)row_idx;
+            dst_a[dst_off] = tot_a;
+            dst_b[dst_off] = tot_b;
+        }
+    }
+}
+
+template<typename block_q_type, short NR0, short NSG, short NW>
+void mul_vec_gelu_q3_f32_impl(
+        device const void  * src0_gate,
+        device const void  * src0_up,
+        device const float * src1,
+        device       float * dst,
+                   int64_t   ne00,
+                   int64_t   ne01,
+                   int64_t   ne02,
+                   int64_t   ne10,
+                   int64_t   ne12,
+                   int64_t   ne0,
+                   int64_t   ne1,
+                   uint      r2,
+                   uint      r3,
+                   uint3 tgpig, uint tiisg, uint sgitg) {
+    const int nb = ne00/QK3_0;
+
+    const int r0 = tgpig.x;
+    const int r1 = tgpig.y;
+    const int im = tgpig.z;
+
+    const int first_row = (r0 * NSG + sgitg) * NR0;
+
+    const uint i12 = im%ne12;
+    const uint i13 = im/ne12;
+
+    const uint offset0 = first_row * nb + (i12/r2)*(nb*ne01) + (i13/r3)*(nb*ne01*ne02);
+
+    device const block_q_type * x_gate = (device const block_q_type *) src0_gate + offset0;
+    device const block_q_type * x_up   = (device const block_q_type *) src0_up   + offset0;
+    device const float        * y      = (device const float        *) src1 + r1*ne10 + im*ne00*ne1;
+
+    float yl[16];
+    float sumf_gate[NR0];
+    float sumf_up[NR0];
+    for (short row = 0; row < NR0; ++row) {
+        sumf_gate[row] = 0.f;
+        sumf_up[row]   = 0.f;
+    }
+
+    const int ix = (tiisg/2);
+    const int il = (tiisg%2)*8;
+
+    device const float * yb = y + ix * QK3_0 + il;
+
+    for (int ib = ix; ib < nb; ib += NW/2) {
+        for (int i = 0; i < 8; i += 2) {
+            yl[i+0] = yb[i+ 0];
+            yl[i+1] = yb[i+ 1];
+            yl[i+8] = yb[i+16];
+            yl[i+9] = yb[i+17];
+        }
+
+        for (int row = 0; row < NR0; row++) {
+            sumf_gate[row] += block_q3_n_dot_y(x_gate+ib+row*nb, yl, il);
+            sumf_up[row]   += block_q3_n_dot_y(x_up  +ib+row*nb, yl, il);
+        }
+
+        yb += QK3_0 * 16;
+    }
+
+    for (int row = 0; row < NR0; ++row) {
+        const int row_idx = first_row + row;
+        const bool valid = row_idx < ne01;
+        const float gate = simd_sum(sumf_gate[row]);
+        const float up   = simd_sum(sumf_up[row]);
+        const float gelu = valid ? gelu_pytorch_tanh_q4(gate) * up : 0.0f;
+        if (tiisg == 0 && valid) {
+            const uint64_t dst_off = (uint64_t)im*ne0*ne1 + (uint64_t)r1*ne0 + (uint64_t)row_idx;
+            dst[dst_off] = gelu;
+        }
+    }
+}
+
+// ─── Q3_0 kernel entry points ────────────────────────────────────────────────
+
+kernel void matvec_ggml_q3_0(
+    device const char * W [[buffer(0)]],
+    device const char * x [[buffer(1)]],
+    device char * y [[buffer(2)]],
+    constant ggml_mul_mv_args& args [[buffer(3)]],
+    uint3 tgpig [[threadgroup_position_in_grid]],
+    uint tiisg [[thread_index_in_simdgroup]],
+    uint sgitg [[simdgroup_index_in_threadgroup]]
+) {
+    mul_vec_q3_f32_impl<block_q3_0, 4, 2, 32>(
+        W, (device const float *)x, (device float *)y,
+        args.ne00, args.ne01, args.ne02,
+        args.ne10, args.ne12,
+        args.ne0, args.ne1,
+        uint(args.r2), uint(args.r3),
+        tgpig, tiisg, sgitg);
+}
+
+kernel void matvec_ggml_q3_0_dual(
+    device const char * W_gate [[buffer(0)]],
+    device const char * W_up   [[buffer(1)]],
+    device const char * x      [[buffer(2)]],
+    device char * gate [[buffer(3)]],
+    device char * up   [[buffer(4)]],
+    constant ggml_mul_mv_args& args [[buffer(5)]],
+    uint3 tgpig [[threadgroup_position_in_grid]],
+    uint tiisg [[thread_index_in_simdgroup]],
+    uint sgitg [[simdgroup_index_in_threadgroup]]
+) {
+    mul_vec_dual_q3_f32_impl<block_q3_0, 4, 2, 32>(
+        W_gate, W_up, (device const float *)x,
+        (device float *)gate, (device float *)up,
+        args.ne00, args.ne01, args.ne02,
+        args.ne10, args.ne12,
+        args.ne0, args.ne1,
+        uint(args.r2), uint(args.r3),
+        tgpig, tiisg, sgitg);
+}
+
+kernel void matvec_ggml_q3_0_gelu_mul(
+    device const char * W_gate [[buffer(0)]],
+    device const char * W_up   [[buffer(1)]],
+    device const char * x      [[buffer(2)]],
+    device char * y            [[buffer(3)]],
+    constant ggml_mul_mv_args& args [[buffer(4)]],
+    uint3 tgpig [[threadgroup_position_in_grid]],
+    uint tiisg [[thread_index_in_simdgroup]],
+    uint sgitg [[simdgroup_index_in_threadgroup]]
+) {
+    mul_vec_gelu_q3_f32_impl<block_q3_0, 4, 2, 32>(
+        W_gate, W_up, (device const float *)x, (device float *)y,
+        args.ne00, args.ne01, args.ne02,
+        args.ne10, args.ne12,
+        args.ne0, args.ne1,
+        uint(args.r2), uint(args.r3),
+        tgpig, tiisg, sgitg);
+}
+
+kernel void matvec_ggml_q3_0_gelu_mul_r2s4(
+    device const char * W_gate [[buffer(0)]],
+    device const char * W_up   [[buffer(1)]],
+    device const char * x      [[buffer(2)]],
+    device char * y            [[buffer(3)]],
+    constant ggml_mul_mv_args& args [[buffer(4)]],
+    uint3 tgpig [[threadgroup_position_in_grid]],
+    uint tiisg [[thread_index_in_simdgroup]],
+    uint sgitg [[simdgroup_index_in_threadgroup]]
+) {
+    mul_vec_gelu_q3_f32_impl<block_q3_0, 2, 4, 32>(
+        W_gate, W_up, (device const float *)x, (device float *)y,
+        args.ne00, args.ne01, args.ne02,
+        args.ne10, args.ne12,
+        args.ne0, args.ne1,
+        uint(args.r2), uint(args.r3),
+        tgpig, tiisg, sgitg);
+}
+
 // ─── mul_mv_ext (batch matvec) ───────────────────────────────────────────────
 
 template <typename type4>

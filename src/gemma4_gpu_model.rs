@@ -554,7 +554,63 @@ pub struct Gemma4GpuLayer {
     pub head_dim: usize,
     pub q_out_dim: usize,
     pub kv_out_dim: usize,
-    pub use_f16: bool, // true = f16 weights (sensitive layers), false = Q4
+    pub weight_format: WeightFormat,
+}
+
+/// Weight format for a layer's projection matrices.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WeightFormat {
+    F16,
+    Q4_0,
+    Q3_0,
+}
+
+impl WeightFormat {
+    pub fn to_u8(self) -> u8 {
+        match self {
+            WeightFormat::F16 => 0,
+            WeightFormat::Q4_0 => 1,
+            WeightFormat::Q3_0 => 2,
+        }
+    }
+
+    pub fn from_u8(v: u8) -> Self {
+        match v {
+            0 => WeightFormat::F16,
+            2 => WeightFormat::Q3_0,
+            _ => WeightFormat::Q4_0,
+        }
+    }
+
+    pub fn is_quantized(self) -> bool {
+        matches!(self, WeightFormat::Q4_0 | WeightFormat::Q3_0)
+    }
+
+    pub fn is_q3(self) -> bool {
+        matches!(self, WeightFormat::Q3_0)
+    }
+}
+
+pub fn env_weight_format() -> WeightFormat {
+    match std::env::var("WEIGHT_FORMAT").as_deref() {
+        Ok("q4") | Ok("Q4") | Ok("q4_0") | Ok("Q4_0") => WeightFormat::Q4_0,
+        Ok("q3") | Ok("Q3") | Ok("q3_0") | Ok("Q3_0") => WeightFormat::Q3_0,
+        _ => WeightFormat::Q4_0,
+    }
+}
+
+/// When `Q3_LAYER_END` is set, returns `Some((start, end))` for the
+/// inclusive layer range to quantize with Q3_0 (default start=0).
+/// Returns `None` when `Q3_LAYER_END` is unset (no Q3 layers).
+fn q3_layer_range() -> Option<(usize, usize)> {
+    let start = std::env::var("Q3_LAYER_START")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0);
+    let end = std::env::var("Q3_LAYER_END")
+        .ok()
+        .and_then(|v| v.parse().ok())?;
+    if end >= start { Some((start, end)) } else { None }
 }
 
 #[derive(Deserialize)]
@@ -768,10 +824,20 @@ impl Gemma4GpuModel {
 
         // Load all layers
         let num_layers_to_load = num_layers;
-        println!(
-            "  Loading layers (Q4_0 quantized, {} layers)...",
-            num_layers_to_load
-        );
+        let q3_range = q3_layer_range();
+        let use_q3 = q3_range.is_some();
+        let (q3_start, q3_end) = q3_range.unwrap_or((0, 0));
+        if use_q3 {
+            println!(
+                "  Loading layers (Q4_0 + Q3_0 layers {}-{}, {} layers)...",
+                q3_start, q3_end, num_layers_to_load
+            );
+        } else {
+            println!(
+                "  Loading layers (Q4_0 quantized, {} layers)...",
+                num_layers_to_load
+            );
+        }
         let mut layers = Vec::with_capacity(num_layers_to_load);
 
         for layer_idx in 0..num_layers_to_load {
@@ -867,44 +933,25 @@ impl Gemma4GpuModel {
                 .remove("self_attn.k_norm.weight")
                 .expect("k_norm missing");
 
-            // All layers Q4_0 (matches llama.cpp GGUF; delete model.q4cache to refresh old f16 caches).
+            let is_q3 = use_q3 && layer_idx >= q3_start && layer_idx <= q3_end;
+            let q_weight = |data: &[f32], rows: usize, cols: usize| -> Buffer {
+                if is_q3 {
+                    ctx.buffer_from_f32_as_q3(data, rows, cols)
+                } else {
+                    ctx.buffer_from_f32_as_q4(data, rows, cols)
+                }
+            };
+
             let layer = Gemma4GpuLayer {
-                q_proj: BufferView::from_buffer(ctx.buffer_from_f32_as_q4(
-                    &q_proj_data,
-                    q_out,
-                    hidden_size,
-                )),
-                k_proj: BufferView::from_buffer(ctx.buffer_from_f32_as_q4(
-                    &k_proj_data,
-                    kv_out,
-                    hidden_size,
-                )),
-                v_proj: BufferView::from_buffer(ctx.buffer_from_f32_as_q4(
-                    &v_proj_data,
-                    kv_out,
-                    hidden_size,
-                )),
-                o_proj: BufferView::from_buffer(ctx.buffer_from_f32_as_q4(
-                    &o_proj_data,
-                    hidden_size,
-                    q_out,
-                )),
-                gate_proj: BufferView::from_buffer(ctx.buffer_from_f32_as_q4(
-                    &gate_proj_data,
-                    intermediate_size,
-                    hidden_size,
-                )),
-                up_proj: BufferView::from_buffer(ctx.buffer_from_f32_as_q4(
-                    &up_proj_data,
-                    intermediate_size,
-                    hidden_size,
-                )),
+                q_proj: BufferView::from_buffer(q_weight(&q_proj_data, q_out, hidden_size)),
+                k_proj: BufferView::from_buffer(q_weight(&k_proj_data, kv_out, hidden_size)),
+                v_proj: BufferView::from_buffer(q_weight(&v_proj_data, kv_out, hidden_size)),
+                o_proj: BufferView::from_buffer(q_weight(&o_proj_data, hidden_size, q_out)),
+
+                gate_proj: BufferView::from_buffer(q_weight(&gate_proj_data, intermediate_size, hidden_size)),
+                up_proj: BufferView::from_buffer(q_weight(&up_proj_data, intermediate_size, hidden_size)),
                 gate_up_proj: BufferView::from_buffer(ctx.buffer_empty(1)),
-                down_proj: BufferView::from_buffer(ctx.buffer_from_f32_as_q4(
-                    &down_proj_data,
-                    hidden_size,
-                    intermediate_size,
-                )),
+                down_proj: BufferView::from_buffer(q_weight(&down_proj_data, hidden_size, intermediate_size)),
 
                 input_layernorm_weight: BufferView::from_buffer(ctx.buffer_from_slice(&input_ln)),
                 post_attention_layernorm_weight: BufferView::from_buffer(ctx.buffer_from_slice(&post_attn_ln)),
@@ -933,7 +980,7 @@ impl Gemma4GpuModel {
                 head_dim,
                 q_out_dim: q_out,
                 kv_out_dim: kv_out,
-                use_f16: false,
+                weight_format: if is_q3 { WeightFormat::Q3_0 } else { WeightFormat::Q4_0 },
             };
 
             layers.push(layer);
@@ -1247,7 +1294,7 @@ impl Gemma4GpuModel {
             file.write_all(&(layer.is_full_attention as u8).to_le_bytes())
                 .unwrap();
             file.write_all(&(layer.has_kv as u8).to_le_bytes()).unwrap();
-            file.write_all(&(layer.use_f16 as u8).to_le_bytes())
+            file.write_all(&[layer.weight_format.to_u8()])
                 .unwrap();
             file.write_all(&(layer.kv_source_layer as u32).to_le_bytes())
                 .unwrap();
@@ -1441,7 +1488,7 @@ impl Gemma4GpuModel {
             *offset += 1;
             let has_kv = data[*offset] != 0;
             *offset += 1;
-            let use_f16 = data[*offset] != 0;
+            let wf = WeightFormat::from_u8(data[*offset]);
             *offset += 1;
 
             let kv_source_layer =
@@ -1492,7 +1539,7 @@ impl Gemma4GpuModel {
                 head_dim,
                 q_out_dim,
                 kv_out_dim,
-                use_f16,
+                weight_format: wf,
             });
         }
 
@@ -1782,9 +1829,9 @@ impl Gemma4GpuModel {
             per_layer_ple_bufs.push(ctx.buffer_empty(ple_dim));
         }
 
-        if layers.iter().any(|l| l.use_f16) {
+        if layers.iter().any(|l| l.weight_format == WeightFormat::F16) {
             eprintln!(
-                "  Warning: weights cache has f16 layers (0-2, 39-41); delete model.q4cache for all-Q4"
+                "  Warning: weights cache has f16 layers; delete model.q4cache for all-Q4"
             );
         }
 
@@ -1899,11 +1946,11 @@ impl Gemma4GpuModel {
         }
         let pack_start = std::time::Instant::now();
         for layer in layers.iter_mut() {
-            if layer.use_f16 {
-                layer.gate_up_proj = BufferView::from_buffer(ctx.buffer_empty(1));
-            } else {
+            if Self::use_packed_mlp_gate_up(layer) {
                 layer.gate_up_proj =
                     ctx.pack_gate_up_interleaved_q4(&layer.gate_proj, &layer.up_proj, m, k);
+            } else {
+                layer.gate_up_proj = BufferView::from_buffer(ctx.buffer_empty(1));
             }
         }
         println!(
@@ -1914,7 +1961,26 @@ impl Gemma4GpuModel {
     }
 
     fn use_packed_mlp_gate_up(layer: &Gemma4GpuLayer) -> bool {
-        crate::gpu::packed_mlp_gate_up_enabled() && !layer.use_f16
+        crate::gpu::packed_mlp_gate_up_enabled() && layer.weight_format == WeightFormat::Q4_0
+    }
+
+    /// Dispatch a plain quantized matvec for a layer's weight (Q4 or Q3).
+    fn encode_matvec_quant(
+        &self,
+        encoder: &metal::ComputeCommandEncoderRef,
+        weight: &BufferView,
+        x_buf: &metal::Buffer,
+        y_buf: &metal::Buffer,
+        m: u32,
+        k: u32,
+        wf: WeightFormat,
+    ) {
+        match wf {
+            WeightFormat::Q3_0 => self.ctx.encode_matvec_q3_at_view(
+                encoder, weight, x_buf, 0, y_buf, 0, m, k),
+            _ => self.ctx.encode_matvec_q4_view(
+                encoder, weight, x_buf, y_buf, m, k),
+        }
     }
 
     fn encode_mlp_gate_up_gelu_q4_view(
@@ -1949,7 +2015,20 @@ impl Gemma4GpuModel {
         intermediate_size: u32,
         hidden_size: u32,
     ) {
-        if Self::use_packed_mlp_gate_up(layer) {
+        if layer.weight_format.is_q3() {
+            // Q3_0: use ggml fused gelu_mul kernel
+            self.ctx.encode_matvec_ggml_q3_gelu_mul_at_view(
+                encoder,
+                &layer.gate_proj,
+                &layer.up_proj,
+                x_buf,
+                x_offset,
+                gelu_buf,
+                gelu_offset,
+                intermediate_size,
+                hidden_size,
+            );
+        } else if Self::use_packed_mlp_gate_up(layer) {
             self.ctx.encode_matvec_q4_interleaved_gelu_at_view(
                 encoder,
                 &layer.gate_up_proj,
@@ -2415,7 +2494,7 @@ impl Gemma4GpuModel {
 
             if !__ablate.skip_attn() {
             // Pre-attention norm + Q/K/V projections (fused when Q4 + FUSED_QKV=1).
-            if !layer.use_f16 && crate::gpu::fused_qkv_enabled() {
+            if layer.weight_format == WeightFormat::Q4_0 && crate::gpu::fused_qkv_enabled() {
                 if layer.has_kv {
                     self.ctx.encode_rmsnorm_qkv_q4_view(
                         encoder,
@@ -2458,7 +2537,7 @@ impl Gemma4GpuModel {
             );
 
             // Q projection (always computed)
-            if layer.use_f16 {
+            if layer.weight_format == WeightFormat::F16 {
                 self.ctx.encode_matvec_f16_view(
                     encoder,
                     &layer.q_proj,
@@ -2468,19 +2547,20 @@ impl Gemma4GpuModel {
                     hidden_size as u32,
                 );
             } else {
-                self.ctx.encode_matvec_q4_view(
+                self.encode_matvec_quant(
                     encoder,
                     &layer.q_proj,
                     &self.normed_buf,
                     &self.q_buf,
                     q_out as u32,
                     hidden_size as u32,
+                    layer.weight_format,
                 );
             }
 
             // K, V only for non-shared layers
             if layer.has_kv {
-                if layer.use_f16 {
+                if layer.weight_format == WeightFormat::F16 {
                     self.ctx.encode_matvec_f16_view(
                         encoder,
                         &layer.k_proj,
@@ -2498,21 +2578,30 @@ impl Gemma4GpuModel {
                         hidden_size as u32,
                     );
                 } else {
-                    self.ctx.encode_matvec_q4_dual_view(
+                    // For Q3_0 and Q4_0: use dual (fused) matvec
+                    self.encode_matvec_quant(
                         encoder,
                         &layer.k_proj,
-                        &layer.v_proj,
                         &self.normed_buf,
                         &self.k_buf,
+                        kv_out as u32,
+                        hidden_size as u32,
+                        layer.weight_format,
+                    );
+                    self.encode_matvec_quant(
+                        encoder,
+                        &layer.v_proj,
+                        &self.normed_buf,
                         &self.v_buf,
                         kv_out as u32,
                         hidden_size as u32,
+                        layer.weight_format,
                     );
                 }
             }
             } // !fused_qkv fallback
 
-            let use_fused_q_attn = !layer.use_f16
+            let use_fused_q_attn = layer.weight_format.is_quantized()
                 && matches!(self.kv_cache_type, KvCacheType::Q4_0)
                 && self.ctx.use_flash_attention
                 && crate::gpu::fused_q_attn_enabled()
@@ -2944,7 +3033,7 @@ impl Gemma4GpuModel {
 
             if !__ablate.skip_mlp() {
             // MLP: gate_proj, up_proj, GeLU activation, down_proj
-            if layer.use_f16 {
+            if layer.weight_format == WeightFormat::F16 {
                 self.ctx.encode_rmsnorm_view(
                     encoder,
                     &self.hidden_buf,
@@ -3011,6 +3100,7 @@ impl Gemma4GpuModel {
                     eps,
                 );
             } else if crate::gpu::fused_mlp_gelu_down_enabled()
+                && !layer.weight_format.is_q3()
                 && crate::gpu::weight_buf_is_q4(
                     &layer.gate_proj,
                     intermediate_size as u32,
@@ -3072,6 +3162,7 @@ impl Gemma4GpuModel {
                     );
                 }
             } else if Self::use_packed_mlp_gate_up(layer)
+                || layer.weight_format.is_q3()
                 || crate::gpu::fused_mlp_ple_enabled()
             {
                 self.ctx.encode_rmsnorm_view(
@@ -3090,13 +3181,14 @@ impl Gemma4GpuModel {
                     intermediate_size as u32,
                     hidden_size as u32,
                 );
-                self.ctx.encode_matvec_q4_view(
+                self.encode_matvec_quant(
                     encoder,
                     &layer.down_proj,
                     &self.gelu_buf,
                     &self.down_buf,
                     hidden_size as u32,
                     intermediate_size as u32,
+                    layer.weight_format,
                 );
             } else {
                 self.ctx.encode_rmsnorm_view(
@@ -3124,13 +3216,14 @@ impl Gemma4GpuModel {
                     &self.gelu_buf,
                     intermediate_size as u32,
                 );
-                self.ctx.encode_matvec_q4_view(
+                self.encode_matvec_quant(
                     encoder,
                     &layer.down_proj,
                     &self.gelu_buf,
                     &self.down_buf,
                     hidden_size as u32,
                     intermediate_size as u32,
+                    layer.weight_format,
                 );
             }
 
@@ -3891,7 +3984,7 @@ impl Gemma4GpuModel {
             seq_len as u32,
         );
 
-        if layer.use_f16 {
+        if layer.weight_format == WeightFormat::F16 {
             self.ctx.encode_projection_f16_batch_view(
                 encoder,
                 &layer.q_proj,
@@ -3921,7 +4014,7 @@ impl Gemma4GpuModel {
                     seq_len as u32,
                 );
             }
-        } else {
+        } else if layer.weight_format == WeightFormat::Q4_0 {
             self.ctx.encode_projection_q4_batch_view(
                 encoder,
                 &layer.q_proj,
@@ -4285,7 +4378,7 @@ impl Gemma4GpuModel {
             eps,
             seq_len as u32,
         );
-        if layer.use_f16 {
+        if layer.weight_format == WeightFormat::F16 {
             self.ctx.encode_projection_f16_batch_view(
                 encoder,
                 &layer.gate_proj,
@@ -4331,7 +4424,7 @@ impl Gemma4GpuModel {
             &self.prefill_scratch.gelu_buf,
             total_intermediate,
         );
-        if layer.use_f16 {
+        if layer.weight_format == WeightFormat::F16 {
             self.ctx.encode_projection_f16_batch_view(
                 encoder,
                 &layer.down_proj,
@@ -4700,7 +4793,7 @@ impl Gemma4GpuModel {
             eps,
             total_seq_len as u32,
         );
-        if layer.use_f16 {
+        if layer.weight_format == WeightFormat::F16 {
             self.ctx.encode_projection_f16_batch_view(
                 encoder,
                 &layer.gate_proj,
@@ -4746,7 +4839,7 @@ impl Gemma4GpuModel {
             &self.prefill_scratch.gelu_buf,
             total_intermediate,
         );
-        if layer.use_f16 {
+        if layer.weight_format == WeightFormat::F16 {
             self.ctx.encode_projection_f16_batch_view(
                 encoder,
                 &layer.down_proj,
@@ -5103,10 +5196,10 @@ impl Gemma4GpuModel {
                 eps,
                 seq_len as u32,
             );
-            if layer.use_f16 {
-                self.ctx.encode_projection_f16_batch_view(
-                    encoder,
-                    &layer.gate_proj,
+        if layer.weight_format == WeightFormat::F16 {
+            self.ctx.encode_projection_f16_batch_view(
+                encoder,
+                &layer.gate_proj,
                     &self.prefill_scratch.normed_buf,
                     &self.prefill_scratch.gate_buf,
                     intermediate_size as u32,
@@ -5149,10 +5242,10 @@ impl Gemma4GpuModel {
                 &self.prefill_scratch.gelu_buf,
                 total_intermediate,
             );
-            if layer.use_f16 {
-                self.ctx.encode_projection_f16_batch_view(
-                    encoder,
-                    &layer.down_proj,
+        if layer.weight_format == WeightFormat::F16 {
+            self.ctx.encode_projection_f16_batch_view(
+                encoder,
+                &layer.down_proj,
                     &self.prefill_scratch.gelu_buf,
                     &self.prefill_scratch.down_buf,
                     hidden_size as u32,
@@ -5429,7 +5522,7 @@ impl Gemma4GpuModel {
                     eps,
                 );
 
-                if layer.use_f16 {
+                if layer.weight_format == WeightFormat::F16 {
                     self.ctx.encode_matvec_f16_at_view(
                         encoder,
                         &layer.q_proj,
@@ -5441,7 +5534,7 @@ impl Gemma4GpuModel {
                         hidden_size as u32,
                     );
                 } else {
-                    self.ctx.encode_matvec_q4_at_view(
+                    self.ctx.encode_matvec_auto_at_view(
                         encoder,
                         &layer.q_proj,
                         &self.decode_batch_scratch.normed_buf,
@@ -5479,7 +5572,7 @@ impl Gemma4GpuModel {
                 );
 
                 if layer.has_kv {
-                    if layer.use_f16 {
+                    if layer.weight_format == WeightFormat::F16 {
                         self.ctx.encode_matvec_f16_at_view(
                             encoder,
                             &layer.k_proj,
@@ -5501,7 +5594,7 @@ impl Gemma4GpuModel {
                             hidden_size as u32,
                         );
                     } else {
-                        self.ctx.encode_matvec_q4_at_view(
+                        self.ctx.encode_matvec_auto_at_view(
                             encoder,
                             &layer.k_proj,
                             &self.decode_batch_scratch.normed_buf,
@@ -5511,7 +5604,7 @@ impl Gemma4GpuModel {
                             kv_out as u32,
                             hidden_size as u32,
                         );
-                        self.ctx.encode_matvec_q4_at_view(
+                        self.ctx.encode_matvec_auto_at_view(
                             encoder,
                             &layer.v_proj,
                             &self.decode_batch_scratch.normed_buf,
@@ -5843,7 +5936,7 @@ impl Gemma4GpuModel {
                     offsets.hidden,
                     hidden_size as u32,
                 );
-                if layer.use_f16 {
+                if layer.weight_format == WeightFormat::F16 {
                     self.ctx.encode_rmsnorm_at_view(
                         encoder,
                         &self.decode_batch_scratch.hidden_buf,
@@ -5922,6 +6015,7 @@ impl Gemma4GpuModel {
                         eps,
                     );
                 } else if crate::gpu::fused_mlp_gelu_down_enabled()
+                    && !layer.weight_format.is_q3()
                     && crate::gpu::weight_buf_is_q4(
                         &layer.gate_proj,
                         intermediate_size as u32,
@@ -5969,6 +6063,7 @@ impl Gemma4GpuModel {
                         );
                     }
                 } else if Self::use_packed_mlp_gate_up(layer)
+                    || layer.weight_format.is_q3()
                     || crate::gpu::fused_mlp_ple_enabled()
                 {
                     self.ctx.encode_rmsnorm_at_view(
@@ -5991,15 +6086,14 @@ impl Gemma4GpuModel {
                         intermediate_size as u32,
                         hidden_size as u32,
                     );
-                    self.ctx.encode_matvec_q4_at_view(
+                    self.encode_matvec_quant(
                         encoder,
                         &layer.down_proj,
                         &self.decode_batch_scratch.gelu_buf,
-                        offsets.intermediate,
                         &self.decode_batch_scratch.down_buf,
-                        offsets.hidden,
                         hidden_size as u32,
                         intermediate_size as u32,
+                        layer.weight_format,
                     );
                 } else {
                     self.ctx.encode_rmsnorm_at_view(
@@ -6012,18 +6106,23 @@ impl Gemma4GpuModel {
                         hidden_size as u32,
                         eps,
                     );
-                    self.ctx.encode_matvec_q4_dual_at_view(
+                    self.encode_matvec_quant(
                         encoder,
                         &layer.gate_proj,
-                        &layer.up_proj,
                         &self.decode_batch_scratch.normed_buf,
-                        offsets.hidden,
                         &self.decode_batch_scratch.gate_buf,
-                        offsets.intermediate,
-                        &self.decode_batch_scratch.up_buf,
-                        offsets.intermediate,
                         intermediate_size as u32,
                         hidden_size as u32,
+                        layer.weight_format,
+                    );
+                    self.encode_matvec_quant(
+                        encoder,
+                        &layer.up_proj,
+                        &self.decode_batch_scratch.normed_buf,
+                        &self.decode_batch_scratch.up_buf,
+                        intermediate_size as u32,
+                        hidden_size as u32,
+                        layer.weight_format,
                     );
                     self.ctx.encode_gelu_mul_at(
                         encoder,
@@ -6035,15 +6134,14 @@ impl Gemma4GpuModel {
                         offsets.intermediate,
                         intermediate_size as u32,
                     );
-                    self.ctx.encode_matvec_q4_at_view(
+                    self.encode_matvec_quant(
                         encoder,
                         &layer.down_proj,
                         &self.decode_batch_scratch.gelu_buf,
-                        offsets.intermediate,
                         &self.decode_batch_scratch.down_buf,
-                        offsets.hidden,
                         hidden_size as u32,
                         intermediate_size as u32,
+                        layer.weight_format,
                     );
                 }
                 if crate::gpu::fused_rmsnorm_acc_enabled() {

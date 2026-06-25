@@ -44,6 +44,12 @@ pub fn weight_buf_is_q4(view: &BufferView, m: u32, k: u32) -> bool {
     view.length <= q4_bytes + 256
 }
 
+/// True when a `[m, k]` weight buffer holds Q3_0 blocks (14 bytes / 32 weights).
+pub fn weight_buf_is_q3(view: &BufferView, m: u32, k: u32) -> bool {
+    let q3_bytes = (m as u64) * (k as u64 / 32) * 14;
+    view.length <= q3_bytes + 256
+}
+
 /// Q4 matvec kernel used on the batch-1 decode path. Selectable at runtime via
 /// the `MATVEC_KERNEL` env var (`r1` | `r2` | `r4`/`fast` | `splitk`) so the
 /// best variant for the model's matvec shapes can be chosen from measurement
@@ -386,6 +392,11 @@ pub struct MetalContext {
     pub matvec_ggml_q4_dual_pipeline: ComputePipelineState,
     pub matvec_ggml_q4_gelu_mul_pipeline: ComputePipelineState,
     pub matvec_ggml_q4_gelu_mul_r2s4_pipeline: ComputePipelineState,
+    // Q3_0 pipelines
+    pub matvec_ggml_q3_pipeline: ComputePipelineState,
+    pub matvec_ggml_q3_dual_pipeline: ComputePipelineState,
+    pub matvec_ggml_q3_gelu_mul_pipeline: ComputePipelineState,
+    pub matvec_ggml_q3_gelu_mul_r2s4_pipeline: ComputePipelineState,
     pub matvec_ggml_ext_q4_nx4_pipeline: ComputePipelineState,
     pub matvec_ggml_ext_q4_nx8_pipeline: ComputePipelineState,
     pub matvec_ggml_ext_q4_nx16_pipeline: ComputePipelineState,
@@ -540,6 +551,10 @@ impl MetalContext {
         let matvec_ggml_q4_dual_pipeline = get_fn("matvec_ggml_q4_0_dual");
         let matvec_ggml_q4_gelu_mul_pipeline = get_fn("matvec_ggml_q4_0_gelu_mul");
         let matvec_ggml_q4_gelu_mul_r2s4_pipeline = get_fn("matvec_ggml_q4_0_gelu_mul_r2s4");
+        let matvec_ggml_q3_pipeline = get_fn("matvec_ggml_q3_0");
+        let matvec_ggml_q3_dual_pipeline = get_fn("matvec_ggml_q3_0_dual");
+        let matvec_ggml_q3_gelu_mul_pipeline = get_fn("matvec_ggml_q3_0_gelu_mul");
+        let matvec_ggml_q3_gelu_mul_r2s4_pipeline = get_fn("matvec_ggml_q3_0_gelu_mul_r2s4");
         let matvec_ggml_ext_q4_nx4_pipeline = get_fn("matvec_ggml_ext_q4_nx4_r4");
         let matvec_ggml_ext_q4_nx8_pipeline = get_fn("matvec_ggml_ext_q4_nx8_r4");
         let matvec_ggml_ext_q4_nx16_pipeline = get_fn("matvec_ggml_ext_q4_nx16_r4");
@@ -769,6 +784,10 @@ impl MetalContext {
             matvec_ggml_q4_dual_pipeline,
             matvec_ggml_q4_gelu_mul_pipeline,
             matvec_ggml_q4_gelu_mul_r2s4_pipeline,
+            matvec_ggml_q3_pipeline,
+            matvec_ggml_q3_dual_pipeline,
+            matvec_ggml_q3_gelu_mul_pipeline,
+            matvec_ggml_q3_gelu_mul_r2s4_pipeline,
             matvec_ggml_ext_q4_nx4_pipeline,
             matvec_ggml_ext_q4_nx8_pipeline,
             matvec_ggml_ext_q4_nx16_pipeline,
@@ -958,6 +977,19 @@ impl MetalContext {
         let byte_len = q4_data.len() as u64;
         self.device.new_buffer_with_data(
             q4_data.as_ptr() as *const _,
+            byte_len,
+            MTLResourceOptions::StorageModeShared,
+        )
+    }
+
+    /// Create a Metal buffer with Q3_0 quantized data from f32.
+    /// Format: for each group of 32 values: [f16 scale][8 bytes low-2-bits][4 bytes high-1-bit]
+    /// Total: 14 bytes per 32 weights (~22% smaller than Q4_0's 18 bytes).
+    pub fn buffer_from_f32_as_q3(&self, data: &[f32], rows: usize, cols: usize) -> Buffer {
+        let q3_data = quantize_q3_0(data, rows, cols);
+        let byte_len = q3_data.len() as u64;
+        self.device.new_buffer_with_data(
+            q3_data.as_ptr() as *const _,
             byte_len,
             MTLResourceOptions::StorageModeShared,
         )
@@ -1320,7 +1352,7 @@ impl MetalContext {
         );
     }
 
-    /// Matvec dispatching to Q4 or f16 based on the weight buffer layout.
+    /// Matvec dispatching to Q4, Q3, or f16 based on the weight buffer layout.
     pub fn encode_matvec_auto_view(
         &self,
         encoder: &metal::ComputeCommandEncoderRef,
@@ -1330,7 +1362,9 @@ impl MetalContext {
         m: u32,
         k: u32,
     ) {
-        if weight_buf_is_q4(weight, m, k) {
+        if weight_buf_is_q3(weight, m, k) {
+            self.encode_matvec_q3_at_view(encoder, weight, x_buf, 0, y_buf, 0, m, k);
+        } else if weight_buf_is_q4(weight, m, k) {
             self.encode_matvec_q4_view(encoder, weight, x_buf, y_buf, m, k);
         } else {
             self.encode_matvec_f16_view(encoder, weight, x_buf, y_buf, m, k);
@@ -1348,7 +1382,11 @@ impl MetalContext {
         m: u32,
         k: u32,
     ) {
-        if weight_buf_is_q4(weight, m, k) {
+        if weight_buf_is_q3(weight, m, k) {
+            self.encode_matvec_q3_at_view(
+                encoder, weight, x_buf, x_offset, y_buf, y_offset, m, k,
+            );
+        } else if weight_buf_is_q4(weight, m, k) {
             self.encode_matvec_q4_at_view(
                 encoder, weight, x_buf, x_offset, y_buf, y_offset, m, k,
             );
@@ -1583,6 +1621,71 @@ impl MetalContext {
                 metal::MTLSize::new(tw, nsg, 1),
             );
         }
+    }
+
+    // ─── Q3_0 matvec dispatch ────────────────────────────────────────────────
+
+    /// Q3_0 weight matvec: W is 3-bit quantized, x and y are f32.
+    pub fn encode_matvec_q3_at_view(
+        &self,
+        encoder: &metal::ComputeCommandEncoderRef,
+        weight: &BufferView,
+        x_buf: &Buffer,
+        x_offset: u64,
+        y_buf: &Buffer,
+        y_offset: u64,
+        m: u32,
+        k: u32,
+    ) {
+        use crate::ggml_gemv::{mul_mv_args, mul_mv_dispatch};
+        let args = mul_mv_args(m, k);
+        encoder.set_compute_pipeline_state(&self.matvec_ggml_q3_pipeline);
+        encoder.set_buffer(0, Some(&weight.buffer), weight.offset);
+        encoder.set_buffer(1, Some(x_buf), x_offset);
+        encoder.set_buffer(2, Some(y_buf), y_offset);
+        encoder.set_bytes(
+            3,
+            std::mem::size_of::<crate::ggml_gemv::GgmlMulMvArgs>() as u64,
+            &args as *const _ as *const _,
+        );
+        let (tg_x, tg_y, tg_z, tw, nsg) = mul_mv_dispatch(m, 1);
+        encoder.dispatch_thread_groups(
+            metal::MTLSize::new(tg_x, tg_y, tg_z),
+            metal::MTLSize::new(tw, nsg, 1),
+        );
+    }
+
+    /// Fused gate+up Q3_0 GEMV with GeLU(gate)*up — one dispatch with shared x loads.
+    pub fn encode_matvec_ggml_q3_gelu_mul_at_view(
+        &self,
+        encoder: &metal::ComputeCommandEncoderRef,
+        gate: &BufferView,
+        up: &BufferView,
+        x_buf: &Buffer,
+        x_offset: u64,
+        gelu_out: &Buffer,
+        gelu_offset: u64,
+        m: u32,
+        k: u32,
+    ) {
+        use crate::ggml_gemv::mul_mv_args;
+        let args = mul_mv_args(m, k);
+        encoder.set_compute_pipeline_state(&self.matvec_ggml_q3_gelu_mul_pipeline);
+        encoder.set_buffer(0, Some(&gate.buffer), gate.offset);
+        encoder.set_buffer(1, Some(&up.buffer), up.offset);
+        encoder.set_buffer(2, Some(x_buf), x_offset);
+        encoder.set_buffer(3, Some(gelu_out), gelu_offset);
+        encoder.set_bytes(
+            4,
+            std::mem::size_of::<crate::ggml_gemv::GgmlMulMvArgs>() as u64,
+            &args as *const _ as *const _,
+        );
+        use crate::ggml_gemv::mul_mv_dispatch;
+        let (tg_x, tg_y, tg_z, tw, nsg) = mul_mv_dispatch(m, 1);
+        encoder.dispatch_thread_groups(
+            metal::MTLSize::new(tg_x, tg_y, tg_z),
+            metal::MTLSize::new(tw, nsg, 1),
+        );
     }
 
     fn encode_matvec_ggml_at(
@@ -4787,6 +4890,21 @@ impl MetalContext {
     }
 }
 
+/// Convert f16 (IEEE 754 half-precision) to f32.
+pub fn f16_to_f32(value: u16) -> f32 {
+    let sign = ((value >> 15) as f32) * -2.0 + 1.0;
+    let exp = (value >> 10) & 0x1F;
+    let mant = value & 0x3FF;
+    if exp == 0 {
+        // Subnormal or zero
+        sign * (mant as f32) * (2.0f32).powi(-24)
+    } else if exp == 31 {
+        if mant == 0 { sign * f32::INFINITY } else { f32::NAN }
+    } else {
+        sign * (1.0 + (mant as f32) / 1024.0) * (2.0f32).powi(exp as i32 - 15)
+    }
+}
+
 /// Convert f32 to f16 (IEEE 754 half-precision).
 pub fn f32_to_f16(value: f32) -> u16 {
     let bits = value.to_bits();
@@ -4808,6 +4926,80 @@ pub fn f32_to_f16(value: f32) -> u16 {
     } else {
         (sign | ((exp as u32) << 10) | mant) as u16
     }
+}
+
+/// Quantize f32 weights to Q3_0 format (3-bit symmetric, group=32).
+/// Block = 14 bytes: f16 scale + 8 bytes low-2-bits + 4 bytes high-1-bit.
+/// 32 weights × 3 bits = 96 bits = 12 bytes payload + 2 byte scale = 14 bytes.
+/// Reconstruction: q ∈ [0,7], value = (q - 4) · d,  d = max_abs / 3.
+fn quantize_q3_0(data: &[f32], rows: usize, cols: usize) -> Vec<u8> {
+    assert_eq!(cols % 32, 0, "cols must be divisible by 32 for Q3_0");
+    let num_groups_per_row = cols / 32;
+    let bytes_per_row = num_groups_per_row * 14;
+    let mut output = vec![0u8; rows * bytes_per_row];
+
+    for row in 0..rows {
+        for g in 0..num_groups_per_row {
+            let group_start = row * cols + g * 32;
+            let group = &data[group_start..group_start + 32];
+
+            let mut max_abs = 0.0f32;
+            for &v in group { let a = v.abs(); if a > max_abs { max_abs = a; } }
+
+            let scale = if max_abs > 0.0 { max_abs / 3.0 } else { 1.0 };
+            let inv_scale = 1.0 / scale;
+
+            let scale_f16 = f32_to_f16(scale);
+            let out_offset = row * bytes_per_row + g * 14;
+            output[out_offset] = (scale_f16 & 0xFF) as u8;
+            output[out_offset + 1] = (scale_f16 >> 8) as u8;
+
+            // Pack 32 3-bit values: low 2 bits in qs_low[0..7], high 1 bit in qs_high[0..3]
+            for i in 0..32 {
+                let v = group[i];
+                let q = ((v * inv_scale).round() as i32 + 4).clamp(0, 7) as u8;
+                let low = q & 0x3;
+                let high = (q >> 2) & 0x1;
+                // qs_low: 4 weights per byte, 2 bits each
+                let low_byte = i / 4;
+                let low_shift = (i % 4) * 2;
+                output[out_offset + 2 + low_byte] |= low << low_shift;
+                // qs_high: 8 weights per byte, 1 bit each
+                let high_byte = i / 8;
+                let high_shift = i % 8;
+                output[out_offset + 10 + high_byte] |= high << high_shift;
+            }
+        }
+    }
+    output
+}
+
+/// Dequantize Q3_0 to f32 (CPU, for testing).
+fn dequantize_q3_0(data: &[u8], rows: usize, cols: usize) -> Vec<f32> {
+    let num_groups_per_row = cols / 32;
+    let bytes_per_row = num_groups_per_row * 14;
+    let mut output = vec![0.0f32; rows * cols];
+
+    for row in 0..rows {
+        for g in 0..num_groups_per_row {
+            let in_offset = row * bytes_per_row + g * 14;
+            let raw_scale = u16::from_le_bytes([data[in_offset], data[in_offset + 1]]);
+            let d = f16_to_f32(raw_scale);
+
+            for i in 0..32 {
+                let low_byte = i / 4;
+                let low_shift = (i % 4) * 2;
+                let low = (data[in_offset + 2 + low_byte] >> low_shift) & 0x3;
+                let high_byte = i / 8;
+                let high_shift = i % 8;
+                let high = (data[in_offset + 10 + high_byte] >> high_shift) & 0x1;
+                let q = low | (high << 2);
+                let v = d * ((q as i32 - 4) as f32);
+                output[row * cols + g * 32 + i] = v;
+            }
+        }
+    }
+    output
 }
 
 /// Quantize f32 weights to Q4_0 format.
@@ -5098,10 +5290,232 @@ impl GpuTimestampProfiler {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rand::Rng;
 
     #[test]
     fn metal_context_compiles_shaders() {
         // Creating a context compiles every Metal function in llama.metal.
         let _ctx = MetalContext::new();
+    }
+
+    #[test]
+    fn q3_0_quantize_dequantize_roundtrip() {
+        let mut rng = rand::thread_rng();
+
+        let rows = 4;
+        let cols = 32;
+
+        // Random data in [-1, 1]
+        let data: Vec<f32> = (0..rows * cols).map(|_| rng.gen_range(-1.0..1.0)).collect();
+
+        let q3 = quantize_q3_0(&data, rows, cols);
+        let deq = dequantize_q3_0(&q3, rows, cols);
+
+        // Check error is reasonable (3-bit symmetric → ~12.5% relative error worst-case)
+        let mut max_err = 0.0f32;
+        for i in 0..data.len() {
+            let err = (data[i] - deq[i]).abs();
+            if err > max_err { max_err = err; }
+        }
+        let data_max = data.iter().map(|v| v.abs()).fold(0.0f32, f32::max);
+        let rel_err = max_err / data_max.max(1e-6);
+        assert!(rel_err < 0.2, "Q3_0 rel error too high: {:.4}", rel_err);
+        assert!(max_err < 0.5, "Q3_0 abs error too high: {:.4}", max_err);
+    }
+
+    #[test]
+    fn q3_0_matvec_matches_cpu_reference() {
+        use crate::ggml_gemv::{mul_mv_args, mul_mv_dispatch};
+        use metal::*;
+
+        let ctx = MetalContext::new();
+        let device = &ctx.device;
+        let queue = ctx.queue.clone();
+
+        let rows: u32 = 8;
+        let cols: u32 = 64;
+
+        // Random weights
+        let mut rng = rand::thread_rng();
+        let w_data: Vec<f32> = (0..rows as usize * cols as usize)
+            .map(|_| rng.gen_range(-0.5..0.5))
+            .collect();
+
+        // Random input vector
+        let x_data: Vec<f32> = (0..cols as usize).map(|_| rng.gen_range(-1.0..1.0)).collect();
+
+        // CPU reference: dequantize and gemv
+        let q3_data = quantize_q3_0(&w_data, rows as usize, cols as usize);
+        let deq = dequantize_q3_0(&q3_data, rows as usize, cols as usize);
+        let cpu_out: Vec<f32> = (0..rows as usize)
+            .map(|r| {
+                deq[r * cols as usize..(r + 1) * cols as usize]
+                    .iter()
+                    .zip(x_data.iter())
+                    .map(|(a, b)| a * b)
+                    .sum()
+            })
+            .collect();
+
+        // GPU buffers
+        let w_buf = device.new_buffer_with_data(
+            q3_data.as_ptr() as *const _,
+            q3_data.len() as u64,
+            MTLResourceOptions::StorageModeShared,
+        );
+        let x_buf = device.new_buffer_with_data(
+            x_data.as_ptr() as *const _,
+            (x_data.len() * 4) as u64,
+            MTLResourceOptions::StorageModeShared,
+        );
+        let y_buf = device.new_buffer(
+            (rows as u64) * 4,
+            MTLResourceOptions::StorageModeShared,
+        );
+
+        let cmd = queue.new_command_buffer();
+        let encoder = cmd.new_compute_command_encoder();
+
+        let args = mul_mv_args(rows, cols);
+        encoder.set_compute_pipeline_state(&ctx.matvec_ggml_q3_pipeline);
+        encoder.set_buffer(0, Some(&w_buf), 0);
+        encoder.set_buffer(1, Some(&x_buf), 0);
+        encoder.set_buffer(2, Some(&y_buf), 0);
+        encoder.set_bytes(
+            3,
+            std::mem::size_of::<crate::ggml_gemv::GgmlMulMvArgs>() as u64,
+            &args as *const _ as *const _,
+        );
+        let (tg_x, tg_y, tg_z, tw, nsg) = mul_mv_dispatch(rows, 1);
+        encoder.dispatch_thread_groups(
+            metal::MTLSize::new(tg_x, tg_y, tg_z),
+            metal::MTLSize::new(tw, nsg, 1),
+        );
+        encoder.end_encoding();
+        cmd.commit();
+        cmd.wait_until_completed();
+
+        let gpu_out: Vec<f32> = {
+            let ptr = y_buf.contents() as *const f32;
+            unsafe { std::slice::from_raw_parts(ptr, rows as usize).to_vec() }
+        };
+
+        let mut max_diff = 0.0f32;
+        for i in 0..rows as usize {
+            let diff = (cpu_out[i] - gpu_out[i]).abs();
+            if diff > max_diff { max_diff = diff; }
+        }
+        let out_scale = cpu_out.iter().map(|v| v.abs()).fold(0.0f32, f32::max).max(1e-6);
+        let rel_diff = max_diff / out_scale;
+        assert!(
+            rel_diff < 0.02,
+            "Q3_0 GPU vs CPU matvec mismatch: max_diff={:.6} rel={:.6}",
+            max_diff,
+            rel_diff
+        );
+    }
+
+    #[test]
+    fn q3_0_gelu_mul_matvec_matches_cpu_reference() {
+        use crate::ggml_gemv::{mul_mv_args, mul_mv_dispatch};
+        use metal::*;
+
+        let ctx = MetalContext::new();
+        let device = &ctx.device;
+        let queue = ctx.queue.clone();
+
+        let rows: u32 = 8;
+        let cols: u32 = 64;
+
+        let mut rng = rand::thread_rng();
+        let gate_data: Vec<f32> = (0..rows as usize * cols as usize)
+            .map(|_| rng.gen_range(-0.5..0.5))
+            .collect();
+        let up_data: Vec<f32> = (0..rows as usize * cols as usize)
+            .map(|_| rng.gen_range(-0.5..0.5))
+            .collect();
+        let x_data: Vec<f32> = (0..cols as usize).map(|_| rng.gen_range(-1.0..1.0)).collect();
+
+        // CPU reference
+        let cpu_gelu = {
+            let q3_gate = quantize_q3_0(&gate_data, rows as usize, cols as usize);
+            let q3_up = quantize_q3_0(&up_data, rows as usize, cols as usize);
+            let dgate = dequantize_q3_0(&q3_gate, rows as usize, cols as usize);
+            let dup = dequantize_q3_0(&q3_up, rows as usize, cols as usize);
+
+            let gate_out: Vec<f32> = (0..rows as usize)
+                .map(|r| {
+                    dgate[r * cols as usize..(r + 1) * cols as usize]
+                        .iter().zip(x_data.iter()).map(|(a, b)| a * b).sum()
+                })
+                .collect();
+            let up_out: Vec<f32> = (0..rows as usize)
+                .map(|r| {
+                    dup[r * cols as usize..(r + 1) * cols as usize]
+                        .iter().zip(x_data.iter()).map(|(a, b)| a * b).sum()
+                })
+                .collect();
+            gate_out.iter().zip(up_out.iter()).map(|(&g, &u)| {
+                let inner = 0.7978845608 * (g + 0.044715 * g * g * g);
+                let inner_clamped = inner.clamp(-10.0, 10.0);
+                (0.5 * g * (1.0 + inner_clamped.tanh())) * u
+            }).collect::<Vec<f32>>()
+        };
+        let cpu_out = cpu_gelu;
+
+        // GPU
+        let gate_q3 = quantize_q3_0(&gate_data, rows as usize, cols as usize);
+        let up_q3 = quantize_q3_0(&up_data, rows as usize, cols as usize);
+
+        let gate_buf = device.new_buffer_with_data(
+            gate_q3.as_ptr() as *const _, gate_q3.len() as u64, MTLResourceOptions::StorageModeShared);
+        let up_buf = device.new_buffer_with_data(
+            up_q3.as_ptr() as *const _, up_q3.len() as u64, MTLResourceOptions::StorageModeShared);
+        let x_buf = device.new_buffer_with_data(
+            x_data.as_ptr() as *const _, (x_data.len() * 4) as u64, MTLResourceOptions::StorageModeShared);
+        let y_buf = device.new_buffer(
+            (rows as u64) * 4, MTLResourceOptions::StorageModeShared);
+
+        let cmd = queue.new_command_buffer();
+        let encoder = cmd.new_compute_command_encoder();
+
+        let args = mul_mv_args(rows, cols);
+        encoder.set_compute_pipeline_state(&ctx.matvec_ggml_q3_gelu_mul_pipeline);
+        encoder.set_buffer(0, Some(&gate_buf), 0);
+        encoder.set_buffer(1, Some(&up_buf), 0);
+        encoder.set_buffer(2, Some(&x_buf), 0);
+        encoder.set_buffer(3, Some(&y_buf), 0);
+        encoder.set_bytes(
+            4,
+            std::mem::size_of::<crate::ggml_gemv::GgmlMulMvArgs>() as u64,
+            &args as *const _ as *const _,
+        );
+        let (tg_x, tg_y, tg_z, tw, nsg) = mul_mv_dispatch(rows, 1);
+        encoder.dispatch_thread_groups(
+            metal::MTLSize::new(tg_x, tg_y, tg_z),
+            metal::MTLSize::new(tw, nsg, 1),
+        );
+        encoder.end_encoding();
+        cmd.commit();
+        cmd.wait_until_completed();
+
+        let gpu_out: Vec<f32> = {
+            let ptr = y_buf.contents() as *const f32;
+            unsafe { std::slice::from_raw_parts(ptr, rows as usize).to_vec() }
+        };
+
+        let mut max_diff = 0.0f32;
+        for i in 0..rows as usize {
+            let diff = (cpu_out[i] - gpu_out[i]).abs();
+            if diff > max_diff { max_diff = diff; }
+        }
+        let out_scale = cpu_out.iter().map(|v| v.abs()).fold(0.0f32, f32::max).max(1e-6);
+        let rel_diff = max_diff / out_scale;
+        assert!(
+            rel_diff < 0.05,
+            "Q3_0 gelu_mul GPU vs CPU mismatch: max_diff={:.6} rel={:.6}",
+            max_diff,
+            rel_diff
+        );
     }
 }
