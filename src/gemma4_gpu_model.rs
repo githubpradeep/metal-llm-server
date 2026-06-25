@@ -422,6 +422,7 @@ struct EmbedTables {
     ple_offset: usize,
     ple_byte_len: usize,
     ple_cols: usize,
+    vocab_size: usize,
     owned_embed: Option<Vec<u8>>,
     owned_ple: Option<Vec<u8>>,
 }
@@ -434,6 +435,7 @@ impl EmbedTables {
         ple_offset: usize,
         ple_byte_len: usize,
         ple_cols: usize,
+        vocab_size: usize,
     ) -> Self {
         Self {
             mmap: Some(mmap),
@@ -442,14 +444,14 @@ impl EmbedTables {
             ple_offset,
             ple_byte_len,
             ple_cols,
+            vocab_size,
             owned_embed: None,
             owned_ple: None,
         }
     }
 
-    fn from_owned(embed: Vec<u8>, ple: Vec<u8>, vocab_size: usize, ple_cols: usize) -> Self {
-        let embed_byte_len = embed.len();
-        let owned_embed = Some(embed);
+    fn from_owned(embed: Vec<u8>, ple: Vec<u8>, vocab_size: usize, ple_cols: usize, embed_cols: usize) -> Self {
+        let (owned_embed, embed_byte_len) = Self::convert_embed_to_q4(embed, vocab_size, embed_cols);
         let (owned_ple, ple_byte_len) = Self::convert_ple_to_q4(ple, vocab_size, ple_cols);
         Self {
             mmap: None,
@@ -458,9 +460,53 @@ impl EmbedTables {
             ple_offset: 0,
             ple_byte_len,
             ple_cols,
+            vocab_size,
             owned_embed,
             owned_ple,
         }
+    }
+
+    /// Convert bf16 embed data to Q4_0 blocks. Each row of length `embed_cols` becomes
+    /// `(embed_cols/32)*18` bytes of Q4_0 blocks.
+    fn convert_embed_to_q4(bf16_data: Vec<u8>, vocab_size: usize, embed_cols: usize) -> (Option<Vec<u8>>, usize) {
+        assert_eq!(bf16_data.len(), vocab_size * embed_cols * 2,
+            "embed data size mismatch: got {} expected {}", bf16_data.len(), vocab_size * embed_cols * 2);
+        assert_eq!(embed_cols % 32, 0, "embed cols not divisible by 32");
+
+        let blocks_per_row = embed_cols / 32;
+        let q4_row_bytes = blocks_per_row * 18;
+        let mut q4_data = vec![0u8; vocab_size * q4_row_bytes];
+        let mut f32_row = vec![0.0f32; embed_cols];
+        for row in 0..vocab_size {
+            let row_start = row * embed_cols * 2;
+            for i in 0..embed_cols {
+                let byte_off = row_start + i * 2;
+                let raw = u16::from_le_bytes([bf16_data[byte_off], bf16_data[byte_off + 1]]);
+                f32_row[i] = crate::gpu::bf16_to_f32(raw);
+            }
+            for g in 0..blocks_per_row {
+                let group_start = g * 32;
+                let mut max_abs = 0.0f32;
+                for &v in f32_row[group_start..group_start + 32].iter() {
+                    let a = v.abs();
+                    if a > max_abs { max_abs = a; }
+                }
+                let d = if max_abs > 0.0 { max_abs / 7.0 } else { 1.0 };
+                let inv_d = 1.0 / d;
+                let d_f16 = crate::gpu::f32_to_f16(d);
+                let out_off = row * q4_row_bytes + g * 18;
+                q4_data[out_off] = (d_f16 & 0xFF) as u8;
+                q4_data[out_off + 1] = (d_f16 >> 8) as u8;
+                for i in 0..16 {
+                    let v0 = f32_row[group_start + i];
+                    let v1 = f32_row[group_start + i + 16];
+                    let q0 = ((v0 * inv_d).round() as i32 + 8).clamp(0, 15) as u8;
+                    let q1 = ((v1 * inv_d).round() as i32 + 8).clamp(0, 15) as u8;
+                    q4_data[out_off + 2 + i] = q0 | (q1 << 4);
+                }
+            }
+        }
+        (Some(q4_data), vocab_size * q4_row_bytes)
     }
 
     /// Convert bf16 PLE data to Q4_0 blocks. Each row of length `ple_cols` becomes
@@ -530,11 +576,34 @@ impl EmbedTables {
     }
 
     fn decode_embed_into(&self, token_id: usize, hidden_size: usize, out: &mut [f32]) {
-        let byte_start = token_id * hidden_size * 2;
-        let bytes = &self.embed_bytes()[byte_start..byte_start + hidden_size * 2];
         let scale = (hidden_size as f32).sqrt();
-        for (i, chunk) in bytes.chunks_exact(2).enumerate() {
-            out[i] = crate::gpu::bf16_to_f32(u16::from_le_bytes([chunk[0], chunk[1]])) * scale;
+        let bf16_row_bytes = hidden_size * 2;
+        if self.embed_byte_len as u64 > self.vocab_size as u64 * bf16_row_bytes as u64 / 2 {
+            // bf16 format
+            let byte_start = token_id * bf16_row_bytes;
+            let bytes = &self.embed_bytes()[byte_start..byte_start + bf16_row_bytes];
+            for (i, chunk) in bytes.chunks_exact(2).enumerate() {
+                out[i] = crate::gpu::bf16_to_f32(u16::from_le_bytes([chunk[0], chunk[1]])) * scale;
+            }
+        } else {
+            // Q4_0 format
+            let blocks = hidden_size / 32;
+            let q4_row_bytes = blocks * 18;
+            let row_start = token_id * q4_row_bytes;
+            let bytes = &self.embed_bytes()[row_start..row_start + q4_row_bytes];
+            for g in 0..blocks {
+                let off = g * 18;
+                let raw_d = u16::from_le_bytes([bytes[off], bytes[off + 1]]);
+                let d = crate::gpu::f16_to_f32(raw_d);
+                let out_off = g * 32;
+                for i in 0..16 {
+                    let packed = bytes[off + 2 + i];
+                    let q0 = packed & 0x0F;
+                    let q1 = packed >> 4;
+                    out[out_off + i] = d * ((q0 as i32 - 8) as f32) * scale;
+                    out[out_off + i + 16] = d * ((q1 as i32 - 8) as f32) * scale;
+                }
+            }
         }
     }
 
@@ -546,7 +615,7 @@ impl EmbedTables {
         out: &mut [f32],
     ) {
         let scale = (ple_dim as f32).sqrt();
-        if self.ple_byte_len as u64 > (262144u64 * ple_total_dim as u64 * 2) / 2 {
+        if self.ple_byte_len as u64 > self.vocab_size as u64 * ple_total_dim as u64 {
             // Old format: bf16 (detected by large byte length)
             let cols = self.ple_cols;
             let byte_start = token_id * cols * 2;
@@ -871,6 +940,7 @@ impl Gemma4GpuModel {
             owned_ple.expect("embed_tokens_per_layer not found"),
             vocab_size,
             ple_total_dim,
+            hidden_size,
         );
 
         // Create GPU buffer for lm_head (tied embeddings — quantize to Q4_0)
@@ -1708,6 +1778,7 @@ impl Gemma4GpuModel {
             ple_offset,
             ple_embed_len as usize,
             ple_cols,
+            vocab_size,
         );
 
         let model = Self::finish_cache_load(
@@ -2257,6 +2328,7 @@ impl Gemma4GpuModel {
             ple_offset,
             ple_len as usize,
             ple_cols,
+            config.vocab_size,
         );
 
         let model = Self::finish_cache_load(
