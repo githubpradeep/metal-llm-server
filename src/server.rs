@@ -823,6 +823,7 @@ async fn chat_completions_sync(
 
     let (mut response_rx, cancel) = enqueue_request(&state, input_ids, generation_params)?;
     let mut output_tokens = Vec::new();
+    let mut decoded_text = String::new();
     let mut finish_reason = "stop".to_string();
 
     while let Some(event) = response_rx.recv().await {
@@ -830,11 +831,12 @@ async fn chat_completions_sync(
             StreamEvent::Token { token_id } => {
                 output_tokens.push(token_id as u32);
 
-                let decoded_so_far = state
+                let tok_str = state
                     .tokenizer
-                    .decode(&output_tokens, false)
+                    .decode(&[token_id as u32], false)
                     .unwrap_or_default();
-                if find_stop_position(&decoded_so_far, request_stop.as_deref()).is_some() {
+                decoded_text.push_str(&tok_str);
+                if find_stop_position(&decoded_text, request_stop.as_deref()).is_some() {
                     cancel.store(CANCEL_STOP, Ordering::Relaxed);
                     break;
                 }
@@ -958,6 +960,7 @@ async fn chat_completions_stream(
             .await;
 
         let mut output_tokens = Vec::new();
+        let mut decoded_text = String::new();
         let mut emitted_text = String::new();
 
         let mut finish_reason = "stop".to_string();
@@ -968,25 +971,24 @@ async fn chat_completions_stream(
                 StreamEvent::Token { token_id } => {
                     output_tokens.push(token_id as u32);
 
+                    let tok_str = state
+                        .tokenizer
+                        .decode(&[token_id as u32], false)
+                        .unwrap_or_default();
+                    decoded_text.push_str(&tok_str);
+
                     // When tools are enabled we cannot stream raw text: it may be
                     // a `tool_call` block that must be parsed and re-emitted as a
                     // structured tool call. Buffer everything and finalize on Done.
                     if has_tools {
-                        let decoded_so_far = state
-                            .tokenizer
-                            .decode(&output_tokens, false)
-                            .unwrap_or_default();
-                        if find_stop_position(&decoded_so_far, request_stop.as_deref()).is_some() {
+                        if find_stop_position(&decoded_text, request_stop.as_deref()).is_some() {
                             cancel.store(CANCEL_STOP, Ordering::Relaxed);
                             break;
                         }
                         continue;
                     }
 
-                    let mut visible_text = state
-                        .tokenizer
-                        .decode(&output_tokens, false)
-                        .unwrap_or_default();
+                    let mut visible_text = decoded_text.clone();
                     let stopped = trim_stream_safe_text(&mut visible_text, request_stop.as_deref());
                     let tok_str = if visible_text.starts_with(&emitted_text) {
                         visible_text[emitted_text.len()..].to_string()
