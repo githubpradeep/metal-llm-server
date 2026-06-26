@@ -59,6 +59,54 @@ pub struct ChatCompletionRequest {
     pub repetition_penalty: f32,
     #[serde(default)]
     pub frequency_penalty: f32,
+    // Accepted for OpenAI compatibility (not currently used by the sampler).
+    #[serde(default)]
+    pub top_p: Option<f32>,
+    #[serde(default)]
+    pub tools: Option<Vec<Tool>>,
+    // Accepted for OpenAI compatibility; tool selection is left to the model.
+    #[serde(default)]
+    pub tool_choice: Option<serde_json::Value>,
+}
+
+#[derive(Deserialize, Clone)]
+pub struct Tool {
+    #[serde(rename = "type", default)]
+    pub tool_type: Option<String>,
+    pub function: FunctionDef,
+}
+
+#[derive(Deserialize, Clone)]
+pub struct FunctionDef {
+    pub name: String,
+    #[serde(default)]
+    pub description: Option<String>,
+    #[serde(default)]
+    pub parameters: Option<serde_json::Value>,
+}
+
+#[derive(Deserialize, Serialize, Clone)]
+pub struct ToolCall {
+    pub id: String,
+    #[serde(rename = "type")]
+    pub call_type: String,
+    pub function: FunctionCall,
+}
+
+#[derive(Deserialize, Serialize, Clone)]
+pub struct FunctionCall {
+    pub name: String,
+    /// JSON-encoded arguments string, per the OpenAI spec.
+    pub arguments: String,
+}
+
+#[derive(Serialize, Clone)]
+pub struct ToolCallDelta {
+    pub index: usize,
+    pub id: String,
+    #[serde(rename = "type")]
+    pub call_type: String,
+    pub function: FunctionCall,
 }
 
 fn default_max_tokens() -> usize {
@@ -74,10 +122,64 @@ fn default_repetition_penalty() -> f32 {
     1.0
 }
 
-#[derive(Deserialize, Serialize, Clone)]
+#[derive(Deserialize, Serialize, Clone, Default)]
 pub struct Message {
     pub role: String,
-    pub content: String,
+    #[serde(
+        default,
+        deserialize_with = "deserialize_content",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub content: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_calls: Option<Vec<ToolCall>>,
+    /// Present on `role: "tool"` messages, linking back to the assistant call.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_call_id: Option<String>,
+    /// Function name for `role: "tool"` messages.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+}
+
+/// OpenAI allows `content` to be either a plain string, `null`, or an array of
+/// content parts (e.g. `[{ "type": "text", "text": "hi" }]`). Accept all forms
+/// and flatten array content down to a single string by concatenating text
+/// parts.
+fn deserialize_content<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum ContentField {
+        Text(String),
+        Parts(Vec<ContentPart>),
+    }
+
+    #[derive(Deserialize)]
+    struct ContentPart {
+        #[serde(rename = "type")]
+        kind: String,
+        #[serde(default)]
+        text: Option<String>,
+    }
+
+    let field = Option::<ContentField>::deserialize(deserializer)?;
+    Ok(match field {
+        None => None,
+        Some(ContentField::Text(s)) => Some(s),
+        Some(ContentField::Parts(parts)) => {
+            let mut out = String::new();
+            for part in parts {
+                if part.kind == "text" {
+                    if let Some(text) = part.text {
+                        out.push_str(&text);
+                    }
+                }
+            }
+            Some(out)
+        }
+    })
 }
 
 #[derive(Serialize)]
@@ -126,6 +228,8 @@ pub struct Delta {
     pub role: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub content: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_calls: Option<Vec<ToolCallDelta>>,
 }
 
 #[derive(Serialize)]
@@ -295,16 +399,165 @@ const BUILT_IN_STOP_SEQUENCES: &[&str] = &[
     "</start_of_turn>",
 ];
 
-fn apply_chat_template(messages: &[Message]) -> String {
-    let mut prompt = String::new();
-    for msg in messages {
-        prompt.push_str(&format!(
-            "<start_of_turn>{}\n{}<end_of_turn>\n",
-            msg.role, msg.content
-        ));
+fn render_tool_instructions(tools: &[Tool]) -> String {
+    let mut s = String::new();
+    s.push_str(
+        "You have access to the following tools. When you need to use a tool, \
+respond with one or more fenced code blocks tagged `tool_call`, each containing \
+a single JSON object with \"name\" and \"arguments\" keys. Emit nothing else when \
+calling a tool. Only call tools from this list.\n\n",
+    );
+    s.push_str("Available tools:\n");
+    for tool in tools {
+        let f = &tool.function;
+        s.push_str("- ");
+        s.push_str(&f.name);
+        if let Some(desc) = &f.description {
+            s.push_str(": ");
+            s.push_str(desc);
+        }
+        s.push('\n');
+        if let Some(params) = &f.parameters {
+            s.push_str("  parameters (JSON schema): ");
+            s.push_str(&params.to_string());
+            s.push('\n');
+        }
     }
+    s.push_str(
+        "\nTo call a tool, output exactly:\n```tool_call\n{\"name\": \"tool_name\", \
+\"arguments\": {\"arg\": \"value\"}}\n```\n",
+    );
+    s
+}
+
+fn apply_chat_template(messages: &[Message], tools: Option<&[Tool]>) -> String {
+    let mut prompt = String::new();
+
+    // Gemma has no dedicated system/tool roles. Fold tool definitions and any
+    // system messages into a preamble prepended to the first user turn.
+    let mut preamble = String::new();
+    if let Some(tools) = tools {
+        if !tools.is_empty() {
+            preamble.push_str(&render_tool_instructions(tools));
+        }
+    }
+    for msg in messages {
+        if msg.role == "system" {
+            if let Some(content) = &msg.content {
+                if !content.is_empty() {
+                    if !preamble.is_empty() {
+                        preamble.push_str("\n\n");
+                    }
+                    preamble.push_str(content);
+                }
+            }
+        }
+    }
+    let mut preamble_pending = !preamble.is_empty();
+
+    for msg in messages {
+        match msg.role.as_str() {
+            "system" => continue,
+            "tool" => {
+                let name = msg.name.as_deref().unwrap_or("tool");
+                prompt.push_str("<start_of_turn>user\n");
+                prompt.push_str(&format!("Tool result for {}:\n", name));
+                if let Some(content) = &msg.content {
+                    prompt.push_str(content);
+                }
+                prompt.push_str("<end_of_turn>\n");
+            }
+            role => {
+                let mapped = if role == "assistant" { "model" } else { "user" };
+                prompt.push_str(&format!("<start_of_turn>{}\n", mapped));
+                if mapped == "user" && preamble_pending {
+                    prompt.push_str(&preamble);
+                    prompt.push_str("\n\n");
+                    preamble_pending = false;
+                }
+                if let Some(content) = &msg.content {
+                    prompt.push_str(content);
+                }
+                if let Some(tool_calls) = &msg.tool_calls {
+                    for tc in tool_calls {
+                        prompt.push_str(&format!(
+                            "\n```tool_call\n{{\"name\": \"{}\", \"arguments\": {}}}\n```",
+                            tc.function.name, tc.function.arguments
+                        ));
+                    }
+                }
+                prompt.push_str("<end_of_turn>\n");
+            }
+        }
+    }
+
+    if preamble_pending {
+        prompt.push_str("<start_of_turn>user\n");
+        prompt.push_str(&preamble);
+        prompt.push_str("<end_of_turn>\n");
+    }
+
     prompt.push_str("<start_of_turn>model\n");
     prompt
+}
+
+/// Parse tool calls emitted by the model. Supports the prompted
+/// ```` ```tool_call ```` fenced-block format as well as
+/// `<tool_call>...</tool_call>` tags, with one JSON object per block.
+fn parse_tool_calls(text: &str) -> Vec<ToolCall> {
+    let mut calls = Vec::new();
+
+    fn push_from_json(calls: &mut Vec<ToolCall>, json_str: &str) {
+        let trimmed = json_str.trim();
+        if trimmed.is_empty() {
+            return;
+        }
+        if let Ok(val) = serde_json::from_str::<serde_json::Value>(trimmed) {
+            if let Some(call) = tool_call_from_value(&val) {
+                calls.push(call);
+            }
+        }
+    }
+
+    // Fenced ```tool_call blocks.
+    let mut rest = text;
+    while let Some(start) = rest.find("```tool_call") {
+        let after = &rest[start + "```tool_call".len()..];
+        if let Some(end) = after.find("```") {
+            push_from_json(&mut calls, &after[..end]);
+            rest = &after[end + 3..];
+        } else {
+            break;
+        }
+    }
+
+    // <tool_call> ... </tool_call> tags.
+    let mut rest = text;
+    while let Some(start) = rest.find("<tool_call>") {
+        let after = &rest[start + "<tool_call>".len()..];
+        if let Some(end) = after.find("</tool_call>") {
+            push_from_json(&mut calls, &after[..end]);
+            rest = &after[end + "</tool_call>".len()..];
+        } else {
+            break;
+        }
+    }
+
+    calls
+}
+
+fn tool_call_from_value(val: &serde_json::Value) -> Option<ToolCall> {
+    let name = val.get("name")?.as_str()?.to_string();
+    let arguments = match val.get("arguments").or_else(|| val.get("parameters")) {
+        Some(args) if args.is_string() => args.as_str().unwrap_or("").to_string(),
+        Some(args) => serde_json::to_string(args).unwrap_or_else(|_| "{}".to_string()),
+        None => "{}".to_string(),
+    };
+    Some(ToolCall {
+        id: format!("call_{}", uuid::Uuid::new_v4().simple()),
+        call_type: "function".to_string(),
+        function: FunctionCall { name, arguments },
+    })
 }
 
 fn find_stop_position(text: &str, request_stop: Option<&[String]>) -> Option<usize> {
@@ -487,8 +740,12 @@ fn validate_request(req: &ChatCompletionRequest) -> Result<(), ApiError> {
     Ok(())
 }
 
-fn encode_prompt(state: &AppState, messages: &[Message]) -> Result<Vec<usize>, ApiError> {
-    let prompt = apply_chat_template(messages);
+fn encode_prompt(
+    state: &AppState,
+    messages: &[Message],
+    tools: Option<&[Tool]>,
+) -> Result<Vec<usize>, ApiError> {
+    let prompt = apply_chat_template(messages, tools);
     let encoding = state
         .tokenizer
         .encode(prompt.as_str(), true)
@@ -554,13 +811,14 @@ async fn chat_completions_sync(
     req: ChatCompletionRequest,
 ) -> Result<Json<ChatCompletionResponse>, ApiError> {
     let generation_params = generation_params_from_request(&req, state.request_timeout())?;
-    let input_ids = encode_prompt(&state, &req.messages)?;
+    let input_ids = encode_prompt(&state, &req.messages, req.tools.as_deref())?;
     let prompt_tokens = input_ids.len();
     validate_context_len(
         prompt_tokens,
         generation_params.max_tokens,
         state.max_context_len,
     )?;
+    let has_tools = req.tools.as_ref().map(|t| !t.is_empty()).unwrap_or(false);
     let request_stop = req.stop.map(StopSequences::into_vec);
 
     let (mut response_rx, cancel) = enqueue_request(&state, input_ids, generation_params)?;
@@ -610,6 +868,33 @@ async fn chat_completions_sync(
     }
     let completion_tokens = output_tokens.len();
 
+    let tool_calls = if has_tools {
+        parse_tool_calls(&text)
+    } else {
+        Vec::new()
+    };
+
+    let (message, finish_reason) = if !tool_calls.is_empty() {
+        (
+            Message {
+                role: "assistant".to_string(),
+                content: None,
+                tool_calls: Some(tool_calls),
+                ..Default::default()
+            },
+            "tool_calls".to_string(),
+        )
+    } else {
+        (
+            Message {
+                role: "assistant".to_string(),
+                content: Some(text),
+                ..Default::default()
+            },
+            finish_reason,
+        )
+    };
+
     let response = ChatCompletionResponse {
         id: format!("chatcmpl-{}", uuid::Uuid::new_v4()),
         object: "chat.completion".to_string(),
@@ -617,10 +902,7 @@ async fn chat_completions_sync(
         model: "gemma-4-e4b-q4".to_string(),
         choices: vec![Choice {
             index: 0,
-            message: Message {
-                role: "assistant".to_string(),
-                content: text,
-            },
+            message,
             finish_reason,
         }],
         usage: Usage {
@@ -642,12 +924,13 @@ async fn chat_completions_stream(
     let chat_id = format!("chatcmpl-{}", uuid::Uuid::new_v4());
     let created = chrono::Utc::now().timestamp();
     let generation_params = generation_params_from_request(&req, state.request_timeout())?;
-    let input_ids = encode_prompt(&state, &req.messages)?;
+    let input_ids = encode_prompt(&state, &req.messages, req.tools.as_deref())?;
     validate_context_len(
         input_ids.len(),
         generation_params.max_tokens,
         state.max_context_len,
     )?;
+    let has_tools = req.tools.as_ref().map(|t| !t.is_empty()).unwrap_or(false);
     let request_stop = req.stop.map(StopSequences::into_vec);
     let request_result = enqueue_request(&state, input_ids, generation_params)?;
 
@@ -663,6 +946,7 @@ async fn chat_completions_stream(
                 delta: Delta {
                     role: Some("assistant".to_string()),
                     content: None,
+                    tool_calls: None,
                 },
                 finish_reason: None,
             }],
@@ -683,6 +967,22 @@ async fn chat_completions_stream(
             match event {
                 StreamEvent::Token { token_id } => {
                     output_tokens.push(token_id as u32);
+
+                    // When tools are enabled we cannot stream raw text: it may be
+                    // a `tool_call` block that must be parsed and re-emitted as a
+                    // structured tool call. Buffer everything and finalize on Done.
+                    if has_tools {
+                        let decoded_so_far = state
+                            .tokenizer
+                            .decode(&output_tokens, false)
+                            .unwrap_or_default();
+                        if find_stop_position(&decoded_so_far, request_stop.as_deref()).is_some() {
+                            cancel.store(CANCEL_STOP, Ordering::Relaxed);
+                            break;
+                        }
+                        continue;
+                    }
+
                     let mut visible_text = state
                         .tokenizer
                         .decode(&output_tokens, false)
@@ -706,6 +1006,7 @@ async fn chat_completions_stream(
                                 delta: Delta {
                                     role: None,
                                     content: Some(tok_str),
+                                    tool_calls: None,
                                 },
                                 finish_reason: None,
                             }],
@@ -741,6 +1042,72 @@ async fn chat_completions_stream(
             }
         }
 
+        // For tool-enabled requests, parse the buffered output and emit either a
+        // tool_calls delta or the buffered text as a single content delta.
+        if has_tools {
+            let mut text = state
+                .tokenizer
+                .decode(&output_tokens, true)
+                .unwrap_or_default();
+            trim_stop_sequences(&mut text, request_stop.as_deref());
+            let tool_calls = parse_tool_calls(&text);
+
+            if !tool_calls.is_empty() {
+                let tool_call_deltas: Vec<ToolCallDelta> = tool_calls
+                    .into_iter()
+                    .enumerate()
+                    .map(|(index, tc)| ToolCallDelta {
+                        index,
+                        id: tc.id,
+                        call_type: tc.call_type,
+                        function: tc.function,
+                    })
+                    .collect();
+                finish_reason = "tool_calls".to_string();
+                let chunk = ChatCompletionChunk {
+                    id: chat_id.clone(),
+                    object: "chat.completion.chunk".to_string(),
+                    created,
+                    model: "gemma-4-e4b-q4".to_string(),
+                    choices: vec![ChunkChoice {
+                        index: 0,
+                        delta: Delta {
+                            role: None,
+                            content: None,
+                            tool_calls: Some(tool_call_deltas),
+                        },
+                        finish_reason: None,
+                    }],
+                };
+                let _ = tx
+                    .send(Ok(
+                        Event::default().data(serde_json::to_string(&chunk).unwrap())
+                    ))
+                    .await;
+            } else if !text.is_empty() {
+                let chunk = ChatCompletionChunk {
+                    id: chat_id.clone(),
+                    object: "chat.completion.chunk".to_string(),
+                    created,
+                    model: "gemma-4-e4b-q4".to_string(),
+                    choices: vec![ChunkChoice {
+                        index: 0,
+                        delta: Delta {
+                            role: None,
+                            content: Some(text),
+                            tool_calls: None,
+                        },
+                        finish_reason: None,
+                    }],
+                };
+                let _ = tx
+                    .send(Ok(
+                        Event::default().data(serde_json::to_string(&chunk).unwrap())
+                    ))
+                    .await;
+            }
+        }
+
         // Send final chunk with finish_reason
         let done_chunk = ChatCompletionChunk {
             id: chat_id,
@@ -752,6 +1119,7 @@ async fn chat_completions_stream(
                 delta: Delta {
                     role: None,
                     content: None,
+                    tool_calls: None,
                 },
                 finish_reason: Some(finish_reason),
             }],
@@ -834,7 +1202,8 @@ mod tests {
             model: Some("gemma-4-e4b-q4".to_string()),
             messages: vec![Message {
                 role: "user".to_string(),
-                content: "hello".to_string(),
+                content: Some("hello".to_string()),
+                ..Default::default()
             }],
             max_tokens: 16,
             temperature: 0.7,
@@ -844,6 +1213,9 @@ mod tests {
             top_k: 0,
             repetition_penalty: 1.0,
             frequency_penalty: 0.0,
+            top_p: None,
+            tools: None,
+            tool_choice: None,
         }
     }
 
@@ -874,6 +1246,111 @@ mod tests {
         let mut custom = "hello CUSTOM_".to_string();
         assert!(!trim_stream_safe_text(&mut custom, Some(&request_stop)));
         assert_eq!(custom, "hello ");
+    }
+
+    #[test]
+    fn parse_tool_calls_handles_fenced_and_tagged_blocks() {
+        let fenced = "Sure!\n```tool_call\n{\"name\": \"read\", \"arguments\": {\"path\": \"a.txt\"}}\n```";
+        let calls = parse_tool_calls(fenced);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].function.name, "read");
+        assert_eq!(calls[0].call_type, "function");
+        assert_eq!(calls[0].function.arguments, "{\"path\":\"a.txt\"}");
+
+        let tagged = "<tool_call>{\"name\": \"bash\", \"arguments\": {\"command\": \"ls\"}}</tool_call>";
+        let calls = parse_tool_calls(tagged);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].function.name, "bash");
+
+        let multi = "```tool_call\n{\"name\": \"a\", \"arguments\": {}}\n```\n```tool_call\n{\"name\": \"b\", \"arguments\": {}}\n```";
+        assert_eq!(parse_tool_calls(multi).len(), 2);
+
+        assert!(parse_tool_calls("just a normal answer").is_empty());
+    }
+
+    #[test]
+    fn apply_chat_template_injects_tools_into_first_user_turn() {
+        let messages = vec![
+            Message {
+                role: "system".to_string(),
+                content: Some("be helpful".to_string()),
+                ..Default::default()
+            },
+            Message {
+                role: "user".to_string(),
+                content: Some("hi".to_string()),
+                ..Default::default()
+            },
+        ];
+        let tools = vec![Tool {
+            tool_type: Some("function".to_string()),
+            function: FunctionDef {
+                name: "read".to_string(),
+                description: Some("Read a file".to_string()),
+                parameters: None,
+            },
+        }];
+
+        let prompt = apply_chat_template(&messages, Some(&tools));
+        assert!(prompt.contains("Available tools:"));
+        assert!(prompt.contains("- read: Read a file"));
+        assert!(prompt.contains("be helpful"));
+        // System content is merged into the user turn, not its own turn.
+        assert!(!prompt.contains("<start_of_turn>system"));
+        assert!(prompt.trim_end().ends_with("<start_of_turn>model"));
+    }
+
+    #[test]
+    fn apply_chat_template_renders_tool_results_and_assistant_calls() {
+        let messages = vec![
+            Message {
+                role: "user".to_string(),
+                content: Some("read a.txt".to_string()),
+                ..Default::default()
+            },
+            Message {
+                role: "assistant".to_string(),
+                content: None,
+                tool_calls: Some(vec![ToolCall {
+                    id: "call_1".to_string(),
+                    call_type: "function".to_string(),
+                    function: FunctionCall {
+                        name: "read".to_string(),
+                        arguments: "{\"path\":\"a.txt\"}".to_string(),
+                    },
+                }]),
+                ..Default::default()
+            },
+            Message {
+                role: "tool".to_string(),
+                content: Some("file contents".to_string()),
+                name: Some("read".to_string()),
+                tool_call_id: Some("call_1".to_string()),
+                ..Default::default()
+            },
+        ];
+
+        let prompt = apply_chat_template(&messages, None);
+        assert!(prompt.contains("<start_of_turn>model\n"));
+        assert!(prompt.contains("```tool_call"));
+        assert!(prompt.contains("\"name\": \"read\""));
+        assert!(prompt.contains("Tool result for read:\nfile contents"));
+    }
+
+    #[test]
+    fn deserialize_message_accepts_array_and_null_content() {
+        let array: Message = serde_json::from_str(
+            r#"{"role":"user","content":[{"type":"text","text":"hi"}]}"#,
+        )
+        .unwrap();
+        assert_eq!(array.content.as_deref(), Some("hi"));
+
+        let null_content: Message = serde_json::from_str(
+            r#"{"role":"assistant","content":null,"tool_calls":[{"id":"c1","type":"function","function":{"name":"read","arguments":"{}"}}]}"#,
+        )
+        .unwrap();
+        assert_eq!(null_content.content, None);
+        assert_eq!(null_content.tool_calls.unwrap().len(), 1);
     }
 
     #[test]
