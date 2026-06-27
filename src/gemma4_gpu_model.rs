@@ -706,6 +706,10 @@ pub enum WeightFormat {
     F16,
     Q4_0,
     Q3_0,
+    /// Mixed K-quant layer (community Q4_K_M). The per-layer tag only marks the
+    /// layer as "not pure Q4_0/F16" so the Q4_0-only fused/mega paths are
+    /// skipped; the actual kernel is chosen per tensor from `BufferView::format`.
+    KQuant,
 }
 
 impl WeightFormat {
@@ -714,6 +718,7 @@ impl WeightFormat {
             WeightFormat::F16 => 0,
             WeightFormat::Q4_0 => 1,
             WeightFormat::Q3_0 => 2,
+            WeightFormat::KQuant => 5,
         }
     }
 
@@ -721,16 +726,24 @@ impl WeightFormat {
         match v {
             0 => WeightFormat::F16,
             2 => WeightFormat::Q3_0,
+            5 => WeightFormat::KQuant,
             _ => WeightFormat::Q4_0,
         }
     }
 
     pub fn is_quantized(self) -> bool {
-        matches!(self, WeightFormat::Q4_0 | WeightFormat::Q3_0)
+        matches!(
+            self,
+            WeightFormat::Q4_0 | WeightFormat::Q3_0 | WeightFormat::KQuant
+        )
     }
 
     pub fn is_q3(self) -> bool {
         matches!(self, WeightFormat::Q3_0)
+    }
+
+    pub fn is_kquant(self) -> bool {
+        matches!(self, WeightFormat::KQuant)
     }
 }
 
@@ -1314,7 +1327,19 @@ impl Gemma4GpuModel {
         }
 
         println!("  Decode RoPE: GPU fill (rope_fill_decode kernel)");
-        println!("  Weights: all {} layers Q4_0", num_layers);
+        {
+            let kq = layers.iter().filter(|l| l.weight_format.is_kquant()).count();
+            let f16 = layers
+                .iter()
+                .filter(|l| l.weight_format == WeightFormat::F16)
+                .count();
+            let q3 = layers.iter().filter(|l| l.weight_format.is_q3()).count();
+            let q4 = num_layers - kq - f16 - q3;
+            println!(
+                "  Weights: {} layers Q4_0, {} K-quant (Q4_K/Q6_K native), {} f16, {} Q3_0",
+                q4, kq, f16, q3
+            );
+        }
 
         println!(
             "  Parallel prefill scratch: max_seq={}",
@@ -1473,7 +1498,10 @@ impl Gemma4GpuModel {
         drop(per_layer_model_proj_f32);
 
         // --- Layers ---
-        println!("  Loading {} layers from GGUF (requantizing to Q4_0)...", num_layers);
+        println!(
+            "  Loading {} layers from GGUF (native Q4_K/Q6_K kept; other types -> Q4_0)...",
+            num_layers
+        );
         let mut layers = Vec::with_capacity(num_layers);
         for layer_idx in 0..num_layers {
             let is_full = config.is_full_attention(layer_idx);
@@ -1482,9 +1510,26 @@ impl Gemma4GpuModel {
             let kv_out = num_kv_heads * head_dim;
             let p = |suffix: &str| format!("blk.{}.{}", layer_idx, suffix);
 
-            let q4 = |name: String, rows: usize, cols: usize| -> BufferView {
-                let data = g.dequant_to_f32(&name);
-                BufferView::from_buffer(ctx.buffer_from_f32_as_q4(&data, rows, cols))
+            // Quantized projection weight: keep community K-quant blocks native
+            // (Q4_K / Q6_K) and tag the view; otherwise dequant + requantize to
+            // Q4_0 (lossless for on-disk Q4_0, lossy for Q4_1/Q5_K fallbacks).
+            let qw = |name: String, rows: usize, cols: usize| -> BufferView {
+                use crate::gguf::ggml_type;
+                use crate::gpu::weight_fmt;
+                match g.tensor_type(&name) {
+                    ggml_type::Q4_K => BufferView::from_buffer(
+                        ctx.buffer_from_bytes(g.tensor_raw(&name)),
+                    )
+                    .with_format(weight_fmt::Q4_K),
+                    ggml_type::Q6_K => BufferView::from_buffer(
+                        ctx.buffer_from_bytes(g.tensor_raw(&name)),
+                    )
+                    .with_format(weight_fmt::Q6_K),
+                    _ => {
+                        let data = g.dequant_to_f32(&name);
+                        BufferView::from_buffer(ctx.buffer_from_f32_as_q4(&data, rows, cols))
+                    }
+                }
             };
             let f32buf = |name: String| -> BufferView {
                 BufferView::from_buffer(ctx.buffer_from_slice(&g.dequant_to_f32(&name)))
@@ -1492,16 +1537,37 @@ impl Gemma4GpuModel {
 
             let layer_scalar = g.dequant_to_f32(&p("layer_output_scale.weight"))[0];
 
-            let layer = Gemma4GpuLayer {
-                q_proj: q4(p("attn_q.weight"), q_out, hidden_size),
-                k_proj: q4(p("attn_k.weight"), kv_out, hidden_size),
-                v_proj: q4(p("attn_v.weight"), kv_out, hidden_size),
-                o_proj: q4(p("attn_output.weight"), hidden_size, q_out),
+            let q_proj = qw(p("attn_q.weight"), q_out, hidden_size);
+            let k_proj = qw(p("attn_k.weight"), kv_out, hidden_size);
+            let v_proj = qw(p("attn_v.weight"), kv_out, hidden_size);
+            let o_proj = qw(p("attn_output.weight"), hidden_size, q_out);
+            let gate_proj = qw(p("ffn_gate.weight"), intermediate_size, hidden_size);
+            let up_proj = qw(p("ffn_up.weight"), intermediate_size, hidden_size);
+            let down_proj = qw(p("ffn_down.weight"), hidden_size, intermediate_size);
+            let per_layer_input_gate_weight = qw(p("inp_gate.weight"), ple_dim, hidden_size);
+            let per_layer_projection_weight = qw(p("proj.weight"), hidden_size, ple_dim);
 
-                gate_proj: q4(p("ffn_gate.weight"), intermediate_size, hidden_size),
-                up_proj: q4(p("ffn_up.weight"), intermediate_size, hidden_size),
+            // A layer is "K-quant" if any projection kept native K-quant blocks;
+            // this disables the Q4_0-only fused/mega paths for the layer while
+            // each tensor still dispatches by its own `BufferView::format`.
+            use crate::gpu::weight_fmt;
+            let any_kquant = [
+                &q_proj, &k_proj, &v_proj, &o_proj, &gate_proj, &up_proj, &down_proj,
+                &per_layer_input_gate_weight, &per_layer_projection_weight,
+            ]
+            .iter()
+            .any(|v| matches!(v.format, weight_fmt::Q4_K | weight_fmt::Q6_K));
+
+            let layer = Gemma4GpuLayer {
+                q_proj,
+                k_proj,
+                v_proj,
+                o_proj,
+
+                gate_proj,
+                up_proj,
                 gate_up_proj: BufferView::from_buffer(ctx.buffer_empty(1)),
-                down_proj: q4(p("ffn_down.weight"), hidden_size, intermediate_size),
+                down_proj,
 
                 input_layernorm_weight: f32buf(p("attn_norm.weight")),
                 post_attention_layernorm_weight: f32buf(p("post_attention_norm.weight")),
@@ -1509,8 +1575,8 @@ impl Gemma4GpuModel {
                 post_feedforward_layernorm_weight: f32buf(p("post_ffw_norm.weight")),
                 post_per_layer_input_norm_weight: f32buf(p("post_norm.weight")),
 
-                per_layer_input_gate_weight: q4(p("inp_gate.weight"), ple_dim, hidden_size),
-                per_layer_projection_weight: q4(p("proj.weight"), hidden_size, ple_dim),
+                per_layer_input_gate_weight,
+                per_layer_projection_weight,
                 layer_scalar,
 
                 q_norm_weight: f32buf(p("attn_q_norm.weight")),
@@ -1522,7 +1588,11 @@ impl Gemma4GpuModel {
                 head_dim,
                 q_out_dim: q_out,
                 kv_out_dim: kv_out,
-                weight_format: WeightFormat::Q4_0,
+                weight_format: if any_kquant {
+                    WeightFormat::KQuant
+                } else {
+                    WeightFormat::Q4_0
+                },
             };
             layers.push(layer);
         }
@@ -2252,6 +2322,12 @@ impl Gemma4GpuModel {
         if !mega_kernel_enabled() {
             return;
         }
+        // The mega decode graph is hard-wired to Q4_0 block layout; K-quant
+        // (Q4_K_M) layers are served by the per-tensor matvec path instead.
+        if self.layers.iter().any(|l| l.weight_format.is_kquant()) {
+            eprintln!("  MEGA_KERNEL ignored: K-quant weights use the per-tensor matvec path");
+            return;
+        }
         match MegaDecodeGraph::build(self) {
             Ok(graph) => {
                 println!(
@@ -2310,11 +2386,40 @@ impl Gemma4GpuModel {
         k: u32,
         wf: WeightFormat,
     ) {
-        match wf {
-            WeightFormat::Q3_0 => self.ctx.encode_matvec_q3_at_view(
-                encoder, weight, x_buf, 0, y_buf, 0, m, k),
-            _ => self.ctx.encode_matvec_q4_view(
-                encoder, weight, x_buf, y_buf, m, k),
+        self.encode_matvec_quant_at(encoder, weight, x_buf, 0, y_buf, 0, m, k, wf);
+    }
+
+    /// Offset-aware variant of `encode_matvec_quant` for the batched decode path,
+    /// where activations for each token live at a per-token offset in a shared
+    /// scratch buffer.
+    #[allow(clippy::too_many_arguments)]
+    fn encode_matvec_quant_at(
+        &self,
+        encoder: &metal::ComputeCommandEncoderRef,
+        weight: &BufferView,
+        x_buf: &metal::Buffer,
+        x_offset: u64,
+        y_buf: &metal::Buffer,
+        y_offset: u64,
+        m: u32,
+        k: u32,
+        wf: WeightFormat,
+    ) {
+        // K-quant is decided per tensor (Q4_K_M mixes Q4_K/Q6_K within a layer),
+        // so the per-tensor `BufferView::format` wins over the per-layer `wf`.
+        use crate::gpu::weight_fmt;
+        match weight.format {
+            weight_fmt::Q4_K | weight_fmt::Q6_K => self.ctx.encode_matvec_qk_at_view(
+                encoder, weight, x_buf, x_offset, y_buf, y_offset, m, k, 1,
+            ),
+            _ => match wf {
+                WeightFormat::Q3_0 => self.ctx.encode_matvec_q3_at_view(
+                    encoder, weight, x_buf, x_offset, y_buf, y_offset, m, k,
+                ),
+                _ => self.ctx.encode_matvec_q4_at_view(
+                    encoder, weight, x_buf, x_offset, y_buf, y_offset, m, k,
+                ),
+            },
         }
     }
 
@@ -2940,6 +3045,7 @@ impl Gemma4GpuModel {
             } // !fused_qkv fallback
 
             let use_fused_q_attn = layer.weight_format.is_quantized()
+                && !layer.weight_format.is_kquant()
                 && matches!(self.kv_cache_type, KvCacheType::Q4_0)
                 && self.ctx.use_flash_attention
                 && crate::gpu::fused_q_attn_enabled()
@@ -3410,6 +3516,50 @@ impl Gemma4GpuModel {
                     &self.down_buf,
                     hidden_size as u32,
                     intermediate_size as u32,
+                );
+            } else if layer.weight_format.is_kquant() {
+                // K-quant (Q4_K_M): per-tensor matvec, no Q4_0 fusion.
+                self.ctx.encode_rmsnorm_view(
+                    encoder,
+                    &self.hidden_buf,
+                    &layer.pre_feedforward_layernorm_weight,
+                    &self.normed_buf,
+                    hidden_size as u32,
+                    eps,
+                );
+                self.encode_matvec_quant(
+                    encoder,
+                    &layer.gate_proj,
+                    &self.normed_buf,
+                    &self.gate_buf,
+                    intermediate_size as u32,
+                    hidden_size as u32,
+                    layer.weight_format,
+                );
+                self.encode_matvec_quant(
+                    encoder,
+                    &layer.up_proj,
+                    &self.normed_buf,
+                    &self.up_buf,
+                    intermediate_size as u32,
+                    hidden_size as u32,
+                    layer.weight_format,
+                );
+                self.ctx.encode_gelu_mul(
+                    encoder,
+                    &self.gate_buf,
+                    &self.up_buf,
+                    &self.gelu_buf,
+                    intermediate_size as u32,
+                );
+                self.encode_matvec_quant(
+                    encoder,
+                    &layer.down_proj,
+                    &self.gelu_buf,
+                    &self.down_buf,
+                    hidden_size as u32,
+                    intermediate_size as u32,
+                    layer.weight_format,
                 );
             } else if crate::gpu::fused_mlp_gelu_down_enabled()
                 && crate::gpu::fused_rmsnorm_mlp_enabled()
@@ -4352,7 +4502,9 @@ impl Gemma4GpuModel {
                     seq_len as u32,
                 );
             }
-        } else if layer.weight_format == WeightFormat::Q4_0 {
+        } else {
+            // Q4_0 and K-quant (Q4_K_M) share the batched projection entry; the
+            // K-quant guard inside picks the right kernel per tensor.
             self.ctx.encode_projection_q4_batch_view(
                 encoder,
                 &layer.q_proj,
@@ -6324,6 +6476,61 @@ impl Gemma4GpuModel {
                         offsets.hidden,
                         hidden_size as u32,
                         intermediate_size as u32,
+                    );
+                } else if layer.weight_format.is_kquant() {
+                    // K-quant (Q4_K_M): per-tensor matvec, no Q4_0 fusion.
+                    self.ctx.encode_rmsnorm_at_view(
+                        encoder,
+                        &self.decode_batch_scratch.hidden_buf,
+                        offsets.hidden,
+                        &layer.pre_feedforward_layernorm_weight,
+                        &self.decode_batch_scratch.normed_buf,
+                        offsets.hidden,
+                        hidden_size as u32,
+                        eps,
+                    );
+                    self.encode_matvec_quant_at(
+                        encoder,
+                        &layer.gate_proj,
+                        &self.decode_batch_scratch.normed_buf,
+                        offsets.hidden,
+                        &self.decode_batch_scratch.gate_buf,
+                        offsets.intermediate,
+                        intermediate_size as u32,
+                        hidden_size as u32,
+                        layer.weight_format,
+                    );
+                    self.encode_matvec_quant_at(
+                        encoder,
+                        &layer.up_proj,
+                        &self.decode_batch_scratch.normed_buf,
+                        offsets.hidden,
+                        &self.decode_batch_scratch.up_buf,
+                        offsets.intermediate,
+                        intermediate_size as u32,
+                        hidden_size as u32,
+                        layer.weight_format,
+                    );
+                    self.ctx.encode_gelu_mul_at(
+                        encoder,
+                        &self.decode_batch_scratch.gate_buf,
+                        offsets.intermediate,
+                        &self.decode_batch_scratch.up_buf,
+                        offsets.intermediate,
+                        &self.decode_batch_scratch.gelu_buf,
+                        offsets.intermediate,
+                        intermediate_size as u32,
+                    );
+                    self.encode_matvec_quant_at(
+                        encoder,
+                        &layer.down_proj,
+                        &self.decode_batch_scratch.gelu_buf,
+                        offsets.intermediate,
+                        &self.decode_batch_scratch.down_buf,
+                        offsets.hidden,
+                        hidden_size as u32,
+                        intermediate_size as u32,
+                        layer.weight_format,
                     );
                 } else if crate::gpu::fused_mlp_gelu_down_enabled()
                     && crate::gpu::fused_rmsnorm_mlp_enabled()

@@ -269,6 +269,19 @@ impl Gguf {
         &self.mmap[start..start + info.byte_len()]
     }
 
+    /// Raw on-disk block bytes for a tensor (no dequant), for native GPU upload.
+    pub fn tensor_raw(&self, name: &str) -> &[u8] {
+        let info = self.tensor(name).unwrap_or_else(|| panic!("tensor not found: {}", name));
+        self.tensor_bytes(info)
+    }
+
+    /// ggml type id of a tensor (see `ggml_type`).
+    pub fn tensor_type(&self, name: &str) -> u32 {
+        self.tensor(name)
+            .unwrap_or_else(|| panic!("tensor not found: {}", name))
+            .ggml_type
+    }
+
     // ---- metadata accessors ----
 
     pub fn get(&self, key: &str) -> Option<&MetaValue> {
@@ -375,6 +388,19 @@ impl Gguf {
 
 fn align_up(x: usize, align: usize) -> usize {
     ((x + align - 1) / align) * align
+}
+
+/// (elements_per_block, bytes_per_block) for a ggml type — public for tooling.
+pub fn type_block_spec(t: u32) -> (usize, usize) {
+    block_spec(t)
+}
+
+/// Dequantize a raw block byte slice of the given ggml type to f32. Used by the
+/// K-quant kernel self-test to produce a CPU reference from native blocks.
+pub fn dequant_type_to_f32(ggml_type: u32, bytes: &[u8], total_elems: usize) -> Vec<f32> {
+    let mut out = Vec::with_capacity(total_elems);
+    dequant_blocks(ggml_type, bytes, total_elems, |chunk| out.extend_from_slice(chunk));
+    out
 }
 
 /// ggml token type ids (tokenizer.ggml.token_type).
@@ -656,6 +682,37 @@ fn dequant_blocks(ggml_type: u32, data: &[u8], total_elems: usize, mut sink: imp
                     y += 64;
                     u1 = u1.wrapping_shl(2);
                     u2 = u2.wrapping_shl(2);
+                }
+                sink(&out);
+            }
+        }
+        ggml_type::Q6_K => {
+            // block_q6_K: ql[128], qh[64], scales[16] (i8), d (half). 210 bytes / 256.
+            let nb = total_elems / QK_K;
+            let mut out = [0.0f32; QK_K];
+            for b in 0..nb {
+                let base = b * 210;
+                let ql = &data[base..base + 128];
+                let qh = &data[base + 128..base + 192];
+                let sc = &data[base + 192..base + 208];
+                let d = f16_to_f32(u16::from_le_bytes([data[base + 208], data[base + 209]]));
+                // Two 128-element halves; each consumes 64 ql, 32 qh, 8 scales.
+                for half in 0..2 {
+                    let ql = &ql[half * 64..];
+                    let qh = &qh[half * 32..];
+                    let sc = &sc[half * 8..];
+                    let y = half * 128;
+                    for l in 0..32 {
+                        let is = l / 16;
+                        let q1 = ((ql[l] & 0x0F) as i32 | (((qh[l] >> 0) & 3) as i32) << 4) - 32;
+                        let q2 = ((ql[l + 32] & 0x0F) as i32 | (((qh[l] >> 2) & 3) as i32) << 4) - 32;
+                        let q3 = ((ql[l] >> 4) as i32 | (((qh[l] >> 4) & 3) as i32) << 4) - 32;
+                        let q4 = ((ql[l + 32] >> 4) as i32 | (((qh[l] >> 6) & 3) as i32) << 4) - 32;
+                        out[y + l] = d * (sc[is] as i8) as f32 * q1 as f32;
+                        out[y + l + 32] = d * (sc[is + 2] as i8) as f32 * q2 as f32;
+                        out[y + l + 64] = d * (sc[is + 4] as i8) as f32 * q3 as f32;
+                        out[y + l + 96] = d * (sc[is + 6] as i8) as f32 * q4 as f32;
+                    }
                 }
                 sink(&out);
             }

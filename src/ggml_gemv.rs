@@ -165,6 +165,45 @@ pub fn mul_mv_dispatch(m: u32, batch: u32) -> (u64, u64, u64, u64, u64) {
     (tg_x, tg_y, 1, 32, GGML_NSG_Q4_0 as u64)
 }
 
+/// Output rows per threadgroup for the K-quant matvec (one row per simdgroup).
+/// Must match `KQ_NSG` in ggml_mul_mv_q4.metal.
+pub const KQ_NSG: u32 = 4;
+
+/// Args for the native K-quant matvec (`matvec_ggml_q4_K` / `matvec_ggml_q6_K`).
+/// The kernels only read ne00/ne01/ne10/ne0 + the batch (ne11 via tgpig.y), so
+/// the byte-stride fields are left zero. `batch` is 1 for decode, seq_len for
+/// prefill. `m` = output rows, `k` = reduction dim (multiple of 256).
+pub fn mul_mv_args_k(m: u32, k: u32, batch: u32) -> GgmlMulMvArgs {
+    GgmlMulMvArgs {
+        ne00: k as i32,
+        ne01: m as i32,
+        ne02: 1,
+        nb00: 0,
+        nb01: 0,
+        nb02: 0,
+        nb03: 0,
+        ne10: k as i32,
+        ne11: batch as i32,
+        ne12: 1,
+        nb10: 4,
+        nb11: (k as u64) * 4,
+        nb12: 0,
+        nb13: 0,
+        ne0: m as i32,
+        ne1: batch as i32,
+        nr0: 1,
+        r2: 1,
+        r3: 1,
+    }
+}
+
+/// Threadgroups/threads for the K-quant matvec: ceil(m/KQ_NSG) groups in x,
+/// `batch` in y; each group is 32 threads × KQ_NSG simdgroups.
+pub fn mul_mv_k_dispatch(m: u32, batch: u32) -> (u64, u64, u64, u64, u64) {
+    let tg_x = ((m + KQ_NSG - 1) / KQ_NSG) as u64;
+    (tg_x, batch as u64, 1, 32, KQ_NSG as u64)
+}
+
 /// Threadgroups for mul_mv_ext (r1ptg=4, nsg=2).
 pub fn mul_mv_ext_dispatch(m: u32, batch: u32, nxpsg: i16) -> (u64, u64, u64, u64, u64) {
     let nypsg = 32 / nxpsg as u32;

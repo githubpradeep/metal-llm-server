@@ -964,3 +964,148 @@ kernel void matvec_ggml_q4_0_gelu_mul_r2s4(
         uint(args.r2), uint(args.r3),
         tgpig, tiisg, sgitg);
 }
+
+// ───────────────────────── K-quant matvec (Q4_K / Q6_K) ─────────────────────
+//
+// Native super-block (QK_K=256) matvec for llama.cpp "_K" weights, used for
+// community Q4_K_M GGUFs. Layout is intentionally simple and verifiable rather
+// than maximally tuned: one simdgroup computes one output row; the 32 lanes
+// stride over the row's super-blocks and a simd_sum reduces the partial dots.
+// The batch dimension (tgpig.y in [0, ne11)) lets the SAME kernel serve both
+// decode (ne11=1) and prefill (ne11=seq_len). x and y are f32.
+//
+// Dequant math is byte-for-byte the CPU reference in gguf.rs (get_scale_min_k4
+// for Q4_K; the ql/qh/scales unpack for Q6_K).
+
+#define QK_K 256
+
+// Number of output rows computed per threadgroup (one per simdgroup).
+#define KQ_NSG 4
+
+struct block_q4_K {
+    half     d;          // super-block scale for the 6-bit scales
+    half     dmin;       // super-block scale for the 6-bit mins
+    uint8_t  scales[12]; // 8 sub-block scales + mins, 6-bit packed
+    uint8_t  qs[128];    // 4-bit quants
+};
+
+struct block_q6_K {
+    uint8_t  ql[128];    // lower 4 bits
+    uint8_t  qh[64];     // upper 2 bits
+    int8_t   scales[16]; // 8-bit sub-block scales
+    half     d;          // super-block scale
+};
+
+// 6-bit (scale, min) unpack — matches ggml get_scale_min_k4.
+inline void kq_scale_min_k4(int j, device const uint8_t * q, thread uint8_t & d, thread uint8_t & m) {
+    if (j < 4) {
+        d = q[j] & 63;
+        m = q[j + 4] & 63;
+    } else {
+        d = (q[j + 4] & 0x0F) | ((q[j - 4] >> 6) << 4);
+        m = (q[j + 4] >> 4)   | ((q[j]     >> 6) << 4);
+    }
+}
+
+// Q4_K matvec: one simdgroup computes one output row. All 32 lanes cooperate on
+// each 256-weight super-block (8 weights/lane), so every lane issues weight
+// loads — keeping the (memory-bound) simdgroup busy even when nb is small.
+// Lane layout: 4 lanes per Q4_K sub-block (8 sub-blocks of 32). Lane t owns
+// sub-block sb=t/4, columns col0=(t%4)*8 .. col0+7.
+kernel void matvec_ggml_q4_K(
+    device const char * W [[buffer(0)]],
+    device const char * x [[buffer(1)]],
+    device char       * y [[buffer(2)]],
+    constant ggml_mul_mv_args& args [[buffer(3)]],
+    uint3 tgpig [[threadgroup_position_in_grid]],
+    uint tiisg  [[thread_index_in_simdgroup]],
+    uint sgitg  [[simdgroup_index_in_threadgroup]]
+) {
+    const int nb  = args.ne00 / QK_K;       // super-blocks per row
+    const int row = tgpig.x * KQ_NSG + sgitg;
+    if (row >= args.ne01) return;
+    const int r1  = tgpig.y;                // batch / token index
+
+    device const block_q4_K * xb = (device const block_q4_K *) W + row * nb;
+    device const float      * yr = (device const float *) x + (uint) r1 * args.ne10;
+
+    const int sb   = tiisg >> 2;            // sub-block 0..7
+    const int col0 = (int)(tiisg & 3) * 8;  // 0, 8, 16, 24
+    const int g    = sb >> 1;               // group 0..3 (64 elems each)
+    const int hi   = sb & 1;                // 0 = low nibble, 1 = high nibble
+
+    float sumf = 0.f;
+    for (int ib = 0; ib < nb; ++ib) {
+        device const block_q4_K * b = xb + ib;
+        const float d    = (float) b->d;
+        const float dmin = (float) b->dmin;
+        uint8_t scu, mnu;
+        kq_scale_min_k4(sb, b->scales, scu, mnu);
+        const float ds = d * scu;
+        const float mn = dmin * mnu;
+        device const uint8_t * qs = b->qs + g * 32 + col0;
+        device const float   * yy = yr + ib * QK_K + g * 64 + hi * 32 + col0;
+        for (int i = 0; i < 8; ++i) {
+            const uint8_t q = qs[i];
+            const float nib = hi == 0 ? (float)(q & 0x0F) : (float)(q >> 4);
+            sumf += (ds * nib - mn) * yy[i];
+        }
+    }
+    const float tot = simd_sum(sumf);
+    if (tiisg == 0) {
+        ((device float *) y)[(uint) r1 * args.ne0 + row] = tot;
+    }
+}
+
+// Q6_K matvec: one simdgroup per row, all 32 lanes cooperate per super-block.
+// Lane layout: 16 lanes per 128-element part. Lane t owns part p=t/16 and the
+// two l-rows l=(t%16)*2 (+1), each producing 4 outputs (offsets 0/32/64/96).
+kernel void matvec_ggml_q6_K(
+    device const char * W [[buffer(0)]],
+    device const char * x [[buffer(1)]],
+    device char       * y [[buffer(2)]],
+    constant ggml_mul_mv_args& args [[buffer(3)]],
+    uint3 tgpig [[threadgroup_position_in_grid]],
+    uint tiisg  [[thread_index_in_simdgroup]],
+    uint sgitg  [[simdgroup_index_in_threadgroup]]
+) {
+    const int nb  = args.ne00 / QK_K;
+    const int row = tgpig.x * KQ_NSG + sgitg;
+    if (row >= args.ne01) return;
+    const int r1  = tgpig.y;
+
+    device const block_q6_K * xb = (device const block_q6_K *) W + row * nb;
+    device const float      * yr = (device const float *) x + (uint) r1 * args.ne10;
+
+    const int p  = tiisg >> 4;              // part 0..1 (128 elems each)
+    const int lp = (int)(tiisg & 15);       // 0..15 within part
+
+    float sumf = 0.f;
+    for (int ib = 0; ib < nb; ++ib) {
+        device const block_q6_K * b = xb + ib;
+        const float d = (float) b->d;
+        device const uint8_t * ql = b->ql + p * 64;
+        device const uint8_t * qh = b->qh + p * 32;
+        device const int8_t  * sc = b->scales + p * 8;
+        device const float   * yy = yr + ib * QK_K + p * 128;
+        for (int li = 0; li < 2; ++li) {
+            const int l  = lp * 2 + li;
+            const int is = l >> 4;
+            const uint8_t lo  = ql[l];
+            const uint8_t lo2 = ql[l + 32];
+            const uint8_t h   = qh[l];
+            const int q1 = (int)((lo  & 0x0F) | (((h >> 0) & 3) << 4)) - 32;
+            const int q2 = (int)((lo2 & 0x0F) | (((h >> 2) & 3) << 4)) - 32;
+            const int q3 = (int)((lo  >> 4)   | (((h >> 4) & 3) << 4)) - 32;
+            const int q4 = (int)((lo2 >> 4)   | (((h >> 6) & 3) << 4)) - 32;
+            sumf += d * (float) sc[is]     * (float) q1 * yy[l];
+            sumf += d * (float) sc[is + 2] * (float) q2 * yy[l + 32];
+            sumf += d * (float) sc[is + 4] * (float) q3 * yy[l + 64];
+            sumf += d * (float) sc[is + 6] * (float) q4 * yy[l + 96];
+        }
+    }
+    const float tot = simd_sum(sumf);
+    if (tiisg == 0) {
+        ((device float *) y)[(uint) r1 * args.ne0 + row] = tot;
+    }
+}

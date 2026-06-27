@@ -77,6 +77,94 @@ fn main() {
         return;
     }
 
+    // Dev helper: validate the native K-quant matvec kernels (Q4_K / Q6_K)
+    // against the CPU dequant reference, using real tensors from the GGUF.
+    if args.iter().any(|a| a == "--gguf-kquant-test") {
+        let g = gguf::Gguf::open(&model_dir);
+        let ctx = gpu::MetalContext::new();
+        let candidates = [
+            "token_embd.weight",
+            "output.weight",
+            "blk.0.attn_v.weight",
+            "blk.0.ffn_down.weight",
+            "blk.0.ffn_gate.weight",
+            "blk.0.attn_q.weight",
+        ];
+        let mut tested = 0;
+        for name in candidates {
+            if !g.has_tensor(name) {
+                continue;
+            }
+            let t = g.tensor_type(name);
+            let fmt = match t {
+                gguf::ggml_type::Q4_K => gpu::weight_fmt::Q4_K,
+                gguf::ggml_type::Q6_K => gpu::weight_fmt::Q6_K,
+                _ => continue,
+            };
+            let info = g.tensor(name).unwrap();
+            let k = info.ne0(); // reduction / in-dim
+            if k % 256 != 0 {
+                continue;
+            }
+            let m = info.n_rows().min(2048); // test a leading row block
+            let (_, bpb) = gguf::type_block_spec(t);
+            let row_bytes = (k / 256) * bpb;
+            let raw = &g.tensor_raw(name)[..m * row_bytes];
+
+            // Deterministic input vector.
+            let x: Vec<f32> = (0..k).map(|j| ((j % 17) as f32 - 8.0) * 0.05).collect();
+
+            // CPU reference.
+            let w = gguf::dequant_type_to_f32(t, raw, m * k);
+            let mut y_ref = vec![0.0f32; m];
+            for r in 0..m {
+                let mut acc = 0.0f32;
+                let base = r * k;
+                for j in 0..k {
+                    acc += w[base + j] * x[j];
+                }
+                y_ref[r] = acc;
+            }
+
+            // GPU kernel.
+            let w_view = gpu::BufferView::from_buffer(ctx.buffer_from_bytes(raw)).with_format(fmt);
+            let x_buf = ctx.buffer_from_slice(&x);
+            let y_buf = ctx.buffer_empty(m);
+            let cmd = ctx.queue.new_command_buffer();
+            let enc = cmd.new_compute_command_encoder();
+            ctx.encode_matvec_qk_at_view(enc, &w_view, &x_buf, 0, &y_buf, 0, m as u32, k as u32, 1);
+            enc.end_encoding();
+            cmd.commit();
+            cmd.wait_until_completed();
+            let y_gpu =
+                unsafe { std::slice::from_raw_parts(y_buf.contents() as *const f32, m) };
+
+            let mut max_abs = 0.0f32;
+            let mut max_rel = 0.0f32;
+            for r in 0..m {
+                let d = (y_gpu[r] - y_ref[r]).abs();
+                max_abs = max_abs.max(d);
+                let denom = y_ref[r].abs().max(1e-3);
+                max_rel = max_rel.max(d / denom);
+            }
+            println!(
+                "{:<26} type={:<5} m={:<6} k={:<6} max_abs_err={:.3e} max_rel_err={:.3e} {}",
+                name,
+                gguf::ggml_type_name(t),
+                m,
+                k,
+                max_abs,
+                max_rel,
+                if max_rel < 1e-3 { "OK" } else { "FAIL" }
+            );
+            tested += 1;
+        }
+        if tested == 0 {
+            println!("No Q4_K/Q6_K tensors found in {} (nothing to test).", model_dir);
+        }
+        return;
+    }
+
     // Dev helper: load a GGUF model on GPU and greedy-decode a short prompt.
     if args.iter().any(|a| a == "--gguf-gen") {
         let mut model = gemma4_gpu_model::Gemma4GpuModel::load_from_gguf(&model_dir);

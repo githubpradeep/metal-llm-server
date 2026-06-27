@@ -1,12 +1,25 @@
 use metal::*;
 use std::path::Path;
 
+/// Per-tensor weight format tag carried on a `BufferView`. Mirrors
+/// `gemma4_gpu_model::WeightFormat::to_u8`. Defaults to Q4_0 so existing
+/// (non-GGUF) load paths keep their current behavior with no churn.
+pub mod weight_fmt {
+    pub const F16: u8 = 0;
+    pub const Q4_0: u8 = 1;
+    pub const Q3_0: u8 = 2;
+    pub const Q4_K: u8 = 3;
+    pub const Q6_K: u8 = 4;
+}
+
 /// A sub-range view into a Metal buffer (offset applied at kernel bind time).
 #[derive(Clone)]
 pub struct BufferView {
     pub buffer: Buffer,
     pub offset: u64,
     pub length: u64,
+    /// Quantization layout of the bytes in this view (see `weight_fmt`).
+    pub format: u8,
 }
 
 impl BufferView {
@@ -16,6 +29,7 @@ impl BufferView {
             buffer,
             offset: 0,
             length,
+            format: weight_fmt::Q4_0,
         }
     }
 
@@ -24,7 +38,14 @@ impl BufferView {
             buffer: buffer.clone(),
             offset,
             length,
+            format: weight_fmt::Q4_0,
         }
+    }
+
+    /// Tag this view with a quantization format (builder style).
+    pub fn with_format(mut self, format: u8) -> Self {
+        self.format = format;
+        self
     }
 
     pub fn as_bytes(&self) -> &[u8] {
@@ -38,7 +59,12 @@ impl BufferView {
 }
 
 /// True when a `[m, k]` weight buffer holds Q4_0 blocks (18 bytes / 32 weights).
+/// K-quant buffers (Q4_K is byte-for-byte the same size as Q4_0) must NOT be
+/// mistaken for Q4_0 by the Q4_0-only fused kernels, so the format tag wins.
 pub fn weight_buf_is_q4(view: &BufferView, m: u32, k: u32) -> bool {
+    if matches!(view.format, weight_fmt::Q4_K | weight_fmt::Q6_K) {
+        return false;
+    }
     let q4_bytes = (m as u64) * (k as u64 / 32) * 18;
     // f16 would be m*k*2 — well above q4_bytes; allow section-alignment padding.
     view.length <= q4_bytes + 256
@@ -46,6 +72,9 @@ pub fn weight_buf_is_q4(view: &BufferView, m: u32, k: u32) -> bool {
 
 /// True when a `[m, k]` weight buffer holds Q3_0 blocks (14 bytes / 32 weights).
 pub fn weight_buf_is_q3(view: &BufferView, m: u32, k: u32) -> bool {
+    if matches!(view.format, weight_fmt::Q4_K | weight_fmt::Q6_K) {
+        return false;
+    }
     let q3_bytes = (m as u64) * (k as u64 / 32) * 14;
     view.length <= q3_bytes + 256
 }
@@ -392,6 +421,9 @@ pub struct MetalContext {
     pub matvec_ggml_q4_dual_pipeline: ComputePipelineState,
     pub matvec_ggml_q4_gelu_mul_pipeline: ComputePipelineState,
     pub matvec_ggml_q4_gelu_mul_r2s4_pipeline: ComputePipelineState,
+    // K-quant pipelines (native Q4_K / Q6_K matvec, decode + prefill)
+    pub matvec_ggml_q4k_pipeline: ComputePipelineState,
+    pub matvec_ggml_q6k_pipeline: ComputePipelineState,
     // Q3_0 pipelines
     pub matvec_ggml_q3_pipeline: ComputePipelineState,
     pub matvec_ggml_q3_dual_pipeline: ComputePipelineState,
@@ -551,6 +583,8 @@ impl MetalContext {
         let matvec_ggml_q4_dual_pipeline = get_fn("matvec_ggml_q4_0_dual");
         let matvec_ggml_q4_gelu_mul_pipeline = get_fn("matvec_ggml_q4_0_gelu_mul");
         let matvec_ggml_q4_gelu_mul_r2s4_pipeline = get_fn("matvec_ggml_q4_0_gelu_mul_r2s4");
+        let matvec_ggml_q4k_pipeline = get_fn("matvec_ggml_q4_K");
+        let matvec_ggml_q6k_pipeline = get_fn("matvec_ggml_q6_K");
         let matvec_ggml_q3_pipeline = get_fn("matvec_ggml_q3_0");
         let matvec_ggml_q3_dual_pipeline = get_fn("matvec_ggml_q3_0_dual");
         let matvec_ggml_q3_gelu_mul_pipeline = get_fn("matvec_ggml_q3_0_gelu_mul");
@@ -784,6 +818,8 @@ impl MetalContext {
             matvec_ggml_q4_dual_pipeline,
             matvec_ggml_q4_gelu_mul_pipeline,
             matvec_ggml_q4_gelu_mul_r2s4_pipeline,
+            matvec_ggml_q4k_pipeline,
+            matvec_ggml_q6k_pipeline,
             matvec_ggml_q3_pipeline,
             matvec_ggml_q3_dual_pipeline,
             matvec_ggml_q3_gelu_mul_pipeline,
@@ -1362,7 +1398,9 @@ impl MetalContext {
         m: u32,
         k: u32,
     ) {
-        if weight_buf_is_q3(weight, m, k) {
+        if matches!(weight.format, weight_fmt::Q4_K | weight_fmt::Q6_K) {
+            self.encode_matvec_qk_at_view(encoder, weight, x_buf, 0, y_buf, 0, m, k, 1);
+        } else if weight_buf_is_q3(weight, m, k) {
             self.encode_matvec_q3_at_view(encoder, weight, x_buf, 0, y_buf, 0, m, k);
         } else if weight_buf_is_q4(weight, m, k) {
             self.encode_matvec_q4_view(encoder, weight, x_buf, y_buf, m, k);
@@ -1382,7 +1420,11 @@ impl MetalContext {
         m: u32,
         k: u32,
     ) {
-        if weight_buf_is_q3(weight, m, k) {
+        if matches!(weight.format, weight_fmt::Q4_K | weight_fmt::Q6_K) {
+            self.encode_matvec_qk_at_view(
+                encoder, weight, x_buf, x_offset, y_buf, y_offset, m, k, 1,
+            );
+        } else if weight_buf_is_q3(weight, m, k) {
             self.encode_matvec_q3_at_view(
                 encoder, weight, x_buf, x_offset, y_buf, y_offset, m, k,
             );
@@ -1407,7 +1449,9 @@ impl MetalContext {
         k: u32,
         seq_len: u32,
     ) {
-        if weight_buf_is_q4(weight, m, k) {
+        if matches!(weight.format, weight_fmt::Q4_K | weight_fmt::Q6_K) {
+            self.encode_matvec_qk_at_view(encoder, weight, x_buf, 0, y_buf, 0, m, k, seq_len);
+        } else if weight_buf_is_q4(weight, m, k) {
             self.encode_projection_q4_batch_view(encoder, weight, x_buf, y_buf, m, k, seq_len);
         } else {
             self.encode_projection_f16_batch_view(encoder, weight, x_buf, y_buf, m, k, seq_len);
@@ -1621,6 +1665,46 @@ impl MetalContext {
                 metal::MTLSize::new(tw, nsg, 1),
             );
         }
+    }
+
+    // ─── K-quant matvec dispatch (Q4_K / Q6_K) ──────────────────────────────
+
+    /// Native K-quant weight matvec for community Q4_K_M GGUFs.
+    /// `weight.format` selects Q4_K vs Q6_K; x and y are f32. `batch` is 1 for
+    /// decode and `seq_len` for prefill (one kernel covers both via tgpig.y).
+    pub fn encode_matvec_qk_at_view(
+        &self,
+        encoder: &metal::ComputeCommandEncoderRef,
+        weight: &BufferView,
+        x_buf: &Buffer,
+        x_offset: u64,
+        y_buf: &Buffer,
+        y_offset: u64,
+        m: u32,
+        k: u32,
+        batch: u32,
+    ) {
+        use crate::ggml_gemv::{mul_mv_args_k, mul_mv_k_dispatch};
+        let pipeline = match weight.format {
+            weight_fmt::Q4_K => &self.matvec_ggml_q4k_pipeline,
+            weight_fmt::Q6_K => &self.matvec_ggml_q6k_pipeline,
+            other => panic!("encode_matvec_qk_at_view: not a K-quant format ({})", other),
+        };
+        let args = mul_mv_args_k(m, k, batch);
+        encoder.set_compute_pipeline_state(pipeline);
+        encoder.set_buffer(0, Some(&weight.buffer), weight.offset);
+        encoder.set_buffer(1, Some(x_buf), x_offset);
+        encoder.set_buffer(2, Some(y_buf), y_offset);
+        encoder.set_bytes(
+            3,
+            std::mem::size_of::<crate::ggml_gemv::GgmlMulMvArgs>() as u64,
+            &args as *const _ as *const _,
+        );
+        let (tg_x, tg_y, tg_z, tw, nsg) = mul_mv_k_dispatch(m, batch);
+        encoder.dispatch_thread_groups(
+            metal::MTLSize::new(tg_x, tg_y, tg_z),
+            metal::MTLSize::new(tw, nsg, 1),
+        );
     }
 
     // ─── Q3_0 matvec dispatch ────────────────────────────────────────────────
@@ -2535,6 +2619,12 @@ impl MetalContext {
         k: u32,
         seq_len: u32,
     ) {
+        // Native K-quant weights (Q4_K_M) route to the K-quant matvec, which
+        // covers the batch via its tgpig.y dimension.
+        if matches!(weight.format, weight_fmt::Q4_K | weight_fmt::Q6_K) {
+            self.encode_matvec_qk_at_view(encoder, weight, x_buf, 0, y_buf, 0, m, k, seq_len);
+            return;
+        }
         encoder.set_compute_pipeline_state(&self.projection_q4_batch_pipeline);
         encoder.set_buffer(0, Some(&weight.buffer), weight.offset);
         encoder.set_buffer(1, Some(x_buf), 0);
