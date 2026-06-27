@@ -8,7 +8,7 @@ use memmap2::Mmap;
 use safetensors::SafeTensors;
 use serde::Deserialize;
 
-use crate::gemma4_config::{Gemma4TextConfig, KvCacheType};
+use crate::gemma4_config::{Gemma4TextConfig, KvCacheType, RopeConfig, RopeParameters};
 use crate::gpu::{BufferView, GpuTimestampProfiler, MetalContext, ProfileAblate, profile_gpu_enabled};
 use crate::kv_pool::{KvCachePool, KvPoolError, KvSlot, KvSlotView};
 use crate::mega_decode::{mega_kernel_enabled, MegaDecodeGraph, MegaScratchBuffers};
@@ -1134,6 +1134,43 @@ impl Gemma4GpuModel {
             // layer_tensors dropped here, freeing memory
         }
 
+        Self::assemble(
+            ctx,
+            config,
+            embed_tables,
+            lm_head_buf,
+            final_norm_weight,
+            per_layer_projection_norm_weight,
+            per_layer_model_projection_weight,
+            layers,
+        )
+    }
+
+    /// Shared model assembly: KV-sharing wiring, gate/up packing, scratch/KV/RoPE
+    /// buffer allocation, and final struct construction. Used by both the
+    /// safetensors loader and the GGUF loader once per-layer `Gemma4GpuLayer`s
+    /// and shared weights have been built.
+    fn assemble(
+        ctx: MetalContext,
+        config: Gemma4TextConfig,
+        embed_tables: EmbedTables,
+        lm_head_buf: BufferView,
+        final_norm_weight: BufferView,
+        per_layer_projection_norm_weight: BufferView,
+        per_layer_model_projection_weight: BufferView,
+        mut layers: Vec<Gemma4GpuLayer>,
+    ) -> Self {
+        let hidden_size = config.hidden_size;
+        let num_heads = config.num_attention_heads;
+        let num_kv_heads = config.num_key_value_heads;
+        let intermediate_size = config.intermediate_size;
+        let vocab_size = config.vocab_size;
+        let num_layers = config.num_hidden_layers;
+        let ple_dim = config.hidden_size_per_layer_input;
+        let max_head_dim = config.global_head_dim;
+        let max_q_out = num_heads * max_head_dim;
+        let max_kv_out = num_kv_heads * max_head_dim;
+
         // Compute kv_source_layer for shared layers
         // For each shared layer, find the last non-shared layer of the same type
         let first_kv_shared = num_layers - config.num_kv_shared_layers;
@@ -1352,6 +1389,154 @@ impl Gemma4GpuModel {
 
         model.attach_mega_graph_if_enabled();
         model
+    }
+
+    /// Load a Gemma-4 model directly from a `.gguf` file (architecture `gemma4`).
+    /// Quantized weights (Q4_0/Q4_1) and the K-quant embedding tables are
+    /// dequantized to f32 on the CPU, then fed through the same Q4_0 GPU path as
+    /// the safetensors loader. No on-disk Q4 cache is produced for GGUF loads.
+    pub fn load_from_gguf(gguf_path: &str) -> Self {
+        let g = crate::gguf::Gguf::open(gguf_path);
+        let arch = g.get_str("general.architecture").unwrap_or("");
+        assert_eq!(
+            arch, "gemma4",
+            "GGUF architecture is '{}', expected 'gemma4'",
+            arch
+        );
+
+        let config = gemma4_config_from_gguf(&g);
+        let ctx = MetalContext::new();
+
+        let hidden_size = config.hidden_size;
+        let num_heads = config.num_attention_heads;
+        let num_kv_heads = config.num_key_value_heads;
+        let intermediate_size = config.intermediate_size;
+        let vocab_size = config.vocab_size;
+        let num_layers = config.num_hidden_layers;
+        let ple_dim = config.hidden_size_per_layer_input;
+        let ple_total_dim = num_layers * ple_dim;
+
+        println!(
+            "  Gemma4 (GGUF): {} layers, hidden={}, heads={}, kv_heads={}, vocab={}",
+            num_layers, hidden_size, num_heads, num_kv_heads, vocab_size
+        );
+        println!(
+            "  Sliding head_dim={}, Full head_dim={}, PLE dim={}, shared_kv_layers={}",
+            config.head_dim, config.global_head_dim, ple_dim, config.num_kv_shared_layers
+        );
+
+        // --- Embeddings ---
+        println!("  Loading embeddings (dequantizing K-quant tables)...");
+        let embed_f32 = g.dequant_to_f32("token_embd.weight");
+        assert_eq!(
+            embed_f32.len(),
+            vocab_size * hidden_size,
+            "token_embd size mismatch"
+        );
+        // lm_head is tied to the input embeddings (no separate output.weight tensor).
+        let lm_head_buf =
+            BufferView::from_buffer(ctx.buffer_from_f32_as_q4(&embed_f32, vocab_size, hidden_size));
+        println!(
+            "    lm_head (tied, Q4_0 on GPU): {:.1} MB",
+            lm_head_buf.length as f64 / 1024.0 / 1024.0
+        );
+        // bf16 image for the CPU embedding lookup table (re-quantized to Q4_0 inside).
+        let embed_bf16 = f32_to_bf16_bytes(&embed_f32);
+        drop(embed_f32);
+        // PLE embedding table is multi-GB; stream straight to bf16 bytes.
+        let ple_bf16 = g.dequant_to_bf16_bytes("per_layer_token_embd.weight");
+        assert_eq!(
+            ple_bf16.len(),
+            vocab_size * ple_total_dim * 2,
+            "per_layer_token_embd size mismatch"
+        );
+        let embed_tables = EmbedTables::from_owned(
+            embed_bf16,
+            ple_bf16,
+            vocab_size,
+            ple_total_dim,
+            hidden_size,
+        );
+
+        // --- Shared norms / projections ---
+        let final_norm_weight =
+            BufferView::from_buffer(ctx.buffer_from_slice(&g.dequant_to_f32("output_norm.weight")));
+        let per_layer_projection_norm_weight = BufferView::from_buffer(
+            ctx.buffer_from_slice(&g.dequant_to_f32("per_layer_proj_norm.weight")),
+        );
+        let per_layer_model_proj_f32 = g.dequant_to_f32("per_layer_model_proj.weight");
+        let per_layer_model_projection_weight = BufferView::from_buffer(ctx.buffer_from_f32_as_q4(
+            &per_layer_model_proj_f32,
+            ple_total_dim,
+            hidden_size,
+        ));
+        drop(per_layer_model_proj_f32);
+
+        // --- Layers ---
+        println!("  Loading {} layers from GGUF (requantizing to Q4_0)...", num_layers);
+        let mut layers = Vec::with_capacity(num_layers);
+        for layer_idx in 0..num_layers {
+            let is_full = config.is_full_attention(layer_idx);
+            let head_dim = config.layer_head_dim(layer_idx);
+            let q_out = num_heads * head_dim;
+            let kv_out = num_kv_heads * head_dim;
+            let p = |suffix: &str| format!("blk.{}.{}", layer_idx, suffix);
+
+            let q4 = |name: String, rows: usize, cols: usize| -> BufferView {
+                let data = g.dequant_to_f32(&name);
+                BufferView::from_buffer(ctx.buffer_from_f32_as_q4(&data, rows, cols))
+            };
+            let f32buf = |name: String| -> BufferView {
+                BufferView::from_buffer(ctx.buffer_from_slice(&g.dequant_to_f32(&name)))
+            };
+
+            let layer_scalar = g.dequant_to_f32(&p("layer_output_scale.weight"))[0];
+
+            let layer = Gemma4GpuLayer {
+                q_proj: q4(p("attn_q.weight"), q_out, hidden_size),
+                k_proj: q4(p("attn_k.weight"), kv_out, hidden_size),
+                v_proj: q4(p("attn_v.weight"), kv_out, hidden_size),
+                o_proj: q4(p("attn_output.weight"), hidden_size, q_out),
+
+                gate_proj: q4(p("ffn_gate.weight"), intermediate_size, hidden_size),
+                up_proj: q4(p("ffn_up.weight"), intermediate_size, hidden_size),
+                gate_up_proj: BufferView::from_buffer(ctx.buffer_empty(1)),
+                down_proj: q4(p("ffn_down.weight"), hidden_size, intermediate_size),
+
+                input_layernorm_weight: f32buf(p("attn_norm.weight")),
+                post_attention_layernorm_weight: f32buf(p("post_attention_norm.weight")),
+                pre_feedforward_layernorm_weight: f32buf(p("ffn_norm.weight")),
+                post_feedforward_layernorm_weight: f32buf(p("post_ffw_norm.weight")),
+                post_per_layer_input_norm_weight: f32buf(p("post_norm.weight")),
+
+                per_layer_input_gate_weight: q4(p("inp_gate.weight"), ple_dim, hidden_size),
+                per_layer_projection_weight: q4(p("proj.weight"), hidden_size, ple_dim),
+                layer_scalar,
+
+                q_norm_weight: f32buf(p("attn_q_norm.weight")),
+                k_norm_weight: f32buf(p("attn_k_norm.weight")),
+
+                is_full_attention: is_full,
+                has_kv: layer_idx < (num_layers - config.num_kv_shared_layers),
+                kv_source_layer: 0,
+                head_dim,
+                q_out_dim: q_out,
+                kv_out_dim: kv_out,
+                weight_format: WeightFormat::Q4_0,
+            };
+            layers.push(layer);
+        }
+
+        Self::assemble(
+            ctx,
+            config,
+            embed_tables,
+            lm_head_buf,
+            final_norm_weight,
+            per_layer_projection_norm_weight,
+            per_layer_model_projection_weight,
+            layers,
+        )
     }
 
     fn decode_rope_byte_offset(&self, layer_idx: usize) -> u64 {
@@ -6847,6 +7032,110 @@ impl Gemma4GpuModel {
 }
 
 /// Decode a safetensors tensor view to Vec<f32>, handling f32/f16/bf16.
+/// Build a `Gemma4TextConfig` from `gemma4.*` GGUF metadata.
+fn gemma4_config_from_gguf(g: &crate::gguf::Gguf) -> Gemma4TextConfig {
+    let mu = |k: &str| g.get_u32(k).unwrap_or_else(|| panic!("gguf missing u32 key {}", k)) as usize;
+
+    let hidden_size = mu("gemma4.embedding_length");
+    let num_hidden_layers = mu("gemma4.block_count");
+    let num_attention_heads = mu("gemma4.attention.head_count");
+    let num_key_value_heads = mu("gemma4.attention.head_count_kv");
+    let head_dim = mu("gemma4.attention.key_length_swa"); // sliding head dim (e.g. 256)
+    let global_head_dim = mu("gemma4.attention.key_length"); // full head dim (e.g. 512)
+    let intermediate_size = mu("gemma4.feed_forward_length");
+    let vocab_size = g
+        .tensor("token_embd.weight")
+        .map(|t| t.n_rows())
+        .expect("token_embd.weight missing");
+    let rms_norm_eps =
+        g.get_f32("gemma4.attention.layer_norm_rms_epsilon").unwrap_or(1e-6) as f64;
+    let sliding_window = mu("gemma4.attention.sliding_window");
+    let hidden_size_per_layer_input = mu("gemma4.embedding_length_per_layer_input");
+    let num_kv_shared_layers = mu("gemma4.attention.shared_kv_layers");
+    let max_position_embeddings =
+        g.get_u32("gemma4.context_length").unwrap_or(131072) as usize;
+    let final_logit_softcapping =
+        g.get_f32("gemma4.final_logit_softcapping").unwrap_or(30.0);
+
+    // sliding_window_pattern: true => sliding attention, false => full attention.
+    let pattern = g
+        .get_arr_bool("gemma4.attention.sliding_window_pattern")
+        .expect("missing gemma4.attention.sliding_window_pattern");
+    assert_eq!(
+        pattern.len(),
+        num_hidden_layers,
+        "sliding_window_pattern length {} != block_count {}",
+        pattern.len(),
+        num_hidden_layers
+    );
+    let layer_types: Vec<String> = pattern
+        .iter()
+        .map(|&sliding| {
+            if sliding {
+                "sliding_attention".to_string()
+            } else {
+                "full_attention".to_string()
+            }
+        })
+        .collect();
+
+    let full_theta = g.get_f32("gemma4.rope.freq_base").unwrap_or(1_000_000.0) as f64;
+    let sliding_theta = g.get_f32("gemma4.rope.freq_base_swa").unwrap_or(10_000.0) as f64;
+    // rope.dimension_count tells us how many of the head_dim channels are rotated.
+    let full_rope_dim =
+        g.get_u32("gemma4.rope.dimension_count").unwrap_or(global_head_dim as u32) as f64;
+    let sliding_rope_dim =
+        g.get_u32("gemma4.rope.dimension_count_swa").unwrap_or(head_dim as u32) as f64;
+
+    let rope_parameters = Some(RopeParameters {
+        full_attention: Some(RopeConfig {
+            rope_theta: full_theta,
+            rope_type: String::new(),
+            partial_rotary_factor: full_rope_dim / global_head_dim as f64,
+            factor: 1.0,
+        }),
+        sliding_attention: Some(RopeConfig {
+            rope_theta: sliding_theta,
+            rope_type: String::new(),
+            partial_rotary_factor: sliding_rope_dim / head_dim as f64,
+            factor: 1.0,
+        }),
+    });
+
+    Gemma4TextConfig {
+        hidden_size,
+        num_hidden_layers,
+        num_attention_heads,
+        num_key_value_heads,
+        head_dim,
+        global_head_dim,
+        intermediate_size,
+        vocab_size,
+        hidden_activation: "gelu_pytorch_tanh".to_string(),
+        rms_norm_eps,
+        sliding_window,
+        layer_types,
+        hidden_size_per_layer_input,
+        num_kv_shared_layers,
+        max_position_embeddings,
+        final_logit_softcapping,
+        tie_word_embeddings: !g.has_tensor("output.weight"),
+        rope_parameters,
+    }
+}
+
+/// Convert an f32 slice to bf16 little-endian bytes (round to nearest even).
+fn f32_to_bf16_bytes(data: &[f32]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(data.len() * 2);
+    for &v in data {
+        let bits = v.to_bits();
+        let rounding_bias = 0x7FFF + ((bits >> 16) & 1);
+        let bf = ((bits + rounding_bias) >> 16) as u16;
+        out.extend_from_slice(&bf.to_le_bytes());
+    }
+    out
+}
+
 fn decode_tensor_to_f32(tensor_view: &safetensors::tensor::TensorView) -> Vec<f32> {
     let dtype = tensor_view.dtype();
     let raw_data = tensor_view.data();

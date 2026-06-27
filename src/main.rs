@@ -6,6 +6,7 @@ mod layers;
 mod cache;
 mod ggml_gemv;
 mod ggml_flash_attn;
+mod gguf;
 mod gpu;
 mod gpu_model;
 mod gemma4_config;
@@ -52,25 +53,87 @@ fn main() {
             format!("{}/Downloads/hub/models--meta-llama--Llama-3.2-1B/snapshots/4e20de362430cd3b72f300e6b0f18e50e7166e08", home)
         });
 
+    // Dev helper: build the embedded GGUF tokenizer and sanity-check encode/decode.
+    if args.iter().any(|a| a == "--gguf-tok-test") {
+        let tok = gguf::build_tokenizer_from_gguf(&model_dir);
+        // Control-token atomicity: each should encode to exactly one id.
+        for ctrl in ["<|turn>", "<turn|>"] {
+            let ids = tok.encode(ctrl, false).expect("encode failed").get_ids().to_vec();
+            println!("ctrl {:?} -> {:?} (atomic={})", ctrl, ids, ids.len() == 1);
+        }
+        for sample in [
+            "<|turn>user\nHello, world!<turn|>\n<|turn>model\n",
+            "The quick brown fox jumps over the lazy dog.",
+        ] {
+            let enc = tok.encode(sample, true).expect("encode failed");
+            let ids = enc.get_ids();
+            let decoded_no_special = tok.decode(ids, true).unwrap_or_default();
+            println!("--- sample ---");
+            println!("text:           {:?}", sample);
+            println!("ids:            {:?}", ids);
+            println!("decoded(skip):  {:?}", decoded_no_special);
+            println!("roundtrip_ok:   {}", decoded_no_special == sample);
+        }
+        return;
+    }
+
+    // Dev helper: load a GGUF model on GPU and greedy-decode a short prompt.
+    if args.iter().any(|a| a == "--gguf-gen") {
+        let mut model = gemma4_gpu_model::Gemma4GpuModel::load_from_gguf(&model_dir);
+        let tok = gguf::build_tokenizer_from_gguf(&model_dir);
+        let prompt = "<|turn>user\nWhat is the capital of France? Answer in one sentence.<turn|>\n<|turn>model\n";
+        let ids: Vec<usize> = tok
+            .encode(prompt, true)
+            .expect("encode")
+            .get_ids()
+            .iter()
+            .map(|&t| t as usize)
+            .collect();
+        println!("Prompt ids ({}): {:?}", ids.len(), ids);
+        let mut next = model.forward_prefill_sample_last(&ids, 0.0, 0.0, 0);
+        let eos: &[usize] = &[1, 106];
+        let mut out = String::new();
+        for _ in 0..60 {
+            if eos.contains(&next) {
+                break;
+            }
+            out.push_str(&tok.decode(&[next as u32], false).unwrap_or_default());
+            next = model.forward_single_token_sample(next, 0.0, 0.0, 0);
+        }
+        println!("=== GGUF greedy generation ===\n{}", out);
+        return;
+    }
+
     let sink_size = 4;
     let window_size = 64;
 
     if use_gpu {
-        // Detect if this is a Gemma4 model by checking for text_config in config.json
-        let config_path = std::path::Path::new(&model_dir).join("config.json");
-        let config_str = std::fs::read_to_string(&config_path)
-            .expect("Failed to read config.json");
-        let is_gemma4 = config_str.contains("\"gemma4\"") || config_str.contains("text_config");
+        // A `.gguf` path is loaded directly (weights + embedded tokenizer).
+        let is_gguf = model_dir.ends_with(".gguf");
+        // Otherwise, detect a Gemma4 HF model dir by checking config.json.
+        let is_gemma4 = is_gguf || {
+            let config_path = std::path::Path::new(&model_dir).join("config.json");
+            let config_str = std::fs::read_to_string(&config_path)
+                .expect("Failed to read config.json");
+            config_str.contains("\"gemma4\"") || config_str.contains("text_config")
+        };
 
         if is_gemma4 {
-            println!("Loading Gemma4 model (GPU/Metal) from: {}", model_dir);
             let start = Instant::now();
 
-            let mut gpu_model = gemma4_gpu_model::Gemma4GpuModel::new(&model_dir);
-
-            let tokenizer_path = std::path::Path::new(&model_dir).join("tokenizer.json");
-            let tokenizer = tokenizers::Tokenizer::from_file(&tokenizer_path)
-                .expect("Failed to load tokenizer.json");
+            let (mut gpu_model, tokenizer) = if is_gguf {
+                println!("Loading Gemma4 model (GGUF) from: {}", model_dir);
+                let model = gemma4_gpu_model::Gemma4GpuModel::load_from_gguf(&model_dir);
+                let tokenizer = gguf::build_tokenizer_from_gguf(&model_dir);
+                (model, tokenizer)
+            } else {
+                println!("Loading Gemma4 model (GPU/Metal) from: {}", model_dir);
+                let model = gemma4_gpu_model::Gemma4GpuModel::new(&model_dir);
+                let tokenizer_path = std::path::Path::new(&model_dir).join("tokenizer.json");
+                let tokenizer = tokenizers::Tokenizer::from_file(&tokenizer_path)
+                    .expect("Failed to load tokenizer.json");
+                (model, tokenizer)
+            };
 
             println!("Model loaded in {:.2}s", start.elapsed().as_secs_f64());
 
