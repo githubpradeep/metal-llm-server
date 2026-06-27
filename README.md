@@ -49,7 +49,7 @@ Still pending:
 - Move the single-command-buffer optimization into the multi-request batched
   prefill path.
 - Use or remove the experimental tiled projection kernels after benchmarking.
-- Add tiled/FlashAttention-style prefill attention.
+- Benchmark and tune the tiled FlashAttention-style attention kernels further.
 - Add deeper logits/top-k debug correctness checks.
 - Publish stable benchmark numbers with exact hardware, model, and runtime
   configuration.
@@ -249,6 +249,30 @@ benchmarks/                 Regression, correctness, stress, fairness scripts
 docs/                       Architecture notes and blog posts
 ```
 
+## Performance Tuning
+
+Decode throughput on an Apple M1 Pro with Gemma4 E4B Q4_0 is ~29 tok/s out of
+ the box and ~31–32 tok/s with:
+
+```bash
+MLP_GATE_UP_GGML=1 cargo run --release -- --gpu "$MODEL_DIR"
+```
+
+`MLP_GATE_UP_GGML=1` replaces the packed interleaved MLP gate∥up+GeLU kernel
+with two separate ggml-style Q4 matvecs plus a GeLU multiply. It is opt-in
+because the extra dispatch can hurt on other shapes, but it helps this model.
+
+To reach llama.cpp-level single-request speeds (~40 tok/s on similar hardware)
+the remaining work is in the attention kernel: it currently dispatches one
+threadgroup per query head, so GQA groups read the same KV cache multiple times.
+A GQA-aware attention kernel (one threadgroup per KV head, computing all query
+heads in the group) plus further dispatch-reduction (e.g., a working mega-kernel
+or fusing O-projection/norm/residual) is the next step.
+
+For serving, use the existing decode batching: aggregate throughput scales with
+the number of concurrent requests because weights and KV are amortized across
+the batch.
+
 ## Known Limits
 
 - Alpha software. Expect sharp edges.
@@ -259,7 +283,8 @@ docs/                       Architecture notes and blog posts
 - Multi-request batched prefill is real, but the latest single-command-buffer
   optimization is not yet applied to that path.
 - Tiled projection kernels are present but not currently used in the hot path.
-- Attention is not yet FlashAttention-style.
+- Decode and causal attention use tiled FlashAttention-style kernels by default
+  (`FLASH_ATTN=legacy` to revert to the older per-token attention path).
 
 ## Positioning
 

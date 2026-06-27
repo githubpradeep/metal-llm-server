@@ -4,11 +4,14 @@ mod config;
 mod batch_engine;
 mod layers;
 mod cache;
+mod ggml_gemv;
+mod ggml_flash_attn;
 mod gpu;
 mod gpu_model;
 mod gemma4_config;
 mod gemma4_gpu_model;
 mod kv_pool;
+mod mega_decode;
 mod metrics;
 mod model;
 mod quantize;
@@ -20,10 +23,25 @@ mod server;
 
 use std::io::{self, Write};
 use std::time::Instant;
+use rand::Rng;
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     let use_gpu = args.iter().any(|a| a == "--gpu");
+
+    if args.iter().any(|a| a == "--bench-matvec") {
+        let ctx = gpu::MetalContext::new();
+        ctx.bench_matvec();
+        return;
+    }
+
+    let bench_decode = args.iter().any(|a| a == "--bench-decode");
+    let bench_decode_tokens: usize = args
+        .iter()
+        .position(|a| a == "--bench-decode-tokens")
+        .and_then(|i| args.get(i + 1))
+        .and_then(|n| n.parse().ok())
+        .unwrap_or(256);
 
     let model_dir = args.iter()
         .filter(|a| !a.starts_with("--") && *a != &args[0])
@@ -48,13 +66,22 @@ fn main() {
             println!("Loading Gemma4 model (GPU/Metal) from: {}", model_dir);
             let start = Instant::now();
 
-            let gpu_model = gemma4_gpu_model::Gemma4GpuModel::new(&model_dir);
+            let mut gpu_model = gemma4_gpu_model::Gemma4GpuModel::new(&model_dir);
 
             let tokenizer_path = std::path::Path::new(&model_dir).join("tokenizer.json");
             let tokenizer = tokenizers::Tokenizer::from_file(&tokenizer_path)
                 .expect("Failed to load tokenizer.json");
 
             println!("Model loaded in {:.2}s", start.elapsed().as_secs_f64());
+
+            if bench_decode {
+                bench_decode_gemma4(
+                    &tokenizer,
+                    &mut gpu_model,
+                    bench_decode_tokens,
+                );
+                return;
+            }
 
             // Serve mode: start OpenAI-compatible HTTP server
             if args.iter().any(|a| a == "--serve") {
@@ -70,14 +97,13 @@ fn main() {
             }
 
             // Interactive generation mode
-            let mut gpu_model = gpu_model;
             println!("{}", "=".repeat(60));
             println!("GEMMA4 E4B GENERATION (Metal GPU, Q4_0)");
             println!("{}", "=".repeat(60));
 
             let gen_start = Instant::now();
             generate_gemma4_gpu(
-                "<start_of_turn>user\n A train leaves at 8:15 AM and arrives at 11:47 AM. How long was the journey?<end_of_turn>\n<start_of_turn>model\n",
+                "<start_of_turn>user\n Write a short essay about the benefits of exercise. Include an introduction, 3 key points, and a conclusion.<end_of_turn>\n<start_of_turn>model\n",
                 &tokenizer,
                 &mut gpu_model,
                 1000,
@@ -178,6 +204,66 @@ fn generate_gpu(
     println!("  Elapsed: {:.2}s", elapsed);
 }
 
+/// llama.cpp-style benchmark: prefill and decode timed separately, no stdout I/O
+/// inside the decode loop (matches `Prompt: X t/s | Generation: Y t/s` reporting).
+fn bench_decode_gemma4(
+    tokenizer: &tokenizers::Tokenizer,
+    model: &mut gemma4_gpu_model::Gemma4GpuModel,
+    gen_tokens: usize,
+) {
+    // Plain prompt for token count; wrap in Gemma chat template so greedy decode
+    // does not immediately sample <end_of_turn> (happens without <start_of_turn>model).
+    let plain = "Write a short essay about the benefits of exercise. Include an introduction, 3 key points, and a conclusion.";
+    let prompt = format!(
+        "<start_of_turn>user\n{plain}<end_of_turn>\n<start_of_turn>model\n"
+    );
+    let encoding = tokenizer.encode(prompt.as_str(), true).expect("Failed to encode");
+    let token_ids: Vec<usize> = encoding.get_ids().iter().map(|&t| t as usize).collect();
+    let prompt_tokens = token_ids.len();
+
+    // Prefill
+    let prefill_start = Instant::now();
+    let mut rng = rand::thread_rng();
+    let seed: u32 = rng.gen();
+    let mut next_token =
+        model.forward_prefill_sample_last(&token_ids, 0.0, 0.0, seed);
+    let prefill_secs = prefill_start.elapsed().as_secs_f64();
+    let prefill_tps = if prefill_secs > 0.0 {
+        prompt_tokens as f64 / prefill_secs
+    } else {
+        0.0
+    };
+
+    // Decode — no print/flush/tokenizer in the timed section
+    let decode_start = Instant::now();
+    let mut generated = 0usize;
+    let eos_tokens: &[usize] = &[1, 106];
+    for _ in 0..gen_tokens {
+        if eos_tokens.contains(&next_token) {
+            break;
+        }
+        generated += 1;
+        let seed: u32 = rng.gen();
+        next_token = model.forward_single_token_sample(next_token, 0.0, 0.0, seed);
+    }
+    let decode_secs = decode_start.elapsed().as_secs_f64();
+    let decode_tps = if decode_secs > 0.0 {
+        generated as f64 / decode_secs
+    } else {
+        0.0
+    };
+
+    println!("\n=== Gemma4 E4B decode benchmark (Metal GPU) ===");
+    println!("  Prompt tokens: {}", prompt_tokens);
+    println!("  Generated tokens: {}", generated);
+    println!("  Context after bench: {} tokens", model.num_items());
+    println!(
+        "  [ Prompt: {:.1} t/s | Generation: {:.1} t/s ]",
+        prefill_tps, decode_tps
+    );
+    println!("  (llama.cpp reports the same Prompt/Generation split; no stdout in decode loop)");
+}
+
 fn generate_gemma4_gpu(
     prompt: &str,
     tokenizer: &tokenizers::Tokenizer,
@@ -190,9 +276,12 @@ fn generate_gemma4_gpu(
     print!("{}", prompt);
     io::stdout().flush().unwrap();
 
-    // Prefill
+    // Prefill: advance intermediate tokens, GPU-sample the last (no full-vocab readback).
     let token_ids: Vec<usize> = input_ids.iter().map(|&t| t as usize).collect();
-    let mut logits = model.forward_prefill(&token_ids);
+    let mut rng = rand::thread_rng();
+    let seed: u32 = rng.gen();
+    let mut next_token =
+        model.forward_prefill_sample_last(&token_ids, 0.7, 0.1, seed);
 
     // Decode loop
     let start_time = Instant::now();
@@ -202,8 +291,6 @@ fn generate_gemma4_gpu(
     let eos_tokens: &[usize] = &[1, 106];
 
     for _ in 0..max_tokens {
-        let next_token = sampling::min_p_sampling(&logits, 0.1);
-
         // Stop at EOS or end-of-turn
         if eos_tokens.contains(&next_token) {
             break;
@@ -214,7 +301,8 @@ fn generate_gemma4_gpu(
         io::stdout().flush().unwrap();
         tokens_generated += 1;
 
-        logits = model.forward_single_token(next_token);
+        let seed: u32 = rng.gen();
+        next_token = model.forward_single_token_sample(next_token, 0.7, 0.1, seed);
     }
 
     let elapsed = start_time.elapsed().as_secs_f64();

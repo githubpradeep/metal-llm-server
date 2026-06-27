@@ -2,16 +2,155 @@ use metal::*;
 use std::collections::HashMap;
 use std::fs;
 use std::path::Path;
+use std::time::Instant;
 
+use memmap2::Mmap;
 use safetensors::SafeTensors;
 use serde::Deserialize;
 
-use crate::gemma4_config::Gemma4TextConfig;
-use crate::gpu::MetalContext;
+use crate::gemma4_config::{Gemma4TextConfig, KvCacheType};
+use crate::gpu::{BufferView, GpuTimestampProfiler, MetalContext, ProfileAblate, profile_gpu_enabled};
 use crate::kv_pool::{KvCachePool, KvPoolError, KvSlot, KvSlotView};
+use crate::mega_decode::{mega_kernel_enabled, MegaDecodeGraph, MegaScratchBuffers};
+
+/// Fused 3→1 operation: projection + norm + residual add
+/// 
+/// This combines three operations into one:
+/// 1. Apply projection to input
+/// 2. Apply RMSNorm to projected output
+/// 3. Add residual connection
+/// 
+/// Result: normalized_residual_output
+fn encode_proj_norm_residual(
+    ctx: &MetalContext,
+    encoder: &metal::ComputeCommandEncoderRef,
+    input_buf: &metal::Buffer,
+    projection_weight: &metal::Buffer,
+    norm_weight: &BufferView,
+    output_buf: &metal::Buffer,
+    hidden_size: u32,
+    eps: f32,
+) {
+    if crate::gpu::fused_rmsnorm_acc_enabled() {
+        ctx.encode_rmsnorm_acc_view(
+            encoder,
+            input_buf,
+            projection_weight,
+            norm_weight,
+            hidden_size,
+            eps,
+        );
+    } else {
+        ctx.encode_matvec_auto_view(
+            encoder,
+            &BufferView::from_buffer(projection_weight.clone()),
+            input_buf,
+            output_buf,
+            hidden_size,
+            hidden_size,
+        );
+        ctx.encode_rmsnorm_view(
+            encoder,
+            output_buf,
+            norm_weight,
+            output_buf,
+            hidden_size,
+            eps,
+        );
+        ctx.encode_vec_add(
+            encoder,
+            input_buf,
+            output_buf,
+            output_buf,
+            hidden_size,
+        );
+    }
+}
 
 const DEFAULT_MAX_PREFILL_SEQ: usize = 128;
 const DEFAULT_MAX_DECODE_BATCH: usize = 4;
+
+/// Cumulative per-phase GPU time (ms) and token count for PROFILE_PHASES.
+#[derive(Clone, Copy)]
+struct PhaseState {
+    sums: [f64; 4],
+    count: u64,
+}
+
+thread_local! {
+    static PHASE_STATE: std::cell::Cell<PhaseState> =
+        std::cell::Cell::new(PhaseState { sums: [0.0; 4], count: 0 });
+}
+/// Metal `setBuffer` offset alignment on Apple GPUs.
+const WEIGHT_BLOB_ALIGN: usize = 256;
+const WEIGHT_CACHE_MAGIC_LEN: usize = 4;
+
+/// GPU RoPE params for one layer (must match `RopeLayerParams` in llama.metal).
+#[repr(C)]
+struct RopeLayerParams {
+    theta: f32,
+    factor: f32,
+    head_dim: u32,
+    rope_angles: u32,
+}
+
+fn build_rope_layer_params(config: &Gemma4TextConfig, num_layers: usize) -> Vec<RopeLayerParams> {
+    let mut params = Vec::with_capacity(num_layers);
+    for layer_idx in 0..num_layers {
+        let head_dim = config.layer_head_dim(layer_idx) as u32;
+        let is_full = config.is_full_attention(layer_idx);
+        let theta = if is_full {
+            config.full_rope_theta() as f32
+        } else {
+            config.sliding_rope_theta() as f32
+        };
+        let factor = if is_full {
+            config.full_rope_factor() as f32
+        } else {
+            config.sliding_rope_factor() as f32
+        };
+        let rotary_dim = if is_full {
+            (head_dim as f64 * config.full_partial_rotary_factor()) as u32
+        } else {
+            head_dim
+        };
+        params.push(RopeLayerParams {
+            theta,
+            factor,
+            head_dim,
+            rope_angles: rotary_dim / 2,
+        });
+    }
+    params
+}
+
+fn alloc_decode_rope_buffers(
+    ctx: &MetalContext,
+    config: &Gemma4TextConfig,
+    num_layers: usize,
+    max_head_dim: usize,
+) -> (Buffer, Buffer, Buffer) {
+    let params = build_rope_layer_params(config, num_layers);
+    let cos = ctx.buffer_empty(num_layers * max_head_dim);
+    let sin = ctx.buffer_empty(num_layers * max_head_dim);
+    let params_bytes =
+        unsafe { std::slice::from_raw_parts(params.as_ptr() as *const u8, params.len() * 16) };
+    let params_buf = ctx.buffer_from_bytes(params_bytes);
+    (cos, sin, params_buf)
+}
+
+fn weight_section_pad(section_offset: usize) -> usize {
+    (WEIGHT_BLOB_ALIGN - (section_offset % WEIGHT_BLOB_ALIGN)) % WEIGHT_BLOB_ALIGN
+}
+
+fn pad_weights_file_to_section_align(file: &mut fs::File) {
+    use std::io::{Seek, Write};
+    let pos = file.stream_position().expect("stream position") as usize;
+    let pad = weight_section_pad(pos - WEIGHT_CACHE_MAGIC_LEN);
+    if pad > 0 {
+        file.write_all(&vec![0u8; pad]).expect("write padding");
+    }
+}
 
 fn configured_max_prefill_seq(kv_capacity: u32) -> usize {
     std::env::var("LLAMA_MAX_PREFILL_SEQ")
@@ -24,25 +163,39 @@ fn configured_max_prefill_seq(kv_capacity: u32) -> usize {
 
 /// Gemma 4 E4B GPU-resident model with persistent KV cache on Metal.
 /// All operations for one token are encoded into a SINGLE command buffer.
+/// Result of a single decode forward pass: either the full (softcapped) logit
+/// vector (CPU sampling path), the GPU-sampled token id (fused fast path), or
+/// KV-only advance (prefill intermediate tokens).
+enum DecodeOutput {
+    Advanced,
+    Logits(Vec<f32>),
+    Token(usize),
+}
+
+enum DecodeMode {
+    /// Update KV cache only; skip final norm, lm_head, and logit readback.
+    Advance,
+    Logits,
+    Sample(f32, f32, u32),
+}
+
 pub struct Gemma4GpuModel {
     pub ctx: MetalContext,
     pub config: Gemma4TextConfig,
 
-    // Embedding table (Q4 quantized for memory efficiency)
-    pub embed_tokens_f16: Vec<u16>, // [vocab_size * hidden_size] as bf16 (~1.3GB)
-    // Per-layer embedding table (Q4 quantized, ~1.6GB)
-    pub embed_tokens_per_layer_f16: Vec<u16>, // [vocab_size * num_layers * ple_dim] as bf16
+    // Embedding tables on CPU (mmap'd from cache for instant load; lm_head is separate Q4 on GPU)
+    embed_tables: EmbedTables,
 
-    // LM head (tied to embed_tokens, stored as f16 Metal buffer for GPU matvec)
-    pub lm_head_buf: Buffer,
+    // LM head (tied to embed_tokens, stored as Q4 Metal buffer for GPU matvec)
+    pub lm_head_buf: BufferView,
 
     // Per-layer weights on GPU
     pub layers: Vec<Gemma4GpuLayer>,
 
     // Shared weights
-    pub final_norm_weight: Buffer,
-    pub per_layer_projection_norm_weight: Buffer,
-    pub per_layer_model_projection_weight: Buffer, // [num_layers * ple_dim, hidden_size] f16
+    pub final_norm_weight: BufferView,
+    pub per_layer_projection_norm_weight: BufferView,
+    pub per_layer_model_projection_weight: BufferView, // [num_layers * ple_dim, hidden_size] f16
 
     // Pre-allocated scratch buffers (reused every token)
     pub hidden_buf: Buffer,
@@ -58,6 +211,8 @@ pub struct Gemma4GpuModel {
     pub gelu_buf: Buffer,
     pub down_buf: Buffer,
     pub logits_buf: Buffer,
+    pub sample_out_buf: Buffer, // [1] u32: GPU-sampled token id (decode fast path)
+    pub inv_rms_buf: Buffer,    // [1] f32: scratch for fused pre-FF RMSNorm + MLP
     pub prefill_scratch: PrefillScratch,
     pub decode_batch_scratch: DecodeBatchScratch,
 
@@ -79,14 +234,18 @@ pub struct Gemma4GpuModel {
     pub v_cache: Vec<Buffer>,
     pub kv_seq_len: u32,
     pub kv_capacity: u32,
+    pub kv_cache_type: KvCacheType,
 
     // Rotary precomputed buffers (per-layer since sliding/full differ)
     pub cos_buf: Buffer,
     pub sin_buf: Buffer,
 
-    // Per-layer persistent buffers (reused every token, contents overwritten)
-    pub per_layer_cos_bufs: Vec<Buffer>,
-    pub per_layer_sin_bufs: Vec<Buffer>,
+    // Packed decode RoPE cos/sin (filled on GPU each token) + static layer params.
+    pub decode_rope_cos_packed: Buffer,
+    pub decode_rope_sin_packed: Buffer,
+    pub rope_layer_params_buf: Buffer,
+    pub rope_max_head_dim: usize,
+
     pub per_layer_prefill_cos_bufs: Vec<Buffer>,
     pub per_layer_prefill_sin_bufs: Vec<Buffer>,
     pub per_layer_decode_batch_cos_bufs: Vec<Buffer>,
@@ -97,6 +256,14 @@ pub struct Gemma4GpuModel {
     pub per_layer_ple_bufs: Vec<Buffer>,
 
     pub total_tokens: usize,
+
+    // Legacy monolithic cache: offset into embed mmap for fast weights save during migration.
+    weights_mmap_offset: Option<usize>,
+    embed_decode_scratch: Vec<f32>,
+    ple_decode_scratch: Vec<f32>,
+
+    /// Single-dispatch decode graph (MEGA_KERNEL=1).
+    mega_graph: Option<MegaDecodeGraph>,
 }
 
 pub struct PrefillScratch {
@@ -135,6 +302,7 @@ pub struct DecodeBatchScratch {
     pub up_buf: Buffer,
     pub gelu_buf: Buffer,
     pub down_buf: Buffer,
+    pub inv_rms_buf: Buffer,
     pub logits_buf: Buffer,
     pub ple_context_proj_buf: Buffer,
     pub ple_token_id_buf: Buffer,
@@ -199,6 +367,7 @@ impl DecodeBatchScratch {
             up_buf: ctx.buffer_empty(max_batch_size * intermediate_size),
             gelu_buf: ctx.buffer_empty(max_batch_size * intermediate_size),
             down_buf: ctx.buffer_empty(max_batch_size * hidden_size),
+            inv_rms_buf: ctx.buffer_empty(max_batch_size),
             logits_buf: ctx.buffer_empty(max_batch_size * vocab_size),
             ple_context_proj_buf: ctx.buffer_empty(max_batch_size * num_layers * ple_dim),
             ple_token_id_buf: ctx.buffer_empty(max_batch_size * num_layers * ple_dim),
@@ -245,30 +414,281 @@ impl PrefillScratch {
     }
 }
 
+/// CPU-resident embedding tables. Cache load mmap's the file (instant); first safetensors load owns bytes.
+struct EmbedTables {
+    mmap: Option<Mmap>,
+    embed_offset: usize,
+    embed_byte_len: usize,
+    ple_offset: usize,
+    ple_byte_len: usize,
+    ple_cols: usize,
+    vocab_size: usize,
+    owned_embed: Option<Vec<u8>>,
+    owned_ple: Option<Vec<u8>>,
+}
+
+impl EmbedTables {
+    fn from_mmap(
+        mmap: Mmap,
+        embed_offset: usize,
+        embed_byte_len: usize,
+        ple_offset: usize,
+        ple_byte_len: usize,
+        ple_cols: usize,
+        vocab_size: usize,
+    ) -> Self {
+        Self {
+            mmap: Some(mmap),
+            embed_offset,
+            embed_byte_len,
+            ple_offset,
+            ple_byte_len,
+            ple_cols,
+            vocab_size,
+            owned_embed: None,
+            owned_ple: None,
+        }
+    }
+
+    fn from_owned(embed: Vec<u8>, ple: Vec<u8>, vocab_size: usize, ple_cols: usize, embed_cols: usize) -> Self {
+        let (owned_embed, embed_byte_len) = Self::convert_embed_to_q4(embed, vocab_size, embed_cols);
+        let (owned_ple, ple_byte_len) = Self::convert_ple_to_q4(ple, vocab_size, ple_cols);
+        Self {
+            mmap: None,
+            embed_offset: 0,
+            embed_byte_len,
+            ple_offset: 0,
+            ple_byte_len,
+            ple_cols,
+            vocab_size,
+            owned_embed,
+            owned_ple,
+        }
+    }
+
+    /// Convert bf16 embed data to Q4_0 blocks. Each row of length `embed_cols` becomes
+    /// `(embed_cols/32)*18` bytes of Q4_0 blocks.
+    fn convert_embed_to_q4(bf16_data: Vec<u8>, vocab_size: usize, embed_cols: usize) -> (Option<Vec<u8>>, usize) {
+        assert_eq!(bf16_data.len(), vocab_size * embed_cols * 2,
+            "embed data size mismatch: got {} expected {}", bf16_data.len(), vocab_size * embed_cols * 2);
+        assert_eq!(embed_cols % 32, 0, "embed cols not divisible by 32");
+
+        let blocks_per_row = embed_cols / 32;
+        let q4_row_bytes = blocks_per_row * 18;
+        let mut q4_data = vec![0u8; vocab_size * q4_row_bytes];
+        let mut f32_row = vec![0.0f32; embed_cols];
+        for row in 0..vocab_size {
+            let row_start = row * embed_cols * 2;
+            for i in 0..embed_cols {
+                let byte_off = row_start + i * 2;
+                let raw = u16::from_le_bytes([bf16_data[byte_off], bf16_data[byte_off + 1]]);
+                f32_row[i] = crate::gpu::bf16_to_f32(raw);
+            }
+            for g in 0..blocks_per_row {
+                let group_start = g * 32;
+                let mut max_abs = 0.0f32;
+                for &v in f32_row[group_start..group_start + 32].iter() {
+                    let a = v.abs();
+                    if a > max_abs { max_abs = a; }
+                }
+                let d = if max_abs > 0.0 { max_abs / 7.0 } else { 1.0 };
+                let inv_d = 1.0 / d;
+                let d_f16 = crate::gpu::f32_to_f16(d);
+                let out_off = row * q4_row_bytes + g * 18;
+                q4_data[out_off] = (d_f16 & 0xFF) as u8;
+                q4_data[out_off + 1] = (d_f16 >> 8) as u8;
+                for i in 0..16 {
+                    let v0 = f32_row[group_start + i];
+                    let v1 = f32_row[group_start + i + 16];
+                    let q0 = ((v0 * inv_d).round() as i32 + 8).clamp(0, 15) as u8;
+                    let q1 = ((v1 * inv_d).round() as i32 + 8).clamp(0, 15) as u8;
+                    q4_data[out_off + 2 + i] = q0 | (q1 << 4);
+                }
+            }
+        }
+        (Some(q4_data), vocab_size * q4_row_bytes)
+    }
+
+    /// Convert bf16 PLE data to Q4_0 blocks. Each row of length `ple_cols` becomes
+    /// `(ple_cols/32)*18` bytes of Q4_0 blocks.
+    fn convert_ple_to_q4(bf16_data: Vec<u8>, vocab_size: usize, ple_cols: usize) -> (Option<Vec<u8>>, usize) {
+        assert_eq!(bf16_data.len(), vocab_size * ple_cols * 2,
+            "PLE data size mismatch: got {} expected {}", bf16_data.len(), vocab_size * ple_cols * 2);
+        assert_eq!(ple_cols % 32, 0, "PLE cols not divisible by 32");
+
+        let blocks_per_row = ple_cols / 32;
+        let q4_row_bytes = blocks_per_row * 18;
+        let mut q4_data = vec![0u8; vocab_size * q4_row_bytes];
+
+        // Process one row at a time to avoid large f32 temp allocations
+        let mut f32_row = vec![0.0f32; ple_cols];
+        for row in 0..vocab_size {
+            let row_start = row * ple_cols * 2;
+            for i in 0..ple_cols {
+                let byte_off = row_start + i * 2;
+                let raw = u16::from_le_bytes([bf16_data[byte_off], bf16_data[byte_off + 1]]);
+                f32_row[i] = crate::gpu::bf16_to_f32(raw);
+            }
+            // Quantize row to Q4_0
+            for g in 0..blocks_per_row {
+                let group_start = g * 32;
+                let mut max_abs = 0.0f32;
+                for &v in f32_row[group_start..group_start + 32].iter() {
+                    let a = v.abs();
+                    if a > max_abs { max_abs = a; }
+                }
+                let d = if max_abs > 0.0 { max_abs / 7.0 } else { 1.0 };
+                let inv_d = 1.0 / d;
+                let d_f16 = crate::gpu::f32_to_f16(d);
+                let out_off = row * q4_row_bytes + g * 18;
+                q4_data[out_off] = (d_f16 & 0xFF) as u8;
+                q4_data[out_off + 1] = (d_f16 >> 8) as u8;
+                for i in 0..16 {
+                    let v0 = f32_row[group_start + i];
+                    let v1 = f32_row[group_start + i + 16];
+                    let q0 = ((v0 * inv_d).round() as i32 + 8).clamp(0, 15) as u8;
+                    let q1 = ((v1 * inv_d).round() as i32 + 8).clamp(0, 15) as u8;
+                    q4_data[out_off + 2 + i] = q0 | (q1 << 4);
+                }
+            }
+        }
+        (Some(q4_data), vocab_size * q4_row_bytes)
+    }
+
+    fn embed_bytes(&self) -> &[u8] {
+        if let Some(mmap) = &self.mmap {
+            &mmap[self.embed_offset..self.embed_offset + self.embed_byte_len]
+        } else {
+            self.owned_embed.as_ref().unwrap()
+        }
+    }
+
+    fn ple_bytes(&self) -> &[u8] {
+        if let Some(mmap) = &self.mmap {
+            &mmap[self.ple_offset..self.ple_offset + self.ple_byte_len]
+        } else {
+            self.owned_ple.as_ref().unwrap()
+        }
+    }
+
+    fn mmap_ref(&self) -> Option<&Mmap> {
+        self.mmap.as_ref()
+    }
+
+    fn decode_embed_into(&self, token_id: usize, hidden_size: usize, out: &mut [f32]) {
+        let scale = (hidden_size as f32).sqrt();
+        let bf16_row_bytes = hidden_size * 2;
+        if self.embed_byte_len as u64 > self.vocab_size as u64 * bf16_row_bytes as u64 / 2 {
+            // bf16 format
+            let byte_start = token_id * bf16_row_bytes;
+            let bytes = &self.embed_bytes()[byte_start..byte_start + bf16_row_bytes];
+            for (i, chunk) in bytes.chunks_exact(2).enumerate() {
+                out[i] = crate::gpu::bf16_to_f32(u16::from_le_bytes([chunk[0], chunk[1]])) * scale;
+            }
+        } else {
+            // Q4_0 format
+            let blocks = hidden_size / 32;
+            let q4_row_bytes = blocks * 18;
+            let row_start = token_id * q4_row_bytes;
+            let bytes = &self.embed_bytes()[row_start..row_start + q4_row_bytes];
+            for g in 0..blocks {
+                let off = g * 18;
+                let raw_d = u16::from_le_bytes([bytes[off], bytes[off + 1]]);
+                let d = crate::gpu::f16_to_f32(raw_d);
+                let out_off = g * 32;
+                for i in 0..16 {
+                    let packed = bytes[off + 2 + i];
+                    let q0 = packed & 0x0F;
+                    let q1 = packed >> 4;
+                    out[out_off + i] = d * ((q0 as i32 - 8) as f32) * scale;
+                    out[out_off + i + 16] = d * ((q1 as i32 - 8) as f32) * scale;
+                }
+            }
+        }
+    }
+
+    fn decode_ple_into(
+        &self,
+        token_id: usize,
+        ple_total_dim: usize,
+        ple_dim: usize,
+        out: &mut [f32],
+    ) {
+        let scale = (ple_dim as f32).sqrt();
+        if self.ple_byte_len as u64 > self.vocab_size as u64 * ple_total_dim as u64 {
+            // Old format: bf16 (detected by large byte length)
+            let cols = self.ple_cols;
+            let byte_start = token_id * cols * 2;
+            let bytes = &self.ple_bytes()[byte_start..byte_start + cols * 2];
+            for (i, chunk) in bytes.chunks_exact(2).enumerate() {
+                out[i] = crate::gpu::bf16_to_f32(u16::from_le_bytes([chunk[0], chunk[1]])) * scale;
+            }
+        } else {
+            // Q4_0 format
+            let blocks = ple_total_dim / 32;
+            let q4_row_bytes = blocks * 18;
+            let row_start = token_id * q4_row_bytes;
+            let bytes = &self.ple_bytes()[row_start..row_start + q4_row_bytes];
+            for g in 0..blocks {
+                let off = g * 18;
+                let raw_d = u16::from_le_bytes([bytes[off], bytes[off + 1]]);
+                let d = crate::gpu::f16_to_f32(raw_d);
+                let out_off = g * 32;
+                for i in 0..16 {
+                    let packed = bytes[off + 2 + i];
+                    let q0 = packed & 0x0F;
+                    let q1 = packed >> 4;
+                    out[out_off + i] = d * ((q0 as i32 - 8) as f32) * scale;
+                    out[out_off + i + 16] = d * ((q1 as i32 - 8) as f32) * scale;
+                }
+            }
+        }
+    }
+
+    fn decode_embed_row_f32(&self, token_id: usize, hidden_size: usize) -> Vec<f32> {
+        let mut out = vec![0.0f32; hidden_size];
+        self.decode_embed_into(token_id, hidden_size, &mut out);
+        out
+    }
+
+    fn decode_ple_row_f32(
+        &self,
+        token_id: usize,
+        ple_total_dim: usize,
+        ple_dim: usize,
+    ) -> Vec<f32> {
+        let mut out = vec![0.0f32; ple_total_dim];
+        self.decode_ple_into(token_id, ple_total_dim, ple_dim, &mut out);
+        out
+    }
+}
+
 pub struct Gemma4GpuLayer {
-    pub q_proj: Buffer,
-    pub k_proj: Buffer,
-    pub v_proj: Buffer,
-    pub o_proj: Buffer,
-    pub gate_proj: Buffer,
-    pub up_proj: Buffer,
-    pub down_proj: Buffer,
+    pub q_proj: BufferView,
+    pub k_proj: BufferView,
+    pub v_proj: BufferView,
+    pub o_proj: BufferView,
+    pub gate_proj: BufferView,
+    pub up_proj: BufferView,
+    /// Interleaved [gate_i, up_i] Q4 rows for packed MLP matvec (decode).
+    pub gate_up_proj: BufferView,
+    pub down_proj: BufferView,
 
     // 4 norms per layer (Gemma-style)
-    pub input_layernorm_weight: Buffer,
-    pub post_attention_layernorm_weight: Buffer,
-    pub pre_feedforward_layernorm_weight: Buffer,
-    pub post_feedforward_layernorm_weight: Buffer,
+    pub input_layernorm_weight: BufferView,
+    pub post_attention_layernorm_weight: BufferView,
+    pub pre_feedforward_layernorm_weight: BufferView,
+    pub post_feedforward_layernorm_weight: BufferView,
 
     // PLE weights
-    pub post_per_layer_input_norm_weight: Buffer,
-    pub per_layer_input_gate_weight: Buffer, // Q4: [ple_dim, hidden_size]
-    pub per_layer_projection_weight: Buffer, // Q4: [hidden_size, ple_dim]
+    pub post_per_layer_input_norm_weight: BufferView,
+    pub per_layer_input_gate_weight: BufferView, // Q4: [ple_dim, hidden_size]
+    pub per_layer_projection_weight: BufferView, // Q4: [hidden_size, ple_dim]
     pub layer_scalar: f32,
 
     // QK norm weights
-    pub q_norm_weight: Buffer,
-    pub k_norm_weight: Buffer,
+    pub q_norm_weight: BufferView,
+    pub k_norm_weight: BufferView,
 
     // Layer properties
     pub is_full_attention: bool,
@@ -277,7 +697,63 @@ pub struct Gemma4GpuLayer {
     pub head_dim: usize,
     pub q_out_dim: usize,
     pub kv_out_dim: usize,
-    pub use_f16: bool, // true = f16 weights (sensitive layers), false = Q4
+    pub weight_format: WeightFormat,
+}
+
+/// Weight format for a layer's projection matrices.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WeightFormat {
+    F16,
+    Q4_0,
+    Q3_0,
+}
+
+impl WeightFormat {
+    pub fn to_u8(self) -> u8 {
+        match self {
+            WeightFormat::F16 => 0,
+            WeightFormat::Q4_0 => 1,
+            WeightFormat::Q3_0 => 2,
+        }
+    }
+
+    pub fn from_u8(v: u8) -> Self {
+        match v {
+            0 => WeightFormat::F16,
+            2 => WeightFormat::Q3_0,
+            _ => WeightFormat::Q4_0,
+        }
+    }
+
+    pub fn is_quantized(self) -> bool {
+        matches!(self, WeightFormat::Q4_0 | WeightFormat::Q3_0)
+    }
+
+    pub fn is_q3(self) -> bool {
+        matches!(self, WeightFormat::Q3_0)
+    }
+}
+
+pub fn env_weight_format() -> WeightFormat {
+    match std::env::var("WEIGHT_FORMAT").as_deref() {
+        Ok("q4") | Ok("Q4") | Ok("q4_0") | Ok("Q4_0") => WeightFormat::Q4_0,
+        Ok("q3") | Ok("Q3") | Ok("q3_0") | Ok("Q3_0") => WeightFormat::Q3_0,
+        _ => WeightFormat::Q4_0,
+    }
+}
+
+/// When `Q3_LAYER_END` is set, returns `Some((start, end))` for the
+/// inclusive layer range to quantize with Q3_0 (default start=0).
+/// Returns `None` when `Q3_LAYER_END` is unset (no Q3 layers).
+fn q3_layer_range() -> Option<(usize, usize)> {
+    let start = std::env::var("Q3_LAYER_START")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0);
+    let end = std::env::var("Q3_LAYER_END")
+        .ok()
+        .and_then(|v| v.parse().ok())?;
+    if end >= start { Some((start, end)) } else { None }
 }
 
 #[derive(Deserialize)]
@@ -291,10 +767,41 @@ impl Gemma4GpuModel {
     /// Subsequent runs: loads pre-quantized cache directly (~5-10s).
     pub fn new(model_dir: &str) -> Self {
         let cache_path = Path::new(model_dir).join("model.q4cache");
+        let embed_cache_path = Path::new(model_dir).join("model.embed.cache");
+
+        if embed_cache_path.exists() && Self::is_stale_split_weights_cache(&cache_path) {
+            eprintln!(
+                "  Stale Q4 cache (old interleaved layout). Delete model.q4cache and model.embed.cache, then re-run to re-quantize with GGUF layout."
+            );
+            std::process::exit(1);
+        }
+
+        if embed_cache_path.exists() && Self::is_split_weights_cache(&cache_path) {
+            println!("  Found split Q4 cache, loading...");
+            println!(
+                "  (Delete model.q4cache + model.embed.cache to re-quantize with all-Q4 weights.)"
+            );
+            return Self::load_from_split_cache(model_dir, &embed_cache_path, &cache_path);
+        }
+
+        if cache_path.exists() && Self::is_legacy_weights_cache(&cache_path) {
+            println!("  Found Q4 cache, loading pre-quantized weights...");
+            return Self::load_from_legacy_cache(model_dir, &cache_path);
+        }
+
+        if embed_cache_path.exists() && cache_path.exists() {
+            eprintln!(
+                "  Corrupt cache: model.embed.cache exists but model.q4cache is not a valid split weights file."
+            );
+            eprintln!(
+                "  Delete model.q4cache and model.embed.cache in the model directory, then re-run to re-quantize."
+            );
+            std::process::exit(1);
+        }
 
         if cache_path.exists() {
-            println!("  Found Q4 cache, loading pre-quantized weights...");
-            return Self::load_from_cache(model_dir, &cache_path);
+            eprintln!("  Unrecognized model.q4cache format. Delete it and re-run to re-quantize.");
+            std::process::exit(1);
         }
 
         println!("  No Q4 cache found, quantizing from safetensors (one-time)...");
@@ -363,15 +870,14 @@ impl Gemma4GpuModel {
         // We'll use a helper that loads a shard and returns a HashMap of tensors
         let prefix = "model.language_model.";
 
-        println!("  Loading embeddings (f16, memory-efficient)...");
+        println!("  Loading embeddings...");
 
-        // embed_tokens: [262144, 2560] in bf16 = 1.34 GB (keep as u16 vec)
-        // embed_tokens_per_layer: [262144, 10752] in bf16 = 5.6 GB (keep as u16 vec)
-        let mut embed_tokens_f16: Vec<u16> = Vec::new();
-        let mut embed_tokens_per_layer_f16: Vec<u16> = Vec::new();
+        let mut owned_embed: Option<Vec<u8>> = None;
+        let mut owned_ple: Option<Vec<u8>> = None;
         let mut final_norm_data: Vec<f32> = Vec::new();
         let mut per_layer_proj_norm_data: Vec<f32> = Vec::new();
         let mut per_layer_model_proj_data: Vec<f32> = Vec::new();
+        let mut lm_head_f32: Vec<f32> = Vec::new();
 
         // Load global weights from shards — use memory mapping to avoid loading entire file
         for shard_file in &shard_files {
@@ -386,22 +892,26 @@ impl Gemma4GpuModel {
             for (name, tensor_view) in safetensors.tensors() {
                 let clean_name = name.strip_prefix(prefix).unwrap_or(&name);
 
-                if clean_name == "embed_tokens.weight" && embed_tokens_f16.is_empty() {
-                    embed_tokens_f16 = raw_to_u16(tensor_view.data());
+                if clean_name == "embed_tokens.weight" && owned_embed.is_none() {
+                    let data = tensor_view.data();
                     println!(
-                        "    embed_tokens: {:?} (kept as f16, {:.1} MB)",
+                        "    embed_tokens: {:?} ({:.1} MB)",
                         tensor_view.shape(),
-                        embed_tokens_f16.len() * 2 / 1024 / 1024
+                        data.len() as f64 / 1024.0 / 1024.0
                     );
-                } else if clean_name == "embed_tokens_per_layer.weight"
-                    && embed_tokens_per_layer_f16.is_empty()
-                {
-                    embed_tokens_per_layer_f16 = raw_to_u16(tensor_view.data());
+                    lm_head_f32 = data
+                        .chunks_exact(2)
+                        .map(|b| bf16_to_f32(u16::from_le_bytes([b[0], b[1]])))
+                        .collect();
+                    owned_embed = Some(data.to_vec());
+                } else if clean_name == "embed_tokens_per_layer.weight" && owned_ple.is_none() {
+                    let data = tensor_view.data();
                     println!(
-                        "    embed_tokens_per_layer: {:?} (kept as f16, {:.1} MB)",
+                        "    embed_tokens_per_layer: {:?} ({:.1} MB)",
                         tensor_view.shape(),
-                        embed_tokens_per_layer_f16.len() * 2 / 1024 / 1024
+                        data.len() as f64 / 1024.0 / 1024.0
                     );
+                    owned_ple = Some(data.to_vec());
                 } else if clean_name == "model.norm.weight" || clean_name == "norm.weight" {
                     if final_norm_data.is_empty() {
                         final_norm_data = decode_tensor_to_f32(&tensor_view);
@@ -424,46 +934,57 @@ impl Gemma4GpuModel {
             // mmap dropped here
         }
 
-        assert!(!embed_tokens_f16.is_empty(), "embed_tokens not found");
-        assert!(
-            !embed_tokens_per_layer_f16.is_empty(),
-            "embed_tokens_per_layer not found"
+        let ple_total_dim = num_layers * ple_dim;
+        let embed_tables = EmbedTables::from_owned(
+            owned_embed.expect("embed_tokens not found"),
+            owned_ple.expect("embed_tokens_per_layer not found"),
+            vocab_size,
+            ple_total_dim,
+            hidden_size,
         );
 
         // Create GPU buffer for lm_head (tied embeddings — quantize to Q4_0)
-        // Convert bf16 → f32 first, then quantize to Q4_0
-        let lm_head_f32: Vec<f32> = embed_tokens_f16
-            .iter()
-            .map(|&bits| bf16_to_f32(bits))
-            .collect();
-        let lm_head_buf = ctx.buffer_from_f32_as_q4(&lm_head_f32, vocab_size, hidden_size);
+        let lm_head_buf = BufferView::from_buffer(ctx.buffer_from_f32_as_q4(&lm_head_f32, vocab_size, hidden_size));
         println!(
             "    lm_head (tied, Q4_0 on GPU): {:.1} MB",
-            lm_head_buf.length() as f64 / 1024.0 / 1024.0
+            lm_head_buf.length as f64 / 1024.0 / 1024.0
         );
 
-        let final_norm_weight = ctx.buffer_from_slice(&final_norm_data);
-        let per_layer_projection_norm_weight = ctx.buffer_from_slice(&per_layer_proj_norm_data);
+        let final_norm_weight = BufferView::from_buffer(ctx.buffer_from_slice(&final_norm_data));
+        let per_layer_projection_norm_weight =
+            BufferView::from_buffer(ctx.buffer_from_slice(&per_layer_proj_norm_data));
         let per_layer_model_projection_weight = if !per_layer_model_proj_data.is_empty() {
-            ctx.buffer_from_f32_as_q4(
-                &per_layer_model_proj_data,
-                num_layers * ple_dim,
-                hidden_size,
+            BufferView::from_buffer(
+                ctx.buffer_from_f32_as_q4(
+                    &per_layer_model_proj_data,
+                    num_layers * ple_dim,
+                    hidden_size,
+                ),
             )
         } else {
             // Fallback: create empty buffer (shouldn't happen for E4B)
             println!(
                 "  WARNING: per_layer_model_projection not found, PLE context projection disabled"
             );
-            ctx.buffer_empty(1)
+            BufferView::from_buffer(ctx.buffer_empty(1))
         };
 
         // Load all layers
         let num_layers_to_load = num_layers;
-        println!(
-            "  Loading layers (Q4_0 quantized, {} layers)...",
-            num_layers_to_load
-        );
+        let q3_range = q3_layer_range();
+        let use_q3 = q3_range.is_some();
+        let (q3_start, q3_end) = q3_range.unwrap_or((0, 0));
+        if use_q3 {
+            println!(
+                "  Loading layers (Q4_0 + Q3_0 layers {}-{}, {} layers)...",
+                q3_start, q3_end, num_layers_to_load
+            );
+        } else {
+            println!(
+                "  Loading layers (Q4_0 quantized, {} layers)...",
+                num_layers_to_load
+            );
+        }
         let mut layers = Vec::with_capacity(num_layers_to_load);
 
         for layer_idx in 0..num_layers_to_load {
@@ -559,55 +1080,46 @@ impl Gemma4GpuModel {
                 .remove("self_attn.k_norm.weight")
                 .expect("k_norm missing");
 
-            // Mixed quantization: first 3 layers, last 3 layers, and attention o_proj use f16
-            // Everything else uses Q4_0. This preserves quality on edge cases.
-            let is_sensitive_layer = layer_idx < 3 || layer_idx >= (num_layers - 3);
+            let is_q3 = use_q3 && layer_idx >= q3_start && layer_idx <= q3_end;
+            let q_weight = |data: &[f32], rows: usize, cols: usize| -> Buffer {
+                if is_q3 {
+                    ctx.buffer_from_f32_as_q3(data, rows, cols)
+                } else {
+                    ctx.buffer_from_f32_as_q4(data, rows, cols)
+                }
+            };
 
             let layer = Gemma4GpuLayer {
-                q_proj: if is_sensitive_layer {
-                    ctx.buffer_from_f32_as_f16(&q_proj_data)
-                } else {
-                    ctx.buffer_from_f32_as_q4(&q_proj_data, q_out, hidden_size)
-                },
-                k_proj: if is_sensitive_layer {
-                    ctx.buffer_from_f32_as_f16(&k_proj_data)
-                } else {
-                    ctx.buffer_from_f32_as_q4(&k_proj_data, kv_out, hidden_size)
-                },
-                v_proj: if is_sensitive_layer {
-                    ctx.buffer_from_f32_as_f16(&v_proj_data)
-                } else {
-                    ctx.buffer_from_f32_as_q4(&v_proj_data, kv_out, hidden_size)
-                },
-                o_proj: ctx.buffer_from_f32_as_f16(&o_proj_data), // always f16 (quality-critical)
-                gate_proj: if is_sensitive_layer {
-                    ctx.buffer_from_f32_as_f16(&gate_proj_data)
-                } else {
-                    ctx.buffer_from_f32_as_q4(&gate_proj_data, intermediate_size, hidden_size)
-                },
-                up_proj: if is_sensitive_layer {
-                    ctx.buffer_from_f32_as_f16(&up_proj_data)
-                } else {
-                    ctx.buffer_from_f32_as_q4(&up_proj_data, intermediate_size, hidden_size)
-                },
-                down_proj: if is_sensitive_layer {
-                    ctx.buffer_from_f32_as_f16(&down_proj_data)
-                } else {
-                    ctx.buffer_from_f32_as_q4(&down_proj_data, hidden_size, intermediate_size)
-                },
+                q_proj: BufferView::from_buffer(q_weight(&q_proj_data, q_out, hidden_size)),
+                k_proj: BufferView::from_buffer(q_weight(&k_proj_data, kv_out, hidden_size)),
+                v_proj: BufferView::from_buffer(q_weight(&v_proj_data, kv_out, hidden_size)),
+                o_proj: BufferView::from_buffer(q_weight(&o_proj_data, hidden_size, q_out)),
 
-                input_layernorm_weight: ctx.buffer_from_slice(&input_ln),
-                post_attention_layernorm_weight: ctx.buffer_from_slice(&post_attn_ln),
-                pre_feedforward_layernorm_weight: ctx.buffer_from_slice(&pre_ff_ln),
-                post_feedforward_layernorm_weight: ctx.buffer_from_slice(&post_ff_ln),
-                post_per_layer_input_norm_weight: ctx.buffer_from_slice(&post_ple_norm),
+                gate_proj: BufferView::from_buffer(q_weight(&gate_proj_data, intermediate_size, hidden_size)),
+                up_proj: BufferView::from_buffer(q_weight(&up_proj_data, intermediate_size, hidden_size)),
+                gate_up_proj: BufferView::from_buffer(ctx.buffer_empty(1)),
+                down_proj: BufferView::from_buffer(q_weight(&down_proj_data, hidden_size, intermediate_size)),
 
-                per_layer_input_gate_weight: ctx.buffer_from_f32_as_f16(&ple_gate_data), // always f16 (small, quality-critical)
-                per_layer_projection_weight: ctx.buffer_from_f32_as_f16(&ple_proj_data), // always f16
+                input_layernorm_weight: BufferView::from_buffer(ctx.buffer_from_slice(&input_ln)),
+                post_attention_layernorm_weight: BufferView::from_buffer(ctx.buffer_from_slice(&post_attn_ln)),
+                pre_feedforward_layernorm_weight: BufferView::from_buffer(ctx.buffer_from_slice(&pre_ff_ln)),
+                post_feedforward_layernorm_weight: BufferView::from_buffer(ctx.buffer_from_slice(&post_ff_ln)),
+                post_per_layer_input_norm_weight: BufferView::from_buffer(ctx.buffer_from_slice(&post_ple_norm)),
+
+                per_layer_input_gate_weight: BufferView::from_buffer(ctx.buffer_from_f32_as_q4(
+                    &ple_gate_data,
+                    ple_dim,
+                    hidden_size,
+                )),
+                per_layer_projection_weight: BufferView::from_buffer(ctx.buffer_from_f32_as_q4(
+                    &ple_proj_data,
+                    hidden_size,
+                    ple_dim,
+                )),
                 layer_scalar,
 
-                q_norm_weight: ctx.buffer_from_slice(&q_norm_data),
-                k_norm_weight: ctx.buffer_from_slice(&k_norm_data),
+                q_norm_weight: BufferView::from_buffer(ctx.buffer_from_slice(&q_norm_data)),
+                k_norm_weight: BufferView::from_buffer(ctx.buffer_from_slice(&k_norm_data)),
 
                 is_full_attention: is_full,
                 has_kv: layer_idx < (num_layers - config.num_kv_shared_layers),
@@ -615,7 +1127,7 @@ impl Gemma4GpuModel {
                 head_dim,
                 q_out_dim: q_out,
                 kv_out_dim: kv_out,
-                use_f16: is_sensitive_layer,
+                weight_format: if is_q3 { WeightFormat::Q3_0 } else { WeightFormat::Q4_0 },
             };
 
             layers.push(layer);
@@ -642,6 +1154,13 @@ impl Gemma4GpuModel {
             layers[i].kv_source_layer = i;
         }
 
+        let layers = Self::pack_layers_gate_up(
+            &ctx,
+            layers,
+            intermediate_size as u32,
+            hidden_size as u32,
+        );
+
         println!(
             "  KV sharing: layers 0-{} have own KV, layers {}-{} share",
             first_kv_shared - 1,
@@ -663,6 +1182,8 @@ impl Gemma4GpuModel {
         let gelu_buf = ctx.buffer_empty(intermediate_size);
         let down_buf = ctx.buffer_empty(hidden_size);
         let logits_buf = ctx.buffer_empty(vocab_size);
+        let sample_out_buf = ctx.buffer_empty_u32(1);
+        let inv_rms_buf = ctx.buffer_empty(1);
         // PLE scratch
         let ple_embed_buf = ctx.buffer_empty(ple_dim);
         let ple_gated_buf = ctx.buffer_empty(ple_dim);
@@ -677,12 +1198,15 @@ impl Gemma4GpuModel {
         let k_normed_buf = ctx.buffer_empty(max_kv_out);
 
         // KV cache: f16 precision to halve memory bandwidth
+        let kv_cache_type = KvCacheType::from_env();
         let kv_capacity = config.max_position_embeddings.min(4096) as u32;
         let mut k_cache = Vec::with_capacity(num_layers);
         let mut v_cache = Vec::with_capacity(num_layers);
         for i in 0..num_layers {
             let hd = config.layer_head_dim(i);
-            let byte_len = (num_kv_heads * kv_capacity as usize * hd * 2) as u64; // f16 = 2 bytes
+            assert!(hd % 32 == 0, "head_dim must be a multiple of 32 for quantized KV cache");
+            let bytes_per_row = kv_cache_type.bytes_per_row(hd);
+            let byte_len = (num_kv_heads * kv_capacity as usize * bytes_per_row) as u64;
             k_cache.push(
                 ctx.device
                     .new_buffer(byte_len, MTLResourceOptions::StorageModeShared),
@@ -692,6 +1216,14 @@ impl Gemma4GpuModel {
                     .new_buffer(byte_len, MTLResourceOptions::StorageModeShared),
             );
         }
+        let f16_bytes = num_kv_heads * kv_capacity as usize * config.head_dim * 2 + num_kv_heads * kv_capacity as usize * config.global_head_dim * 2;
+        let quant_bytes = num_kv_heads * kv_capacity as usize * kv_cache_type.bytes_per_row(config.head_dim) + num_kv_heads * kv_capacity as usize * kv_cache_type.bytes_per_row(config.global_head_dim);
+        println!("  KV cache type: {}, est. memory per layer: {:.1} MB (vs f16: {:.1} MB, {:.0}% savings)",
+            kv_cache_type,
+            quant_bytes as f64 / num_layers as f64 / 1024.0 / 1024.0,
+            f16_bytes as f64 / num_layers as f64 / 1024.0 / 1024.0,
+            (1.0 - quant_bytes as f64 / f16_bytes as f64) * 100.0,
+        );
         let max_prefill_seq = configured_max_prefill_seq(kv_capacity);
         let prefill_scratch = PrefillScratch::new(
             &ctx,
@@ -719,9 +1251,9 @@ impl Gemma4GpuModel {
         let cos_buf = ctx.buffer_empty(max_head_dim);
         let sin_buf = ctx.buffer_empty(max_head_dim);
 
-        // Per-layer persistent buffers for cos/sin/ple (allocated once, overwritten each token)
-        let mut per_layer_cos_bufs = Vec::with_capacity(num_layers);
-        let mut per_layer_sin_bufs = Vec::with_capacity(num_layers);
+        // Per-layer prefill/batch RoPE buffers (decode uses packed GPU fill).
+        let (decode_rope_cos_packed, decode_rope_sin_packed, rope_layer_params_buf) =
+            alloc_decode_rope_buffers(&ctx, &config, num_layers, max_head_dim);
         let mut per_layer_prefill_cos_bufs = Vec::with_capacity(num_layers);
         let mut per_layer_prefill_sin_bufs = Vec::with_capacity(num_layers);
         let mut per_layer_decode_batch_cos_bufs = Vec::with_capacity(num_layers);
@@ -732,8 +1264,6 @@ impl Gemma4GpuModel {
         let mut per_layer_ple_bufs = Vec::with_capacity(num_layers);
         for i in 0..num_layers {
             let hd = config.layer_head_dim(i);
-            per_layer_cos_bufs.push(ctx.buffer_empty(hd));
-            per_layer_sin_bufs.push(ctx.buffer_empty(hd));
             per_layer_prefill_cos_bufs.push(ctx.buffer_empty(max_prefill_seq * hd));
             per_layer_prefill_sin_bufs.push(ctx.buffer_empty(max_prefill_seq * hd));
             per_layer_decode_batch_cos_bufs.push(ctx.buffer_empty(DEFAULT_MAX_DECODE_BATCH * hd));
@@ -746,6 +1276,9 @@ impl Gemma4GpuModel {
             per_layer_ple_bufs.push(ctx.buffer_empty(ple_dim));
         }
 
+        println!("  Decode RoPE: GPU fill (rope_fill_decode kernel)");
+        println!("  Weights: all {} layers Q4_0", num_layers);
+
         println!(
             "  Parallel prefill scratch: max_seq={}",
             prefill_scratch.max_seq_len
@@ -756,11 +1289,10 @@ impl Gemma4GpuModel {
         );
         println!("  Gemma4 model loaded successfully (Q4_0 quantized on Metal)");
 
-        Gemma4GpuModel {
+        let mut model = Gemma4GpuModel {
             ctx,
             config,
-            embed_tokens_f16,
-            embed_tokens_per_layer_f16,
+            embed_tables,
             lm_head_buf,
             layers,
             final_norm_weight,
@@ -779,6 +1311,8 @@ impl Gemma4GpuModel {
             gelu_buf,
             down_buf,
             logits_buf,
+            sample_out_buf,
+            inv_rms_buf,
             prefill_scratch,
             decode_batch_scratch,
             ple_embed_buf,
@@ -794,10 +1328,13 @@ impl Gemma4GpuModel {
             v_cache,
             kv_seq_len: 0,
             kv_capacity,
+            kv_cache_type,
             cos_buf,
             sin_buf,
-            per_layer_cos_bufs,
-            per_layer_sin_bufs,
+            decode_rope_cos_packed,
+            decode_rope_sin_packed,
+            rope_layer_params_buf,
+            rope_max_head_dim: max_head_dim,
             per_layer_prefill_cos_bufs,
             per_layer_prefill_sin_bufs,
             per_layer_decode_batch_cos_bufs,
@@ -807,115 +1344,104 @@ impl Gemma4GpuModel {
             per_layer_decode_batch_kv_len_bufs,
             per_layer_ple_bufs,
             total_tokens: 0,
-        }
+            weights_mmap_offset: None,
+            embed_decode_scratch: vec![0.0f32; hidden_size],
+            ple_decode_scratch: vec![0.0f32; num_layers * ple_dim],
+            mega_graph: None,
+        };
+
+        model.attach_mega_graph_if_enabled();
+        model
     }
 
-    /// Save all quantized weights to a binary cache file for fast loading.
+    fn decode_rope_byte_offset(&self, layer_idx: usize) -> u64 {
+        (layer_idx * self.rope_max_head_dim * std::mem::size_of::<f32>()) as u64
+    }
+
+    /// Save split cache: model.embed.cache (CPU mmap) + model.q4cache (GPU weights).
     fn save_cache(&self, path: &Path) {
-        use std::io::Write;
-        let mut file = fs::File::create(path).expect("Failed to create cache file");
-        let magic = b"GQ4C"; // Gemma Q4 Cache
-        file.write_all(magic).unwrap();
+        let embed_path = path
+            .parent()
+            .expect("cache path has no parent")
+            .join("model.embed.cache");
+        self.save_embed_cache(&embed_path);
+        self.save_weights_cache(path);
+    }
 
-        // Save embeddings (raw bf16)
-        let embed_bytes = unsafe {
-            std::slice::from_raw_parts(
-                self.embed_tokens_f16.as_ptr() as *const u8,
-                self.embed_tokens_f16.len() * 2,
-            )
-        };
-        let len = embed_bytes.len() as u64;
-        file.write_all(&len.to_le_bytes()).unwrap();
+    fn save_embed_cache(&self, path: &Path) {
+        use std::io::{Seek, Write};
+        let mut file = fs::File::create(path).expect("Failed to create embed cache");
+        file.write_all(b"GQ4E").unwrap();
+        let embed_bytes = self.embed_tables.embed_bytes();
+        file.write_all(&(embed_bytes.len() as u64).to_le_bytes()).unwrap();
         file.write_all(embed_bytes).unwrap();
-
-        // Save embed_tokens_per_layer (raw bf16)
-        let ple_bytes = unsafe {
-            std::slice::from_raw_parts(
-                self.embed_tokens_per_layer_f16.as_ptr() as *const u8,
-                self.embed_tokens_per_layer_f16.len() * 2,
-            )
-        };
-        let len = ple_bytes.len() as u64;
-        file.write_all(&len.to_le_bytes()).unwrap();
+        let ple_bytes = self.embed_tables.ple_bytes();
+        file.write_all(&(ple_bytes.len() as u64).to_le_bytes()).unwrap();
         file.write_all(ple_bytes).unwrap();
+        println!(
+            "  Embed cache saved: {:.1} MB",
+            file.metadata().map(|m| m.len()).unwrap_or(0) as f64 / 1024.0 / 1024.0
+        );
+    }
 
-        // Save lm_head (Q4 on GPU)
-        let lm_head_len = self.lm_head_buf.length() as u64;
-        file.write_all(&lm_head_len.to_le_bytes()).unwrap();
-        let lm_head_bytes = unsafe {
-            std::slice::from_raw_parts(
-                self.lm_head_buf.contents() as *const u8,
-                lm_head_len as usize,
-            )
-        };
-        file.write_all(lm_head_bytes).unwrap();
+    fn save_weights_cache(&self, path: &Path) {
+        if let Some(start_offset) = self.weights_mmap_offset {
+            let mmap = self
+                .embed_tables
+                .mmap_ref()
+                .expect("weights_mmap_offset set without backing mmap");
+            Self::write_weights_cache_from_mmap(mmap, start_offset, path, self.layers.len());
+            return;
+        }
 
-        // Save per_layer_model_projection (Q4 on GPU)
-        let proj_len = self.per_layer_model_projection_weight.length() as u64;
-        file.write_all(&proj_len.to_le_bytes()).unwrap();
-        let proj_bytes = unsafe {
-            std::slice::from_raw_parts(
-                self.per_layer_model_projection_weight.contents() as *const u8,
-                proj_len as usize,
-            )
+        use std::io::{Seek, Write};
+        let mut file = fs::File::create(path).expect("Failed to create weights cache");
+        file.write_all(b"GQ4G").unwrap();
+        let save_view = |f: &mut fs::File, view: &BufferView| {
+            f.write_all(&view.length.to_le_bytes()).unwrap();
+            let pos = f.stream_position().expect("stream position") as usize;
+            let pad_before = weight_section_pad(pos - WEIGHT_CACHE_MAGIC_LEN);
+            if pad_before > 0 {
+                f.write_all(&vec![0u8; pad_before]).unwrap();
+            }
+            f.write_all(view.as_bytes()).unwrap();
+            let pos = f.stream_position().expect("stream position") as usize;
+            let pad_after = weight_section_pad(pos - WEIGHT_CACHE_MAGIC_LEN);
+            if pad_after > 0 {
+                f.write_all(&vec![0u8; pad_after]).unwrap();
+            }
         };
-        file.write_all(proj_bytes).unwrap();
-
-        // Save norms
-        let norm_len = self.final_norm_weight.length() as u64;
-        file.write_all(&norm_len.to_le_bytes()).unwrap();
-        let norm_bytes = unsafe {
-            std::slice::from_raw_parts(
-                self.final_norm_weight.contents() as *const u8,
-                norm_len as usize,
-            )
-        };
-        file.write_all(norm_bytes).unwrap();
-
-        let pnorm_len = self.per_layer_projection_norm_weight.length() as u64;
-        file.write_all(&pnorm_len.to_le_bytes()).unwrap();
-        let pnorm_bytes = unsafe {
-            std::slice::from_raw_parts(
-                self.per_layer_projection_norm_weight.contents() as *const u8,
-                pnorm_len as usize,
-            )
-        };
-        file.write_all(pnorm_bytes).unwrap();
+        save_view(&mut file, &self.lm_head_buf);
+        save_view(&mut file, &self.per_layer_model_projection_weight);
+        save_view(&mut file, &self.final_norm_weight);
+        save_view(&mut file, &self.per_layer_projection_norm_weight);
 
         // Save per-layer weights
         let num_layers = self.layers.len() as u32;
         file.write_all(&num_layers.to_le_bytes()).unwrap();
+        pad_weights_file_to_section_align(&mut file);
         for layer in &self.layers {
-            // Save all GPU buffers as raw bytes
-            let save_buf = |f: &mut fs::File, buf: &Buffer| {
-                let len = buf.length() as u64;
-                f.write_all(&len.to_le_bytes()).unwrap();
-                let bytes = unsafe {
-                    std::slice::from_raw_parts(buf.contents() as *const u8, len as usize)
-                };
-                f.write_all(bytes).unwrap();
-            };
-            save_buf(&mut file, &layer.q_proj);
-            save_buf(&mut file, &layer.k_proj);
-            save_buf(&mut file, &layer.v_proj);
-            save_buf(&mut file, &layer.o_proj);
-            save_buf(&mut file, &layer.gate_proj);
-            save_buf(&mut file, &layer.up_proj);
-            save_buf(&mut file, &layer.down_proj);
-            save_buf(&mut file, &layer.input_layernorm_weight);
-            save_buf(&mut file, &layer.post_attention_layernorm_weight);
-            save_buf(&mut file, &layer.pre_feedforward_layernorm_weight);
-            save_buf(&mut file, &layer.post_feedforward_layernorm_weight);
-            save_buf(&mut file, &layer.post_per_layer_input_norm_weight);
-            save_buf(&mut file, &layer.per_layer_input_gate_weight);
-            save_buf(&mut file, &layer.per_layer_projection_weight);
-            save_buf(&mut file, &layer.q_norm_weight);
-            save_buf(&mut file, &layer.k_norm_weight);
+            save_view(&mut file, &layer.q_proj);
+            save_view(&mut file, &layer.k_proj);
+            save_view(&mut file, &layer.v_proj);
+            save_view(&mut file, &layer.o_proj);
+            save_view(&mut file, &layer.gate_proj);
+            save_view(&mut file, &layer.up_proj);
+            save_view(&mut file, &layer.down_proj);
+            save_view(&mut file, &layer.input_layernorm_weight);
+            save_view(&mut file, &layer.post_attention_layernorm_weight);
+            save_view(&mut file, &layer.pre_feedforward_layernorm_weight);
+            save_view(&mut file, &layer.post_feedforward_layernorm_weight);
+            save_view(&mut file, &layer.post_per_layer_input_norm_weight);
+            save_view(&mut file, &layer.per_layer_input_gate_weight);
+            save_view(&mut file, &layer.per_layer_projection_weight);
+            save_view(&mut file, &layer.q_norm_weight);
+            save_view(&mut file, &layer.k_norm_weight);
             file.write_all(&layer.layer_scalar.to_le_bytes()).unwrap();
             file.write_all(&(layer.is_full_attention as u8).to_le_bytes())
                 .unwrap();
             file.write_all(&(layer.has_kv as u8).to_le_bytes()).unwrap();
-            file.write_all(&(layer.use_f16 as u8).to_le_bytes())
+            file.write_all(&[layer.weight_format.to_u8()])
                 .unwrap();
             file.write_all(&(layer.kv_source_layer as u32).to_le_bytes())
                 .unwrap();
@@ -925,16 +1451,257 @@ impl Gemma4GpuModel {
                 .unwrap();
             file.write_all(&(layer.kv_out_dim as u32).to_le_bytes())
                 .unwrap();
+            pad_weights_file_to_section_align(&mut file);
         }
         println!(
-            "  Cache saved: {:.1} MB",
+            "  Weights cache saved: {:.1} MB",
             file.metadata().map(|m| m.len()).unwrap_or(0) as f64 / 1024.0 / 1024.0
         );
     }
 
-    /// Load model from pre-quantized cache file (fast path).
-    fn load_from_cache(model_dir: &str, cache_path: &Path) -> Self {
-        use std::io::Read;
+    fn write_weights_cache_from_mmap(
+        mmap: &Mmap,
+        mut offset: usize,
+        path: &Path,
+        num_layers: usize,
+    ) {
+        use std::io::{Seek, Write};
+        let mut file = fs::File::create(path).expect("Failed to create weights cache");
+        file.write_all(b"GQ4G").unwrap();
+
+        let write_blob = |file: &mut fs::File, mmap: &Mmap, offset: &mut usize| {
+            let len = Self::read_u64_at(mmap, offset);
+            if *offset + len as usize > mmap.len() {
+                panic!(
+                    "Internal error while writing weights cache: source blob at offset {} \
+                     needs {} bytes but mmap is {} bytes",
+                    *offset,
+                    len,
+                    mmap.len()
+                );
+            }
+            file.write_all(&len.to_le_bytes()).unwrap();
+            let pos = file.stream_position().expect("stream position") as usize;
+            let pad_before = weight_section_pad(pos - WEIGHT_CACHE_MAGIC_LEN);
+            if pad_before > 0 {
+                file.write_all(&vec![0u8; pad_before]).unwrap();
+            }
+            file.write_all(&mmap[*offset..*offset + len as usize]).unwrap();
+            *offset += len as usize;
+            let pos = file.stream_position().expect("stream position") as usize;
+            let pad_after = weight_section_pad(pos - WEIGHT_CACHE_MAGIC_LEN);
+            if pad_after > 0 {
+                file.write_all(&vec![0u8; pad_after]).unwrap();
+            }
+        };
+
+        write_blob(&mut file, mmap, &mut offset);
+        write_blob(&mut file, mmap, &mut offset);
+        write_blob(&mut file, mmap, &mut offset);
+        write_blob(&mut file, mmap, &mut offset);
+
+        file.write_all(&mmap[offset..offset + 4]).unwrap();
+        offset += 4;
+        pad_weights_file_to_section_align(&mut file);
+
+        for _ in 0..num_layers {
+            for _ in 0..16 {
+                write_blob(&mut file, mmap, &mut offset);
+            }
+            // layer_scalar + 3 bools + 4 u32 metadata fields
+            file.write_all(&mmap[offset..offset + 23]).unwrap();
+            offset += 23;
+            pad_weights_file_to_section_align(&mut file);
+        }
+
+        println!(
+            "  Weights cache saved: {:.1} MB",
+            file.metadata().map(|m| m.len()).unwrap_or(0) as f64 / 1024.0 / 1024.0
+        );
+    }
+
+    fn read_u64_at(mmap: &[u8], offset: &mut usize) -> u64 {
+        if *offset + 8 > mmap.len() {
+            panic!(
+                "Corrupt weights cache near offset {} (file size {}). \
+                 Delete model.q4cache and model.embed.cache, then re-run to re-quantize.",
+                *offset,
+                mmap.len()
+            );
+        }
+        let value = u64::from_le_bytes(mmap[*offset..*offset + 8].try_into().unwrap());
+        *offset += 8;
+        value
+    }
+
+    fn load_weight_sections(
+        data: &[u8],
+        offset: &mut usize,
+        device: &Device,
+        num_layers: usize,
+        aligned_layout: bool,
+        parent: Option<&Buffer>,
+        parent_base: usize,
+    ) -> (
+        BufferView,
+        BufferView,
+        BufferView,
+        BufferView,
+        Vec<Gemma4GpuLayer>,
+    ) {
+        let read_buf = |offset: &mut usize| -> BufferView {
+            let len = Self::read_u64_at(data, offset);
+            let view = if aligned_layout {
+                let parent = parent.expect("aligned layout requires parent buffer");
+                let pad_before =
+                    weight_section_pad(*offset - parent_base);
+                *offset += pad_before;
+                if *offset + len as usize > data.len() {
+                    panic!(
+                        "Corrupt weights cache: blob at offset {} needs {} bytes but file is {} bytes. \
+                         Delete model.q4cache and model.embed.cache, then re-run to re-quantize.",
+                        *offset,
+                        len,
+                        data.len()
+                    );
+                }
+                let parent_off = *offset - parent_base;
+                assert_eq!(
+                    parent_off % WEIGHT_BLOB_ALIGN,
+                    0,
+                    "unaligned blob at file offset {} (section offset {}). \
+                     Delete model.q4cache and model.embed.cache, then re-run to re-quantize.",
+                    *offset,
+                    parent_off
+                );
+                let view = BufferView::subrange(parent, parent_off as u64, len);
+                *offset += len as usize;
+                let pad_after = weight_section_pad(*offset - parent_base);
+                *offset += pad_after;
+                view
+            } else {
+                if *offset + len as usize > data.len() {
+                    panic!(
+                        "Corrupt weights cache: blob at offset {} needs {} bytes but file is {} bytes. \
+                         Delete model.q4cache and model.embed.cache, then re-run to re-quantize.",
+                        *offset,
+                        len,
+                        data.len()
+                    );
+                }
+                let buf =
+                    MetalContext::buffer_from_slice_parallel(device, &data[*offset..*offset + len as usize]);
+                *offset += len as usize;
+                BufferView::from_buffer(buf)
+            };
+            view
+        };
+
+        let lm_head_buf = read_buf(offset);
+        let per_layer_model_projection_weight = read_buf(offset);
+        let final_norm_weight = read_buf(offset);
+        let per_layer_projection_norm_weight = read_buf(offset);
+
+        let num_layers_in_cache =
+            u32::from_le_bytes(data[*offset..*offset + 4].try_into().unwrap()) as usize;
+        *offset += 4;
+        let pad = weight_section_pad(*offset - parent_base);
+        *offset += pad;
+        assert_eq!(num_layers_in_cache, num_layers);
+
+        let mut layers = Vec::with_capacity(num_layers);
+        for layer_idx in 0..num_layers {
+            let q_proj = read_buf(offset);
+            let k_proj = read_buf(offset);
+            let v_proj = read_buf(offset);
+            let o_proj = read_buf(offset);
+            let gate_proj = read_buf(offset);
+            let up_proj = read_buf(offset);
+            let down_proj = read_buf(offset);
+            let input_layernorm_weight = read_buf(offset);
+            let post_attention_layernorm_weight = read_buf(offset);
+            let pre_feedforward_layernorm_weight = read_buf(offset);
+            let post_feedforward_layernorm_weight = read_buf(offset);
+            let post_per_layer_input_norm_weight = read_buf(offset);
+            let per_layer_input_gate_weight = read_buf(offset);
+            let per_layer_projection_weight = read_buf(offset);
+            let q_norm_weight = read_buf(offset);
+            let k_norm_weight = read_buf(offset);
+
+            let layer_scalar = f32::from_le_bytes(data[*offset..*offset + 4].try_into().unwrap());
+            *offset += 4;
+
+            let is_full_attention = data[*offset] != 0;
+            *offset += 1;
+            let has_kv = data[*offset] != 0;
+            *offset += 1;
+            let wf = WeightFormat::from_u8(data[*offset]);
+            *offset += 1;
+
+            let kv_source_layer =
+                u32::from_le_bytes(data[*offset..*offset + 4].try_into().unwrap()) as usize;
+            *offset += 4;
+            let head_dim =
+                u32::from_le_bytes(data[*offset..*offset + 4].try_into().unwrap()) as usize;
+            *offset += 4;
+            let q_out_dim =
+                u32::from_le_bytes(data[*offset..*offset + 4].try_into().unwrap()) as usize;
+            *offset += 4;
+            let kv_out_dim =
+                u32::from_le_bytes(data[*offset..*offset + 4].try_into().unwrap()) as usize;
+            *offset += 4;
+            if aligned_layout {
+                let pad = weight_section_pad(*offset - parent_base);
+                *offset += pad;
+            }
+
+            if (layer_idx + 1) % 10 == 0 || layer_idx == num_layers - 1 {
+                println!("    Loaded layer {}/{}", layer_idx + 1, num_layers);
+            }
+
+            layers.push(Gemma4GpuLayer {
+                q_proj,
+                k_proj,
+                v_proj,
+                o_proj,
+                gate_proj,
+                up_proj,
+                gate_up_proj: BufferView::from_buffer(
+                    device.new_buffer(1, MTLResourceOptions::StorageModeShared),
+                ),
+                down_proj,
+                input_layernorm_weight,
+                post_attention_layernorm_weight,
+                pre_feedforward_layernorm_weight,
+                post_feedforward_layernorm_weight,
+                post_per_layer_input_norm_weight,
+                per_layer_input_gate_weight,
+                per_layer_projection_weight,
+                layer_scalar,
+                q_norm_weight,
+                k_norm_weight,
+                is_full_attention,
+                has_kv,
+                kv_source_layer,
+                head_dim,
+                q_out_dim,
+                kv_out_dim,
+                weight_format: wf,
+            });
+        }
+
+        (
+            lm_head_buf,
+            per_layer_model_projection_weight,
+            final_norm_weight,
+            per_layer_projection_norm_weight,
+            layers,
+        )
+    }
+
+    /// Legacy monolithic GQ4C cache: mmap embeds on CPU + zero-copy GPU weights.
+    fn load_from_legacy_cache(model_dir: &str, cache_path: &Path) -> Self {
+        let load_start = Instant::now();
 
         let config_path = Path::new(model_dir).join("config.json");
         let config_str = fs::read_to_string(&config_path).expect("Failed to read config.json");
@@ -957,141 +1724,156 @@ impl Gemma4GpuModel {
         let max_head_dim = config.global_head_dim;
         let max_q_out = num_heads * max_head_dim;
         let max_kv_out = num_kv_heads * max_head_dim;
+        let device = &ctx.device;
 
-        let mut file = fs::File::open(cache_path).expect("Failed to open cache");
-        let mut magic = [0u8; 4];
-        file.read_exact(&mut magic).unwrap();
-        assert_eq!(&magic, b"GQ4C", "Invalid cache magic");
+        let cache_file = fs::File::open(cache_path).expect("Failed to open cache");
+        let mmap = unsafe { Mmap::map(&cache_file).expect("Failed to mmap cache") };
+        assert_eq!(&mmap[0..4], b"GQ4C", "Invalid cache magic (expected GQ4C legacy format)");
 
-        let read_len = |f: &mut fs::File| -> u64 {
-            let mut buf = [0u8; 8];
-            f.read_exact(&mut buf).unwrap();
-            u64::from_le_bytes(buf)
-        };
-
-        let read_buf = |f: &mut fs::File, device: &Device| -> Buffer {
-            let len = read_len(f);
-            let mut data = vec![0u8; len as usize];
-            f.read_exact(&mut data).unwrap();
-            device.new_buffer_with_data(
-                data.as_ptr() as *const _,
-                len,
-                MTLResourceOptions::StorageModeShared,
-            )
-        };
-
-        // Load embeddings
-        let embed_len = read_len(&mut file) as usize;
-        let mut embed_bytes = vec![0u8; embed_len];
-        file.read_exact(&mut embed_bytes).unwrap();
-        let embed_tokens_f16: Vec<u16> = embed_bytes
-            .chunks_exact(2)
-            .map(|b| u16::from_le_bytes([b[0], b[1]]))
-            .collect();
+        let mut offset = 4;
+        let embed_len = Self::read_u64_at(&mmap, &mut offset);
+        let embed_offset = offset;
+        offset += embed_len as usize;
         println!(
-            "    embed_tokens: {:.1} MB",
+            "    embed_tokens: {:.1} MB (mmap)",
             embed_len as f64 / 1024.0 / 1024.0
         );
 
-        // Load embed_tokens_per_layer
-        let ple_embed_len = read_len(&mut file) as usize;
-        let mut ple_bytes = vec![0u8; ple_embed_len];
-        file.read_exact(&mut ple_bytes).unwrap();
-        let embed_tokens_per_layer_f16: Vec<u16> = ple_bytes
-            .chunks_exact(2)
-            .map(|b| u16::from_le_bytes([b[0], b[1]]))
-            .collect();
+        let ple_embed_len = Self::read_u64_at(&mmap, &mut offset);
+        let ple_offset = offset;
+        offset += ple_embed_len as usize;
         println!(
-            "    embed_tokens_per_layer: {:.1} MB",
+            "    embed_tokens_per_layer: {:.1} MB (mmap)",
             ple_embed_len as f64 / 1024.0 / 1024.0
         );
 
-        // Load lm_head, projection, norms
-        let lm_head_buf = read_buf(&mut file, &ctx.device);
-        let per_layer_model_projection_weight = read_buf(&mut file, &ctx.device);
-        let final_norm_weight = read_buf(&mut file, &ctx.device);
-        let per_layer_projection_norm_weight = read_buf(&mut file, &ctx.device);
+        let weights_mmap_offset = offset;
+        println!("  Loading weights (per-tensor copy)...");
+        let weights_load_start = Instant::now();
+        let (
+            lm_head_buf,
+            per_layer_model_projection_weight,
+            final_norm_weight,
+            per_layer_projection_norm_weight,
+            layers,
+        ) = Self::load_weight_sections(
+            mmap.as_ref(),
+            &mut offset,
+            device,
+            num_layers,
+            false,
+            None,
+            weights_mmap_offset,
+        );
+        println!(
+            "  Weights loaded in {:.2}s",
+            weights_load_start.elapsed().as_secs_f64()
+        );
 
-        // Load layers
-        let mut nl_buf = [0u8; 4];
-        file.read_exact(&mut nl_buf).unwrap();
-        let num_layers_in_cache = u32::from_le_bytes(nl_buf) as usize;
-        assert_eq!(num_layers_in_cache, num_layers);
+        let ple_cols = num_layers * ple_dim;
+        let embed_tables = EmbedTables::from_mmap(
+            mmap,
+            embed_offset,
+            embed_len as usize,
+            ple_offset,
+            ple_embed_len as usize,
+            ple_cols,
+            vocab_size,
+        );
 
-        let mut layers = Vec::with_capacity(num_layers);
-        for layer_idx in 0..num_layers {
-            let q_proj = read_buf(&mut file, &ctx.device);
-            let k_proj = read_buf(&mut file, &ctx.device);
-            let v_proj = read_buf(&mut file, &ctx.device);
-            let o_proj = read_buf(&mut file, &ctx.device);
-            let gate_proj = read_buf(&mut file, &ctx.device);
-            let up_proj = read_buf(&mut file, &ctx.device);
-            let down_proj = read_buf(&mut file, &ctx.device);
-            let input_layernorm_weight = read_buf(&mut file, &ctx.device);
-            let post_attention_layernorm_weight = read_buf(&mut file, &ctx.device);
-            let pre_feedforward_layernorm_weight = read_buf(&mut file, &ctx.device);
-            let post_feedforward_layernorm_weight = read_buf(&mut file, &ctx.device);
-            let post_per_layer_input_norm_weight = read_buf(&mut file, &ctx.device);
-            let per_layer_input_gate_weight = read_buf(&mut file, &ctx.device);
-            let per_layer_projection_weight = read_buf(&mut file, &ctx.device);
-            let q_norm_weight = read_buf(&mut file, &ctx.device);
-            let k_norm_weight = read_buf(&mut file, &ctx.device);
+        let model = Self::finish_cache_load(
+            ctx,
+            config,
+            embed_tables,
+            Some(weights_mmap_offset),
+            lm_head_buf,
+            per_layer_model_projection_weight,
+            final_norm_weight,
+            per_layer_projection_norm_weight,
+            layers,
+            load_start,
+            "legacy Q4 cache",
+        );
 
-            let mut scalar_buf = [0u8; 4];
-            file.read_exact(&mut scalar_buf).unwrap();
-            let layer_scalar = f32::from_le_bytes(scalar_buf);
-
-            let mut meta = [0u8; 1];
-            file.read_exact(&mut meta).unwrap();
-            let is_full_attention = meta[0] != 0;
-            file.read_exact(&mut meta).unwrap();
-            let has_kv = meta[0] != 0;
-            file.read_exact(&mut meta).unwrap();
-            let use_f16 = meta[0] != 0;
-
-            let mut u32_buf = [0u8; 4];
-            file.read_exact(&mut u32_buf).unwrap();
-            let kv_source_layer = u32::from_le_bytes(u32_buf) as usize;
-            file.read_exact(&mut u32_buf).unwrap();
-            let head_dim = u32::from_le_bytes(u32_buf) as usize;
-            file.read_exact(&mut u32_buf).unwrap();
-            let q_out_dim = u32::from_le_bytes(u32_buf) as usize;
-            file.read_exact(&mut u32_buf).unwrap();
-            let kv_out_dim = u32::from_le_bytes(u32_buf) as usize;
-
-            if (layer_idx + 1) % 10 == 0 || layer_idx == num_layers - 1 {
-                println!("    Loaded layer {}/{}", layer_idx + 1, num_layers);
+        // One-time migration to split cache (instant load on subsequent runs).
+        let embed_path = Path::new(model_dir).join("model.embed.cache");
+        if !Self::is_split_weights_cache(cache_path) {
+            println!("  Migrating to split cache format...");
+            if !embed_path.exists() {
+                model.save_embed_cache(&embed_path);
             }
-
-            layers.push(Gemma4GpuLayer {
-                q_proj,
-                k_proj,
-                v_proj,
-                o_proj,
-                gate_proj,
-                up_proj,
-                down_proj,
-                input_layernorm_weight,
-                post_attention_layernorm_weight,
-                pre_feedforward_layernorm_weight,
-                post_feedforward_layernorm_weight,
-                post_per_layer_input_norm_weight,
-                per_layer_input_gate_weight,
-                per_layer_projection_weight,
-                layer_scalar,
-                q_norm_weight,
-                k_norm_weight,
-                is_full_attention,
-                has_kv,
-                kv_source_layer,
-                head_dim,
-                q_out_dim,
-                kv_out_dim,
-                use_f16,
-            });
+            model.save_weights_cache(cache_path);
         }
 
-        // Allocate scratch buffers (same as load_from_safetensors)
+        model
+    }
+
+    fn is_split_weights_cache(path: &Path) -> bool {
+        use std::io::Read;
+        let file = match fs::File::open(path) {
+            Ok(file) => file,
+            Err(_) => return false,
+        };
+        // Weights-only cache should be hundreds of MB, not a truncated header.
+        const MIN_BYTES: u64 = 64 * 1024 * 1024;
+        if file.metadata().map(|m| m.len()).unwrap_or(0) < MIN_BYTES {
+            return false;
+        }
+        let mut magic = [0u8; 4];
+        let mut file = file;
+        file.read_exact(&mut magic).is_ok() && magic == *b"GQ4G"
+    }
+
+    fn is_stale_split_weights_cache(path: &Path) -> bool {
+        use std::io::Read;
+        let mut file = match fs::File::open(path) {
+            Ok(file) => file,
+            Err(_) => return false,
+        };
+        let mut magic = [0u8; 4];
+        file.read_exact(&mut magic).is_ok() && (magic == *b"GQ4W" || magic == *b"GQ4A")
+    }
+
+    fn is_legacy_weights_cache(path: &Path) -> bool {
+        use std::io::Read;
+        let mut file = match fs::File::open(path) {
+            Ok(file) => file,
+            Err(_) => return false,
+        };
+        let mut magic = [0u8; 4];
+        file.read_exact(&mut magic).is_ok() && magic == *b"GQ4C"
+    }
+
+    fn finish_cache_load(
+        ctx: MetalContext,
+        config: Gemma4TextConfig,
+        embed_tables: EmbedTables,
+        weights_mmap_offset: Option<usize>,
+        lm_head_buf: BufferView,
+        per_layer_model_projection_weight: BufferView,
+        final_norm_weight: BufferView,
+        per_layer_projection_norm_weight: BufferView,
+        layers: Vec<Gemma4GpuLayer>,
+        load_start: Instant,
+        load_label: &str,
+    ) -> Self {
+        let layers = Self::pack_layers_gate_up(
+            &ctx,
+            layers,
+            config.intermediate_size as u32,
+            config.hidden_size as u32,
+        );
+        let hidden_size = config.hidden_size;
+        let num_heads = config.num_attention_heads;
+        let num_kv_heads = config.num_key_value_heads;
+        let intermediate_size = config.intermediate_size;
+        let vocab_size = config.vocab_size;
+        let num_layers = config.num_hidden_layers;
+        let ple_dim = config.hidden_size_per_layer_input;
+        let max_head_dim = config.global_head_dim;
+        let max_q_out = num_heads * max_head_dim;
+        let max_kv_out = num_kv_heads * max_head_dim;
+
         let hidden_buf = ctx.buffer_empty(hidden_size);
         let normed_buf = ctx.buffer_empty(hidden_size);
         let residual_buf = ctx.buffer_empty(hidden_size);
@@ -1105,6 +1887,8 @@ impl Gemma4GpuModel {
         let gelu_buf = ctx.buffer_empty(intermediate_size);
         let down_buf = ctx.buffer_empty(hidden_size);
         let logits_buf = ctx.buffer_empty(vocab_size);
+        let sample_out_buf = ctx.buffer_empty_u32(1);
+        let inv_rms_buf = ctx.buffer_empty(1);
         let ple_embed_buf = ctx.buffer_empty(ple_dim);
         let ple_gated_buf = ctx.buffer_empty(ple_dim);
         let ple_normed_buf = ctx.buffer_empty(ple_dim);
@@ -1115,12 +1899,15 @@ impl Gemma4GpuModel {
         let q_normed_buf = ctx.buffer_empty(max_q_out);
         let k_normed_buf = ctx.buffer_empty(max_kv_out);
 
+        let kv_cache_type = KvCacheType::from_env();
         let kv_capacity = config.max_position_embeddings.min(4096) as u32;
         let mut k_cache = Vec::with_capacity(num_layers);
         let mut v_cache = Vec::with_capacity(num_layers);
         for i in 0..num_layers {
             let hd = config.layer_head_dim(i);
-            let byte_len = (num_kv_heads * kv_capacity as usize * hd * 2) as u64;
+            assert!(hd % 32 == 0, "head_dim must be a multiple of 32 for quantized KV cache");
+            let bytes_per_row = kv_cache_type.bytes_per_row(hd);
+            let byte_len = (num_kv_heads * kv_capacity as usize * bytes_per_row) as u64;
             k_cache.push(
                 ctx.device
                     .new_buffer(byte_len, MTLResourceOptions::StorageModeShared),
@@ -1130,6 +1917,17 @@ impl Gemma4GpuModel {
                     .new_buffer(byte_len, MTLResourceOptions::StorageModeShared),
             );
         }
+        let f16_bytes = num_kv_heads * kv_capacity as usize * config.head_dim * 2
+            + num_kv_heads * kv_capacity as usize * config.global_head_dim * 2;
+        let quant_bytes = num_kv_heads * kv_capacity as usize * kv_cache_type.bytes_per_row(config.head_dim)
+            + num_kv_heads * kv_capacity as usize * kv_cache_type.bytes_per_row(config.global_head_dim);
+        println!(
+            "  KV cache type: {}, est. memory per layer: {:.1} MB (vs f16: {:.1} MB, {:.0}% savings)",
+            kv_cache_type,
+            quant_bytes as f64 / num_layers as f64 / 1024.0 / 1024.0,
+            f16_bytes as f64 / num_layers as f64 / 1024.0 / 1024.0,
+            (1.0 - quant_bytes as f64 / f16_bytes as f64) * 100.0,
+        );
         let max_prefill_seq = configured_max_prefill_seq(kv_capacity);
         let prefill_scratch = PrefillScratch::new(
             &ctx,
@@ -1157,8 +1955,8 @@ impl Gemma4GpuModel {
         let cos_buf = ctx.buffer_empty(max_head_dim);
         let sin_buf = ctx.buffer_empty(max_head_dim);
 
-        let mut per_layer_cos_bufs = Vec::with_capacity(num_layers);
-        let mut per_layer_sin_bufs = Vec::with_capacity(num_layers);
+        let (decode_rope_cos_packed, decode_rope_sin_packed, rope_layer_params_buf) =
+            alloc_decode_rope_buffers(&ctx, &config, num_layers, max_head_dim);
         let mut per_layer_prefill_cos_bufs = Vec::with_capacity(num_layers);
         let mut per_layer_prefill_sin_bufs = Vec::with_capacity(num_layers);
         let mut per_layer_decode_batch_cos_bufs = Vec::with_capacity(num_layers);
@@ -1169,8 +1967,6 @@ impl Gemma4GpuModel {
         let mut per_layer_ple_bufs = Vec::with_capacity(num_layers);
         for i in 0..num_layers {
             let hd = config.layer_head_dim(i);
-            per_layer_cos_bufs.push(ctx.buffer_empty(hd));
-            per_layer_sin_bufs.push(ctx.buffer_empty(hd));
             per_layer_prefill_cos_bufs.push(ctx.buffer_empty(max_prefill_seq * hd));
             per_layer_prefill_sin_bufs.push(ctx.buffer_empty(max_prefill_seq * hd));
             per_layer_decode_batch_cos_bufs.push(ctx.buffer_empty(DEFAULT_MAX_DECODE_BATCH * hd));
@@ -1183,6 +1979,12 @@ impl Gemma4GpuModel {
             per_layer_ple_bufs.push(ctx.buffer_empty(ple_dim));
         }
 
+        if layers.iter().any(|l| l.weight_format == WeightFormat::F16) {
+            eprintln!(
+                "  Warning: weights cache has f16 layers; delete model.q4cache for all-Q4"
+            );
+        }
+
         println!(
             "  Parallel prefill scratch: max_seq={}",
             prefill_scratch.max_seq_len
@@ -1191,13 +1993,16 @@ impl Gemma4GpuModel {
             "  Decode batch scratch: max_batch={}",
             decode_batch_scratch.max_batch_size
         );
-        println!("  Loaded from Q4 cache successfully");
+        println!(
+            "  Loaded from {} in {:.2}s",
+            load_label,
+            load_start.elapsed().as_secs_f64()
+        );
 
-        Gemma4GpuModel {
+        let mut model = Gemma4GpuModel {
             ctx,
             config,
-            embed_tokens_f16,
-            embed_tokens_per_layer_f16,
+            embed_tables,
             lm_head_buf,
             layers,
             final_norm_weight,
@@ -1216,6 +2021,8 @@ impl Gemma4GpuModel {
             gelu_buf,
             down_buf,
             logits_buf,
+            sample_out_buf,
+            inv_rms_buf,
             prefill_scratch,
             decode_batch_scratch,
             ple_embed_buf,
@@ -1231,10 +2038,13 @@ impl Gemma4GpuModel {
             v_cache,
             kv_seq_len: 0,
             kv_capacity,
+            kv_cache_type,
             cos_buf,
             sin_buf,
-            per_layer_cos_bufs,
-            per_layer_sin_bufs,
+            decode_rope_cos_packed,
+            decode_rope_sin_packed,
+            rope_layer_params_buf,
+            rope_max_head_dim: max_head_dim,
             per_layer_prefill_cos_bufs,
             per_layer_prefill_sin_bufs,
             per_layer_decode_batch_cos_bufs,
@@ -1244,11 +2054,366 @@ impl Gemma4GpuModel {
             per_layer_decode_batch_kv_len_bufs,
             per_layer_ple_bufs,
             total_tokens: 0,
+            weights_mmap_offset,
+            embed_decode_scratch: vec![0.0f32; hidden_size],
+            ple_decode_scratch: vec![0.0f32; num_layers * ple_dim],
+            mega_graph: None,
+        };
+        model.attach_mega_graph_if_enabled();
+        model
+    }
+
+    fn attach_mega_graph_if_enabled(&mut self) {
+        if !mega_kernel_enabled() {
+            return;
         }
+        match MegaDecodeGraph::build(self) {
+            Ok(graph) => {
+                println!(
+                    "  Mega decode enabled ({} ops, single command buffer)",
+                    graph.ops.len()
+                );
+                self.mega_graph = Some(graph);
+            }
+            Err(e) => {
+                eprintln!("  MEGA_KERNEL=1 but mega graph build failed: {e}");
+            }
+        }
+    }
+
+    /// Build interleaved gate∥up Q4 buffers for decode MLP (uzu-style packing).
+    fn pack_layers_gate_up(
+        ctx: &MetalContext,
+        mut layers: Vec<Gemma4GpuLayer>,
+        m: u32,
+        k: u32,
+    ) -> Vec<Gemma4GpuLayer> {
+        if !crate::gpu::packed_mlp_gate_up_enabled() {
+            for layer in layers.iter_mut() {
+                layer.gate_up_proj = BufferView::from_buffer(ctx.buffer_empty(1));
+            }
+            return layers;
+        }
+        let pack_start = std::time::Instant::now();
+        for layer in layers.iter_mut() {
+            if Self::use_packed_mlp_gate_up(layer) {
+                layer.gate_up_proj =
+                    ctx.pack_gate_up_interleaved_q4(&layer.gate_proj, &layer.up_proj, m, k);
+            } else {
+                layer.gate_up_proj = BufferView::from_buffer(ctx.buffer_empty(1));
+            }
+        }
+        println!(
+            "  Packed interleaved gate∥up Q4 weights in {:.2}s",
+            pack_start.elapsed().as_secs_f64()
+        );
+        layers
+    }
+
+    fn use_packed_mlp_gate_up(layer: &Gemma4GpuLayer) -> bool {
+        crate::gpu::packed_mlp_gate_up_enabled() && layer.weight_format == WeightFormat::Q4_0
+    }
+
+    /// Dispatch a plain quantized matvec for a layer's weight (Q4 or Q3).
+    fn encode_matvec_quant(
+        &self,
+        encoder: &metal::ComputeCommandEncoderRef,
+        weight: &BufferView,
+        x_buf: &metal::Buffer,
+        y_buf: &metal::Buffer,
+        m: u32,
+        k: u32,
+        wf: WeightFormat,
+    ) {
+        match wf {
+            WeightFormat::Q3_0 => self.ctx.encode_matvec_q3_at_view(
+                encoder, weight, x_buf, 0, y_buf, 0, m, k),
+            _ => self.ctx.encode_matvec_q4_view(
+                encoder, weight, x_buf, y_buf, m, k),
+        }
+    }
+
+    fn encode_mlp_gate_up_gelu_q4_view(
+        &self,
+        encoder: &metal::ComputeCommandEncoderRef,
+        layer: &Gemma4GpuLayer,
+        x_buf: &metal::Buffer,
+        gelu_buf: &metal::Buffer,
+        intermediate_size: u32,
+        hidden_size: u32,
+    ) {
+        self.encode_mlp_gate_up_gelu_q4_at_view(
+            encoder,
+            layer,
+            x_buf,
+            0,
+            gelu_buf,
+            0,
+            intermediate_size,
+            hidden_size,
+        );
+    }
+
+    fn encode_mlp_gate_up_gelu_q4_at_view(
+        &self,
+        encoder: &metal::ComputeCommandEncoderRef,
+        layer: &Gemma4GpuLayer,
+        x_buf: &metal::Buffer,
+        x_offset: u64,
+        gelu_buf: &metal::Buffer,
+        gelu_offset: u64,
+        intermediate_size: u32,
+        hidden_size: u32,
+    ) {
+        if layer.weight_format.is_q3() {
+            // Q3_0: use ggml fused gelu_mul kernel
+            self.ctx.encode_matvec_ggml_q3_gelu_mul_at_view(
+                encoder,
+                &layer.gate_proj,
+                &layer.up_proj,
+                x_buf,
+                x_offset,
+                gelu_buf,
+                gelu_offset,
+                intermediate_size,
+                hidden_size,
+            );
+        } else if Self::use_packed_mlp_gate_up(layer) {
+            self.ctx.encode_matvec_q4_interleaved_gelu_at_view(
+                encoder,
+                &layer.gate_up_proj,
+                x_buf,
+                x_offset,
+                gelu_buf,
+                gelu_offset,
+                intermediate_size,
+                hidden_size,
+            );
+        } else {
+            self.ctx.encode_matvec_q4_dual_gelu_at_view(
+                encoder,
+                &layer.gate_proj,
+                &layer.up_proj,
+                x_buf,
+                x_offset,
+                gelu_buf,
+                gelu_offset,
+                intermediate_size,
+                hidden_size,
+            );
+        }
+    }
+
+    /// Split cache: load weights first, then mmap embeddings.
+    fn load_from_split_cache(
+        model_dir: &str,
+        embed_cache_path: &Path,
+        weights_cache_path: &Path,
+    ) -> Self {
+        let load_start = Instant::now();
+
+        let config_path = Path::new(model_dir).join("config.json");
+        let config_str = fs::read_to_string(&config_path).expect("Failed to read config.json");
+        let outer: serde_json::Value =
+            serde_json::from_str(&config_str).expect("Failed to parse config.json");
+        let config: Gemma4TextConfig = if let Some(tc) = outer.get("text_config") {
+            serde_json::from_value(tc.clone()).expect("Failed to parse text_config")
+        } else {
+            serde_json::from_str(&config_str).expect("Failed to parse config")
+        };
+
+        let ctx = MetalContext::new();
+        let device = &ctx.device;
+        let num_layers = config.num_hidden_layers;
+
+        let mut weights_file =
+            fs::File::open(weights_cache_path).expect("Failed to open weights cache");
+        let file_len = weights_file
+            .metadata()
+            .expect("weights metadata")
+            .len();
+        let weights_bytes = file_len.saturating_sub(4) as u64;
+
+        let mut magic = [0u8; 4];
+        use std::io::Read;
+        weights_file
+            .read_exact(&mut magic)
+            .expect("read weights cache magic");
+        let aligned_layout = magic == *b"GQ4G";
+        if magic == *b"GQ4W" || magic == *b"GQ4A" {
+            panic!(
+                "Stale weights cache (old interleaved Q4 layout). \
+                 Delete model.q4cache and model.embed.cache, then re-run to re-quantize."
+            );
+        }
+        if !aligned_layout {
+            panic!("Invalid weights cache magic (expected GQ4G)");
+        }
+
+        let mut offset = 4;
+        let (
+            lm_head_buf,
+            per_layer_model_projection_weight,
+            final_norm_weight,
+            per_layer_projection_norm_weight,
+            layers,
+        ) = if aligned_layout {
+            println!(
+                "  Copying weights to GPU: {:.1} MB (aligned layout)...",
+                weights_bytes as f64 / 1024.0 / 1024.0
+            );
+            let copy_start = Instant::now();
+            let weights_buf =
+                MetalContext::buffer_read_from_file(device, &mut weights_file, 4, weights_bytes);
+            println!(
+                "  Weights copied in {:.2}s",
+                copy_start.elapsed().as_secs_f64()
+            );
+            let section = unsafe {
+                std::slice::from_raw_parts(weights_buf.contents() as *const u8, weights_bytes as usize)
+            };
+            let mut section_offset = 0;
+            Self::load_weight_sections(
+                section,
+                &mut section_offset,
+                device,
+                num_layers,
+                true,
+                Some(&weights_buf),
+                0,
+            )
+        } else {
+            let weights_mmap =
+                unsafe { Mmap::map(&weights_file).expect("Failed to mmap weights cache") };
+            println!("  Loading weights (per-tensor copy)...");
+            let weights_load_start = Instant::now();
+            let sections = Self::load_weight_sections(
+                weights_mmap.as_ref(),
+                &mut offset,
+                device,
+                num_layers,
+                false,
+                None,
+                4,
+            );
+            println!(
+                "  Weights loaded in {:.2}s",
+                weights_load_start.elapsed().as_secs_f64()
+            );
+            sections
+        };
+
+        let embed_file = fs::File::open(embed_cache_path).expect("Failed to open embed cache");
+        let embed_mmap = unsafe { Mmap::map(&embed_file).expect("Failed to mmap embed cache") };
+        assert_eq!(&embed_mmap[0..4], b"GQ4E", "Invalid embed cache magic");
+        let mut eoff = 4;
+        let embed_len = Self::read_u64_at(&embed_mmap, &mut eoff);
+        let embed_offset = eoff;
+        eoff += embed_len as usize;
+        println!(
+            "    embed_tokens: {:.1} MB (mmap)",
+            embed_len as f64 / 1024.0 / 1024.0
+        );
+        let ple_len = Self::read_u64_at(&embed_mmap, &mut eoff);
+        let ple_offset = eoff;
+        println!(
+            "    embed_tokens_per_layer: {:.1} MB (mmap)",
+            ple_len as f64 / 1024.0 / 1024.0
+        );
+        let ple_cols = num_layers * config.hidden_size_per_layer_input;
+        let embed_tables = EmbedTables::from_mmap(
+            embed_mmap,
+            embed_offset,
+            embed_len as usize,
+            ple_offset,
+            ple_len as usize,
+            ple_cols,
+            config.vocab_size,
+        );
+
+        let model = Self::finish_cache_load(
+            ctx,
+            config,
+            embed_tables,
+            None,
+            lm_head_buf,
+            per_layer_model_projection_weight,
+            final_norm_weight,
+            per_layer_projection_norm_weight,
+            layers,
+            load_start,
+            "split Q4 cache",
+        );
+
+        if !aligned_layout {
+            println!("  Upgrading weights cache to aligned format for faster loads...");
+            model.save_weights_cache(weights_cache_path);
+        }
+
+        model
     }
 
     /// Forward one token through the entire model. One command buffer per layer.
     pub fn forward_single_token(&mut self, token_id: usize) -> Vec<f32> {
+        match self.forward_single_token_inner(token_id, DecodeMode::Logits) {
+            DecodeOutput::Logits(logits) => logits,
+            DecodeOutput::Token(_) | DecodeOutput::Advanced => {
+                unreachable!("Logits mode must return logits")
+            }
+        }
+    }
+
+    /// KV-only prefill step: runs layers but skips lm_head and logit readback.
+    pub fn forward_advance(&mut self, token_id: usize) {
+        match self.forward_single_token_inner(token_id, DecodeMode::Advance) {
+            DecodeOutput::Advanced => {}
+            _ => unreachable!("Advance mode must return Advanced"),
+        }
+    }
+
+    /// Fused decode step: runs the full forward pass and GPU-side sampling in a
+    /// single command buffer, returning the sampled token id. Only 4 bytes are
+    /// read back (the token), avoiding the full-vocab logits readback + CPU
+    /// softmax that `forward_single_token` incurs.
+    pub fn forward_single_token_sample(
+        &mut self,
+        token_id: usize,
+        temperature: f32,
+        min_p: f32,
+        seed: u32,
+    ) -> usize {
+        match self.forward_single_token_inner(
+            token_id,
+            DecodeMode::Sample(temperature, min_p, seed),
+        ) {
+            DecodeOutput::Token(token) => token,
+            _ => unreachable!("Sample mode must return a token"),
+        }
+    }
+
+    fn forward_single_token_inner(
+        &mut self,
+        token_id: usize,
+        mode: DecodeMode,
+    ) -> DecodeOutput {
+        let __profile = std::env::var("PROFILE_DECODE").is_ok();
+        // When set, splits the token into per-phase command buffers and times
+        // each phase's commit→wait (wall clock). Each phase is its own command
+        // buffer dominated by GPU execution, so the numbers isolate where the
+        // floor is; they include a small fixed sync per phase (note in output).
+        let __pp = std::env::var("PROFILE_PHASES").is_ok();
+        let __ablate = ProfileAblate::from_env();
+        let layer_count = self.layers.len() as u32;
+        let mut __gpu_prof = if !__pp && !__ablate.active() && profile_gpu_enabled() {
+            GpuTimestampProfiler::try_new(&self.ctx.device, layer_count)
+        } else {
+            None
+        };
+        if __gpu_prof.is_some() {
+            eprintln!("  GPU timestamp profiling enabled (PROFILE_GPU=1)");
+        }
+        __ablate.log_once();
+        let __t0 = std::time::Instant::now();
         let hidden_size = self.config.hidden_size;
         let num_heads = self.config.num_attention_heads;
         let num_kv_heads = self.config.num_key_value_heads;
@@ -1258,147 +2423,155 @@ impl Gemma4GpuModel {
         let eps = self.config.rms_norm_eps as f32;
         let ple_dim = self.config.hidden_size_per_layer_input;
         let num_layers = self.config.num_hidden_layers;
+        let ple_total_dim = num_layers * ple_dim;
 
-        // Embed token (CPU — decode from f16 on the fly)
-        // Gemma scales embeddings by sqrt(hidden_size)
-        let embed_offset = token_id * hidden_size;
-        let embed_scale = (hidden_size as f32).sqrt();
-        let mut embed_f32 = vec![0.0f32; hidden_size];
-        for i in 0..hidden_size {
-            embed_f32[i] = bf16_to_f32(self.embed_tokens_f16[embed_offset + i]) * embed_scale;
-        }
-        MetalContext::write_buffer(&self.hidden_buf, &embed_f32);
+        // CPU embedding lookup (mmap-backed, no GPU gather)
+        self.embed_tables
+            .decode_embed_into(token_id, hidden_size, &mut self.embed_decode_scratch);
+        MetalContext::write_buffer(&self.hidden_buf, &self.embed_decode_scratch);
+        self.embed_tables.decode_ple_into(
+            token_id,
+            ple_total_dim,
+            ple_dim,
+            &mut self.ple_decode_scratch,
+        );
+        MetalContext::write_buffer(&self.ple_token_id_buf, &self.ple_decode_scratch);
 
         let kv_seq = self.kv_seq_len;
+        let pos = self.total_tokens as f32;
 
         // ─── PLE: Compute per-layer inputs on GPU ───
-        // Reference: Gemma4TextModel.get_per_layer_inputs() + project_per_layer_inputs()
-        //
-        // 1. Token identity: embed_tokens_per_layer(token_id) * sqrt(ple_dim)
-        // 2. Context projection: per_layer_model_projection(embed) * (1/sqrt(hidden_size))
-        //    then per_layer_projection_norm (RMSNorm per layer)
-        // 3. Combined: (context_proj + token_identity) * (1/sqrt(2))
-        let ple_total_dim = num_layers * ple_dim;
         let ple_input_scale = std::f32::consts::FRAC_1_SQRT_2; // 1/sqrt(2)
         let context_proj_scale = 1.0 / (hidden_size as f32).sqrt();
 
-        // Step 1: Token identity from embed_tokens_per_layer (CPU decode bf16, write to GPU)
-        let ple_token_offset = token_id * ple_total_dim;
-        let ple_scale = (ple_dim as f32).sqrt();
-        let mut ple_token_identity = vec![0.0f32; ple_total_dim];
-        if ple_token_offset + ple_total_dim <= self.embed_tokens_per_layer_f16.len() {
-            for i in 0..ple_total_dim {
-                ple_token_identity[i] =
-                    bf16_to_f32(self.embed_tokens_per_layer_f16[ple_token_offset + i]) * ple_scale;
-            }
-        }
-        MetalContext::write_buffer(&self.ple_token_id_buf, &ple_token_identity);
-
-        // Steps 2-3: GPU computation (will be part of main command buffer)
-        // We'll encode PLE ops at the start of the main command buffer,
-        // then reference ple_context_proj_buf with offsets per layer.
-
-        // Precompute all rotary cos/sin per layer (CPU, trivial)
-        let pos = self.total_tokens as f32;
-        let mut rotary_cos_per_layer: Vec<Vec<f32>> = Vec::with_capacity(self.layers.len());
-        let mut rotary_sin_per_layer: Vec<Vec<f32>> = Vec::with_capacity(self.layers.len());
-
-        for layer_idx in 0..self.layers.len() {
-            let layer = &self.layers[layer_idx];
-            let head_dim = layer.head_dim;
-            let is_full = layer.is_full_attention;
-
-            let rope_theta = if is_full {
-                self.config.full_rope_theta()
-            } else {
-                self.config.sliding_rope_theta()
-            };
-
-            let rope_factor = if is_full {
-                self.config.full_rope_factor()
-            } else {
-                self.config.sliding_rope_factor()
-            };
-
-            let rotary_dim = if is_full {
-                (head_dim as f64 * self.config.full_partial_rotary_factor()) as usize
-            } else {
-                head_dim
-            };
-
-            // Proportional RoPE: compute rope_angles frequencies using head_dim as denominator
-            // then pad with zeros for non-rotary dimensions.
-            // Reference: _compute_proportional_rope_parameters in modeling_rope_utils.py
-            let rope_angles = rotary_dim / 2; // = partial_rotary_factor * head_dim / 2
-            let half_dim = head_dim / 2;
-            let mut cos_data = vec![0.0f32; head_dim];
-            let mut sin_data = vec![0.0f32; head_dim];
-            for i in 0..rope_angles {
-                // inv_freq = 1 / (theta ^ (2i / head_dim)) / factor
-                let inv_freq = 1.0
-                    / (rope_theta.powf(i as f64 * 2.0 / head_dim as f64) as f32)
-                    / rope_factor as f32;
-                let angle = pos * inv_freq;
-                cos_data[i] = angle.cos();
-                cos_data[i + half_dim] = angle.cos();
-                sin_data[i] = angle.sin();
-                sin_data[i + half_dim] = angle.sin();
-            }
-            // Non-rotary angles (nope_angles) remain 0 in inv_freq → cos=1, sin=0
-            // cos_data[rope_angles..half_dim] and cos_data[half_dim+rope_angles..head_dim] stay 0
-            // But for the rotary kernel, we need cos=1 for pass-through dimensions
-            for i in rope_angles..half_dim {
-                cos_data[i] = 1.0;
-                cos_data[i + half_dim] = 1.0;
-                // sin stays 0.0 (already initialized)
-            }
-
-            rotary_cos_per_layer.push(cos_data);
-            rotary_sin_per_layer.push(sin_data);
-        }
-
-        // ═══ ENCODE ALL LAYERS INTO A SINGLE COMMAND BUFFER ═══
-        // Write per-layer cos/sin data into persistent buffers
         let actual_num_layers = self.layers.len();
-        for layer_idx in 0..actual_num_layers {
-            MetalContext::write_buffer(
-                &self.per_layer_cos_bufs[layer_idx],
-                &rotary_cos_per_layer[layer_idx],
-            );
-            MetalContext::write_buffer(
-                &self.per_layer_sin_bufs[layer_idx],
-                &rotary_sin_per_layer[layer_idx],
-            );
+        let __t_prep = std::time::Instant::now();
+        // `mut` so the phase profiler (or METAL_N_CB>=2) can flush and re-open
+        // command buffers mid-token. Default: rope+PLE+layers[0..mid] on CB0,
+        // layers[mid..]+head on CB1 — commit CB0 without wait so encode of CB1
+        // overlaps GPU execution of CB0.
+        let mut cmd = self.ctx.queue.new_command_buffer();
+        let mut encoder = cmd.new_compute_command_encoder();
+
+        // GPU RoPE table fill for all layers (replaces CPU sin/cos + write_buffer).
+        self.ctx.encode_rope_fill_decode(
+            &encoder,
+            &self.decode_rope_cos_packed,
+            &self.decode_rope_sin_packed,
+            &self.rope_layer_params_buf,
+            actual_num_layers as u32,
+            self.rope_max_head_dim as u32,
+            pos,
+        );
+        if let Some(p) = &mut __gpu_prof {
+            p.mark(&encoder);
         }
 
-        let cmd = self.ctx.queue.new_command_buffer();
-
-        // ─── PLE pre-pass: encode into the same command buffer ───
+        if self.mega_graph.is_some()
+            && !__pp
+            && !__ablate.active()
+            && __gpu_prof.is_none()
+            && !matches!(mode, DecodeMode::Advance)
         {
-            let ple_enc = cmd.new_compute_command_encoder();
+            let cap = self.config.final_logit_softcapping;
+            let sliding = self.config.sliding_window as u32;
+            let sample = match mode {
+                DecodeMode::Sample(t, mp, s) => Some((t, mp, s)),
+                DecodeMode::Logits => None,
+                DecodeMode::Advance => unreachable!(),
+            };
+            let scratch = MegaScratchBuffers {
+                hidden: &self.hidden_buf,
+                normed: &self.normed_buf,
+                q: &self.q_buf,
+                k: &self.k_buf,
+                v: &self.v_buf,
+                q_normed: &self.q_normed_buf,
+                k_normed: &self.k_normed_buf,
+                gate: &self.gate_buf,
+                attn_out: &self.attn_out_buf,
+                o_out: &self.o_out_buf,
+                up: &self.up_buf,
+                gelu: &self.gelu_buf,
+                down: &self.down_buf,
+                ple_ctx: &self.ple_context_proj_buf,
+                ple_tmp: &self.ple_combined_buf,
+                ple_tok: &self.ple_token_id_buf,
+                logits: &self.logits_buf,
+                sample_out: &self.sample_out_buf,
+            };
+            let layers = &self.layers;
+            let mega = self.mega_graph.as_mut().unwrap();
+            mega.encode(
+                &self.ctx,
+                &encoder,
+                layers,
+                sliding,
+                &scratch,
+                &self.k_cache,
+                &self.v_cache,
+                &self.decode_rope_cos_packed,
+                &self.decode_rope_sin_packed,
+                self.rope_max_head_dim,
+                kv_seq,
+                sample,
+            );
+            encoder.end_encoding();
+            let __t_encode = std::time::Instant::now();
+            cmd.commit();
+            cmd.wait_until_completed();
+            let __t_gpu = std::time::Instant::now();
+            let output = match mode {
+                DecodeMode::Sample(..) => {
+                    let tok = MetalContext::read_u32(&self.sample_out_buf) as usize;
+                    if __profile {
+                        Self::profile_record(__t0, __t_prep, __t_encode, __t_gpu);
+                    }
+                    DecodeOutput::Token(tok)
+                }
+                DecodeMode::Logits => {
+                    let mut logits = MetalContext::read_buffer(&self.logits_buf, vocab_size);
+                    for l in logits.iter_mut() {
+                        let x = (*l / cap).clamp(-10.0, 10.0);
+                        *l = cap * x.tanh();
+                    }
+                    if __profile {
+                        Self::profile_record(__t0, __t_prep, __t_encode, __t_gpu);
+                    }
+                    DecodeOutput::Logits(logits)
+                }
+                DecodeMode::Advance => unreachable!(),
+            };
+            self.total_tokens += 1;
+            self.kv_seq_len += 1;
+            return output;
+        }
 
-            // Step 2a: context_proj = per_layer_model_projection @ embed (GPU matvec)
-            self.ctx.encode_matvec_q4(
-                ple_enc,
+        // ─── PLE pre-pass ───
+        // Produces the per-layer PLE inputs contiguously in ple_context_proj_buf;
+        // each layer reads its slice directly (byte offset = layer_idx * ple_dim
+        // * 4), so the previous 42 per-layer copy-out dispatches are gone.
+        if !__ablate.skip_ple() {
+            // Step 2a: context_proj = per_layer_model_projection @ embed
+            self.ctx.encode_matvec_q4_view(
+                encoder,
                 &self.per_layer_model_projection_weight,
                 &self.hidden_buf,
                 &self.ple_context_proj_buf,
                 ple_total_dim as u32,
                 hidden_size as u32,
             );
-
             // Step 2b: context_proj *= 1/sqrt(hidden_size)
             self.ctx.encode_vec_scale(
-                ple_enc,
+                encoder,
                 &self.ple_context_proj_buf,
                 &self.ple_combined_buf,
                 ple_total_dim as u32,
                 context_proj_scale,
             );
-
-            // Step 2c: RMSNorm per layer (42 chunks of 256)
-            self.ctx.encode_rmsnorm_per_head(
-                ple_enc,
+            // Step 2c: RMSNorm per layer
+            self.ctx.encode_rmsnorm_per_head_view(
+                encoder,
                 &self.ple_combined_buf,
                 &self.per_layer_projection_norm_weight,
                 &self.ple_context_proj_buf,
@@ -1406,40 +2579,59 @@ impl Gemma4GpuModel {
                 ple_dim as u32,
                 eps,
             );
-
             // Step 3: combined = (context_proj + token_identity) * 1/sqrt(2)
             self.ctx.encode_vec_add(
-                ple_enc,
+                encoder,
                 &self.ple_context_proj_buf,
                 &self.ple_token_id_buf,
                 &self.ple_combined_buf,
                 ple_total_dim as u32,
             );
             self.ctx.encode_vec_scale(
-                ple_enc,
+                encoder,
                 &self.ple_combined_buf,
                 &self.ple_context_proj_buf,
                 ple_total_dim as u32,
                 ple_input_scale,
             );
-
-            // Copy per-layer slices from ple_context_proj_buf to per_layer_ple_bufs
-            // (GPU-to-GPU copy, avoids CPU readback)
-            for i in 0..actual_num_layers {
-                let offset = (i * ple_dim * 4) as u64; // byte offset
-                ple_enc.set_compute_pipeline_state(&self.ctx.buf_copy_pipeline);
-                ple_enc.set_buffer(0, Some(&self.ple_context_proj_buf), offset);
-                ple_enc.set_buffer(1, Some(&self.per_layer_ple_bufs[i]), 0);
-                let n = ple_dim as u32;
-                ple_enc.set_bytes(2, 4, &n as *const u32 as *const _);
-                ple_enc
-                    .dispatch_threads(MTLSize::new(ple_dim as u64, 1, 1), MTLSize::new(256, 1, 1));
-            }
-
-            ple_enc.end_encoding();
+        }
+        if let Some(p) = &mut __gpu_prof {
+            p.mark(&encoder);
         }
 
+        // Phase boundary: PLE pre-pass (profiling only).
+        if __pp {
+            encoder.end_encoding();
+            let __pt = std::time::Instant::now();
+            cmd.commit();
+            cmd.wait_until_completed();
+            Self::phase_accum(0, __pt.elapsed().as_secs_f64() * 1e3);
+            cmd = self.ctx.queue.new_command_buffer();
+            encoder = cmd.new_compute_command_encoder();
+        }
+
+        let metal_n_cb = if !__pp && !__ablate.active() && __gpu_prof.is_none() {
+            crate::gpu::metal_n_cb()
+        } else {
+            1
+        };
+        let cb_layer_splits: Vec<usize> = if metal_n_cb >= 2 {
+            (1..metal_n_cb as usize)
+                .map(|i| actual_num_layers * i / metal_n_cb as usize)
+                .collect()
+        } else {
+            Vec::new()
+        };
+        let mut cb_split_idx = 0usize;
+
         for layer_idx in 0..actual_num_layers {
+            if cb_split_idx < cb_layer_splits.len() && layer_idx == cb_layer_splits[cb_split_idx] {
+                encoder.end_encoding();
+                cmd.commit();
+                cmd = self.ctx.queue.new_command_buffer();
+                encoder = cmd.new_compute_command_encoder();
+                cb_split_idx += 1;
+            }
             let layer = &self.layers[layer_idx];
             let head_dim = layer.head_dim;
             let q_out = layer.q_out_dim;
@@ -1448,19 +2640,47 @@ impl Gemma4GpuModel {
             // Gemma4 uses attention_scale = 1.0 (QK norm handles scaling)
             let scale = 1.0f32;
 
-            let encoder = cmd.new_compute_command_encoder();
-
             // ─── Attention Block ───
-            // Save residual
-            self.ctx.encode_copy(
-                encoder,
-                &self.hidden_buf,
-                &self.residual_buf,
-                hidden_size as u32,
-            );
+            // Residual is the current hidden_buf, which is not overwritten until
+            // the residual add below, so no separate "save residual" copy is
+            // needed; the add reads hidden in place.
 
+            if !__ablate.skip_attn() {
+            // Pre-attention norm + Q/K/V projections (fused when Q4 + FUSED_QKV=1).
+            if layer.weight_format == WeightFormat::Q4_0 && crate::gpu::fused_qkv_enabled() {
+                if layer.has_kv {
+                    self.ctx.encode_rmsnorm_qkv_q4_view(
+                        encoder,
+                        &self.hidden_buf,
+                        &layer.input_layernorm_weight,
+                        &self.inv_rms_buf,
+                        &layer.q_proj,
+                        &layer.k_proj,
+                        &layer.v_proj,
+                        &self.q_buf,
+                        &self.k_buf,
+                        &self.v_buf,
+                        q_out as u32,
+                        kv_out as u32,
+                        hidden_size as u32,
+                        eps,
+                    );
+                } else {
+                    self.ctx.encode_rmsnorm_q_q4_view(
+                        encoder,
+                        &self.hidden_buf,
+                        &layer.input_layernorm_weight,
+                        &self.inv_rms_buf,
+                        &layer.q_proj,
+                        &self.q_buf,
+                        q_out as u32,
+                        hidden_size as u32,
+                        eps,
+                    );
+                }
+            } else {
             // Pre-attention norm
-            self.ctx.encode_rmsnorm(
+            self.ctx.encode_rmsnorm_view(
                 encoder,
                 &self.hidden_buf,
                 &layer.input_layernorm_weight,
@@ -1470,8 +2690,8 @@ impl Gemma4GpuModel {
             );
 
             // Q projection (always computed)
-            if layer.use_f16 {
-                self.ctx.encode_matvec_f16(
+            if layer.weight_format == WeightFormat::F16 {
+                self.ctx.encode_matvec_f16_view(
                     encoder,
                     &layer.q_proj,
                     &self.normed_buf,
@@ -1480,18 +2700,73 @@ impl Gemma4GpuModel {
                     hidden_size as u32,
                 );
             } else {
-                self.ctx.encode_matvec_q4(
+                self.encode_matvec_quant(
                     encoder,
                     &layer.q_proj,
                     &self.normed_buf,
                     &self.q_buf,
                     q_out as u32,
                     hidden_size as u32,
+                    layer.weight_format,
                 );
             }
 
+            // K, V only for non-shared layers
+            if layer.has_kv {
+                if layer.weight_format == WeightFormat::F16 {
+                    self.ctx.encode_matvec_f16_view(
+                        encoder,
+                        &layer.k_proj,
+                        &self.normed_buf,
+                        &self.k_buf,
+                        kv_out as u32,
+                        hidden_size as u32,
+                    );
+                    self.ctx.encode_matvec_f16_view(
+                        encoder,
+                        &layer.v_proj,
+                        &self.normed_buf,
+                        &self.v_buf,
+                        kv_out as u32,
+                        hidden_size as u32,
+                    );
+                } else {
+                    // For Q3_0 and Q4_0: use dual (fused) matvec
+                    self.encode_matvec_quant(
+                        encoder,
+                        &layer.k_proj,
+                        &self.normed_buf,
+                        &self.k_buf,
+                        kv_out as u32,
+                        hidden_size as u32,
+                        layer.weight_format,
+                    );
+                    self.encode_matvec_quant(
+                        encoder,
+                        &layer.v_proj,
+                        &self.normed_buf,
+                        &self.v_buf,
+                        kv_out as u32,
+                        hidden_size as u32,
+                        layer.weight_format,
+                    );
+                }
+            }
+            } // !fused_qkv fallback
+
+            let use_fused_q_attn = layer.weight_format.is_quantized()
+                && matches!(self.kv_cache_type, KvCacheType::Q4_0)
+                && self.ctx.use_flash_attention
+                && crate::gpu::fused_q_attn_enabled()
+                && !crate::gpu::attention_use_ggml_for_layer(layer.has_kv)
+                && matches!(head_dim, 128 | 256 | 512);
+            let use_fused_k_attn =
+                use_fused_q_attn && layer.has_kv && crate::gpu::fused_k_attn_enabled();
+            let rope_off = self.decode_rope_byte_offset(layer_idx);
+
+            if !use_fused_q_attn {
             // QK Norm on Q
-            self.ctx.encode_rmsnorm_per_head(
+            self.ctx.encode_rmsnorm_per_head_view(
                 encoder,
                 &self.q_buf,
                 &layer.q_norm_weight,
@@ -1502,57 +2777,25 @@ impl Gemma4GpuModel {
             );
 
             // Apply rotary to Q (full head_dim — non-rotary dims have cos=1, sin=0 for pass-through)
-            self.ctx.encode_rotary(
+            self.ctx.encode_rotary_at(
                 encoder,
                 &self.q_normed_buf,
+                0,
                 &self.k_normed_buf,
-                &self.per_layer_cos_bufs[layer_idx],
-                &self.per_layer_sin_bufs[layer_idx],
+                0,
+                &self.decode_rope_cos_packed,
+                rope_off,
+                &self.decode_rope_sin_packed,
+                rope_off,
                 num_heads as u32,
                 0,
                 head_dim as u32,
             );
+            } // !use_fused_q_attn
 
-            // K, V only for non-shared layers
-            if layer.has_kv {
-                if layer.use_f16 {
-                    self.ctx.encode_matvec_f16(
-                        encoder,
-                        &layer.k_proj,
-                        &self.normed_buf,
-                        &self.k_buf,
-                        kv_out as u32,
-                        hidden_size as u32,
-                    );
-                    self.ctx.encode_matvec_f16(
-                        encoder,
-                        &layer.v_proj,
-                        &self.normed_buf,
-                        &self.v_buf,
-                        kv_out as u32,
-                        hidden_size as u32,
-                    );
-                } else {
-                    self.ctx.encode_matvec_q4(
-                        encoder,
-                        &layer.k_proj,
-                        &self.normed_buf,
-                        &self.k_buf,
-                        kv_out as u32,
-                        hidden_size as u32,
-                    );
-                    self.ctx.encode_matvec_q4(
-                        encoder,
-                        &layer.v_proj,
-                        &self.normed_buf,
-                        &self.v_buf,
-                        kv_out as u32,
-                        hidden_size as u32,
-                    );
-                }
-
-                // K norm + rotary (full head_dim — non-rotary dims pass through)
-                self.ctx.encode_rmsnorm_per_head(
+            // K norm + rotary (K/V matvecs fused above when FUSED_QKV=1)
+            if layer.has_kv && !use_fused_k_attn {
+                self.ctx.encode_rmsnorm_per_head_view(
                     encoder,
                     &self.k_buf,
                     &layer.k_norm_weight,
@@ -1561,12 +2804,17 @@ impl Gemma4GpuModel {
                     head_dim as u32,
                     eps,
                 );
-                self.ctx.encode_rotary(
+                let rope_off = self.decode_rope_byte_offset(layer_idx);
+                self.ctx.encode_rotary_at(
                     encoder,
                     &self.q_buf,
+                    0,
                     &self.k_normed_buf,
-                    &self.per_layer_cos_bufs[layer_idx],
-                    &self.per_layer_sin_bufs[layer_idx],
+                    0,
+                    &self.decode_rope_cos_packed,
+                    rope_off,
+                    &self.decode_rope_sin_packed,
+                    rope_off,
                     0,
                     num_kv_heads as u32,
                     head_dim as u32,
@@ -1582,25 +2830,73 @@ impl Gemma4GpuModel {
                     eps,
                 );
 
-                // Append to this layer's cache (f16)
-                self.ctx.encode_kv_append_f16(
-                    encoder,
-                    &self.k_normed_buf,
-                    &self.k_cache[layer_idx],
-                    num_kv_heads as u32,
-                    head_dim as u32,
-                    self.kv_capacity,
-                    kv_seq,
-                );
-                self.ctx.encode_kv_append_f16(
-                    encoder,
-                    &self.gate_buf,
-                    &self.v_cache[layer_idx],
-                    num_kv_heads as u32,
-                    head_dim as u32,
-                    self.kv_capacity,
-                    kv_seq,
-                );
+                // Append to this layer's cache
+                match self.kv_cache_type {
+                    KvCacheType::F16 => {
+                        self.ctx.encode_kv_append_f16(
+                            encoder,
+                            &self.k_normed_buf,
+                            &self.k_cache[layer_idx],
+                            num_kv_heads as u32,
+                            head_dim as u32,
+                            self.kv_capacity,
+                            kv_seq,
+                        );
+                        self.ctx.encode_kv_append_f16(
+                            encoder,
+                            &self.gate_buf,
+                            &self.v_cache[layer_idx],
+                            num_kv_heads as u32,
+                            head_dim as u32,
+                            self.kv_capacity,
+                            kv_seq,
+                        );
+                    }
+                    KvCacheType::Q8_0 => {
+                        self.ctx.encode_kv_append_q8_0(
+                            encoder,
+                            &self.k_normed_buf,
+                            &self.k_cache[layer_idx],
+                            num_kv_heads as u32,
+                            head_dim as u32,
+                            self.kv_capacity,
+                            kv_seq,
+                        );
+                        self.ctx.encode_kv_append_q8_0(
+                            encoder,
+                            &self.gate_buf,
+                            &self.v_cache[layer_idx],
+                            num_kv_heads as u32,
+                            head_dim as u32,
+                            self.kv_capacity,
+                            kv_seq,
+                        );
+                    }
+                    KvCacheType::Q4_0 => {
+                        if !(self.ctx.use_flash_attention
+                            && crate::gpu::fused_kv_attention_enabled())
+                        {
+                            self.ctx.encode_kv_append_q4_0(
+                                encoder,
+                                &self.k_normed_buf,
+                                &self.k_cache[layer_idx],
+                                num_kv_heads as u32,
+                                head_dim as u32,
+                                self.kv_capacity,
+                                kv_seq,
+                            );
+                            self.ctx.encode_kv_append_q4_0(
+                                encoder,
+                                &self.gate_buf,
+                                &self.v_cache[layer_idx],
+                                num_kv_heads as u32,
+                                head_dim as u32,
+                                self.kv_capacity,
+                                kv_seq,
+                            );
+                        }
+                    }
+                }
             }
 
             // Attention
@@ -1620,24 +2916,235 @@ impl Gemma4GpuModel {
                 0u32
             };
 
-            self.ctx.encode_attention_with_offset_f16(
-                encoder,
-                &self.q_normed_buf,
-                &self.k_cache[layer.kv_source_layer],
-                &self.v_cache[layer.kv_source_layer],
-                &self.attn_out_buf,
-                num_heads as u32,
-                num_kv_heads as u32,
-                num_kv_groups,
-                head_dim as u32,
-                effective_kv_seq,
-                self.kv_capacity,
-                scale,
-                kv_start,
-            );
+            match self.kv_cache_type {
+                KvCacheType::F16 => {
+                    if crate::gpu::attention_gqa_f16_enabled(num_kv_groups) {
+                        self.ctx.encode_attention_with_offset_f16_gqa_at(
+                            encoder,
+                            &self.q_normed_buf,
+                            0,
+                            &self.k_cache[layer.kv_source_layer],
+                            &self.v_cache[layer.kv_source_layer],
+                            &self.attn_out_buf,
+                            0,
+                            num_heads as u32,
+                            num_kv_heads as u32,
+                            num_kv_groups,
+                            head_dim as u32,
+                            effective_kv_seq,
+                            self.kv_capacity,
+                            scale,
+                            kv_start,
+                        );
+                    } else {
+                        self.ctx.encode_attention_with_offset_f16(
+                            encoder,
+                            &self.q_normed_buf,
+                            &self.k_cache[layer.kv_source_layer],
+                            &self.v_cache[layer.kv_source_layer],
+                            &self.attn_out_buf,
+                            num_heads as u32,
+                            num_kv_heads as u32,
+                            num_kv_groups,
+                            head_dim as u32,
+                            effective_kv_seq,
+                            self.kv_capacity,
+                            scale,
+                            kv_start,
+                        );
+                    }
+                }
+                KvCacheType::Q8_0 => {
+                    let groups_per_row = (head_dim / 32) as u32;
+                    let row_bytes = groups_per_row * 34;
+                    self.ctx.encode_attention_with_offset_q8_0(
+                        encoder,
+                        &self.q_normed_buf,
+                        &self.k_cache[layer.kv_source_layer],
+                        &self.v_cache[layer.kv_source_layer],
+                        &self.attn_out_buf,
+                        num_heads as u32,
+                        num_kv_heads as u32,
+                        num_kv_groups,
+                        head_dim as u32,
+                        effective_kv_seq,
+                        self.kv_capacity,
+                        scale,
+                        kv_start,
+                        groups_per_row,
+                        row_bytes,
+                    );
+                }
+                KvCacheType::Q4_0 => {
+                    let groups_per_row = (head_dim / 32) as u32;
+                    let row_bytes = groups_per_row * 18;
+                    if use_fused_k_attn {
+                        self.ctx.encode_attention_full_fused_q4_0(
+                            encoder,
+                            &self.q_buf,
+                            &layer.q_norm_weight,
+                            &self.decode_rope_cos_packed,
+                            rope_off,
+                            &self.decode_rope_sin_packed,
+                            rope_off,
+                            &self.k_buf,
+                            &layer.k_norm_weight,
+                            &self.v_buf,
+                            &self.attn_out_buf,
+                            &self.k_cache[layer.kv_source_layer],
+                            &self.v_cache[layer.kv_source_layer],
+                            num_heads as u32,
+                            num_kv_heads as u32,
+                            num_kv_groups,
+                            head_dim as u32,
+                            effective_kv_seq,
+                            self.kv_capacity,
+                            scale,
+                            kv_start,
+                            kv_seq,
+                            groups_per_row,
+                            row_bytes,
+                            eps,
+                        );
+                    } else if use_fused_q_attn && layer.has_kv && crate::gpu::fused_kv_attention_enabled() {
+                        self.ctx.encode_attention_fused_qknorm_rope_q4_0(
+                            encoder,
+                            &self.q_buf,
+                            &layer.q_norm_weight,
+                            &self.decode_rope_cos_packed,
+                            rope_off,
+                            &self.decode_rope_sin_packed,
+                            rope_off,
+                            &self.k_normed_buf,
+                            &self.gate_buf,
+                            &self.attn_out_buf,
+                            &self.k_cache[layer.kv_source_layer],
+                            &self.v_cache[layer.kv_source_layer],
+                            num_heads as u32,
+                            num_kv_heads as u32,
+                            num_kv_groups,
+                            head_dim as u32,
+                            effective_kv_seq,
+                            self.kv_capacity,
+                            scale,
+                            kv_start,
+                            kv_seq,
+                            groups_per_row,
+                            row_bytes,
+                            eps,
+                        );
+                    } else if use_fused_q_attn {
+                        self.ctx.encode_attention_qknorm_rope_q4_0(
+                            encoder,
+                            &self.q_buf,
+                            &layer.q_norm_weight,
+                            &self.decode_rope_cos_packed,
+                            rope_off,
+                            &self.decode_rope_sin_packed,
+                            rope_off,
+                            &self.k_cache[layer.kv_source_layer],
+                            &self.v_cache[layer.kv_source_layer],
+                            &self.attn_out_buf,
+                            num_heads as u32,
+                            num_kv_heads as u32,
+                            num_kv_groups,
+                            head_dim as u32,
+                            effective_kv_seq,
+                            self.kv_capacity,
+                            scale,
+                            kv_start,
+                            groups_per_row,
+                            row_bytes,
+                            eps,
+                        );
+                    } else if crate::gpu::attention_use_ggml_for_layer(layer.has_kv)
+                        && self.ctx.use_flash_attention
+                    {
+                        self.ctx.encode_attention_ggml_q4_0(
+                            encoder,
+                            &self.q_normed_buf,
+                            &self.k_cache[layer.kv_source_layer],
+                            &self.v_cache[layer.kv_source_layer],
+                            &self.attn_out_buf,
+                            num_heads as u32,
+                            num_kv_heads as u32,
+                            head_dim as u32,
+                            effective_kv_seq,
+                            self.kv_capacity,
+                            scale,
+                            kv_start,
+                            row_bytes,
+                        );
+                    } else if layer.has_kv
+                        && self.ctx.use_flash_attention
+                        && crate::gpu::fused_kv_attention_enabled()
+                    {
+                        self.ctx.encode_attention_fused_q4_0(
+                            encoder,
+                            &self.q_normed_buf,
+                            &self.k_normed_buf,
+                            &self.gate_buf,
+                            &self.attn_out_buf,
+                            &self.k_cache[layer.kv_source_layer],
+                            &self.v_cache[layer.kv_source_layer],
+                            num_heads as u32,
+                            num_kv_heads as u32,
+                            num_kv_groups,
+                            head_dim as u32,
+                            effective_kv_seq,
+                            self.kv_capacity,
+                            scale,
+                            kv_start,
+                            kv_seq,
+                            groups_per_row,
+                            row_bytes,
+                        );
+                    } else if self.ctx.use_flash_attention
+                        && num_kv_groups > 1
+                        && (8 % num_kv_groups) == 0
+                        && crate::gpu::attention_gqa_q4_0_enabled(num_kv_groups)
+                    {
+                        self.ctx.encode_attention_with_offset_q4_0_gqa(
+                            encoder,
+                            &self.q_normed_buf,
+                            &self.k_cache[layer.kv_source_layer],
+                            &self.v_cache[layer.kv_source_layer],
+                            &self.attn_out_buf,
+                            num_heads as u32,
+                            num_kv_heads as u32,
+                            num_kv_groups,
+                            head_dim as u32,
+                            effective_kv_seq,
+                            self.kv_capacity,
+                            scale,
+                            kv_start,
+                            groups_per_row,
+                            row_bytes,
+                        );
+                    } else {
+                        self.ctx.encode_attention_with_offset_q4_0(
+                            encoder,
+                            &self.q_normed_buf,
+                            &self.k_cache[layer.kv_source_layer],
+                            &self.v_cache[layer.kv_source_layer],
+                            &self.attn_out_buf,
+                            num_heads as u32,
+                            num_kv_heads as u32,
+                            num_kv_groups,
+                            head_dim as u32,
+                            effective_kv_seq,
+                            self.kv_capacity,
+                            scale,
+                            kv_start,
+                            groups_per_row,
+                            row_bytes,
+                        );
+                    }
+                }
+            }
 
-            // O projection (always f16 for quality)
-            self.ctx.encode_matvec_f16(
+            // O projection (Q4 on middle layers, f16 on sensitive layers)
+            self.ctx.encode_matvec_auto_view(
                 encoder,
                 &layer.o_proj,
                 &self.attn_out_buf,
@@ -1646,47 +3153,49 @@ impl Gemma4GpuModel {
                 q_out as u32,
             );
 
-            // Post-attention norm (cannot be in-place, use normed_buf as temp)
-            self.ctx.encode_rmsnorm(
+            // Post-attention norm + residual add (3→1: proj + norm + residual)
+            encode_proj_norm_residual(
+                &self.ctx,
                 encoder,
+                &self.hidden_buf,
                 &self.o_out_buf,
                 &layer.post_attention_layernorm_weight,
-                &self.normed_buf,
+                &self.hidden_buf,
                 hidden_size as u32,
                 eps,
             );
+            } // !skip_attn
+            if let Some(p) = &mut __gpu_prof {
+                p.mark(&encoder);
+            }
 
-            // Residual add: hidden = residual + normed_attn_output
-            self.ctx.encode_vec_add(
-                encoder,
-                &self.residual_buf,
-                &self.normed_buf,
-                &self.hidden_buf,
-                hidden_size as u32,
-            );
+            // Phase boundary: attention block (profiling only).
+            if __pp {
+                encoder.end_encoding();
+                let __pt = std::time::Instant::now();
+                cmd.commit();
+                cmd.wait_until_completed();
+                Self::phase_accum(1, __pt.elapsed().as_secs_f64() * 1e3);
+                cmd = self.ctx.queue.new_command_buffer();
+                encoder = cmd.new_compute_command_encoder();
+            }
 
             // ─── MLP Block ───
-            // Save residual
-            self.ctx.encode_copy(
-                encoder,
-                &self.hidden_buf,
-                &self.residual_buf,
-                hidden_size as u32,
-            );
+            // hidden_buf is the residual; it is only read (by the pre-FF norm)
+            // until the residual add below, so no save-residual copy is needed.
 
-            // Pre-feedforward norm
-            self.ctx.encode_rmsnorm(
-                encoder,
-                &self.hidden_buf,
-                &layer.pre_feedforward_layernorm_weight,
-                &self.normed_buf,
-                hidden_size as u32,
-                eps,
-            );
-
+            if !__ablate.skip_mlp() {
             // MLP: gate_proj, up_proj, GeLU activation, down_proj
-            if layer.use_f16 {
-                self.ctx.encode_matvec_f16(
+            if layer.weight_format == WeightFormat::F16 {
+                self.ctx.encode_rmsnorm_view(
+                    encoder,
+                    &self.hidden_buf,
+                    &layer.pre_feedforward_layernorm_weight,
+                    &self.normed_buf,
+                    hidden_size as u32,
+                    eps,
+                );
+                self.ctx.encode_matvec_f16_view(
                     encoder,
                     &layer.gate_proj,
                     &self.normed_buf,
@@ -1694,7 +3203,7 @@ impl Gemma4GpuModel {
                     intermediate_size as u32,
                     hidden_size as u32,
                 );
-                self.ctx.encode_matvec_f16(
+                self.ctx.encode_matvec_f16_view(
                     encoder,
                     &layer.up_proj,
                     &self.normed_buf,
@@ -1702,99 +3211,251 @@ impl Gemma4GpuModel {
                     intermediate_size as u32,
                     hidden_size as u32,
                 );
+                self.ctx.encode_gelu_mul(
+                    encoder,
+                    &self.gate_buf,
+                    &self.up_buf,
+                    &self.gelu_buf,
+                    intermediate_size as u32,
+                );
+                self.ctx.encode_matvec_f16_view(
+                    encoder,
+                    &layer.down_proj,
+                    &self.gelu_buf,
+                    &self.down_buf,
+                    hidden_size as u32,
+                    intermediate_size as u32,
+                );
+            } else if crate::gpu::fused_mlp_gelu_down_enabled()
+                && crate::gpu::fused_rmsnorm_mlp_enabled()
+                && Self::use_packed_mlp_gate_up(layer)
+                && crate::gpu::weight_buf_is_q4(
+                    &layer.gate_proj,
+                    intermediate_size as u32,
+                    hidden_size as u32,
+                )
+            {
+                self.ctx.encode_mlp_fused_q4_gelu_down_packed_from_hidden_at_view(
+                    encoder,
+                    &layer.gate_up_proj,
+                    &layer.down_proj,
+                    &layer.pre_feedforward_layernorm_weight,
+                    &self.hidden_buf,
+                    0,
+                    &self.inv_rms_buf,
+                    0,
+                    &self.up_buf,
+                    0,
+                    &self.down_buf,
+                    0,
+                    hidden_size as u32,
+                    intermediate_size as u32,
+                    eps,
+                );
+            } else if crate::gpu::fused_mlp_gelu_down_enabled()
+                && !layer.weight_format.is_q3()
+                && crate::gpu::weight_buf_is_q4(
+                    &layer.gate_proj,
+                    intermediate_size as u32,
+                    hidden_size as u32,
+                )
+            {
+                self.ctx.encode_rmsnorm_view(
+                    encoder,
+                    &self.hidden_buf,
+                    &layer.pre_feedforward_layernorm_weight,
+                    &self.normed_buf,
+                    hidden_size as u32,
+                    eps,
+                );
+                if Self::use_packed_mlp_gate_up(layer) {
+                    if crate::gpu::mlp_gate_up_ggml_enabled() {
+                        self.ctx.encode_mlp_fused_q4_gelu_down_ggml_at_view(
+                            encoder,
+                            &layer.gate_proj,
+                            &layer.up_proj,
+                            &layer.down_proj,
+                            &self.normed_buf,
+                            0,
+                            &self.gate_buf,
+                            &self.up_buf,
+                            &self.gelu_buf,
+                            0,
+                            &self.down_buf,
+                            0,
+                            hidden_size as u32,
+                            intermediate_size as u32,
+                        );
+                    } else {
+                        self.ctx.encode_mlp_fused_q4_gelu_down_packed_at_view(
+                            encoder,
+                            &layer.gate_up_proj,
+                            &layer.down_proj,
+                            &self.normed_buf,
+                            0,
+                            &self.up_buf,
+                            0,
+                            &self.down_buf,
+                            0,
+                            hidden_size as u32,
+                            intermediate_size as u32,
+                        );
+                    }
+                } else {
+                    self.ctx.encode_mlp_fused_q4_gelu_down_view(
+                        encoder,
+                        &layer.gate_proj,
+                        &layer.up_proj,
+                        &layer.down_proj,
+                        &self.normed_buf,
+                        &self.gelu_buf,
+                        &self.down_buf,
+                        hidden_size as u32,
+                        intermediate_size as u32,
+                    );
+                }
+            } else if Self::use_packed_mlp_gate_up(layer)
+                || layer.weight_format.is_q3()
+                || crate::gpu::fused_mlp_ple_enabled()
+            {
+                self.ctx.encode_rmsnorm_view(
+                    encoder,
+                    &self.hidden_buf,
+                    &layer.pre_feedforward_layernorm_weight,
+                    &self.normed_buf,
+                    hidden_size as u32,
+                    eps,
+                );
+                self.encode_mlp_gate_up_gelu_q4_view(
+                    encoder,
+                    layer,
+                    &self.normed_buf,
+                    &self.gelu_buf,
+                    intermediate_size as u32,
+                    hidden_size as u32,
+                );
+                self.encode_matvec_quant(
+                    encoder,
+                    &layer.down_proj,
+                    &self.gelu_buf,
+                    &self.down_buf,
+                    hidden_size as u32,
+                    intermediate_size as u32,
+                    layer.weight_format,
+                );
             } else {
-                self.ctx.encode_matvec_q4(
+                self.ctx.encode_rmsnorm_view(
+                    encoder,
+                    &self.hidden_buf,
+                    &layer.pre_feedforward_layernorm_weight,
+                    &self.normed_buf,
+                    hidden_size as u32,
+                    eps,
+                );
+                self.ctx.encode_matvec_q4_dual_view(
                     encoder,
                     &layer.gate_proj,
-                    &self.normed_buf,
-                    &self.gate_buf,
-                    intermediate_size as u32,
-                    hidden_size as u32,
-                );
-                self.ctx.encode_matvec_q4(
-                    encoder,
                     &layer.up_proj,
                     &self.normed_buf,
+                    &self.gate_buf,
                     &self.up_buf,
                     intermediate_size as u32,
                     hidden_size as u32,
                 );
-            }
-            self.ctx.encode_gelu_mul(
-                encoder,
-                &self.gate_buf,
-                &self.up_buf,
-                &self.gelu_buf,
-                intermediate_size as u32,
-            );
-            if layer.use_f16 {
-                self.ctx.encode_matvec_f16(
+                self.ctx.encode_gelu_mul(
+                    encoder,
+                    &self.gate_buf,
+                    &self.up_buf,
+                    &self.gelu_buf,
+                    intermediate_size as u32,
+                );
+                self.encode_matvec_quant(
                     encoder,
                     &layer.down_proj,
                     &self.gelu_buf,
                     &self.down_buf,
                     hidden_size as u32,
                     intermediate_size as u32,
+                    layer.weight_format,
+                );
+            }
+
+            // Post-feedforward norm + residual add
+            if crate::gpu::fused_rmsnorm_acc_enabled() {
+                self.ctx.encode_rmsnorm_acc_view(
+                    encoder,
+                    &self.hidden_buf,
+                    &self.down_buf,
+                    &layer.post_feedforward_layernorm_weight,
+                    hidden_size as u32,
+                    eps,
                 );
             } else {
-                self.ctx.encode_matvec_q4(
+                self.ctx.encode_rmsnorm_view(
                     encoder,
-                    &layer.down_proj,
-                    &self.gelu_buf,
                     &self.down_buf,
+                    &layer.post_feedforward_layernorm_weight,
+                    &self.normed_buf,
                     hidden_size as u32,
-                    intermediate_size as u32,
+                    eps,
+                );
+                self.ctx.encode_vec_add(
+                    encoder,
+                    &self.hidden_buf,
+                    &self.normed_buf,
+                    &self.hidden_buf,
+                    hidden_size as u32,
                 );
             }
-
-            // Post-feedforward norm (cannot be in-place, use normed_buf as temp)
-            self.ctx.encode_rmsnorm(
-                encoder,
-                &self.down_buf,
-                &layer.post_feedforward_layernorm_weight,
-                &self.normed_buf,
-                hidden_size as u32,
-                eps,
-            );
-
-            // Residual add: hidden = residual + normed_mlp_output
-            self.ctx.encode_vec_add(
-                encoder,
-                &self.residual_buf,
-                &self.normed_buf,
-                &self.hidden_buf,
-                hidden_size as u32,
-            );
+            } // !skip_mlp
+            if let Some(p) = &mut __gpu_prof {
+                p.mark(&encoder);
+            }
 
             // ─── Per-Layer Embedding (PLE) — after MLP, before layer_scalar ───
-            // Save residual for PLE
-            self.ctx.encode_copy(
-                encoder,
-                &self.hidden_buf,
-                &self.residual_buf,
-                hidden_size as u32,
-            );
+            if !__ablate.skip_ple() {
+            // hidden_buf is the residual; it is only read (by the input gate
+            // matvec) until the residual add below, so no save copy is needed.
             // Gate: ple_gated = per_layer_input_gate(hidden) → [ple_dim]
-            self.ctx.encode_matvec_f16(
-                encoder,
-                &layer.per_layer_input_gate_weight,
-                &self.hidden_buf,
-                &self.ple_gated_buf,
-                ple_dim as u32,
-                hidden_size as u32,
-            );
-            // GeLU activation (PLE uses GeLU, not the model's hidden_activation)
-            // Reuse gelu_mul with up=ple_embed (element-wise multiply after gelu)
-            // gelu_mul does: out = gelu(gate) * up
-            self.ctx.encode_gelu_mul(
-                encoder,
-                &self.ple_gated_buf,
-                &self.per_layer_ple_bufs[layer_idx],
-                &self.ple_normed_buf,
-                ple_dim as u32,
-            );
+            if crate::gpu::fused_mlp_ple_enabled()
+                && crate::gpu::weight_buf_is_q4(
+                    &layer.per_layer_input_gate_weight,
+                    ple_dim as u32,
+                    hidden_size as u32,
+                )
+            {
+                self.ctx.encode_ple_matvec_gelu_q4_view(
+                    encoder,
+                    &layer.per_layer_input_gate_weight,
+                    &self.hidden_buf,
+                    &self.ple_context_proj_buf,
+                    (layer_idx * ple_dim * 4) as u64,
+                    &self.ple_normed_buf,
+                    ple_dim as u32,
+                    hidden_size as u32,
+                );
+            } else {
+                self.ctx.encode_matvec_auto_view(
+                    encoder,
+                    &layer.per_layer_input_gate_weight,
+                    &self.hidden_buf,
+                    &self.ple_gated_buf,
+                    ple_dim as u32,
+                    hidden_size as u32,
+                );
+                self.ctx.encode_gelu_mul_at(
+                    encoder,
+                    &self.ple_gated_buf,
+                    0,
+                    &self.ple_context_proj_buf,
+                    (layer_idx * ple_dim * 4) as u64,
+                    &self.ple_normed_buf,
+                    0,
+                    ple_dim as u32,
+                );
+            }
             // Project back: ple_projected = per_layer_projection(ple_normed) → [hidden]
-            self.ctx.encode_matvec_f16(
+            self.ctx.encode_matvec_auto_view(
                 encoder,
                 &layer.per_layer_projection_weight,
                 &self.ple_normed_buf,
@@ -1802,51 +3463,64 @@ impl Gemma4GpuModel {
                 hidden_size as u32,
                 ple_dim as u32,
             );
-            // Post-PLE norm
-            self.ctx.encode_rmsnorm(
+            // Post-PLE norm + residual add (3→1: proj + norm + residual)
+            encode_proj_norm_residual(
+                &self.ctx,
                 encoder,
+                &self.hidden_buf,
                 &self.ple_projected_buf,
                 &layer.post_per_layer_input_norm_weight,
-                &self.o_out_buf,
+                &self.hidden_buf,
                 hidden_size as u32,
                 eps,
             );
-            // Residual: hidden = hidden + ple_output
-            self.ctx.encode_vec_add(
-                encoder,
-                &self.residual_buf,
-                &self.o_out_buf,
-                &self.hidden_buf,
-                hidden_size as u32,
-            );
 
-            // Layer scalar: hidden *= layer_scalar (prevents signal growth across layers)
-            // Use residual_buf as temp to avoid in-place read/write race
+            } // !skip_ple (per-layer)
+
+            // Layer scalar (in place): hidden *= layer_scalar. vec_scale is a
+            // pure elementwise map (dst[i] = scale * src[i]), so src == dst is
+            // race-free and the temp copy is unnecessary.
             self.ctx.encode_vec_scale(
                 encoder,
                 &self.hidden_buf,
-                &self.residual_buf,
+                &self.hidden_buf,
                 hidden_size as u32,
                 layer.layer_scalar,
             );
-            self.ctx.encode_copy(
-                encoder,
-                &self.residual_buf,
-                &self.hidden_buf,
-                hidden_size as u32,
-            );
+            if let Some(p) = &mut __gpu_prof {
+                p.mark(&encoder);
+            }
 
-            encoder.end_encoding();
+            // Phase boundary: MLP + PLE block (profiling only).
+            if __pp {
+                encoder.end_encoding();
+                let __pt = std::time::Instant::now();
+                cmd.commit();
+                cmd.wait_until_completed();
+                Self::phase_accum(2, __pt.elapsed().as_secs_f64() * 1e3);
+                cmd = self.ctx.queue.new_command_buffer();
+                encoder = cmd.new_compute_command_encoder();
+            }
         }
 
-        // Commit all layer work
-        cmd.commit();
-        cmd.wait_until_completed();
+        if matches!(mode, DecodeMode::Advance) {
+            encoder.end_encoding();
+            let __t_encode = std::time::Instant::now();
+            cmd.commit();
+            cmd.wait_until_completed();
+            let __t_gpu = std::time::Instant::now();
+            if __profile {
+                Self::profile_record(__t0, __t_prep, __t_encode, __t_gpu);
+            }
+            self.total_tokens += 1;
+            self.kv_seq_len += 1;
+            return DecodeOutput::Advanced;
+        }
 
-        // Final norm
-        let cmd = self.ctx.queue.new_command_buffer();
-        let encoder = cmd.new_compute_command_encoder();
-        self.ctx.encode_rmsnorm(
+        // ─── Final norm + LM head (+ optional sampling) — same encoder ───
+        let cap = self.config.final_logit_softcapping;
+        if !__ablate.skip_head() {
+        self.ctx.encode_rmsnorm_view(
             encoder,
             &self.hidden_buf,
             &self.final_norm_weight,
@@ -1854,43 +3528,158 @@ impl Gemma4GpuModel {
             hidden_size as u32,
             eps,
         );
-        encoder.end_encoding();
-
-        // Submit and wait
-        cmd.commit();
-        cmd.wait_until_completed();
-
-        // Compute logits using GPU (tied embeddings = embed_tokens as lm_head)
-        // Use matvec_f16: embed_tokens_f16 is (vocab_size, hidden_size) in bf16
-        let cmd2 = self.ctx.queue.new_command_buffer();
-        let enc2 = cmd2.new_compute_command_encoder();
-        self.ctx.encode_matvec_q4(
-            enc2,
+        // Logits via tied embeddings (Q4 lm_head): logits = lm_head @ normed
+        self.ctx.encode_matvec_q4_view(
+            encoder,
             &self.lm_head_buf,
             &self.normed_buf,
             &self.logits_buf,
             vocab_size as u32,
             hidden_size as u32,
         );
-        enc2.end_encoding();
-        cmd2.commit();
-        cmd2.wait_until_completed();
 
-        let mut logits = MetalContext::read_buffer(&self.logits_buf, vocab_size);
-
-        // Logit softcapping: logits = cap * tanh(logits / cap)
-        // Clamp input to tanh to prevent NaN from overflow (same issue as GeLU)
-        let cap = self.config.final_logit_softcapping;
-        for l in logits.iter_mut() {
-            let x = (*l / cap).clamp(-10.0, 10.0);
-            *l = cap * x.tanh();
+        } // !skip_head
+        if let Some(p) = &mut __gpu_prof {
+            p.mark(&encoder);
         }
+
+        let output = match mode {
+            DecodeMode::Sample(temperature, min_p, seed) => {
+                if __ablate.skip_head() {
+                    MetalContext::write_u32_buffer(&self.sample_out_buf, &[0]);
+                } else {
+                // GPU-side softcap + min-p sampling; read back only the token id.
+                self.ctx.encode_sample(
+                    encoder,
+                    &self.logits_buf,
+                    &self.sample_out_buf,
+                    vocab_size as u32,
+                    cap,
+                    temperature,
+                    min_p,
+                    seed,
+                );
+                }
+                encoder.end_encoding();
+                if let Some(p) = &__gpu_prof {
+                    p.resolve(&cmd);
+                }
+                let __t_encode = std::time::Instant::now();
+                cmd.commit();
+                cmd.wait_until_completed();
+                let __t_gpu = std::time::Instant::now();
+                if let Some(p) = &__gpu_prof {
+                    p.ingest(actual_num_layers as u32);
+                }
+                if __pp {
+                    Self::phase_accum(3, (__t_gpu - __t_encode).as_secs_f64() * 1e3);
+                    Self::phase_end_token();
+                }
+                let tok = MetalContext::read_u32(&self.sample_out_buf) as usize;
+                if __profile {
+                    Self::profile_record(__t0, __t_prep, __t_encode, __t_gpu);
+                }
+                DecodeOutput::Token(tok)
+            }
+            DecodeMode::Logits => {
+                encoder.end_encoding();
+                if let Some(p) = &__gpu_prof {
+                    p.resolve(&cmd);
+                }
+                let __t_encode = std::time::Instant::now();
+                cmd.commit();
+                cmd.wait_until_completed();
+                let __t_gpu = std::time::Instant::now();
+                if let Some(p) = &__gpu_prof {
+                    p.ingest(actual_num_layers as u32);
+                }
+                if __pp {
+                    Self::phase_accum(3, (__t_gpu - __t_encode).as_secs_f64() * 1e3);
+                    Self::phase_end_token();
+                }
+
+                let mut logits = MetalContext::read_buffer(&self.logits_buf, vocab_size);
+                // Logit softcapping: logits = cap * tanh(logits / cap)
+                // Clamp input to tanh to prevent NaN from overflow.
+                for l in logits.iter_mut() {
+                    let x = (*l / cap).clamp(-10.0, 10.0);
+                    *l = cap * x.tanh();
+                }
+                if __profile {
+                    Self::profile_record(__t0, __t_prep, __t_encode, __t_gpu);
+                }
+                DecodeOutput::Logits(logits)
+            }
+            DecodeMode::Advance => unreachable!(),
+        };
 
         // Update state
         self.total_tokens += 1;
         self.kv_seq_len += 1;
 
-        logits
+        output
+    }
+
+    // Per-phase GPU-time accumulators (PROFILE_PHASES). Index: 0=prepass,
+    // 1=attention, 2=mlp+ple, 3=head. Sums + token count live in a module-level
+    // thread-local (PHASE_STATE) so both helpers share the same window.
+    fn phase_accum(idx: usize, ms: f64) {
+        PHASE_STATE.with(|s| {
+            let mut v = s.get();
+            v.sums[idx] += ms;
+            s.set(v);
+        });
+    }
+
+    fn phase_end_token() {
+        PHASE_STATE.with(|s| {
+            let mut v = s.get();
+            v.count += 1;
+            s.set(v);
+            if v.count % 16 == 0 {
+                let c = v.count as f64;
+                let s0 = v.sums[0] / c;
+                let s1 = v.sums[1] / c;
+                let s2 = v.sums[2] / c;
+                let s3 = v.sums[3] / c;
+                eprintln!(
+                    "[phase profile] n={} avg/token commit->wait ms (incl per-phase sync): prepass={:.2} attention={:.2} mlp_ple={:.2} head={:.2} sum={:.2}",
+                    v.count, s0, s1, s2, s3, s0 + s1 + s2 + s3
+                );
+            }
+        });
+    }
+
+    fn profile_record(
+        t0: std::time::Instant,
+        t_prep: std::time::Instant,
+        t_encode: std::time::Instant,
+        t_gpu: std::time::Instant,
+    ) {
+        use std::cell::Cell;
+        thread_local! {
+            static ACC: Cell<(f64, f64, f64, f64, u64)> = Cell::new((0.0, 0.0, 0.0, 0.0, 0));
+        }
+        let prep = (t_prep - t0).as_secs_f64() * 1e3;
+        let encode = (t_encode - t_prep).as_secs_f64() * 1e3;
+        let gpu = (t_gpu - t_encode).as_secs_f64() * 1e3;
+        let read = t_gpu.elapsed().as_secs_f64() * 1e3;
+        ACC.with(|a| {
+            let (mut p, mut e, mut g, mut r, mut n) = a.get();
+            p += prep;
+            e += encode;
+            g += gpu;
+            r += read;
+            n += 1;
+            if n % 16 == 0 {
+                let nf = n as f64;
+                eprintln!(
+                    "[decode profile] n={} avg/token: cpu_prep={:.2}ms encode={:.2}ms gpu_wait={:.2}ms readback={:.2}ms total={:.2}ms",
+                    n, p / nf, e / nf, g / nf, r / nf, (p + e + g + r) / nf
+                );
+            }
+            a.set((p, e, g, r, n));
+        });
     }
 
     pub fn num_items(&self) -> usize {
@@ -1904,7 +3693,7 @@ impl Gemma4GpuModel {
 
     pub fn create_kv_pool(&self, num_slots: usize, max_seq_len: u32) -> KvCachePool {
         let max_seq_len = max_seq_len.min(self.config.max_position_embeddings as u32);
-        KvCachePool::new(&self.ctx, &self.config, num_slots, max_seq_len)
+        KvCachePool::new(&self.ctx, &self.config, num_slots, max_seq_len, self.kv_cache_type)
     }
 
     pub fn max_parallel_prefill_seq(&self) -> usize {
@@ -2038,6 +3827,42 @@ impl Gemma4GpuModel {
         Ok(())
     }
 
+    fn prepare_batched_token_inputs(
+        &self,
+        token_ids: &[usize],
+    ) -> Result<BatchedTokenInputs, String> {
+        let hidden_size = self.config.hidden_size;
+        let num_layers = self.config.num_hidden_layers;
+        let ple_dim = self.config.hidden_size_per_layer_input;
+        let ple_total_dim = num_layers * ple_dim;
+
+        let mut hidden = vec![0.0f32; token_ids.len() * hidden_size];
+        let mut ple_token_identity = vec![0.0f32; token_ids.len() * ple_total_dim];
+
+        for (pos, &token_id) in token_ids.iter().enumerate() {
+            let hidden_offset = pos * hidden_size;
+            self.embed_tables.decode_embed_into(
+                token_id,
+                hidden_size,
+                &mut hidden[hidden_offset..hidden_offset + hidden_size],
+            );
+
+            let ple_out_offset = pos * ple_total_dim;
+            self.embed_tables.decode_ple_into(
+                token_id,
+                ple_total_dim,
+                ple_dim,
+                &mut ple_token_identity[ple_out_offset..ple_out_offset + ple_total_dim],
+            );
+        }
+
+        Ok(BatchedTokenInputs {
+            batch_size: token_ids.len(),
+            hidden,
+            ple_token_identity,
+        })
+    }
+
     fn prepare_decode_batch_rotary(&mut self, slot_views: &[KvSlotView]) -> Result<(), String> {
         for layer_idx in 0..self.layers.len() {
             let layer = &self.layers[layer_idx];
@@ -2141,58 +3966,6 @@ impl Gemma4GpuModel {
         Ok(())
     }
 
-    fn prepare_batched_token_inputs(
-        &self,
-        token_ids: &[usize],
-    ) -> Result<BatchedTokenInputs, String> {
-        let hidden_size = self.config.hidden_size;
-        let num_layers = self.config.num_hidden_layers;
-        let ple_dim = self.config.hidden_size_per_layer_input;
-        let ple_total_dim = num_layers * ple_dim;
-        let embed_scale = (hidden_size as f32).sqrt();
-        let ple_scale = (ple_dim as f32).sqrt();
-
-        let mut hidden = vec![0.0f32; token_ids.len() * hidden_size];
-        let mut ple_token_identity = vec![0.0f32; token_ids.len() * ple_total_dim];
-
-        for (pos, &token_id) in token_ids.iter().enumerate() {
-            let embed_offset = token_id
-                .checked_mul(hidden_size)
-                .ok_or_else(|| format!("token id {} overflowed embedding offset", token_id))?;
-            if embed_offset + hidden_size > self.embed_tokens_f16.len() {
-                return Err(format!("token id {} is outside embed_tokens", token_id));
-            }
-
-            let hidden_offset = pos * hidden_size;
-            for i in 0..hidden_size {
-                hidden[hidden_offset + i] =
-                    bf16_to_f32(self.embed_tokens_f16[embed_offset + i]) * embed_scale;
-            }
-
-            let ple_token_offset = token_id
-                .checked_mul(ple_total_dim)
-                .ok_or_else(|| format!("token id {} overflowed PLE offset", token_id))?;
-            if ple_token_offset + ple_total_dim > self.embed_tokens_per_layer_f16.len() {
-                return Err(format!(
-                    "token id {} is outside embed_tokens_per_layer",
-                    token_id
-                ));
-            }
-
-            let ple_out_offset = pos * ple_total_dim;
-            for i in 0..ple_total_dim {
-                ple_token_identity[ple_out_offset + i] =
-                    bf16_to_f32(self.embed_tokens_per_layer_f16[ple_token_offset + i]) * ple_scale;
-            }
-        }
-
-        Ok(BatchedTokenInputs {
-            batch_size: token_ids.len(),
-            hidden,
-            ple_token_identity,
-        })
-    }
-
     fn f32_byte_offset(elements: usize) -> u64 {
         (elements * std::mem::size_of::<f32>()) as u64
     }
@@ -2280,7 +4053,7 @@ impl Gemma4GpuModel {
         let encoder = cmd.new_compute_command_encoder();
         let total_ple = (seq_len * ple_total_dim) as u32;
 
-        self.ctx.encode_projection_q4_batch(
+        self.ctx.encode_projection_q4_batch_view(
             encoder,
             &self.per_layer_model_projection_weight,
             &self.prefill_scratch.hidden_buf,
@@ -2296,7 +4069,7 @@ impl Gemma4GpuModel {
             total_ple,
             context_proj_scale,
         );
-        self.ctx.encode_rmsnorm_batch(
+        self.ctx.encode_rmsnorm_batch_view(
             encoder,
             &self.prefill_scratch.ple_combined_buf,
             &self.per_layer_projection_norm_weight,
@@ -2328,7 +4101,7 @@ impl Gemma4GpuModel {
 
     fn encode_parallel_prefill_attention_inputs(
         &self,
-        encoder: &ComputeCommandEncoderRef,
+        encoder: &metal::ComputeCommandEncoderRef,
         layer_idx: usize,
         seq_len: usize,
     ) -> Result<(), String> {
@@ -2354,7 +4127,7 @@ impl Gemma4GpuModel {
         let kv_out = layer.kv_out_dim;
         let eps = self.config.rms_norm_eps as f32;
 
-        self.ctx.encode_rmsnorm_batch(
+        self.ctx.encode_rmsnorm_batch_view(
             encoder,
             &self.prefill_scratch.hidden_buf,
             &layer.input_layernorm_weight,
@@ -2364,8 +4137,8 @@ impl Gemma4GpuModel {
             seq_len as u32,
         );
 
-        if layer.use_f16 {
-            self.ctx.encode_projection_f16_batch(
+        if layer.weight_format == WeightFormat::F16 {
+            self.ctx.encode_projection_f16_batch_view(
                 encoder,
                 &layer.q_proj,
                 &self.prefill_scratch.normed_buf,
@@ -2375,7 +4148,7 @@ impl Gemma4GpuModel {
                 seq_len as u32,
             );
             if layer.has_kv {
-                self.ctx.encode_projection_f16_batch(
+                self.ctx.encode_projection_f16_batch_view(
                     encoder,
                     &layer.k_proj,
                     &self.prefill_scratch.normed_buf,
@@ -2384,7 +4157,7 @@ impl Gemma4GpuModel {
                     hidden_size as u32,
                     seq_len as u32,
                 );
-                self.ctx.encode_projection_f16_batch(
+                self.ctx.encode_projection_f16_batch_view(
                     encoder,
                     &layer.v_proj,
                     &self.prefill_scratch.normed_buf,
@@ -2394,8 +4167,8 @@ impl Gemma4GpuModel {
                     seq_len as u32,
                 );
             }
-        } else {
-            self.ctx.encode_projection_q4_batch(
+        } else if layer.weight_format == WeightFormat::Q4_0 {
+            self.ctx.encode_projection_q4_batch_view(
                 encoder,
                 &layer.q_proj,
                 &self.prefill_scratch.normed_buf,
@@ -2405,7 +4178,7 @@ impl Gemma4GpuModel {
                 seq_len as u32,
             );
             if layer.has_kv {
-                self.ctx.encode_projection_q4_batch(
+                self.ctx.encode_projection_q4_batch_view(
                     encoder,
                     &layer.k_proj,
                     &self.prefill_scratch.normed_buf,
@@ -2414,7 +4187,7 @@ impl Gemma4GpuModel {
                     hidden_size as u32,
                     seq_len as u32,
                 );
-                self.ctx.encode_projection_q4_batch(
+                self.ctx.encode_projection_q4_batch_view(
                     encoder,
                     &layer.v_proj,
                     &self.prefill_scratch.normed_buf,
@@ -2426,7 +4199,7 @@ impl Gemma4GpuModel {
             }
         }
 
-        self.ctx.encode_rmsnorm_batch(
+        self.ctx.encode_rmsnorm_batch_view(
             encoder,
             &self.prefill_scratch.q_buf,
             &layer.q_norm_weight,
@@ -2437,7 +4210,7 @@ impl Gemma4GpuModel {
         );
 
         if layer.has_kv {
-            self.ctx.encode_rmsnorm_batch(
+            self.ctx.encode_rmsnorm_batch_view(
                 encoder,
                 &self.prefill_scratch.k_buf,
                 &layer.k_norm_weight,
@@ -2559,26 +4332,74 @@ impl Gemma4GpuModel {
             let v_cache = kv_pool
                 .layer_v_cache(slot, layer_idx)
                 .map_err(|err| err.to_string())?;
-            self.ctx.encode_kv_batch_append_f16(
-                encoder,
-                &self.prefill_scratch.k_buf,
-                k_cache,
-                num_kv_heads as u32,
-                head_dim as u32,
-                kv_pool.capacity(),
-                start_pos as u32,
-                seq_len as u32,
-            );
-            self.ctx.encode_kv_batch_append_f16(
-                encoder,
-                &self.prefill_scratch.v_buf,
-                v_cache,
-                num_kv_heads as u32,
-                head_dim as u32,
-                kv_pool.capacity(),
-                start_pos as u32,
-                seq_len as u32,
-            );
+            match self.kv_cache_type {
+                KvCacheType::F16 => {
+                    self.ctx.encode_kv_batch_append_f16(
+                        encoder,
+                        &self.prefill_scratch.k_buf,
+                        k_cache,
+                        num_kv_heads as u32,
+                        head_dim as u32,
+                        kv_pool.capacity(),
+                        start_pos as u32,
+                        seq_len as u32,
+                    );
+                    self.ctx.encode_kv_batch_append_f16(
+                        encoder,
+                        &self.prefill_scratch.v_buf,
+                        v_cache,
+                        num_kv_heads as u32,
+                        head_dim as u32,
+                        kv_pool.capacity(),
+                        start_pos as u32,
+                        seq_len as u32,
+                    );
+                }
+                KvCacheType::Q8_0 => {
+                    self.ctx.encode_kv_batch_append_q8_0(
+                        encoder,
+                        &self.prefill_scratch.k_buf,
+                        k_cache,
+                        num_kv_heads as u32,
+                        head_dim as u32,
+                        kv_pool.capacity(),
+                        start_pos as u32,
+                        seq_len as u32,
+                    );
+                    self.ctx.encode_kv_batch_append_q8_0(
+                        encoder,
+                        &self.prefill_scratch.v_buf,
+                        v_cache,
+                        num_kv_heads as u32,
+                        head_dim as u32,
+                        kv_pool.capacity(),
+                        start_pos as u32,
+                        seq_len as u32,
+                    );
+                }
+                KvCacheType::Q4_0 => {
+                    self.ctx.encode_kv_batch_append_q4_0(
+                        encoder,
+                        &self.prefill_scratch.k_buf,
+                        k_cache,
+                        num_kv_heads as u32,
+                        head_dim as u32,
+                        kv_pool.capacity(),
+                        start_pos as u32,
+                        seq_len as u32,
+                    );
+                    self.ctx.encode_kv_batch_append_q4_0(
+                        encoder,
+                        &self.prefill_scratch.v_buf,
+                        v_cache,
+                        num_kv_heads as u32,
+                        head_dim as u32,
+                        kv_pool.capacity(),
+                        start_pos as u32,
+                        seq_len as u32,
+                    );
+                }
+            }
         }
 
         let k_cache = kv_pool
@@ -2587,23 +4408,73 @@ impl Gemma4GpuModel {
         let v_cache = kv_pool
             .layer_v_cache(slot, layer.kv_source_layer)
             .map_err(|err| err.to_string())?;
-        self.ctx.encode_attention_causal_f16(
-            encoder,
-            &self.prefill_scratch.q_buf,
-            k_cache,
-            v_cache,
-            &self.prefill_scratch.attn_out_buf,
-            num_heads as u32,
-            num_kv_heads as u32,
-            num_kv_groups,
-            head_dim as u32,
-            (start_pos + seq_len) as u32,
-            kv_pool.capacity(),
-            scale,
-            seq_len as u32,
-            start_pos as u32,
-            attention_window,
-        );
+        match self.kv_cache_type {
+            KvCacheType::F16 => {
+                self.ctx.encode_attention_causal_f16(
+                    encoder,
+                    &self.prefill_scratch.q_buf,
+                    k_cache,
+                    v_cache,
+                    &self.prefill_scratch.attn_out_buf,
+                    num_heads as u32,
+                    num_kv_heads as u32,
+                    num_kv_groups,
+                    head_dim as u32,
+                    (start_pos + seq_len) as u32,
+                    kv_pool.capacity(),
+                    scale,
+                    seq_len as u32,
+                    start_pos as u32,
+                    attention_window,
+                );
+            }
+            KvCacheType::Q8_0 => {
+                let groups_per_row = (head_dim / 32) as u32;
+                let row_bytes = groups_per_row * 34;
+                self.ctx.encode_attention_causal_q8_0(
+                    encoder,
+                    &self.prefill_scratch.q_buf,
+                    k_cache,
+                    v_cache,
+                    &self.prefill_scratch.attn_out_buf,
+                    num_heads as u32,
+                    num_kv_heads as u32,
+                    num_kv_groups,
+                    head_dim as u32,
+                    (start_pos + seq_len) as u32,
+                    kv_pool.capacity(),
+                    scale,
+                    seq_len as u32,
+                    start_pos as u32,
+                    attention_window,
+                    groups_per_row,
+                    row_bytes,
+                );
+            }
+            KvCacheType::Q4_0 => {
+                let groups_per_row = (head_dim / 32) as u32;
+                let row_bytes = groups_per_row * 18;
+                self.ctx.encode_attention_causal_q4_0(
+                    encoder,
+                    &self.prefill_scratch.q_buf,
+                    k_cache,
+                    v_cache,
+                    &self.prefill_scratch.attn_out_buf,
+                    num_heads as u32,
+                    num_kv_heads as u32,
+                    num_kv_groups,
+                    head_dim as u32,
+                    (start_pos + seq_len) as u32,
+                    kv_pool.capacity(),
+                    scale,
+                    seq_len as u32,
+                    start_pos as u32,
+                    attention_window,
+                    groups_per_row,
+                    row_bytes,
+                );
+            }
+        }
 
         self.ctx.encode_copy(
             encoder,
@@ -2619,7 +4490,7 @@ impl Gemma4GpuModel {
             num_heads as u32,
             head_dim as u32,
         );
-        self.ctx.encode_projection_f16_batch(
+        self.ctx.encode_projection_auto_batch_view(
             encoder,
             &layer.o_proj,
             &self.prefill_scratch.q_normed_buf,
@@ -2628,7 +4499,7 @@ impl Gemma4GpuModel {
             q_out as u32,
             seq_len as u32,
         );
-        self.ctx.encode_rmsnorm_batch(
+        self.ctx.encode_rmsnorm_batch_view(
             encoder,
             &self.prefill_scratch.o_out_buf,
             &layer.post_attention_layernorm_weight,
@@ -2651,7 +4522,7 @@ impl Gemma4GpuModel {
             &self.prefill_scratch.residual_buf,
             total_hidden,
         );
-        self.ctx.encode_rmsnorm_batch(
+        self.ctx.encode_rmsnorm_batch_view(
             encoder,
             &self.prefill_scratch.hidden_buf,
             &layer.pre_feedforward_layernorm_weight,
@@ -2660,8 +4531,8 @@ impl Gemma4GpuModel {
             eps,
             seq_len as u32,
         );
-        if layer.use_f16 {
-            self.ctx.encode_projection_f16_batch(
+        if layer.weight_format == WeightFormat::F16 {
+            self.ctx.encode_projection_f16_batch_view(
                 encoder,
                 &layer.gate_proj,
                 &self.prefill_scratch.normed_buf,
@@ -2670,7 +4541,7 @@ impl Gemma4GpuModel {
                 hidden_size as u32,
                 seq_len as u32,
             );
-            self.ctx.encode_projection_f16_batch(
+            self.ctx.encode_projection_f16_batch_view(
                 encoder,
                 &layer.up_proj,
                 &self.prefill_scratch.normed_buf,
@@ -2680,7 +4551,7 @@ impl Gemma4GpuModel {
                 seq_len as u32,
             );
         } else {
-            self.ctx.encode_projection_q4_batch(
+            self.ctx.encode_projection_q4_batch_view(
                 encoder,
                 &layer.gate_proj,
                 &self.prefill_scratch.normed_buf,
@@ -2689,7 +4560,7 @@ impl Gemma4GpuModel {
                 hidden_size as u32,
                 seq_len as u32,
             );
-            self.ctx.encode_projection_q4_batch(
+            self.ctx.encode_projection_q4_batch_view(
                 encoder,
                 &layer.up_proj,
                 &self.prefill_scratch.normed_buf,
@@ -2706,8 +4577,8 @@ impl Gemma4GpuModel {
             &self.prefill_scratch.gelu_buf,
             total_intermediate,
         );
-        if layer.use_f16 {
-            self.ctx.encode_projection_f16_batch(
+        if layer.weight_format == WeightFormat::F16 {
+            self.ctx.encode_projection_f16_batch_view(
                 encoder,
                 &layer.down_proj,
                 &self.prefill_scratch.gelu_buf,
@@ -2717,7 +4588,7 @@ impl Gemma4GpuModel {
                 seq_len as u32,
             );
         } else {
-            self.ctx.encode_projection_q4_batch(
+            self.ctx.encode_projection_q4_batch_view(
                 encoder,
                 &layer.down_proj,
                 &self.prefill_scratch.gelu_buf,
@@ -2727,7 +4598,7 @@ impl Gemma4GpuModel {
                 seq_len as u32,
             );
         }
-        self.ctx.encode_rmsnorm_batch(
+        self.ctx.encode_rmsnorm_batch_view(
             encoder,
             &self.prefill_scratch.down_buf,
             &layer.post_feedforward_layernorm_weight,
@@ -2750,7 +4621,7 @@ impl Gemma4GpuModel {
             &self.prefill_scratch.residual_buf,
             total_hidden,
         );
-        self.ctx.encode_projection_f16_batch(
+        self.ctx.encode_projection_auto_batch_view(
             encoder,
             &layer.per_layer_input_gate_weight,
             &self.prefill_scratch.hidden_buf,
@@ -2769,7 +4640,7 @@ impl Gemma4GpuModel {
             ple_dim as u32,
             seq_len as u32,
         );
-        self.ctx.encode_projection_f16_batch(
+        self.ctx.encode_projection_auto_batch_view(
             encoder,
             &layer.per_layer_projection_weight,
             &self.prefill_scratch.up_buf,
@@ -2778,7 +4649,7 @@ impl Gemma4GpuModel {
             ple_dim as u32,
             seq_len as u32,
         );
-        self.ctx.encode_rmsnorm_batch(
+        self.ctx.encode_rmsnorm_batch_view(
             encoder,
             &self.prefill_scratch.o_out_buf,
             &layer.post_per_layer_input_norm_weight,
@@ -2855,30 +4726,86 @@ impl Gemma4GpuModel {
                 let v_cache = kv_pool
                     .layer_v_cache(segment.slot, layer_idx)
                     .map_err(|err| err.to_string())?;
-                self.ctx.encode_kv_batch_append_strided_f16(
-                    encoder,
-                    &self.prefill_scratch.k_buf,
-                    k_cache,
-                    num_kv_heads as u32,
-                    head_dim as u32,
-                    kv_pool.capacity(),
-                    segment.start_pos as u32,
-                    segment.token_count as u32,
-                    total_seq_len as u32,
-                    segment.row_start as u32,
-                );
-                self.ctx.encode_kv_batch_append_strided_f16(
-                    encoder,
-                    &self.prefill_scratch.v_buf,
-                    v_cache,
-                    num_kv_heads as u32,
-                    head_dim as u32,
-                    kv_pool.capacity(),
-                    segment.start_pos as u32,
-                    segment.token_count as u32,
-                    total_seq_len as u32,
-                    segment.row_start as u32,
-                );
+                match self.kv_cache_type {
+                    KvCacheType::F16 => {
+                        self.ctx.encode_kv_batch_append_strided_f16(
+                            encoder,
+                            &self.prefill_scratch.k_buf,
+                            k_cache,
+                            num_kv_heads as u32,
+                            head_dim as u32,
+                            kv_pool.capacity(),
+                            segment.start_pos as u32,
+                            segment.token_count as u32,
+                            total_seq_len as u32,
+                            segment.row_start as u32,
+                        );
+                        self.ctx.encode_kv_batch_append_strided_f16(
+                            encoder,
+                            &self.prefill_scratch.v_buf,
+                            v_cache,
+                            num_kv_heads as u32,
+                            head_dim as u32,
+                            kv_pool.capacity(),
+                            segment.start_pos as u32,
+                            segment.token_count as u32,
+                            total_seq_len as u32,
+                            segment.row_start as u32,
+                        );
+                    }
+                    KvCacheType::Q8_0 => {
+                        self.ctx.encode_kv_batch_append_strided_q8_0(
+                            encoder,
+                            &self.prefill_scratch.k_buf,
+                            k_cache,
+                            num_kv_heads as u32,
+                            head_dim as u32,
+                            kv_pool.capacity(),
+                            segment.start_pos as u32,
+                            segment.token_count as u32,
+                            total_seq_len as u32,
+                            segment.row_start as u32,
+                        );
+                        self.ctx.encode_kv_batch_append_strided_q8_0(
+                            encoder,
+                            &self.prefill_scratch.v_buf,
+                            v_cache,
+                            num_kv_heads as u32,
+                            head_dim as u32,
+                            kv_pool.capacity(),
+                            segment.start_pos as u32,
+                            segment.token_count as u32,
+                            total_seq_len as u32,
+                            segment.row_start as u32,
+                        );
+                    }
+                    KvCacheType::Q4_0 => {
+                        self.ctx.encode_kv_batch_append_strided_q4_0(
+                            encoder,
+                            &self.prefill_scratch.k_buf,
+                            k_cache,
+                            num_kv_heads as u32,
+                            head_dim as u32,
+                            kv_pool.capacity(),
+                            segment.start_pos as u32,
+                            segment.token_count as u32,
+                            total_seq_len as u32,
+                            segment.row_start as u32,
+                        );
+                        self.ctx.encode_kv_batch_append_strided_q4_0(
+                            encoder,
+                            &self.prefill_scratch.v_buf,
+                            v_cache,
+                            num_kv_heads as u32,
+                            head_dim as u32,
+                            kv_pool.capacity(),
+                            segment.start_pos as u32,
+                            segment.token_count as u32,
+                            total_seq_len as u32,
+                            segment.row_start as u32,
+                        );
+                    }
+                }
             }
         }
 
@@ -2889,25 +4816,79 @@ impl Gemma4GpuModel {
             let v_cache = kv_pool
                 .layer_v_cache(segment.slot, layer.kv_source_layer)
                 .map_err(|err| err.to_string())?;
-            self.ctx.encode_attention_causal_strided_f16(
-                encoder,
-                &self.prefill_scratch.q_buf,
-                k_cache,
-                v_cache,
-                &self.prefill_scratch.attn_out_buf,
-                num_heads as u32,
-                num_kv_heads as u32,
-                num_kv_groups,
-                head_dim as u32,
-                (segment.start_pos + segment.token_count) as u32,
-                kv_pool.capacity(),
-                scale,
-                segment.token_count as u32,
-                segment.start_pos as u32,
-                attention_window,
-                total_seq_len as u32,
-                segment.row_start as u32,
-            );
+            match self.kv_cache_type {
+                KvCacheType::F16 => {
+                    self.ctx.encode_attention_causal_strided_f16(
+                        encoder,
+                        &self.prefill_scratch.q_buf,
+                        k_cache,
+                        v_cache,
+                        &self.prefill_scratch.attn_out_buf,
+                        num_heads as u32,
+                        num_kv_heads as u32,
+                        num_kv_groups,
+                        head_dim as u32,
+                        (segment.start_pos + segment.token_count) as u32,
+                        kv_pool.capacity(),
+                        scale,
+                        segment.token_count as u32,
+                        segment.start_pos as u32,
+                        attention_window,
+                        total_seq_len as u32,
+                        segment.row_start as u32,
+                    );
+                }
+                KvCacheType::Q8_0 => {
+                    let groups_per_row = (head_dim / 32) as u32;
+                    let row_bytes = groups_per_row * 34;
+                    self.ctx.encode_attention_causal_strided_q8_0(
+                        encoder,
+                        &self.prefill_scratch.q_buf,
+                        k_cache,
+                        v_cache,
+                        &self.prefill_scratch.attn_out_buf,
+                        num_heads as u32,
+                        num_kv_heads as u32,
+                        num_kv_groups,
+                        head_dim as u32,
+                        (segment.start_pos + segment.token_count) as u32,
+                        kv_pool.capacity(),
+                        scale,
+                        segment.token_count as u32,
+                        segment.start_pos as u32,
+                        attention_window,
+                        total_seq_len as u32,
+                        segment.row_start as u32,
+                        groups_per_row,
+                        row_bytes,
+                    );
+                }
+                KvCacheType::Q4_0 => {
+                    let groups_per_row = (head_dim / 32) as u32;
+                    let row_bytes = groups_per_row * 18;
+                    self.ctx.encode_attention_causal_strided_q4_0(
+                        encoder,
+                        &self.prefill_scratch.q_buf,
+                        k_cache,
+                        v_cache,
+                        &self.prefill_scratch.attn_out_buf,
+                        num_heads as u32,
+                        num_kv_heads as u32,
+                        num_kv_groups,
+                        head_dim as u32,
+                        (segment.start_pos + segment.token_count) as u32,
+                        kv_pool.capacity(),
+                        scale,
+                        segment.token_count as u32,
+                        segment.start_pos as u32,
+                        attention_window,
+                        total_seq_len as u32,
+                        segment.row_start as u32,
+                        groups_per_row,
+                        row_bytes,
+                    );
+                }
+            }
         }
 
         self.ctx.encode_copy(
@@ -2924,7 +4905,7 @@ impl Gemma4GpuModel {
             num_heads as u32,
             head_dim as u32,
         );
-        self.ctx.encode_projection_f16_batch(
+        self.ctx.encode_projection_auto_batch_view(
             encoder,
             &layer.o_proj,
             &self.prefill_scratch.q_normed_buf,
@@ -2933,7 +4914,7 @@ impl Gemma4GpuModel {
             q_out as u32,
             total_seq_len as u32,
         );
-        self.ctx.encode_rmsnorm_batch(
+        self.ctx.encode_rmsnorm_batch_view(
             encoder,
             &self.prefill_scratch.o_out_buf,
             &layer.post_attention_layernorm_weight,
@@ -2956,7 +4937,7 @@ impl Gemma4GpuModel {
             &self.prefill_scratch.residual_buf,
             total_hidden,
         );
-        self.ctx.encode_rmsnorm_batch(
+        self.ctx.encode_rmsnorm_batch_view(
             encoder,
             &self.prefill_scratch.hidden_buf,
             &layer.pre_feedforward_layernorm_weight,
@@ -2965,8 +4946,8 @@ impl Gemma4GpuModel {
             eps,
             total_seq_len as u32,
         );
-        if layer.use_f16 {
-            self.ctx.encode_projection_f16_batch(
+        if layer.weight_format == WeightFormat::F16 {
+            self.ctx.encode_projection_f16_batch_view(
                 encoder,
                 &layer.gate_proj,
                 &self.prefill_scratch.normed_buf,
@@ -2975,7 +4956,7 @@ impl Gemma4GpuModel {
                 hidden_size as u32,
                 total_seq_len as u32,
             );
-            self.ctx.encode_projection_f16_batch(
+            self.ctx.encode_projection_f16_batch_view(
                 encoder,
                 &layer.up_proj,
                 &self.prefill_scratch.normed_buf,
@@ -2985,7 +4966,7 @@ impl Gemma4GpuModel {
                 total_seq_len as u32,
             );
         } else {
-            self.ctx.encode_projection_q4_batch(
+            self.ctx.encode_projection_q4_batch_view(
                 encoder,
                 &layer.gate_proj,
                 &self.prefill_scratch.normed_buf,
@@ -2994,7 +4975,7 @@ impl Gemma4GpuModel {
                 hidden_size as u32,
                 total_seq_len as u32,
             );
-            self.ctx.encode_projection_q4_batch(
+            self.ctx.encode_projection_q4_batch_view(
                 encoder,
                 &layer.up_proj,
                 &self.prefill_scratch.normed_buf,
@@ -3011,8 +4992,8 @@ impl Gemma4GpuModel {
             &self.prefill_scratch.gelu_buf,
             total_intermediate,
         );
-        if layer.use_f16 {
-            self.ctx.encode_projection_f16_batch(
+        if layer.weight_format == WeightFormat::F16 {
+            self.ctx.encode_projection_f16_batch_view(
                 encoder,
                 &layer.down_proj,
                 &self.prefill_scratch.gelu_buf,
@@ -3022,7 +5003,7 @@ impl Gemma4GpuModel {
                 total_seq_len as u32,
             );
         } else {
-            self.ctx.encode_projection_q4_batch(
+            self.ctx.encode_projection_q4_batch_view(
                 encoder,
                 &layer.down_proj,
                 &self.prefill_scratch.gelu_buf,
@@ -3032,7 +5013,7 @@ impl Gemma4GpuModel {
                 total_seq_len as u32,
             );
         }
-        self.ctx.encode_rmsnorm_batch(
+        self.ctx.encode_rmsnorm_batch_view(
             encoder,
             &self.prefill_scratch.down_buf,
             &layer.post_feedforward_layernorm_weight,
@@ -3055,7 +5036,7 @@ impl Gemma4GpuModel {
             &self.prefill_scratch.residual_buf,
             total_hidden,
         );
-        self.ctx.encode_projection_f16_batch(
+        self.ctx.encode_projection_auto_batch_view(
             encoder,
             &layer.per_layer_input_gate_weight,
             &self.prefill_scratch.hidden_buf,
@@ -3074,7 +5055,7 @@ impl Gemma4GpuModel {
             ple_dim as u32,
             total_seq_len as u32,
         );
-        self.ctx.encode_projection_f16_batch(
+        self.ctx.encode_projection_auto_batch_view(
             encoder,
             &layer.per_layer_projection_weight,
             &self.prefill_scratch.up_buf,
@@ -3083,7 +5064,7 @@ impl Gemma4GpuModel {
             ple_dim as u32,
             total_seq_len as u32,
         );
-        self.ctx.encode_rmsnorm_batch(
+        self.ctx.encode_rmsnorm_batch_view(
             encoder,
             &self.prefill_scratch.o_out_buf,
             &layer.post_per_layer_input_norm_weight,
@@ -3169,26 +5150,74 @@ impl Gemma4GpuModel {
                 let v_cache = kv_pool
                     .layer_v_cache(slot, layer_idx)
                     .map_err(|err| err.to_string())?;
-                self.ctx.encode_kv_batch_append_f16(
-                    encoder,
-                    &self.prefill_scratch.k_buf,
-                    k_cache,
-                    num_kv_heads as u32,
-                    head_dim as u32,
-                    kv_pool.capacity(),
-                    start_pos as u32,
-                    seq_len as u32,
-                );
-                self.ctx.encode_kv_batch_append_f16(
-                    encoder,
-                    &self.prefill_scratch.v_buf,
-                    v_cache,
-                    num_kv_heads as u32,
-                    head_dim as u32,
-                    kv_pool.capacity(),
-                    start_pos as u32,
-                    seq_len as u32,
-                );
+                match self.kv_cache_type {
+                    KvCacheType::F16 => {
+                        self.ctx.encode_kv_batch_append_f16(
+                            encoder,
+                            &self.prefill_scratch.k_buf,
+                            k_cache,
+                            num_kv_heads as u32,
+                            head_dim as u32,
+                            kv_pool.capacity(),
+                            start_pos as u32,
+                            seq_len as u32,
+                        );
+                        self.ctx.encode_kv_batch_append_f16(
+                            encoder,
+                            &self.prefill_scratch.v_buf,
+                            v_cache,
+                            num_kv_heads as u32,
+                            head_dim as u32,
+                            kv_pool.capacity(),
+                            start_pos as u32,
+                            seq_len as u32,
+                        );
+                    }
+                    KvCacheType::Q8_0 => {
+                        self.ctx.encode_kv_batch_append_q8_0(
+                            encoder,
+                            &self.prefill_scratch.k_buf,
+                            k_cache,
+                            num_kv_heads as u32,
+                            head_dim as u32,
+                            kv_pool.capacity(),
+                            start_pos as u32,
+                            seq_len as u32,
+                        );
+                        self.ctx.encode_kv_batch_append_q8_0(
+                            encoder,
+                            &self.prefill_scratch.v_buf,
+                            v_cache,
+                            num_kv_heads as u32,
+                            head_dim as u32,
+                            kv_pool.capacity(),
+                            start_pos as u32,
+                            seq_len as u32,
+                        );
+                    }
+                    KvCacheType::Q4_0 => {
+                        self.ctx.encode_kv_batch_append_q4_0(
+                            encoder,
+                            &self.prefill_scratch.k_buf,
+                            k_cache,
+                            num_kv_heads as u32,
+                            head_dim as u32,
+                            kv_pool.capacity(),
+                            start_pos as u32,
+                            seq_len as u32,
+                        );
+                        self.ctx.encode_kv_batch_append_q4_0(
+                            encoder,
+                            &self.prefill_scratch.v_buf,
+                            v_cache,
+                            num_kv_heads as u32,
+                            head_dim as u32,
+                            kv_pool.capacity(),
+                            start_pos as u32,
+                            seq_len as u32,
+                        );
+                    }
+                }
             }
 
             let k_cache = kv_pool
@@ -3197,23 +5226,73 @@ impl Gemma4GpuModel {
             let v_cache = kv_pool
                 .layer_v_cache(slot, layer.kv_source_layer)
                 .map_err(|err| err.to_string())?;
-            self.ctx.encode_attention_causal_f16(
-                encoder,
-                &self.prefill_scratch.q_buf,
-                k_cache,
-                v_cache,
-                &self.prefill_scratch.attn_out_buf,
-                num_heads as u32,
-                num_kv_heads as u32,
-                num_kv_groups,
-                head_dim as u32,
-                (start_pos + seq_len) as u32,
-                kv_pool.capacity(),
-                scale,
-                seq_len as u32,
-                start_pos as u32,
-                attention_window,
-            );
+            match self.kv_cache_type {
+                KvCacheType::F16 => {
+                    self.ctx.encode_attention_causal_f16(
+                        encoder,
+                        &self.prefill_scratch.q_buf,
+                        k_cache,
+                        v_cache,
+                        &self.prefill_scratch.attn_out_buf,
+                        num_heads as u32,
+                        num_kv_heads as u32,
+                        num_kv_groups,
+                        head_dim as u32,
+                        (start_pos + seq_len) as u32,
+                        kv_pool.capacity(),
+                        scale,
+                        seq_len as u32,
+                        start_pos as u32,
+                        attention_window,
+                    );
+                }
+                KvCacheType::Q8_0 => {
+                    let groups_per_row = (head_dim / 32) as u32;
+                    let row_bytes = groups_per_row * 34;
+                    self.ctx.encode_attention_causal_q8_0(
+                        encoder,
+                        &self.prefill_scratch.q_buf,
+                        k_cache,
+                        v_cache,
+                        &self.prefill_scratch.attn_out_buf,
+                        num_heads as u32,
+                        num_kv_heads as u32,
+                        num_kv_groups,
+                        head_dim as u32,
+                        (start_pos + seq_len) as u32,
+                        kv_pool.capacity(),
+                        scale,
+                        seq_len as u32,
+                        start_pos as u32,
+                        attention_window,
+                        groups_per_row,
+                        row_bytes,
+                    );
+                }
+                KvCacheType::Q4_0 => {
+                    let groups_per_row = (head_dim / 32) as u32;
+                    let row_bytes = groups_per_row * 18;
+                    self.ctx.encode_attention_causal_q4_0(
+                        encoder,
+                        &self.prefill_scratch.q_buf,
+                        k_cache,
+                        v_cache,
+                        &self.prefill_scratch.attn_out_buf,
+                        num_heads as u32,
+                        num_kv_heads as u32,
+                        num_kv_groups,
+                        head_dim as u32,
+                        (start_pos + seq_len) as u32,
+                        kv_pool.capacity(),
+                        scale,
+                        seq_len as u32,
+                        start_pos as u32,
+                        attention_window,
+                        groups_per_row,
+                        row_bytes,
+                    );
+                }
+            }
 
             self.ctx.encode_copy(
                 encoder,
@@ -3229,7 +5308,7 @@ impl Gemma4GpuModel {
                 num_heads as u32,
                 head_dim as u32,
             );
-            self.ctx.encode_projection_f16_batch(
+            self.ctx.encode_projection_auto_batch_view(
                 encoder,
                 &layer.o_proj,
                 &self.prefill_scratch.q_normed_buf,
@@ -3238,7 +5317,7 @@ impl Gemma4GpuModel {
                 q_out as u32,
                 seq_len as u32,
             );
-            self.ctx.encode_rmsnorm_batch(
+            self.ctx.encode_rmsnorm_batch_view(
                 encoder,
                 &self.prefill_scratch.o_out_buf,
                 &layer.post_attention_layernorm_weight,
@@ -3261,7 +5340,7 @@ impl Gemma4GpuModel {
                 &self.prefill_scratch.residual_buf,
                 total_hidden,
             );
-            self.ctx.encode_rmsnorm_batch(
+            self.ctx.encode_rmsnorm_batch_view(
                 encoder,
                 &self.prefill_scratch.hidden_buf,
                 &layer.pre_feedforward_layernorm_weight,
@@ -3270,17 +5349,17 @@ impl Gemma4GpuModel {
                 eps,
                 seq_len as u32,
             );
-            if layer.use_f16 {
-                self.ctx.encode_projection_f16_batch(
-                    encoder,
-                    &layer.gate_proj,
+        if layer.weight_format == WeightFormat::F16 {
+            self.ctx.encode_projection_f16_batch_view(
+                encoder,
+                &layer.gate_proj,
                     &self.prefill_scratch.normed_buf,
                     &self.prefill_scratch.gate_buf,
                     intermediate_size as u32,
                     hidden_size as u32,
                     seq_len as u32,
                 );
-                self.ctx.encode_projection_f16_batch(
+                self.ctx.encode_projection_f16_batch_view(
                     encoder,
                     &layer.up_proj,
                     &self.prefill_scratch.normed_buf,
@@ -3290,7 +5369,7 @@ impl Gemma4GpuModel {
                     seq_len as u32,
                 );
             } else {
-                self.ctx.encode_projection_q4_batch(
+                self.ctx.encode_projection_q4_batch_view(
                     encoder,
                     &layer.gate_proj,
                     &self.prefill_scratch.normed_buf,
@@ -3299,7 +5378,7 @@ impl Gemma4GpuModel {
                     hidden_size as u32,
                     seq_len as u32,
                 );
-                self.ctx.encode_projection_q4_batch(
+                self.ctx.encode_projection_q4_batch_view(
                     encoder,
                     &layer.up_proj,
                     &self.prefill_scratch.normed_buf,
@@ -3316,10 +5395,10 @@ impl Gemma4GpuModel {
                 &self.prefill_scratch.gelu_buf,
                 total_intermediate,
             );
-            if layer.use_f16 {
-                self.ctx.encode_projection_f16_batch(
-                    encoder,
-                    &layer.down_proj,
+        if layer.weight_format == WeightFormat::F16 {
+            self.ctx.encode_projection_f16_batch_view(
+                encoder,
+                &layer.down_proj,
                     &self.prefill_scratch.gelu_buf,
                     &self.prefill_scratch.down_buf,
                     hidden_size as u32,
@@ -3327,7 +5406,7 @@ impl Gemma4GpuModel {
                     seq_len as u32,
                 );
             } else {
-                self.ctx.encode_projection_q4_batch(
+                self.ctx.encode_projection_q4_batch_view(
                     encoder,
                     &layer.down_proj,
                     &self.prefill_scratch.gelu_buf,
@@ -3337,7 +5416,7 @@ impl Gemma4GpuModel {
                     seq_len as u32,
                 );
             }
-            self.ctx.encode_rmsnorm_batch(
+            self.ctx.encode_rmsnorm_batch_view(
                 encoder,
                 &self.prefill_scratch.down_buf,
                 &layer.post_feedforward_layernorm_weight,
@@ -3360,7 +5439,7 @@ impl Gemma4GpuModel {
                 &self.prefill_scratch.residual_buf,
                 total_hidden,
             );
-            self.ctx.encode_projection_f16_batch(
+            self.ctx.encode_projection_auto_batch_view(
                 encoder,
                 &layer.per_layer_input_gate_weight,
                 &self.prefill_scratch.hidden_buf,
@@ -3379,7 +5458,7 @@ impl Gemma4GpuModel {
                 ple_dim as u32,
                 seq_len as u32,
             );
-            self.ctx.encode_projection_f16_batch(
+            self.ctx.encode_projection_auto_batch_view(
                 encoder,
                 &layer.per_layer_projection_weight,
                 &self.prefill_scratch.up_buf,
@@ -3388,7 +5467,7 @@ impl Gemma4GpuModel {
                 ple_dim as u32,
                 seq_len as u32,
             );
-            self.ctx.encode_rmsnorm_batch(
+            self.ctx.encode_rmsnorm_batch_view(
                 encoder,
                 &self.prefill_scratch.o_out_buf,
                 &layer.post_per_layer_input_norm_weight,
@@ -3423,7 +5502,7 @@ impl Gemma4GpuModel {
 
         // Final norm + lm_head (still in the same command buffer)
         let encoder = cmd.new_compute_command_encoder();
-        self.ctx.encode_rmsnorm_batch(
+        self.ctx.encode_rmsnorm_batch_view(
             encoder,
             &self.prefill_scratch.hidden_buf,
             &self.final_norm_weight,
@@ -3433,7 +5512,7 @@ impl Gemma4GpuModel {
             seq_len as u32,
         );
         let last_offsets = self.prefill_row_offsets(seq_len - 1);
-        self.ctx.encode_matvec_q4_at(
+        self.ctx.encode_matvec_q4_at_view(
             encoder,
             &self.lm_head_buf,
             &self.prefill_scratch.normed_buf,
@@ -3496,7 +5575,7 @@ impl Gemma4GpuModel {
             let encoder = cmd.new_compute_command_encoder();
             for batch_idx in 0..batch_size {
                 let offsets = self.decode_batch_row_offsets(batch_idx);
-                self.ctx.encode_matvec_q4_at(
+                self.ctx.encode_matvec_q4_at_view(
                     encoder,
                     &self.per_layer_model_projection_weight,
                     &self.decode_batch_scratch.hidden_buf,
@@ -3515,7 +5594,7 @@ impl Gemma4GpuModel {
                     ple_total_dim as u32,
                     context_proj_scale,
                 );
-                self.ctx.encode_rmsnorm_per_head_at(
+                self.ctx.encode_rmsnorm_per_head_at_view(
                     encoder,
                     &self.decode_batch_scratch.ple_combined_buf,
                     offsets.ple_row,
@@ -3585,7 +5664,7 @@ impl Gemma4GpuModel {
                     offsets.hidden,
                     hidden_size as u32,
                 );
-                self.ctx.encode_rmsnorm_at(
+                self.ctx.encode_rmsnorm_at_view(
                     encoder,
                     &self.decode_batch_scratch.hidden_buf,
                     offsets.hidden,
@@ -3596,8 +5675,8 @@ impl Gemma4GpuModel {
                     eps,
                 );
 
-                if layer.use_f16 {
-                    self.ctx.encode_matvec_f16_at(
+                if layer.weight_format == WeightFormat::F16 {
+                    self.ctx.encode_matvec_f16_at_view(
                         encoder,
                         &layer.q_proj,
                         &self.decode_batch_scratch.normed_buf,
@@ -3608,7 +5687,7 @@ impl Gemma4GpuModel {
                         hidden_size as u32,
                     );
                 } else {
-                    self.ctx.encode_matvec_q4_at(
+                    self.ctx.encode_matvec_auto_at_view(
                         encoder,
                         &layer.q_proj,
                         &self.decode_batch_scratch.normed_buf,
@@ -3619,7 +5698,7 @@ impl Gemma4GpuModel {
                         hidden_size as u32,
                     );
                 }
-                self.ctx.encode_rmsnorm_per_head_at(
+                self.ctx.encode_rmsnorm_per_head_at_view(
                     encoder,
                     &self.decode_batch_scratch.q_buf,
                     offsets.q,
@@ -3646,8 +5725,8 @@ impl Gemma4GpuModel {
                 );
 
                 if layer.has_kv {
-                    if layer.use_f16 {
-                        self.ctx.encode_matvec_f16_at(
+                    if layer.weight_format == WeightFormat::F16 {
+                        self.ctx.encode_matvec_f16_at_view(
                             encoder,
                             &layer.k_proj,
                             &self.decode_batch_scratch.normed_buf,
@@ -3657,7 +5736,7 @@ impl Gemma4GpuModel {
                             kv_out as u32,
                             hidden_size as u32,
                         );
-                        self.ctx.encode_matvec_f16_at(
+                        self.ctx.encode_matvec_f16_at_view(
                             encoder,
                             &layer.v_proj,
                             &self.decode_batch_scratch.normed_buf,
@@ -3668,7 +5747,7 @@ impl Gemma4GpuModel {
                             hidden_size as u32,
                         );
                     } else {
-                        self.ctx.encode_matvec_q4_at(
+                        self.ctx.encode_matvec_auto_at_view(
                             encoder,
                             &layer.k_proj,
                             &self.decode_batch_scratch.normed_buf,
@@ -3678,7 +5757,7 @@ impl Gemma4GpuModel {
                             kv_out as u32,
                             hidden_size as u32,
                         );
-                        self.ctx.encode_matvec_q4_at(
+                        self.ctx.encode_matvec_auto_at_view(
                             encoder,
                             &layer.v_proj,
                             &self.decode_batch_scratch.normed_buf,
@@ -3690,7 +5769,7 @@ impl Gemma4GpuModel {
                         );
                     }
 
-                    self.ctx.encode_rmsnorm_per_head_at(
+                    self.ctx.encode_rmsnorm_per_head_at_view(
                         encoder,
                         &self.decode_batch_scratch.k_buf,
                         offsets.kv,
@@ -3732,26 +5811,78 @@ impl Gemma4GpuModel {
                     let v_cache = kv_pool
                         .layer_v_cache(slot_view.slot, layer_idx)
                         .map_err(|err| err.to_string())?;
-                    self.ctx.encode_kv_append_f16_at(
-                        encoder,
-                        &self.decode_batch_scratch.k_normed_buf,
-                        offsets.kv,
-                        k_cache,
-                        num_kv_heads as u32,
-                        head_dim as u32,
-                        kv_pool.capacity(),
-                        append_pos,
-                    );
-                    self.ctx.encode_kv_append_f16_at(
-                        encoder,
-                        &self.decode_batch_scratch.gate_buf,
-                        offsets.intermediate,
-                        v_cache,
-                        num_kv_heads as u32,
-                        head_dim as u32,
-                        kv_pool.capacity(),
-                        append_pos,
-                    );
+                    match self.kv_cache_type {
+                        KvCacheType::F16 => {
+                            self.ctx.encode_kv_append_f16_at(
+                                encoder,
+                                &self.decode_batch_scratch.k_normed_buf,
+                                offsets.kv,
+                                k_cache,
+                                num_kv_heads as u32,
+                                head_dim as u32,
+                                kv_pool.capacity(),
+                                append_pos,
+                            );
+                            self.ctx.encode_kv_append_f16_at(
+                                encoder,
+                                &self.decode_batch_scratch.gate_buf,
+                                offsets.intermediate,
+                                v_cache,
+                                num_kv_heads as u32,
+                                head_dim as u32,
+                                kv_pool.capacity(),
+                                append_pos,
+                            );
+                        }
+                        KvCacheType::Q8_0 => {
+                            self.ctx.encode_kv_append_q8_0_at(
+                                encoder,
+                                &self.decode_batch_scratch.k_normed_buf,
+                                offsets.kv,
+                                k_cache,
+                                num_kv_heads as u32,
+                                head_dim as u32,
+                                kv_pool.capacity(),
+                                append_pos,
+                            );
+                            self.ctx.encode_kv_append_q8_0_at(
+                                encoder,
+                                &self.decode_batch_scratch.gate_buf,
+                                offsets.intermediate,
+                                v_cache,
+                                num_kv_heads as u32,
+                                head_dim as u32,
+                                kv_pool.capacity(),
+                                append_pos,
+                            );
+                        }
+                        KvCacheType::Q4_0 => {
+                            if !(self.ctx.use_flash_attention
+                                && crate::gpu::fused_kv_attention_enabled())
+                            {
+                                self.ctx.encode_kv_append_q4_0_at(
+                                    encoder,
+                                    &self.decode_batch_scratch.k_normed_buf,
+                                    offsets.kv,
+                                    k_cache,
+                                    num_kv_heads as u32,
+                                    head_dim as u32,
+                                    kv_pool.capacity(),
+                                    append_pos,
+                                );
+                                self.ctx.encode_kv_append_q4_0_at(
+                                    encoder,
+                                    &self.decode_batch_scratch.gate_buf,
+                                    offsets.intermediate,
+                                    v_cache,
+                                    num_kv_heads as u32,
+                                    head_dim as u32,
+                                    kv_pool.capacity(),
+                                    append_pos,
+                                );
+                            }
+                        }
+                    }
                 }
 
                 let k_cache = kv_pool
@@ -3760,25 +5891,151 @@ impl Gemma4GpuModel {
                 let v_cache = kv_pool
                     .layer_v_cache(slot_view.slot, layer.kv_source_layer)
                     .map_err(|err| err.to_string())?;
-                self.ctx.encode_attention_with_offset_f16_at(
-                    encoder,
-                    &self.decode_batch_scratch.q_normed_buf,
-                    offsets.q,
-                    k_cache,
-                    v_cache,
-                    &self.decode_batch_scratch.attn_out_buf,
-                    offsets.q,
-                    num_heads as u32,
-                    num_kv_heads as u32,
-                    num_kv_groups,
-                    head_dim as u32,
-                    effective_kv_seq,
-                    kv_pool.capacity(),
-                    scale,
-                    kv_start,
-                );
+                match self.kv_cache_type {
+                    KvCacheType::F16 => {
+                        self.ctx.encode_attention_with_offset_f16_at(
+                            encoder,
+                            &self.decode_batch_scratch.q_normed_buf,
+                            offsets.q,
+                            k_cache,
+                            v_cache,
+                            &self.decode_batch_scratch.attn_out_buf,
+                            offsets.q,
+                            num_heads as u32,
+                            num_kv_heads as u32,
+                            num_kv_groups,
+                            head_dim as u32,
+                            effective_kv_seq,
+                            kv_pool.capacity(),
+                            scale,
+                            kv_start,
+                        );
+                    }
+                    KvCacheType::Q8_0 => {
+                        let groups_per_row = (head_dim / 32) as u32;
+                        let row_bytes = groups_per_row * 34;
+                        self.ctx.encode_attention_with_offset_q8_0_at(
+                            encoder,
+                            &self.decode_batch_scratch.q_normed_buf,
+                            offsets.q,
+                            k_cache,
+                            v_cache,
+                            &self.decode_batch_scratch.attn_out_buf,
+                            offsets.q,
+                            num_heads as u32,
+                            num_kv_heads as u32,
+                            num_kv_groups,
+                            head_dim as u32,
+                            effective_kv_seq,
+                            kv_pool.capacity(),
+                            scale,
+                            kv_start,
+                            groups_per_row,
+                            row_bytes,
+                        );
+                    }
+                    KvCacheType::Q4_0 => {
+                        let groups_per_row = (head_dim / 32) as u32;
+                        let row_bytes = groups_per_row * 18;
+                        if crate::gpu::attention_use_ggml_for_layer(layer.has_kv)
+                        && self.ctx.use_flash_attention
+                    {
+                            self.ctx.encode_attention_ggml_q4_0_at(
+                                encoder,
+                                &self.decode_batch_scratch.q_normed_buf,
+                                offsets.q,
+                                k_cache,
+                                0,
+                                v_cache,
+                                0,
+                                &self.decode_batch_scratch.attn_out_buf,
+                                offsets.q,
+                                num_heads as u32,
+                                num_kv_heads as u32,
+                                head_dim as u32,
+                                effective_kv_seq,
+                                kv_pool.capacity(),
+                                scale,
+                                kv_start,
+                                row_bytes,
+                            );
+                        } else if layer.has_kv
+                            && self.ctx.use_flash_attention
+                            && crate::gpu::fused_kv_attention_enabled()
+                        {
+                            self.ctx.encode_attention_fused_q4_0_at(
+                                encoder,
+                                &self.decode_batch_scratch.q_normed_buf,
+                                offsets.q,
+                                &self.decode_batch_scratch.k_normed_buf,
+                                offsets.kv,
+                                &self.decode_batch_scratch.gate_buf,
+                                offsets.intermediate,
+                                &self.decode_batch_scratch.attn_out_buf,
+                                offsets.q,
+                                k_cache,
+                                v_cache,
+                                num_heads as u32,
+                                num_kv_heads as u32,
+                                num_kv_groups,
+                                head_dim as u32,
+                                effective_kv_seq,
+                                kv_pool.capacity(),
+                                scale,
+                                kv_start,
+                                append_pos,
+                                groups_per_row,
+                                row_bytes,
+                            );
+                        } else if self.ctx.use_flash_attention
+                            && num_kv_groups > 1
+                            && (8 % num_kv_groups) == 0
+                            && crate::gpu::attention_gqa_q4_0_enabled(num_kv_groups)
+                        {
+                            self.ctx.encode_attention_with_offset_q4_0_gqa_at(
+                                encoder,
+                                &self.decode_batch_scratch.q_normed_buf,
+                                offsets.q,
+                                k_cache,
+                                v_cache,
+                                &self.decode_batch_scratch.attn_out_buf,
+                                offsets.q,
+                                num_heads as u32,
+                                num_kv_heads as u32,
+                                num_kv_groups,
+                                head_dim as u32,
+                                effective_kv_seq,
+                                kv_pool.capacity(),
+                                scale,
+                                kv_start,
+                                groups_per_row,
+                                row_bytes,
+                            );
+                        } else {
+                            self.ctx.encode_attention_with_offset_q4_0_at(
+                                encoder,
+                                &self.decode_batch_scratch.q_normed_buf,
+                                offsets.q,
+                                k_cache,
+                                v_cache,
+                                &self.decode_batch_scratch.attn_out_buf,
+                                offsets.q,
+                                num_heads as u32,
+                                num_kv_heads as u32,
+                                num_kv_groups,
+                                head_dim as u32,
+                                effective_kv_seq,
+                                kv_pool.capacity(),
+                                scale,
+                                kv_start,
+                                groups_per_row,
+                                row_bytes,
+                            );
+                        }
+                    }
+                }
 
-                self.ctx.encode_matvec_f16_at(
+                self.ctx.encode_matvec_auto_at_view(
                     encoder,
                     &layer.o_proj,
                     &self.decode_batch_scratch.attn_out_buf,
@@ -3788,26 +6045,41 @@ impl Gemma4GpuModel {
                     hidden_size as u32,
                     q_out as u32,
                 );
-                self.ctx.encode_rmsnorm_at(
-                    encoder,
-                    &self.decode_batch_scratch.o_out_buf,
-                    offsets.hidden,
-                    &layer.post_attention_layernorm_weight,
-                    &self.decode_batch_scratch.normed_buf,
-                    offsets.hidden,
-                    hidden_size as u32,
-                    eps,
-                );
-                self.ctx.encode_vec_add_at(
-                    encoder,
-                    &self.decode_batch_scratch.residual_buf,
-                    offsets.hidden,
-                    &self.decode_batch_scratch.normed_buf,
-                    offsets.hidden,
-                    &self.decode_batch_scratch.hidden_buf,
-                    offsets.hidden,
-                    hidden_size as u32,
-                );
+                if crate::gpu::fused_rmsnorm_acc_enabled() {
+                    self.ctx.encode_rmsnorm_acc_out_at_view(
+                        encoder,
+                        &self.decode_batch_scratch.residual_buf,
+                        offsets.hidden,
+                        &self.decode_batch_scratch.o_out_buf,
+                        offsets.hidden,
+                        &layer.post_attention_layernorm_weight,
+                        &self.decode_batch_scratch.hidden_buf,
+                        offsets.hidden,
+                        hidden_size as u32,
+                        eps,
+                    );
+                } else {
+                    self.ctx.encode_rmsnorm_at_view(
+                        encoder,
+                        &self.decode_batch_scratch.o_out_buf,
+                        offsets.hidden,
+                        &layer.post_attention_layernorm_weight,
+                        &self.decode_batch_scratch.normed_buf,
+                        offsets.hidden,
+                        hidden_size as u32,
+                        eps,
+                    );
+                    self.ctx.encode_vec_add_at(
+                        encoder,
+                        &self.decode_batch_scratch.residual_buf,
+                        offsets.hidden,
+                        &self.decode_batch_scratch.normed_buf,
+                        offsets.hidden,
+                        &self.decode_batch_scratch.hidden_buf,
+                        offsets.hidden,
+                        hidden_size as u32,
+                    );
+                }
 
                 self.ctx.encode_copy_at(
                     encoder,
@@ -3817,18 +6089,18 @@ impl Gemma4GpuModel {
                     offsets.hidden,
                     hidden_size as u32,
                 );
-                self.ctx.encode_rmsnorm_at(
-                    encoder,
-                    &self.decode_batch_scratch.hidden_buf,
-                    offsets.hidden,
-                    &layer.pre_feedforward_layernorm_weight,
-                    &self.decode_batch_scratch.normed_buf,
-                    offsets.hidden,
-                    hidden_size as u32,
-                    eps,
-                );
-                if layer.use_f16 {
-                    self.ctx.encode_matvec_f16_at(
+                if layer.weight_format == WeightFormat::F16 {
+                    self.ctx.encode_rmsnorm_at_view(
+                        encoder,
+                        &self.decode_batch_scratch.hidden_buf,
+                        offsets.hidden,
+                        &layer.pre_feedforward_layernorm_weight,
+                        &self.decode_batch_scratch.normed_buf,
+                        offsets.hidden,
+                        hidden_size as u32,
+                        eps,
+                    );
+                    self.ctx.encode_matvec_f16_at_view(
                         encoder,
                         &layer.gate_proj,
                         &self.decode_batch_scratch.normed_buf,
@@ -3838,7 +6110,7 @@ impl Gemma4GpuModel {
                         intermediate_size as u32,
                         hidden_size as u32,
                     );
-                    self.ctx.encode_matvec_f16_at(
+                    self.ctx.encode_matvec_f16_at_view(
                         encoder,
                         &layer.up_proj,
                         &self.decode_batch_scratch.normed_buf,
@@ -3848,81 +6120,218 @@ impl Gemma4GpuModel {
                         intermediate_size as u32,
                         hidden_size as u32,
                     );
+                    self.ctx.encode_gelu_mul_at(
+                        encoder,
+                        &self.decode_batch_scratch.gate_buf,
+                        offsets.intermediate,
+                        &self.decode_batch_scratch.up_buf,
+                        offsets.intermediate,
+                        &self.decode_batch_scratch.gelu_buf,
+                        offsets.intermediate,
+                        intermediate_size as u32,
+                    );
+                    self.ctx.encode_matvec_f16_at_view(
+                        encoder,
+                        &layer.down_proj,
+                        &self.decode_batch_scratch.gelu_buf,
+                        offsets.intermediate,
+                        &self.decode_batch_scratch.down_buf,
+                        offsets.hidden,
+                        hidden_size as u32,
+                        intermediate_size as u32,
+                    );
+                } else if crate::gpu::fused_mlp_gelu_down_enabled()
+                    && crate::gpu::fused_rmsnorm_mlp_enabled()
+                    && Self::use_packed_mlp_gate_up(layer)
+                    && crate::gpu::weight_buf_is_q4(
+                        &layer.gate_proj,
+                        intermediate_size as u32,
+                        hidden_size as u32,
+                    )
+                {
+                    let inv_rms_off = offsets.hidden / hidden_size as u64;
+                    self.ctx.encode_mlp_fused_q4_gelu_down_packed_from_hidden_at_view(
+                        encoder,
+                        &layer.gate_up_proj,
+                        &layer.down_proj,
+                        &layer.pre_feedforward_layernorm_weight,
+                        &self.decode_batch_scratch.hidden_buf,
+                        offsets.hidden,
+                        &self.decode_batch_scratch.inv_rms_buf,
+                        inv_rms_off,
+                        &self.decode_batch_scratch.up_buf,
+                        offsets.intermediate,
+                        &self.decode_batch_scratch.down_buf,
+                        offsets.hidden,
+                        hidden_size as u32,
+                        intermediate_size as u32,
+                        eps,
+                    );
+                } else if crate::gpu::fused_mlp_gelu_down_enabled()
+                    && !layer.weight_format.is_q3()
+                    && crate::gpu::weight_buf_is_q4(
+                        &layer.gate_proj,
+                        intermediate_size as u32,
+                        hidden_size as u32,
+                    )
+                {
+                    self.ctx.encode_rmsnorm_at_view(
+                        encoder,
+                        &self.decode_batch_scratch.hidden_buf,
+                        offsets.hidden,
+                        &layer.pre_feedforward_layernorm_weight,
+                        &self.decode_batch_scratch.normed_buf,
+                        offsets.hidden,
+                        hidden_size as u32,
+                        eps,
+                    );
+                    if Self::use_packed_mlp_gate_up(layer) {
+                        self.ctx.encode_mlp_fused_q4_gelu_down_packed_at_view(
+                            encoder,
+                            &layer.gate_up_proj,
+                            &layer.down_proj,
+                            &self.decode_batch_scratch.normed_buf,
+                            offsets.hidden,
+                            &self.decode_batch_scratch.up_buf,
+                            offsets.intermediate,
+                            &self.decode_batch_scratch.down_buf,
+                            offsets.hidden,
+                            hidden_size as u32,
+                            intermediate_size as u32,
+                        );
+                    } else {
+                        self.ctx.encode_mlp_fused_q4_gelu_down_at_view(
+                            encoder,
+                            &layer.gate_proj,
+                            &layer.up_proj,
+                            &layer.down_proj,
+                            &self.decode_batch_scratch.normed_buf,
+                            offsets.hidden,
+                            &self.decode_batch_scratch.gelu_buf,
+                            offsets.intermediate,
+                            &self.decode_batch_scratch.down_buf,
+                            offsets.hidden,
+                            hidden_size as u32,
+                            intermediate_size as u32,
+                        );
+                    }
+                } else if Self::use_packed_mlp_gate_up(layer)
+                    || layer.weight_format.is_q3()
+                    || crate::gpu::fused_mlp_ple_enabled()
+                {
+                    self.ctx.encode_rmsnorm_at_view(
+                        encoder,
+                        &self.decode_batch_scratch.hidden_buf,
+                        offsets.hidden,
+                        &layer.pre_feedforward_layernorm_weight,
+                        &self.decode_batch_scratch.normed_buf,
+                        offsets.hidden,
+                        hidden_size as u32,
+                        eps,
+                    );
+                    self.encode_mlp_gate_up_gelu_q4_at_view(
+                        encoder,
+                        layer,
+                        &self.decode_batch_scratch.normed_buf,
+                        offsets.hidden,
+                        &self.decode_batch_scratch.gelu_buf,
+                        offsets.intermediate,
+                        intermediate_size as u32,
+                        hidden_size as u32,
+                    );
+                    self.encode_matvec_quant(
+                        encoder,
+                        &layer.down_proj,
+                        &self.decode_batch_scratch.gelu_buf,
+                        &self.decode_batch_scratch.down_buf,
+                        hidden_size as u32,
+                        intermediate_size as u32,
+                        layer.weight_format,
+                    );
                 } else {
-                    self.ctx.encode_matvec_q4_at(
+                    self.ctx.encode_rmsnorm_at_view(
+                        encoder,
+                        &self.decode_batch_scratch.hidden_buf,
+                        offsets.hidden,
+                        &layer.pre_feedforward_layernorm_weight,
+                        &self.decode_batch_scratch.normed_buf,
+                        offsets.hidden,
+                        hidden_size as u32,
+                        eps,
+                    );
+                    self.encode_matvec_quant(
                         encoder,
                         &layer.gate_proj,
                         &self.decode_batch_scratch.normed_buf,
-                        offsets.hidden,
                         &self.decode_batch_scratch.gate_buf,
-                        offsets.intermediate,
                         intermediate_size as u32,
                         hidden_size as u32,
+                        layer.weight_format,
                     );
-                    self.ctx.encode_matvec_q4_at(
+                    self.encode_matvec_quant(
                         encoder,
                         &layer.up_proj,
                         &self.decode_batch_scratch.normed_buf,
-                        offsets.hidden,
+                        &self.decode_batch_scratch.up_buf,
+                        intermediate_size as u32,
+                        hidden_size as u32,
+                        layer.weight_format,
+                    );
+                    self.ctx.encode_gelu_mul_at(
+                        encoder,
+                        &self.decode_batch_scratch.gate_buf,
+                        offsets.intermediate,
                         &self.decode_batch_scratch.up_buf,
                         offsets.intermediate,
+                        &self.decode_batch_scratch.gelu_buf,
+                        offsets.intermediate,
                         intermediate_size as u32,
-                        hidden_size as u32,
                     );
-                }
-                self.ctx.encode_gelu_mul_at(
-                    encoder,
-                    &self.decode_batch_scratch.gate_buf,
-                    offsets.intermediate,
-                    &self.decode_batch_scratch.up_buf,
-                    offsets.intermediate,
-                    &self.decode_batch_scratch.gelu_buf,
-                    offsets.intermediate,
-                    intermediate_size as u32,
-                );
-                if layer.use_f16 {
-                    self.ctx.encode_matvec_f16_at(
+                    self.encode_matvec_quant(
                         encoder,
                         &layer.down_proj,
                         &self.decode_batch_scratch.gelu_buf,
-                        offsets.intermediate,
                         &self.decode_batch_scratch.down_buf,
-                        offsets.hidden,
                         hidden_size as u32,
                         intermediate_size as u32,
+                        layer.weight_format,
+                    );
+                }
+                if crate::gpu::fused_rmsnorm_acc_enabled() {
+                    self.ctx.encode_rmsnorm_acc_out_at_view(
+                        encoder,
+                        &self.decode_batch_scratch.residual_buf,
+                        offsets.hidden,
+                        &self.decode_batch_scratch.down_buf,
+                        offsets.hidden,
+                        &layer.post_feedforward_layernorm_weight,
+                        &self.decode_batch_scratch.hidden_buf,
+                        offsets.hidden,
+                        hidden_size as u32,
+                        eps,
                     );
                 } else {
-                    self.ctx.encode_matvec_q4_at(
+                    self.ctx.encode_rmsnorm_at_view(
                         encoder,
-                        &layer.down_proj,
-                        &self.decode_batch_scratch.gelu_buf,
-                        offsets.intermediate,
                         &self.decode_batch_scratch.down_buf,
                         offsets.hidden,
+                        &layer.post_feedforward_layernorm_weight,
+                        &self.decode_batch_scratch.normed_buf,
+                        offsets.hidden,
                         hidden_size as u32,
-                        intermediate_size as u32,
+                        eps,
+                    );
+                    self.ctx.encode_vec_add_at(
+                        encoder,
+                        &self.decode_batch_scratch.residual_buf,
+                        offsets.hidden,
+                        &self.decode_batch_scratch.normed_buf,
+                        offsets.hidden,
+                        &self.decode_batch_scratch.hidden_buf,
+                        offsets.hidden,
+                        hidden_size as u32,
                     );
                 }
-                self.ctx.encode_rmsnorm_at(
-                    encoder,
-                    &self.decode_batch_scratch.down_buf,
-                    offsets.hidden,
-                    &layer.post_feedforward_layernorm_weight,
-                    &self.decode_batch_scratch.normed_buf,
-                    offsets.hidden,
-                    hidden_size as u32,
-                    eps,
-                );
-                self.ctx.encode_vec_add_at(
-                    encoder,
-                    &self.decode_batch_scratch.residual_buf,
-                    offsets.hidden,
-                    &self.decode_batch_scratch.normed_buf,
-                    offsets.hidden,
-                    &self.decode_batch_scratch.hidden_buf,
-                    offsets.hidden,
-                    hidden_size as u32,
-                );
 
                 self.ctx.encode_copy_at(
                     encoder,
@@ -3932,27 +6341,48 @@ impl Gemma4GpuModel {
                     offsets.hidden,
                     hidden_size as u32,
                 );
-                self.ctx.encode_matvec_f16_at(
-                    encoder,
-                    &layer.per_layer_input_gate_weight,
-                    &self.decode_batch_scratch.hidden_buf,
-                    offsets.hidden,
-                    &self.decode_batch_scratch.gate_buf,
-                    offsets.intermediate,
-                    ple_dim as u32,
-                    hidden_size as u32,
-                );
-                self.ctx.encode_gelu_mul_at(
-                    encoder,
-                    &self.decode_batch_scratch.gate_buf,
-                    offsets.intermediate,
-                    &self.decode_batch_scratch.ple_context_proj_buf,
-                    ple_layer_offset,
-                    &self.decode_batch_scratch.up_buf,
-                    offsets.intermediate,
-                    ple_dim as u32,
-                );
-                self.ctx.encode_matvec_f16_at(
+                if crate::gpu::fused_mlp_ple_enabled()
+                    && crate::gpu::weight_buf_is_q4(
+                        &layer.per_layer_input_gate_weight,
+                        ple_dim as u32,
+                        hidden_size as u32,
+                    )
+                {
+                    self.ctx.encode_ple_matvec_gelu_q4_at_view(
+                        encoder,
+                        &layer.per_layer_input_gate_weight,
+                        &self.decode_batch_scratch.hidden_buf,
+                        offsets.hidden,
+                        &self.decode_batch_scratch.ple_context_proj_buf,
+                        ple_layer_offset,
+                        &self.decode_batch_scratch.up_buf,
+                        offsets.intermediate,
+                        ple_dim as u32,
+                        hidden_size as u32,
+                    );
+                } else {
+                    self.ctx.encode_matvec_auto_at_view(
+                        encoder,
+                        &layer.per_layer_input_gate_weight,
+                        &self.decode_batch_scratch.hidden_buf,
+                        offsets.hidden,
+                        &self.decode_batch_scratch.gate_buf,
+                        offsets.intermediate,
+                        ple_dim as u32,
+                        hidden_size as u32,
+                    );
+                    self.ctx.encode_gelu_mul_at(
+                        encoder,
+                        &self.decode_batch_scratch.gate_buf,
+                        offsets.intermediate,
+                        &self.decode_batch_scratch.ple_context_proj_buf,
+                        ple_layer_offset,
+                        &self.decode_batch_scratch.up_buf,
+                        offsets.intermediate,
+                        ple_dim as u32,
+                    );
+                }
+                self.ctx.encode_matvec_auto_at_view(
                     encoder,
                     &layer.per_layer_projection_weight,
                     &self.decode_batch_scratch.up_buf,
@@ -3962,26 +6392,41 @@ impl Gemma4GpuModel {
                     hidden_size as u32,
                     ple_dim as u32,
                 );
-                self.ctx.encode_rmsnorm_at(
-                    encoder,
-                    &self.decode_batch_scratch.o_out_buf,
-                    offsets.hidden,
-                    &layer.post_per_layer_input_norm_weight,
-                    &self.decode_batch_scratch.normed_buf,
-                    offsets.hidden,
-                    hidden_size as u32,
-                    eps,
-                );
-                self.ctx.encode_vec_add_at(
-                    encoder,
-                    &self.decode_batch_scratch.residual_buf,
-                    offsets.hidden,
-                    &self.decode_batch_scratch.normed_buf,
-                    offsets.hidden,
-                    &self.decode_batch_scratch.hidden_buf,
-                    offsets.hidden,
-                    hidden_size as u32,
-                );
+                if crate::gpu::fused_rmsnorm_acc_enabled() {
+                    self.ctx.encode_rmsnorm_acc_out_at_view(
+                        encoder,
+                        &self.decode_batch_scratch.residual_buf,
+                        offsets.hidden,
+                        &self.decode_batch_scratch.o_out_buf,
+                        offsets.hidden,
+                        &layer.post_per_layer_input_norm_weight,
+                        &self.decode_batch_scratch.hidden_buf,
+                        offsets.hidden,
+                        hidden_size as u32,
+                        eps,
+                    );
+                } else {
+                    self.ctx.encode_rmsnorm_at_view(
+                        encoder,
+                        &self.decode_batch_scratch.o_out_buf,
+                        offsets.hidden,
+                        &layer.post_per_layer_input_norm_weight,
+                        &self.decode_batch_scratch.normed_buf,
+                        offsets.hidden,
+                        hidden_size as u32,
+                        eps,
+                    );
+                    self.ctx.encode_vec_add_at(
+                        encoder,
+                        &self.decode_batch_scratch.residual_buf,
+                        offsets.hidden,
+                        &self.decode_batch_scratch.normed_buf,
+                        offsets.hidden,
+                        &self.decode_batch_scratch.hidden_buf,
+                        offsets.hidden,
+                        hidden_size as u32,
+                    );
+                }
                 self.ctx.encode_vec_scale_at(
                     encoder,
                     &self.decode_batch_scratch.hidden_buf,
@@ -4006,7 +6451,7 @@ impl Gemma4GpuModel {
 
         {
             let encoder = cmd.new_compute_command_encoder();
-            self.ctx.encode_rmsnorm_batch(
+            self.ctx.encode_rmsnorm_batch_view(
                 encoder,
                 &self.decode_batch_scratch.hidden_buf,
                 &self.final_norm_weight,
@@ -4018,7 +6463,7 @@ impl Gemma4GpuModel {
             for batch_idx in 0..batch_size {
                 let offsets = self.decode_batch_row_offsets(batch_idx);
                 let logits_offset = Self::f32_byte_offset(batch_idx * vocab_size);
-                self.ctx.encode_matvec_q4_at(
+                self.ctx.encode_matvec_q4_at_view(
                     encoder,
                     &self.lm_head_buf,
                     &self.decode_batch_scratch.normed_buf,
@@ -4063,13 +6508,44 @@ impl Gemma4GpuModel {
         Ok(outputs)
     }
 
-    /// Batched prefill: process all prompt tokens sequentially.
+    /// Batched prefill: intermediate tokens skip lm_head; only the last token
+    /// computes logits (avoids N× full-vocab readback during prompt processing).
     pub fn forward_prefill(&mut self, token_ids: &[usize]) -> Vec<f32> {
-        let mut logits = Vec::new();
-        for &tid in token_ids {
-            logits = self.forward_single_token(tid);
+        if token_ids.is_empty() {
+            return Vec::new();
         }
-        logits
+        if token_ids.len() == 1 {
+            return self.forward_single_token(token_ids[0]);
+        }
+        for &tid in &token_ids[..token_ids.len() - 1] {
+            self.forward_advance(tid);
+        }
+        self.forward_single_token(*token_ids.last().unwrap())
+    }
+
+    /// Prefill with GPU sampling on the last prompt token (4-byte readback only).
+    pub fn forward_prefill_sample_last(
+        &mut self,
+        token_ids: &[usize],
+        temperature: f32,
+        min_p: f32,
+        seed: u32,
+    ) -> usize {
+        if token_ids.is_empty() {
+            return 0;
+        }
+        if token_ids.len() == 1 {
+            return self.forward_single_token_sample(token_ids[0], temperature, min_p, seed);
+        }
+        for &tid in &token_ids[..token_ids.len() - 1] {
+            self.forward_advance(tid);
+        }
+        self.forward_single_token_sample(
+            *token_ids.last().unwrap(),
+            temperature,
+            min_p,
+            seed,
+        )
     }
 
     pub fn forward_single_token_with_kv_slot(
@@ -4257,7 +6733,7 @@ impl Gemma4GpuModel {
         let eps = self.config.rms_norm_eps as f32;
         let cmd = self.ctx.queue.new_command_buffer();
         let encoder = cmd.new_compute_command_encoder();
-        self.ctx.encode_rmsnorm_batch(
+        self.ctx.encode_rmsnorm_batch_view(
             encoder,
             &self.prefill_scratch.hidden_buf,
             &self.final_norm_weight,
@@ -4276,7 +6752,7 @@ impl Gemma4GpuModel {
                 self.prefill_row_offsets(segment.row_start + segment.token_count - 1);
             let cmd = self.ctx.queue.new_command_buffer();
             let encoder = cmd.new_compute_command_encoder();
-            self.ctx.encode_matvec_q4_at(
+            self.ctx.encode_matvec_q4_at_view(
                 encoder,
                 &self.lm_head_buf,
                 &self.prefill_scratch.normed_buf,
@@ -4427,11 +6903,4 @@ fn half_to_f32(bits: u16) -> f32 {
 
 fn bf16_to_f32(bits: u16) -> f32 {
     f32::from_bits((bits as u32) << 16)
-}
-
-/// Convert raw bytes to Vec<u16> (for storing bf16/f16 data compactly).
-fn raw_to_u16(data: &[u8]) -> Vec<u16> {
-    data.chunks_exact(2)
-        .map(|b| u16::from_le_bytes([b[0], b[1]]))
-        .collect()
 }
