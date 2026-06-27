@@ -1498,6 +1498,10 @@ impl Gemma4GpuModel {
         drop(per_layer_model_proj_f32);
 
         // --- Layers ---
+        let q6k_to_q4 = std::env::var("Q6K_TO_Q4").as_deref() == Ok("1");
+        if q6k_to_q4 {
+            println!("  Q6K_TO_Q4=1: converting Q6_K tensors to Q4_0 (faster, slightly lower quality)");
+        }
         println!(
             "  Loading {} layers from GGUF (native Q4_K/Q6_K kept; other types -> Q4_0)...",
             num_layers
@@ -1513,6 +1517,8 @@ impl Gemma4GpuModel {
             // Quantized projection weight: keep community K-quant blocks native
             // (Q4_K / Q6_K) and tag the view; otherwise dequant + requantize to
             // Q4_0 (lossless for on-disk Q4_0, lossy for Q4_1/Q5_K fallbacks).
+            // Set Q6K_TO_Q4=1 to convert Q6_K→Q4_0 at load time (faster but
+            // slightly lower quality for the most sensitive weights).
             let qw = |name: String, rows: usize, cols: usize| -> BufferView {
                 use crate::gguf::ggml_type;
                 use crate::gpu::weight_fmt;
@@ -1521,6 +1527,10 @@ impl Gemma4GpuModel {
                         ctx.buffer_from_bytes(g.tensor_raw(&name)),
                     )
                     .with_format(weight_fmt::Q4_K),
+                    ggml_type::Q6_K if q6k_to_q4 => {
+                        let data = g.dequant_to_f32(&name);
+                        BufferView::from_buffer(ctx.buffer_from_f32_as_q4(&data, rows, cols))
+                    }
                     ggml_type::Q6_K => BufferView::from_buffer(
                         ctx.buffer_from_bytes(g.tensor_raw(&name)),
                     )
@@ -6496,6 +6506,8 @@ impl Gemma4GpuModel {
                     );
                 } else if layer.weight_format.is_kquant() {
                     // K-quant (Q4_K_M): per-tensor matvec, no Q4_0 fusion.
+                    // Gate and up (both Q4_K in standard Q4_K_M) are fused into
+                    // one GeLU dispatch; down (Q6_K) is a plain matvec.
                     self.ctx.encode_rmsnorm_at_view(
                         encoder,
                         &self.decode_batch_scratch.hidden_buf,
@@ -6506,38 +6518,54 @@ impl Gemma4GpuModel {
                         hidden_size as u32,
                         eps,
                     );
-                    self.encode_matvec_quant_at(
-                        encoder,
-                        &layer.gate_proj,
-                        &self.decode_batch_scratch.normed_buf,
-                        offsets.hidden,
-                        &self.decode_batch_scratch.gate_buf,
-                        offsets.intermediate,
-                        intermediate_size as u32,
-                        hidden_size as u32,
-                        layer.weight_format,
-                    );
-                    self.encode_matvec_quant_at(
-                        encoder,
-                        &layer.up_proj,
-                        &self.decode_batch_scratch.normed_buf,
-                        offsets.hidden,
-                        &self.decode_batch_scratch.up_buf,
-                        offsets.intermediate,
-                        intermediate_size as u32,
-                        hidden_size as u32,
-                        layer.weight_format,
-                    );
-                    self.ctx.encode_gelu_mul_at(
-                        encoder,
-                        &self.decode_batch_scratch.gate_buf,
-                        offsets.intermediate,
-                        &self.decode_batch_scratch.up_buf,
-                        offsets.intermediate,
-                        &self.decode_batch_scratch.gelu_buf,
-                        offsets.intermediate,
-                        intermediate_size as u32,
-                    );
+                    if layer.gate_proj.format == crate::gpu::weight_fmt::Q4_K
+                        && layer.up_proj.format == crate::gpu::weight_fmt::Q4_K
+                    {
+                        self.ctx.encode_matvec_qk_gelu_mul_at_view(
+                            encoder,
+                            &layer.gate_proj,
+                            &layer.up_proj,
+                            &self.decode_batch_scratch.normed_buf,
+                            offsets.hidden,
+                            &self.decode_batch_scratch.gelu_buf,
+                            offsets.intermediate,
+                            intermediate_size as u32,
+                            hidden_size as u32,
+                        );
+                    } else {
+                        self.encode_matvec_quant_at(
+                            encoder,
+                            &layer.gate_proj,
+                            &self.decode_batch_scratch.normed_buf,
+                            offsets.hidden,
+                            &self.decode_batch_scratch.gate_buf,
+                            offsets.intermediate,
+                            intermediate_size as u32,
+                            hidden_size as u32,
+                            layer.weight_format,
+                        );
+                        self.encode_matvec_quant_at(
+                            encoder,
+                            &layer.up_proj,
+                            &self.decode_batch_scratch.normed_buf,
+                            offsets.hidden,
+                            &self.decode_batch_scratch.up_buf,
+                            offsets.intermediate,
+                            intermediate_size as u32,
+                            hidden_size as u32,
+                            layer.weight_format,
+                        );
+                        self.ctx.encode_gelu_mul_at(
+                            encoder,
+                            &self.decode_batch_scratch.gate_buf,
+                            offsets.intermediate,
+                            &self.decode_batch_scratch.up_buf,
+                            offsets.intermediate,
+                            &self.decode_batch_scratch.gelu_buf,
+                            offsets.intermediate,
+                            intermediate_size as u32,
+                        );
+                    }
                     self.encode_matvec_quant_at(
                         encoder,
                         &layer.down_proj,

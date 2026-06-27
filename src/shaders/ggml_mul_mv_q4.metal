@@ -982,7 +982,7 @@ kernel void matvec_ggml_q4_0_gelu_mul_r2s4(
 // K-quant matvec tiling: KQ_NSG simdgroups per threadgroup, each computing
 // KQ_NR0 output rows. Rows/threadgroup = KQ_NSG * KQ_NR0. Must match
 // `KQ_NSG`/`KQ_NR0` in ggml_gemv.rs.
-#define KQ_NSG 4
+#define KQ_NSG 2
 #define KQ_NR0 2
 
 struct block_q4_K {
@@ -1038,12 +1038,14 @@ kernel void matvec_ggml_q4_K(
     const int g    = sb >> 1;               // group 0..3 (64 elems each)
     const int hi   = sb & 1;                // 0 = low nibble, 1 = high nibble
 
+    const int act_off = g * 64 + hi * 32 + col0;
+
     float sumf[KQ_NR0];
     for (int r = 0; r < KQ_NR0; ++r) sumf[r] = 0.f;
 
     for (int ib = 0; ib < nb; ++ib) {
         // Activation slice for this lane's 8 columns (shared across rows).
-        device const float * yy = yr + ib * QK_K + g * 64 + hi * 32 + col0;
+        device const float * yy = yr + ib * QK_K + act_off;
         float yl[8];
         for (int i = 0; i < 8; ++i) yl[i] = yy[i];
 
@@ -1062,10 +1064,17 @@ kernel void matvec_ggml_q4_K(
             const uint w0 = qw[0];
             const uint w1 = qw[1];
             float acc = 0.f;
-            for (int i = 0; i < 8; ++i) {
-                const uint byte = (i < 4) ? (w0 >> (i * 8)) : (w1 >> ((i - 4) * 8));
+            // Low half (bytes from w0)
+            for (int i = 0; i < 4; ++i) {
+                const uint byte = (w0 >> (i * 8)) & 0xFF;
                 const float nib = hi == 0 ? (float)(byte & 0x0F) : (float)((byte >> 4) & 0x0F);
                 acc += (ds * nib - mn) * yl[i];
+            }
+            // High half (bytes from w1)
+            for (int i = 0; i < 4; ++i) {
+                const uint byte = (w1 >> (i * 8)) & 0xFF;
+                const float nib = hi == 0 ? (float)(byte & 0x0F) : (float)((byte >> 4) & 0x0F);
+                acc += (ds * nib - mn) * yl[i + 4];
             }
             sumf[r] += acc;
         }
@@ -1186,12 +1195,14 @@ kernel void matvec_ggml_q4_K_gelu_mul(
     const int g    = sb >> 1;
     const int hi   = sb & 1;
 
+    const int act_off = g * 64 + hi * 32 + col0;
+
     float sgate[KQ_NR0];
     float sup[KQ_NR0];
     for (int r = 0; r < KQ_NR0; ++r) { sgate[r] = 0.f; sup[r] = 0.f; }
 
     for (int ib = 0; ib < nb; ++ib) {
-        device const float * yy = yr + ib * QK_K + g * 64 + hi * 32 + col0;
+        device const float * yy = yr + ib * QK_K + act_off;
         float yl[8];
         for (int i = 0; i < 8; ++i) yl[i] = yy[i];
 
@@ -1212,13 +1223,23 @@ kernel void matvec_ggml_q4_K_gelu_mul(
             const uint g0 = qg[0], g1 = qg[1];
             const uint u0 = qu[0], u1 = qu[1];
             float ag = 0.f, au = 0.f;
-            for (int i = 0; i < 8; ++i) {
-                const uint gb = (i < 4) ? (g0 >> (i * 8)) : (g1 >> ((i - 4) * 8));
-                const uint ub = (i < 4) ? (u0 >> (i * 8)) : (u1 >> ((i - 4) * 8));
+            // Low half (bytes from g0/u0)
+            for (int i = 0; i < 4; ++i) {
+                const uint gb = (g0 >> (i * 8)) & 0xFF;
+                const uint ub = (u0 >> (i * 8)) & 0xFF;
                 const float gn = hi == 0 ? (float)(gb & 0x0F) : (float)((gb >> 4) & 0x0F);
                 const float un = hi == 0 ? (float)(ub & 0x0F) : (float)((ub >> 4) & 0x0F);
                 ag += (dsg * gn - mng) * yl[i];
                 au += (dsu * un - mnu_) * yl[i];
+            }
+            // High half (bytes from g1/u1)
+            for (int i = 0; i < 4; ++i) {
+                const uint gb = (g1 >> (i * 8)) & 0xFF;
+                const uint ub = (u1 >> (i * 8)) & 0xFF;
+                const float gn = hi == 0 ? (float)(gb & 0x0F) : (float)((gb >> 4) & 0x0F);
+                const float un = hi == 0 ? (float)(ub & 0x0F) : (float)((ub >> 4) & 0x0F);
+                ag += (dsg * gn - mng) * yl[i + 4];
+                au += (dsu * un - mnu_) * yl[i + 4];
             }
             sgate[r] += ag;
             sup[r]   += au;
