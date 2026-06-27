@@ -1417,10 +1417,17 @@ impl Gemma4GpuModel {
     }
 
     /// Load a Gemma-4 model directly from a `.gguf` file (architecture `gemma4`).
-    /// Quantized weights (Q4_0/Q4_1) and the K-quant embedding tables are
-    /// dequantized to f32 on the CPU, then fed through the same Q4_0 GPU path as
-    /// the safetensors loader. No on-disk Q4 cache is produced for GGUF loads.
+    /// On first load, dequantizes K-quant embeddings and quantizes weights to Q4_0
+    /// on the GPU, saving a Q4 cache for instant loads on subsequent runs.
     pub fn load_from_gguf(gguf_path: &str) -> Self {
+        let load_start = Instant::now();
+
+        let gguf_path = std::path::Path::new(gguf_path);
+        let gguf_dir = gguf_path.parent().unwrap_or(std::path::Path::new("."));
+        let cache_path = gguf_dir.join("model.q4cache");
+        let embed_cache_path = gguf_dir.join("model.embed.cache");
+
+        // Open GGUF for fast metadata parsing (header only).
         let g = crate::gguf::Gguf::open(gguf_path);
         let arch = g.get_str("general.architecture").unwrap_or("");
         assert_eq!(
@@ -1430,6 +1437,25 @@ impl Gemma4GpuModel {
         );
 
         let config = gemma4_config_from_gguf(&g);
+
+        // Check for existing Q4 cache (instant load).
+        if embed_cache_path.exists() {
+            match Self::read_weights_magic(&cache_path) {
+                Some(m) if m == *b"GQ4H" => {
+                    println!("  Found Q4 cache, loading from cache (instant)...");
+                    return Self::load_gguf_from_cache(config, &embed_cache_path, &cache_path, load_start);
+                }
+                Some(m) if m == *b"GQ4G" => {
+                    // GQ4G from an earlier GGUF load lacks per-tensor format tags.
+                    // Delete and re-generate as GQ4H.
+                    println!("  Stale GGUF Q4 cache (GQ4G without format tags). Re-generating...");
+                    let _ = std::fs::remove_file(&embed_cache_path);
+                    let _ = std::fs::remove_file(&cache_path);
+                }
+                _ => {}
+            }
+        }
+
         let ctx = MetalContext::new();
 
         let hidden_size = config.hidden_size;
@@ -1607,7 +1633,7 @@ impl Gemma4GpuModel {
             layers.push(layer);
         }
 
-        Self::assemble(
+        let model = Self::assemble(
             ctx,
             config,
             embed_tables,
@@ -1616,6 +1642,151 @@ impl Gemma4GpuModel {
             per_layer_projection_norm_weight,
             per_layer_model_projection_weight,
             layers,
+        );
+
+        // Save cache for future loads
+        println!("  Saving Q4 cache for fast future loads...");
+        model.save_gguf_cache(&cache_path);
+
+        model
+    }
+
+    /// Fast path: load GGUF model from previously-saved Q4 cache files.
+    fn load_gguf_from_cache(
+        config: Gemma4TextConfig,
+        embed_cache_path: &Path,
+        weights_cache_path: &Path,
+        load_start: Instant,
+    ) -> Self {
+        let ctx = MetalContext::new();
+        let device = &ctx.device;
+
+        // --- Embed tables: mmap from embed cache ---
+        let embed_file = fs::File::open(embed_cache_path).expect("Failed to open embed cache");
+        let embed_mmap =
+            unsafe { Mmap::map(&embed_file).expect("Failed to mmap embed cache") };
+        assert_eq!(&embed_mmap[0..4], b"GQ4E", "Invalid embed cache magic");
+        let mut eoff = 4;
+        let embed_len = Self::read_u64_at(&embed_mmap, &mut eoff);
+        let embed_offset = eoff;
+        eoff += embed_len as usize;
+        println!(
+            "    embed_tokens: {:.1} MB (mmap)",
+            embed_len as f64 / 1024.0 / 1024.0
+        );
+        let ple_len = Self::read_u64_at(&embed_mmap, &mut eoff);
+        let ple_offset = eoff;
+        println!(
+            "    embed_tokens_per_layer: {:.1} MB (mmap)",
+            ple_len as f64 / 1024.0 / 1024.0
+        );
+        let ple_cols = config.num_hidden_layers * config.hidden_size_per_layer_input;
+        let embed_tables = EmbedTables::from_mmap(
+            embed_mmap,
+            embed_offset,
+            embed_len as usize,
+            ple_offset,
+            ple_len as usize,
+            ple_cols,
+            config.vocab_size,
+        );
+
+        // --- Weights: read directly into a single GPU buffer (aligned layout) ---
+        let mut weights_file =
+            fs::File::open(weights_cache_path).expect("Failed to open weights cache");
+        let file_len = weights_file
+            .metadata()
+            .expect("weights metadata")
+            .len();
+        let weights_bytes = file_len.saturating_sub(4) as u64;
+
+        use std::io::Read;
+        let mut magic = [0u8; 4];
+        weights_file
+            .read_exact(&mut magic)
+            .expect("read weights cache magic");
+        let has_tensor_formats = magic == *b"GQ4H";
+        assert!(
+            magic == *b"GQ4G" || magic == *b"GQ4H",
+            "Invalid weights cache magic ({:?}), expected GQ4G or GQ4H",
+            magic
+        );
+        let copy_start = Instant::now();
+        let weights_buf =
+            MetalContext::buffer_read_from_file(&device, &mut weights_file, 4, weights_bytes);
+        println!(
+            "  Copying weights to GPU: {:.1} MB ({:.2}s)...",
+            weights_bytes as f64 / 1024.0 / 1024.0,
+            copy_start.elapsed().as_secs_f64()
+        );
+        let section = unsafe {
+            std::slice::from_raw_parts(weights_buf.contents() as *const u8, weights_bytes as usize)
+        };
+        let mut section_offset = 0;
+        let (mut lm_head_buf, mut per_layer_model_projection_weight,
+             mut final_norm_weight, mut per_layer_projection_norm_weight,
+             mut layers) =
+            Self::load_weight_sections(
+                section,
+                &mut section_offset,
+                &device,
+                config.num_hidden_layers,
+                true,
+                Some(&weights_buf),
+                0,
+            );
+
+        // Restore per-tensor format tags from the format table
+        // (appended after all layer data by save_gguf_cache).
+        if has_tensor_formats {
+            let num_tensors = 4 + 16 * config.num_hidden_layers;
+            let fmt_bytes = &section[section_offset..section_offset + num_tensors];
+            let mut fi = 0;
+
+            let mut global_views = [
+                &mut lm_head_buf,
+                &mut per_layer_model_projection_weight,
+                &mut final_norm_weight,
+                &mut per_layer_projection_norm_weight,
+            ];
+            for v in &mut *global_views.as_mut_slice() {
+                v.format = fmt_bytes[fi];
+                fi += 1;
+            }
+
+            for layer in &mut layers {
+                for v in [
+                    &mut layer.q_proj, &mut layer.k_proj, &mut layer.v_proj,
+                    &mut layer.o_proj, &mut layer.gate_proj, &mut layer.up_proj,
+                    &mut layer.down_proj,
+                    &mut layer.input_layernorm_weight,
+                    &mut layer.post_attention_layernorm_weight,
+                    &mut layer.pre_feedforward_layernorm_weight,
+                    &mut layer.post_feedforward_layernorm_weight,
+                    &mut layer.post_per_layer_input_norm_weight,
+                    &mut layer.per_layer_input_gate_weight,
+                    &mut layer.per_layer_projection_weight,
+                    &mut layer.q_norm_weight, &mut layer.k_norm_weight,
+                ] {
+                    v.format = fmt_bytes[fi];
+                    fi += 1;
+                }
+            }
+            debug_assert_eq!(fi, num_tensors);
+        }
+
+        Self::finish_cache_load(
+            ctx,
+            config,
+            embed_tables,
+            None,
+            lm_head_buf,
+            per_layer_model_projection_weight,
+            final_norm_weight,
+            per_layer_projection_norm_weight,
+            layers,
+            load_start,
+            "GGUF Q4 cache",
         )
     }
 
@@ -1631,6 +1802,96 @@ impl Gemma4GpuModel {
             .join("model.embed.cache");
         self.save_embed_cache(&embed_path);
         self.save_weights_cache(path);
+    }
+
+    /// Save GGUF cache with per-tensor format tags (magic `GQ4H`).
+    /// The format byte for each tensor is appended after all layer data
+    /// so that the existing `load_weight_sections` can read the tensor
+    /// payloads unchanged; the format table is then read separately.
+    fn save_gguf_cache(&self, path: &Path) {
+        let embed_path = path
+            .parent()
+            .expect("cache path has no parent")
+            .join("model.embed.cache");
+        self.save_embed_cache(&embed_path);
+
+        use std::io::{Seek, Write};
+        let mut file = fs::File::create(path).expect("Failed to create weights cache");
+        file.write_all(b"GQ4H").unwrap();
+
+        let save_view = |f: &mut fs::File, view: &BufferView| {
+            f.write_all(&view.length.to_le_bytes()).unwrap();
+            let pos = f.stream_position().expect("stream position") as usize;
+            let pad_before = weight_section_pad(pos - WEIGHT_CACHE_MAGIC_LEN);
+            if pad_before > 0 {
+                f.write_all(&vec![0u8; pad_before]).unwrap();
+            }
+            f.write_all(view.as_bytes()).unwrap();
+            let pos = f.stream_position().expect("stream position") as usize;
+            let pad_after = weight_section_pad(pos - WEIGHT_CACHE_MAGIC_LEN);
+            if pad_after > 0 {
+                f.write_all(&vec![0u8; pad_after]).unwrap();
+            }
+        };
+
+        let collect_formats = |views: &[&BufferView]| -> Vec<u8> {
+            views.iter().map(|v| v.format).collect()
+        };
+
+        // Global tensors (4)
+        let mut formats = Vec::new();
+        let global_views = [
+            &self.lm_head_buf,
+            &self.per_layer_model_projection_weight,
+            &self.final_norm_weight,
+            &self.per_layer_projection_norm_weight,
+        ];
+        for &v in &global_views {
+            save_view(&mut file, v);
+        }
+        formats.extend(collect_formats(&global_views));
+
+        // Per-layer weights
+        let num_layers = self.layers.len() as u32;
+        file.write_all(&num_layers.to_le_bytes()).unwrap();
+        pad_weights_file_to_section_align(&mut file);
+        for layer in &self.layers {
+            let layer_views = [
+                &layer.q_proj, &layer.k_proj, &layer.v_proj,
+                &layer.o_proj, &layer.gate_proj, &layer.up_proj,
+                &layer.down_proj,
+                &layer.input_layernorm_weight,
+                &layer.post_attention_layernorm_weight,
+                &layer.pre_feedforward_layernorm_weight,
+                &layer.post_feedforward_layernorm_weight,
+                &layer.post_per_layer_input_norm_weight,
+                &layer.per_layer_input_gate_weight,
+                &layer.per_layer_projection_weight,
+                &layer.q_norm_weight, &layer.k_norm_weight,
+            ];
+            for &v in &layer_views {
+                save_view(&mut file, v);
+            }
+            formats.extend(collect_formats(&layer_views));
+
+            file.write_all(&layer.layer_scalar.to_le_bytes()).unwrap();
+            file.write_all(&(layer.is_full_attention as u8).to_le_bytes()).unwrap();
+            file.write_all(&(layer.has_kv as u8).to_le_bytes()).unwrap();
+            file.write_all(&[layer.weight_format.to_u8()]).unwrap();
+            file.write_all(&(layer.kv_source_layer as u32).to_le_bytes()).unwrap();
+            file.write_all(&(layer.head_dim as u32).to_le_bytes()).unwrap();
+            file.write_all(&(layer.q_out_dim as u32).to_le_bytes()).unwrap();
+            file.write_all(&(layer.kv_out_dim as u32).to_le_bytes()).unwrap();
+            pad_weights_file_to_section_align(&mut file);
+        }
+
+        // Append format table (all format bytes, in tensor order)
+        file.write_all(&formats).unwrap();
+
+        println!(
+            "  Weights cache saved: {:.1} MB",
+            file.metadata().map(|m| m.len()).unwrap_or(0) as f64 / 1024.0 / 1024.0
+        );
     }
 
     fn save_embed_cache(&self, path: &Path) {
@@ -2097,6 +2358,22 @@ impl Gemma4GpuModel {
         };
         let mut magic = [0u8; 4];
         file.read_exact(&mut magic).is_ok() && (magic == *b"GQ4W" || magic == *b"GQ4A")
+    }
+
+    /// Read the 4-byte magic from a weights cache file.
+    fn read_weights_magic(path: &Path) -> Option<[u8; 4]> {
+        use std::io::Read;
+        let mut file = fs::File::open(path).ok()?;
+        let mut magic = [0u8; 4];
+        file.read_exact(&mut magic).ok()?;
+        Some(magic)
+    }
+
+    /// True if the file is a GGUF-compatible weights cache
+    /// (GQ4G: all-Q4_0 layout, GQ4H: with per-tensor format tags).
+    fn is_gguf_weights_cache(path: &Path) -> bool {
+        Self::read_weights_magic(path)
+            .map_or(false, |m| m == *b"GQ4G" || m == *b"GQ4H")
     }
 
     fn is_legacy_weights_cache(path: &Path) -> bool {
