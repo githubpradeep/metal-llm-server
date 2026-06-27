@@ -165,9 +165,10 @@ pub fn mul_mv_dispatch(m: u32, batch: u32) -> (u64, u64, u64, u64, u64) {
     (tg_x, tg_y, 1, 32, GGML_NSG_Q4_0 as u64)
 }
 
-/// Output rows per threadgroup for the K-quant matvec (one row per simdgroup).
-/// Must match `KQ_NSG` in ggml_mul_mv_q4.metal.
+/// K-quant matvec tiling: KQ_NSG simdgroups/threadgroup, KQ_NR0 rows each.
+/// Must match `KQ_NSG`/`KQ_NR0` in ggml_mul_mv_q4.metal.
 pub const KQ_NSG: u32 = 4;
+pub const KQ_NR0: u32 = 2;
 
 /// Args for the native K-quant matvec (`matvec_ggml_q4_K` / `matvec_ggml_q6_K`).
 /// The kernels only read ne00/ne01/ne10/ne0 + the batch (ne11 via tgpig.y), so
@@ -197,10 +198,12 @@ pub fn mul_mv_args_k(m: u32, k: u32, batch: u32) -> GgmlMulMvArgs {
     }
 }
 
-/// Threadgroups/threads for the K-quant matvec: ceil(m/KQ_NSG) groups in x,
-/// `batch` in y; each group is 32 threads × KQ_NSG simdgroups.
+/// Threadgroups/threads for the K-quant matvec: ceil(m / (KQ_NSG*KQ_NR0))
+/// groups in x, `batch` in y; each group is 32 threads × KQ_NSG simdgroups,
+/// and each simdgroup computes KQ_NR0 rows.
 pub fn mul_mv_k_dispatch(m: u32, batch: u32) -> (u64, u64, u64, u64, u64) {
-    let tg_x = ((m + KQ_NSG - 1) / KQ_NSG) as u64;
+    let rows_per_tg = KQ_NSG * KQ_NR0;
+    let tg_x = ((m + rows_per_tg - 1) / rows_per_tg) as u64;
     (tg_x, batch as u64, 1, 32, KQ_NSG as u64)
 }
 

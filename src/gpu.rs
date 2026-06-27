@@ -424,6 +424,7 @@ pub struct MetalContext {
     // K-quant pipelines (native Q4_K / Q6_K matvec, decode + prefill)
     pub matvec_ggml_q4k_pipeline: ComputePipelineState,
     pub matvec_ggml_q6k_pipeline: ComputePipelineState,
+    pub matvec_ggml_q4k_gelu_mul_pipeline: ComputePipelineState,
     // Q3_0 pipelines
     pub matvec_ggml_q3_pipeline: ComputePipelineState,
     pub matvec_ggml_q3_dual_pipeline: ComputePipelineState,
@@ -585,6 +586,7 @@ impl MetalContext {
         let matvec_ggml_q4_gelu_mul_r2s4_pipeline = get_fn("matvec_ggml_q4_0_gelu_mul_r2s4");
         let matvec_ggml_q4k_pipeline = get_fn("matvec_ggml_q4_K");
         let matvec_ggml_q6k_pipeline = get_fn("matvec_ggml_q6_K");
+        let matvec_ggml_q4k_gelu_mul_pipeline = get_fn("matvec_ggml_q4_K_gelu_mul");
         let matvec_ggml_q3_pipeline = get_fn("matvec_ggml_q3_0");
         let matvec_ggml_q3_dual_pipeline = get_fn("matvec_ggml_q3_0_dual");
         let matvec_ggml_q3_gelu_mul_pipeline = get_fn("matvec_ggml_q3_0_gelu_mul");
@@ -820,6 +822,7 @@ impl MetalContext {
             matvec_ggml_q4_gelu_mul_r2s4_pipeline,
             matvec_ggml_q4k_pipeline,
             matvec_ggml_q6k_pipeline,
+            matvec_ggml_q4k_gelu_mul_pipeline,
             matvec_ggml_q3_pipeline,
             matvec_ggml_q3_dual_pipeline,
             matvec_ggml_q3_gelu_mul_pipeline,
@@ -1701,6 +1704,41 @@ impl MetalContext {
             &args as *const _ as *const _,
         );
         let (tg_x, tg_y, tg_z, tw, nsg) = mul_mv_k_dispatch(m, batch);
+        encoder.dispatch_thread_groups(
+            metal::MTLSize::new(tg_x, tg_y, tg_z),
+            metal::MTLSize::new(tw, nsg, 1),
+        );
+    }
+
+    /// Fused gate+up Q4_K GEMV with GeLU(gate)*up — one dispatch, shared x loads.
+    /// Both `gate` and `up` must be Q4_K. Output is `gelu_out[i] = GeLU(gate·x)·(up·x)`.
+    pub fn encode_matvec_qk_gelu_mul_at_view(
+        &self,
+        encoder: &metal::ComputeCommandEncoderRef,
+        gate: &BufferView,
+        up: &BufferView,
+        x_buf: &Buffer,
+        x_offset: u64,
+        gelu_out: &Buffer,
+        gelu_offset: u64,
+        m: u32,
+        k: u32,
+    ) {
+        debug_assert_eq!(gate.format, weight_fmt::Q4_K);
+        debug_assert_eq!(up.format, weight_fmt::Q4_K);
+        use crate::ggml_gemv::{mul_mv_args_k, mul_mv_k_dispatch};
+        let args = mul_mv_args_k(m, k, 1);
+        encoder.set_compute_pipeline_state(&self.matvec_ggml_q4k_gelu_mul_pipeline);
+        encoder.set_buffer(0, Some(&gate.buffer), gate.offset);
+        encoder.set_buffer(1, Some(&up.buffer), up.offset);
+        encoder.set_buffer(2, Some(x_buf), x_offset);
+        encoder.set_buffer(3, Some(gelu_out), gelu_offset);
+        encoder.set_bytes(
+            4,
+            std::mem::size_of::<crate::ggml_gemv::GgmlMulMvArgs>() as u64,
+            &args as *const _ as *const _,
+        );
+        let (tg_x, tg_y, tg_z, tw, nsg) = mul_mv_k_dispatch(m, 1);
         encoder.dispatch_thread_groups(
             metal::MTLSize::new(tg_x, tg_y, tg_z),
             metal::MTLSize::new(tw, nsg, 1),
