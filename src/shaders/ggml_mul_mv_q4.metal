@@ -974,7 +974,7 @@ kernel void matvec_ggml_q4_0_gelu_mul_r2s4(
 #define QK_K 256
 
 #define KQ_NSG 2
-#define KQ_NR0 2
+#define KQ_NR0 4
 
 struct block_q4_K {
     half     d;

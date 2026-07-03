@@ -168,7 +168,7 @@ pub fn mul_mv_dispatch(m: u32, batch: u32) -> (u64, u64, u64, u64, u64) {
 /// K-quant matvec tiling: KQ_NSG simdgroups/threadgroup, KQ_NR0 rows each.
 /// Must match `KQ_NSG`/`KQ_NR0` in ggml_mul_mv_q4.metal.
 pub const KQ_NSG: u32 = 2;
-pub const KQ_NR0: u32 = 2;
+pub const KQ_NR0: u32 = 4;
 
 /// Args for K-quant matvec (`matvec_ggml_q4_K` / `matvec_ggml_q6_K`).
 /// Byte strides match ggml-metal: `nb01` is the row stride in bytes.
