@@ -1687,13 +1687,15 @@ impl MetalContext {
         k: u32,
         batch: u32,
     ) {
-        use crate::ggml_gemv::{mul_mv_args_k, mul_mv_k_dispatch};
-        let pipeline = match weight.format {
-            weight_fmt::Q4_K => &self.matvec_ggml_q4k_pipeline,
-            weight_fmt::Q6_K => &self.matvec_ggml_q6k_pipeline,
+        use crate::ggml_gemv::{
+            mul_mv_args_k, mul_mv_k_dispatch, Q4_K_BLOCK_BYTES, Q6_K_BLOCK_BYTES,
+        };
+        let (pipeline, block_bytes) = match weight.format {
+            weight_fmt::Q4_K => (&self.matvec_ggml_q4k_pipeline, Q4_K_BLOCK_BYTES),
+            weight_fmt::Q6_K => (&self.matvec_ggml_q6k_pipeline, Q6_K_BLOCK_BYTES),
             other => panic!("encode_matvec_qk_at_view: not a K-quant format ({})", other),
         };
-        let args = mul_mv_args_k(m, k, batch);
+        let args = mul_mv_args_k(m, k, batch, block_bytes);
         encoder.set_compute_pipeline_state(pipeline);
         encoder.set_buffer(0, Some(&weight.buffer), weight.offset);
         encoder.set_buffer(1, Some(x_buf), x_offset);
@@ -1726,8 +1728,8 @@ impl MetalContext {
     ) {
         debug_assert_eq!(gate.format, weight_fmt::Q4_K);
         debug_assert_eq!(up.format, weight_fmt::Q4_K);
-        use crate::ggml_gemv::{mul_mv_args_k, mul_mv_k_dispatch};
-        let args = mul_mv_args_k(m, k, 1);
+        use crate::ggml_gemv::{mul_mv_args_k, mul_mv_k_dispatch, Q4_K_BLOCK_BYTES};
+        let args = mul_mv_args_k(m, k, 1, Q4_K_BLOCK_BYTES);
         encoder.set_compute_pipeline_state(&self.matvec_ggml_q4k_gelu_mul_pipeline);
         encoder.set_buffer(0, Some(&gate.buffer), gate.offset);
         encoder.set_buffer(1, Some(&up.buffer), up.offset);

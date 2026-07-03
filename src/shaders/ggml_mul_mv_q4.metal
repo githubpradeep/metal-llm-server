@@ -967,56 +967,137 @@ kernel void matvec_ggml_q4_0_gelu_mul_r2s4(
 
 // ───────────────────────── K-quant matvec (Q4_K / Q6_K) ─────────────────────
 //
-// Native super-block (QK_K=256) matvec for llama.cpp "_K" weights, used for
-// community Q4_K_M GGUFs. Layout is intentionally simple and verifiable rather
-// than maximally tuned: one simdgroup computes one output row; the 32 lanes
-// stride over the row's super-blocks and a simd_sum reduces the partial dots.
-// The batch dimension (tgpig.y in [0, ne11)) lets the SAME kernel serve both
-// decode (ne11=1) and prefill (ne11=seq_len). x and y are f32.
-//
-// Dequant math is byte-for-byte the CPU reference in gguf.rs (get_scale_min_k4
-// for Q4_K; the ql/qh/scales unpack for Q6_K).
+// Ported from ggml-org/llama.cpp ggml-metal.metal (N_R0=2, N_SG=2).
+// Uses the same lane layout, super-block striping, and scale/min folding as
+// kernel_mul_mv_q4_K_f32 / kernel_mul_mv_q6_K_f32.
 
 #define QK_K 256
 
-// K-quant matvec tiling: KQ_NSG simdgroups per threadgroup, each computing
-// KQ_NR0 output rows. Rows/threadgroup = KQ_NSG * KQ_NR0. Must match
-// `KQ_NSG`/`KQ_NR0` in ggml_gemv.rs.
 #define KQ_NSG 2
 #define KQ_NR0 2
 
 struct block_q4_K {
-    half     d;          // super-block scale for the 6-bit scales
-    half     dmin;       // super-block scale for the 6-bit mins
-    uint8_t  scales[12]; // 8 sub-block scales + mins, 6-bit packed
-    uint8_t  qs[128];    // 4-bit quants
+    half     d;
+    half     dmin;
+    uint8_t  scales[12];
+    uint8_t  qs[128];
 };
 
 struct block_q6_K {
-    uint8_t  ql[128];    // lower 4 bits
-    uint8_t  qh[64];     // upper 2 bits
-    int8_t   scales[16]; // 8-bit sub-block scales
-    half     d;          // super-block scale
+    uint8_t  ql[128];
+    uint8_t  qh[64];
+    int8_t   scales[16];
+    half     d;
 };
 
-// 6-bit (scale, min) unpack — matches ggml get_scale_min_k4.
-inline void kq_scale_min_k4(int j, device const uint8_t * q, thread uint8_t & d, thread uint8_t & m) {
-    if (j < 4) {
-        d = q[j] & 63;
-        m = q[j + 4] & 63;
-    } else {
-        d = (q[j + 4] & 0x0F) | ((q[j - 4] >> 6) << 4);
-        m = (q[j + 4] >> 4)   | ((q[j]     >> 6) << 4);
+template<short nr0>
+void mul_vec_q4_K_f32_impl(
+        constant ggml_mul_mv_args& args,
+        device const char * src0,
+        device const char * src1,
+        device       char * dst,
+        uint3  tgpig,
+        ushort tiisg,
+        ushort sgitg) {
+    const short NSG = KQ_NSG;
+
+    constexpr uint16_t kmask1 = 0x3f3f;
+    constexpr uint16_t kmask2 = 0x0f0f;
+    constexpr uint16_t kmask3 = 0xc0c0;
+
+    const short ix = tiisg/8;
+    const short it = tiisg%8;
+    const short iq = it/4;
+    const short ir = it%4;
+
+    const int nb = args.ne00/QK_K;
+
+    const int r0 = tgpig.x;
+    const int r1 = tgpig.y;
+    const int im = tgpig.z;
+
+    const int first_row = (r0 * NSG + sgitg) * nr0;
+
+    const uint i12 = im % uint(args.ne12);
+    const uint i13 = im / uint(args.ne12);
+
+    const uint64_t offset0 = first_row*args.nb01 + (i12/uint(args.r2))*args.nb02 + (i13/uint(args.r3))*args.nb03;
+    const uint64_t offset1 = r1*args.nb11 + i12*args.nb12 + i13*args.nb13;
+
+    device const block_q4_K * x = (device const block_q4_K *)(src0 + offset0);
+    device const float      * y = (device const float *)(src1 + offset1);
+
+    float yl[16];
+    float yh[16];
+
+    float sumf[nr0]={0.f};
+
+    device const float * y4 = y + ix * QK_K + 64 * iq + 8 * ir;
+
+    uint16_t sc16[4];
+    thread const uint8_t * sc8 = (thread const uint8_t *)sc16;
+
+    for (int ib = ix; ib < nb; ib += 4) {
+        float4 sumy = {0.f, 0.f, 0.f, 0.f};
+
+        for (short i = 0; i < 8; ++i) {
+            yl[i+0] = y4[i+  0]; sumy[0] += yl[i+0];
+            yl[i+8] = y4[i+ 32]; sumy[1] += yl[i+8];
+            yh[i+0] = y4[i+128]; sumy[2] += yh[i+0];
+            yh[i+8] = y4[i+160]; sumy[3] += yh[i+8];
+        }
+
+        device const uint16_t * sc = (device const uint16_t *)x[ib].scales + iq;
+        device const uint16_t * q1 = (device const uint16_t *)x[ib].qs + 16 * iq + 4 * ir;
+        device const half     * dh = &x[ib].d;
+
+        for (short row = 0; row < nr0; row++) {
+            sc16[0] = sc[0] & kmask1;
+            sc16[1] = sc[2] & kmask1;
+            sc16[2] = ((sc[4] >> 0) & kmask2) | ((sc[0] & kmask3) >> 2);
+            sc16[3] = ((sc[4] >> 4) & kmask2) | ((sc[2] & kmask3) >> 2);
+
+            device const uint16_t * q2 = q1 + 32;
+
+            float4 acc1 = {0.f, 0.f, 0.f, 0.f};
+            float4 acc2 = {0.f, 0.f, 0.f, 0.f};
+
+            #pragma unroll
+            for (short i = 0; i < 4; ++i) {
+                acc1[0] += yl[2*i + 0] * (q1[i] & 0x000F);
+                acc1[1] += yl[2*i + 1] * (q1[i] & 0x0F00);
+                acc1[2] += yl[2*i + 8] * (q1[i] & 0x00F0);
+                acc1[3] += yl[2*i + 9] * (q1[i] & 0xF000);
+                acc2[0] += yh[2*i + 0] * (q2[i] & 0x000F);
+                acc2[1] += yh[2*i + 1] * (q2[i] & 0x0F00);
+                acc2[2] += yh[2*i + 8] * (q2[i] & 0x00F0);
+                acc2[3] += yh[2*i + 9] * (q2[i] & 0xF000);
+            }
+
+            sumf[row] += dh[0] * ((acc1[0] + 1.f/256.f * acc1[1]) * sc8[0] +
+                                  (acc1[2] + 1.f/256.f * acc1[3]) * sc8[1] * 1.f/16.f +
+                                  (acc2[0] + 1.f/256.f * acc2[1]) * sc8[4] +
+                                  (acc2[2] + 1.f/256.f * acc2[3]) * sc8[5] * 1.f/16.f) -
+                         dh[1] * (sumy[0] * sc8[2] + sumy[1] * sc8[3] + sumy[2] * sc8[6] + sumy[3] * sc8[7]);
+
+            q1 += args.nb01/2;
+            sc += args.nb01/2;
+            dh += args.nb01/2;
+        }
+
+        y4 += 4 * QK_K;
+    }
+
+    device float * dst_f32 = (device float *) dst + (int64_t)im*args.ne0*args.ne1 + (int64_t)r1*args.ne0;
+
+    for (int row = 0; row < nr0 && first_row + row < args.ne0; ++row) {
+        float sum_all = simd_sum(sumf[row]);
+        if (tiisg == 0) {
+            dst_f32[first_row + row] = sum_all;
+        }
     }
 }
 
-// Q4_K matvec: each simdgroup computes KQ_NR0 output rows. All 32 lanes
-// cooperate on each 256-weight super-block (8 weights/lane), so every lane
-// issues weight loads — keeping the (memory-bound) simdgroup busy even when nb
-// is small. Lane layout: 4 lanes per Q4_K sub-block (8 sub-blocks of 32); lane
-// t owns sub-block sb=t/4, columns col0=(t%4)*8 .. col0+7. The activation
-// (yl) is loaded once per super-block and reused across the KQ_NR0 rows; the
-// 8 weight nibbles are read as two 32-bit words instead of scalar bytes.
 kernel void matvec_ggml_q4_K(
     device const char * W [[buffer(0)]],
     device const char * x [[buffer(1)]],
@@ -1026,72 +1107,104 @@ kernel void matvec_ggml_q4_K(
     uint tiisg  [[thread_index_in_simdgroup]],
     uint sgitg  [[simdgroup_index_in_threadgroup]]
 ) {
-    const int nb        = args.ne00 / QK_K;       // super-blocks per row
-    const int first_row = (int)(tgpig.x * KQ_NSG + sgitg) * KQ_NR0;
-    if (first_row >= args.ne01) return;
-    const int r1 = tgpig.y;                        // batch / token index
+    mul_vec_q4_K_f32_impl<KQ_NR0>(args, W, x, y, tgpig, tiisg, sgitg);
+}
 
-    device const float * yr = (device const float *) x + (uint) r1 * args.ne10;
+template<short nr0>
+void mul_vec_q6_K_f32_impl(
+        constant ggml_mul_mv_args& args,
+        device const char * src0,
+        device const char * src1,
+        device       char * dst,
+        uint3  tgpig,
+        ushort tiisg,
+        ushort sgitg) {
+    const short NSG = KQ_NSG;
 
-    const int sb   = tiisg >> 2;            // sub-block 0..7
-    const int col0 = (int)(tiisg & 3) * 8;  // 0, 8, 16, 24
-    const int g    = sb >> 1;               // group 0..3 (64 elems each)
-    const int hi   = sb & 1;                // 0 = low nibble, 1 = high nibble
+    constexpr uint8_t kmask1 = 0x03;
+    constexpr uint8_t kmask2 = 0x0C;
+    constexpr uint8_t kmask3 = 0x30;
+    constexpr uint8_t kmask4 = 0xC0;
 
-    const int act_off = g * 64 + hi * 32 + col0;
+    const int nb = args.ne00/QK_K;
 
-    float sumf[KQ_NR0];
-    for (int r = 0; r < KQ_NR0; ++r) sumf[r] = 0.f;
+    const int r0 = tgpig.x;
+    const int r1 = tgpig.y;
+    const int im = tgpig.z;
 
-    for (int ib = 0; ib < nb; ++ib) {
-        // Activation slice for this lane's 8 columns (shared across rows).
-        device const float * yy = yr + ib * QK_K + act_off;
-        float yl[8];
-        for (int i = 0; i < 8; ++i) yl[i] = yy[i];
+    const int first_row = (r0 * NSG + sgitg) * nr0;
 
-        for (int r = 0; r < KQ_NR0; ++r) {
-            const int row = first_row + r;
-            if (row >= args.ne01) break;
-            device const block_q4_K * b = (device const block_q4_K *) W + (uint)row * nb + ib;
-            const float d    = (float) b->d;
-            const float dmin = (float) b->dmin;
-            uint8_t scu, mnu;
-            kq_scale_min_k4(sb, b->scales, scu, mnu);
-            const float ds = d * scu;
-            const float mn = dmin * mnu;
-            // 8 nibbles = two aligned 32-bit words (col0 is a multiple of 8).
-            device const uint * qw = (device const uint *)(b->qs + g * 32 + col0);
-            const uint w0 = qw[0];
-            const uint w1 = qw[1];
-            float acc = 0.f;
-            // Low half (bytes from w0)
-            for (int i = 0; i < 4; ++i) {
-                const uint byte = (w0 >> (i * 8)) & 0xFF;
-                const float nib = hi == 0 ? (float)(byte & 0x0F) : (float)((byte >> 4) & 0x0F);
-                acc += (ds * nib - mn) * yl[i];
+    const uint i12 = im % uint(args.ne12);
+    const uint i13 = im / uint(args.ne12);
+
+    const uint64_t offset0 = first_row*args.nb01 + (i12/uint(args.r2))*args.nb02 + (i13/uint(args.r3))*args.nb03;
+    const uint64_t offset1 = r1*args.nb11 + i12*args.nb12 + i13*args.nb13;
+
+    device const block_q6_K * x = (device const block_q6_K *)(src0 + offset0);
+    device const float        * yy = (device const float *)(src1 + offset1);
+
+    float sumf[nr0] = { 0.f };
+
+    float yl[16];
+
+    const short tid = tiisg/2;
+    const short ix  = tiisg%2;
+    const short ip  = tid/8;
+    const short il  = tid%8;
+    const short l0  = 4*il;
+    const short is  = 8*ip + l0/16;
+
+    const short y_offset   = 128*ip + l0;
+    const short q_offset_l =  64*ip + l0;
+    const short q_offset_h =  32*ip + l0;
+
+    for (int i = ix; i < nb; i += 2) {
+        device const uint8_t * q1 = x[i].ql + q_offset_l;
+        device const uint8_t * q2 = q1 + 32;
+        device const uint8_t * qh = x[i].qh + q_offset_h;
+        device const int8_t  * sc = x[i].scales + is;
+        device const half    * dh = &x[i].d;
+
+        device const float * y = yy + i * QK_K + y_offset;
+
+        for (short l = 0; l < 4; ++l) {
+            yl[4*l + 0] = y[l +  0];
+            yl[4*l + 1] = y[l + 32];
+            yl[4*l + 2] = y[l + 64];
+            yl[4*l + 3] = y[l + 96];
+        }
+
+        for (short row = 0; row < nr0; ++row) {
+            float4 sums = {0.f, 0.f, 0.f, 0.f};
+
+            #pragma unroll
+            for (short l = 0; l < 4; ++l) {
+                sums[0] += yl[4*l + 0] * ((int8_t)((q1[l] & 0xF) | ((qh[l] & kmask1) << 4)) - 32);
+                sums[1] += yl[4*l + 1] * ((int8_t)((q2[l] & 0xF) | ((qh[l] & kmask2) << 2)) - 32);
+                sums[2] += yl[4*l + 2] * ((int8_t)((q1[l]  >> 4) | ((qh[l] & kmask3) << 0)) - 32);
+                sums[3] += yl[4*l + 3] * ((int8_t)((q2[l]  >> 4) | ((qh[l] & kmask4) >> 2)) - 32);
             }
-            // High half (bytes from w1)
-            for (int i = 0; i < 4; ++i) {
-                const uint byte = (w1 >> (i * 8)) & 0xFF;
-                const float nib = hi == 0 ? (float)(byte & 0x0F) : (float)((byte >> 4) & 0x0F);
-                acc += (ds * nib - mn) * yl[i + 4];
-            }
-            sumf[r] += acc;
+
+            sumf[row] += dh[0] * (sums[0] * sc[0] + sums[1] * sc[2] + sums[2] * sc[4] + sums[3] * sc[6]);
+
+            q1 += args.nb01;
+            q2 += args.nb01;
+            qh += args.nb01;
+            sc += args.nb01;
+            dh += args.nb01/2;
         }
     }
-    for (int r = 0; r < KQ_NR0; ++r) {
-        const int row = first_row + r;
-        const float tot = simd_sum(sumf[r]);
-        if (tiisg == 0 && row < args.ne01) {
-            ((device float *) y)[(uint) r1 * args.ne0 + row] = tot;
+
+    device float * dst_f32 = (device float *) dst + (uint64_t)im*args.ne0*args.ne1 + (uint64_t)r1*args.ne0;
+
+    for (int row = 0; row < nr0 && first_row + row < args.ne0; ++row) {
+        float sum_all = simd_sum(sumf[row]);
+        if (tiisg == 0) {
+            dst_f32[first_row + row] = sum_all;
         }
     }
 }
 
-// Q6_K matvec: each simdgroup computes KQ_NR0 rows; all 32 lanes cooperate per
-// super-block. Lane layout: 16 lanes per 128-element part; lane t owns part
-// p=t/16 and the two l-rows l=(t%16)*2 (+1), each producing 4 outputs (offsets
-// 0/32/64/96). The activation is loaded once per super-block and reused.
 kernel void matvec_ggml_q6_K(
     device const char * W [[buffer(0)]],
     device const char * x [[buffer(1)]],
@@ -1101,78 +1214,157 @@ kernel void matvec_ggml_q6_K(
     uint tiisg  [[thread_index_in_simdgroup]],
     uint sgitg  [[simdgroup_index_in_threadgroup]]
 ) {
-    const int nb        = args.ne00 / QK_K;
-    const int first_row = (int)(tgpig.x * KQ_NSG + sgitg) * KQ_NR0;
-    if (first_row >= args.ne01) return;
+    mul_vec_q6_K_f32_impl<KQ_NR0>(args, W, x, y, tgpig, tiisg, sgitg);
+}
+
+// Fused gate+up+GeLU for Q4_K weights. Shared activation loads, dual weight streams.
+template<short nr0>
+void mul_vec_q4_K_gelu_f32_impl(
+        constant ggml_mul_mv_args& args,
+        device const char * src0_gate,
+        device const char * src0_up,
+        device const char * src1,
+        device       char * dst,
+        uint3  tgpig,
+        ushort tiisg,
+        ushort sgitg) {
+    const short NSG = KQ_NSG;
+
+    constexpr uint16_t kmask1 = 0x3f3f;
+    constexpr uint16_t kmask2 = 0x0f0f;
+    constexpr uint16_t kmask3 = 0xc0c0;
+
+    const short ix = tiisg/8;
+    const short it = tiisg%8;
+    const short iq = it/4;
+    const short ir = it%4;
+
+    const int nb = args.ne00/QK_K;
+
+    const int r0 = tgpig.x;
     const int r1 = tgpig.y;
+    const int im = tgpig.z;
 
-    device const float * yr = (device const float *) x + (uint) r1 * args.ne10;
+    const int first_row = (r0 * NSG + sgitg) * nr0;
 
-    const int p  = tiisg >> 4;              // part 0..1 (128 elems each)
-    const int lp = (int)(tiisg & 15);       // 0..15 within part
+    const uint i12 = im % uint(args.ne12);
+    const uint i13 = im / uint(args.ne12);
 
-    float sumf[KQ_NR0];
-    for (int r = 0; r < KQ_NR0; ++r) sumf[r] = 0.f;
+    const uint64_t offset0 = first_row*args.nb01 + (i12/uint(args.r2))*args.nb02 + (i13/uint(args.r3))*args.nb03;
+    const uint64_t offset1 = r1*args.nb11 + i12*args.nb12 + i13*args.nb13;
 
-    for (int ib = 0; ib < nb; ++ib) {
-        device const float * yy = yr + ib * QK_K + p * 128;
-        // Activation for this lane's two l-rows × 4 output slots (shared).
-        float yl[2][4];
-        for (int li = 0; li < 2; ++li) {
-            const int l = lp * 2 + li;
-            yl[li][0] = yy[l];
-            yl[li][1] = yy[l + 32];
-            yl[li][2] = yy[l + 64];
-            yl[li][3] = yy[l + 96];
+    device const block_q4_K * xg = (device const block_q4_K *)(src0_gate + offset0);
+    device const block_q4_K * xu = (device const block_q4_K *)(src0_up   + offset0);
+    device const float      * y  = (device const float *)(src1 + offset1);
+
+    float yl[16];
+    float yh[16];
+
+    float sumf_gate[nr0]={0.f};
+    float sumf_up[nr0]={0.f};
+
+    device const float * y4 = y + ix * QK_K + 64 * iq + 8 * ir;
+
+    uint16_t sc16[4];
+    thread const uint8_t * sc8 = (thread const uint8_t *)sc16;
+
+    for (int ib = ix; ib < nb; ib += 4) {
+        float4 sumy = {0.f, 0.f, 0.f, 0.f};
+
+        for (short i = 0; i < 8; ++i) {
+            yl[i+0] = y4[i+  0]; sumy[0] += yl[i+0];
+            yl[i+8] = y4[i+ 32]; sumy[1] += yl[i+8];
+            yh[i+0] = y4[i+128]; sumy[2] += yh[i+0];
+            yh[i+8] = y4[i+160]; sumy[3] += yh[i+8];
         }
-        for (int r = 0; r < KQ_NR0; ++r) {
-            const int row = first_row + r;
-            if (row >= args.ne01) break;
-            device const block_q6_K * b = (device const block_q6_K *) W + (uint)row * nb + ib;
-            const float d = (float) b->d;
-            device const uint8_t * ql = b->ql + p * 64;
-            device const uint8_t * qh = b->qh + p * 32;
-            device const int8_t  * sc = b->scales + p * 8;
-            // is is identical for li=0/1 (lp*2 is even, never straddles 16).
-            const int is = (lp * 2) >> 4;
-            const float dsc0 = d * (float) sc[is];
-            const float dsc1 = d * (float) sc[is + 2];
-            const float dsc2 = d * (float) sc[is + 4];
-            const float dsc3 = d * (float) sc[is + 6];
-            // Vectorized loads: the two li-rows are at consecutive bytes.
-            const ushort qlA = *(device const ushort *)(ql + lp * 2);
-            const ushort qlB = *(device const ushort *)(ql + lp * 2 + 32);
-            const ushort qhW = *(device const ushort *)(qh + lp * 2);
-            float acc = 0.f;
-            for (int li = 0; li < 2; ++li) {
-                const uint8_t lo  = (li == 0) ? (qlA & 0xFF) : (qlA >> 8);
-                const uint8_t lo2 = (li == 0) ? (qlB & 0xFF) : (qlB >> 8);
-                const uint8_t h   = (li == 0) ? (qhW & 0xFF) : (qhW >> 8);
-                const int q1 = (int)((lo  & 0x0F) | (((h >> 0) & 3) << 4)) - 32;
-                const int q2 = (int)((lo2 & 0x0F) | (((h >> 2) & 3) << 4)) - 32;
-                const int q3 = (int)((lo  >> 4)   | (((h >> 4) & 3) << 4)) - 32;
-                const int q4 = (int)((lo2 >> 4)   | (((h >> 6) & 3) << 4)) - 32;
-                acc += dsc0 * (float) q1 * yl[li][0];
-                acc += dsc1 * (float) q2 * yl[li][1];
-                acc += dsc2 * (float) q3 * yl[li][2];
-                acc += dsc3 * (float) q4 * yl[li][3];
+
+        device const uint16_t * sc_g = (device const uint16_t *)xg[ib].scales + iq;
+        device const uint16_t * q1_g = (device const uint16_t *)xg[ib].qs + 16 * iq + 4 * ir;
+        device const half     * dh_g = &xg[ib].d;
+
+        device const uint16_t * sc_u = (device const uint16_t *)xu[ib].scales + iq;
+        device const uint16_t * q1_u = (device const uint16_t *)xu[ib].qs + 16 * iq + 4 * ir;
+        device const half     * dh_u = &xu[ib].d;
+
+        for (short row = 0; row < nr0; row++) {
+            float4 acc1_g = {0.f, 0.f, 0.f, 0.f};
+            float4 acc2_g = {0.f, 0.f, 0.f, 0.f};
+            float4 acc1_u = {0.f, 0.f, 0.f, 0.f};
+            float4 acc2_u = {0.f, 0.f, 0.f, 0.f};
+
+            sc16[0] = sc_g[0] & kmask1;
+            sc16[1] = sc_g[2] & kmask1;
+            sc16[2] = ((sc_g[4] >> 0) & kmask2) | ((sc_g[0] & kmask3) >> 2);
+            sc16[3] = ((sc_g[4] >> 4) & kmask2) | ((sc_g[2] & kmask3) >> 2);
+
+            device const uint16_t * q2_g = q1_g + 32;
+
+            #pragma unroll
+            for (short i = 0; i < 4; ++i) {
+                acc1_g[0] += yl[2*i + 0] * (q1_g[i] & 0x000F);
+                acc1_g[1] += yl[2*i + 1] * (q1_g[i] & 0x0F00);
+                acc1_g[2] += yl[2*i + 8] * (q1_g[i] & 0x00F0);
+                acc1_g[3] += yl[2*i + 9] * (q1_g[i] & 0xF000);
+                acc2_g[0] += yh[2*i + 0] * (q2_g[i] & 0x000F);
+                acc2_g[1] += yh[2*i + 1] * (q2_g[i] & 0x0F00);
+                acc2_g[2] += yh[2*i + 8] * (q2_g[i] & 0x00F0);
+                acc2_g[3] += yh[2*i + 9] * (q2_g[i] & 0xF000);
             }
-            sumf[r] += acc;
+
+            sumf_gate[row] += dh_g[0] * ((acc1_g[0] + 1.f/256.f * acc1_g[1]) * sc8[0] +
+                                         (acc1_g[2] + 1.f/256.f * acc1_g[3]) * sc8[1] * 1.f/16.f +
+                                         (acc2_g[0] + 1.f/256.f * acc2_g[1]) * sc8[4] +
+                                         (acc2_g[2] + 1.f/256.f * acc2_g[3]) * sc8[5] * 1.f/16.f) -
+                            dh_g[1] * (sumy[0] * sc8[2] + sumy[1] * sc8[3] + sumy[2] * sc8[6] + sumy[3] * sc8[7]);
+
+            sc16[0] = sc_u[0] & kmask1;
+            sc16[1] = sc_u[2] & kmask1;
+            sc16[2] = ((sc_u[4] >> 0) & kmask2) | ((sc_u[0] & kmask3) >> 2);
+            sc16[3] = ((sc_u[4] >> 4) & kmask2) | ((sc_u[2] & kmask3) >> 2);
+
+            device const uint16_t * q2_u = q1_u + 32;
+
+            #pragma unroll
+            for (short i = 0; i < 4; ++i) {
+                acc1_u[0] += yl[2*i + 0] * (q1_u[i] & 0x000F);
+                acc1_u[1] += yl[2*i + 1] * (q1_u[i] & 0x0F00);
+                acc1_u[2] += yl[2*i + 8] * (q1_u[i] & 0x00F0);
+                acc1_u[3] += yl[2*i + 9] * (q1_u[i] & 0xF000);
+                acc2_u[0] += yh[2*i + 0] * (q2_u[i] & 0x000F);
+                acc2_u[1] += yh[2*i + 1] * (q2_u[i] & 0x0F00);
+                acc2_u[2] += yh[2*i + 8] * (q2_u[i] & 0x00F0);
+                acc2_u[3] += yh[2*i + 9] * (q2_u[i] & 0xF000);
+            }
+
+            sumf_up[row] += dh_u[0] * ((acc1_u[0] + 1.f/256.f * acc1_u[1]) * sc8[0] +
+                                       (acc1_u[2] + 1.f/256.f * acc1_u[3]) * sc8[1] * 1.f/16.f +
+                                       (acc2_u[0] + 1.f/256.f * acc2_u[1]) * sc8[4] +
+                                       (acc2_u[2] + 1.f/256.f * acc2_u[3]) * sc8[5] * 1.f/16.f) -
+                          dh_u[1] * (sumy[0] * sc8[2] + sumy[1] * sc8[3] + sumy[2] * sc8[6] + sumy[3] * sc8[7]);
+
+            q1_g += args.nb01/2;
+            sc_g += args.nb01/2;
+            dh_g += args.nb01/2;
+            q1_u += args.nb01/2;
+            sc_u += args.nb01/2;
+            dh_u += args.nb01/2;
         }
+
+        y4 += 4 * QK_K;
     }
-    for (int r = 0; r < KQ_NR0; ++r) {
-        const int row = first_row + r;
-        const float tot = simd_sum(sumf[r]);
-        if (tiisg == 0 && row < args.ne01) {
-            ((device float *) y)[(uint) r1 * args.ne0 + row] = tot;
+
+    device float * dst_f32 = (device float *) dst + (int64_t)im*args.ne0*args.ne1 + (int64_t)r1*args.ne0;
+
+    for (int row = 0; row < nr0 && first_row + row < args.ne0; ++row) {
+        const float gate = simd_sum(sumf_gate[row]);
+        const float up   = simd_sum(sumf_up[row]);
+        const float gelu = gelu_pytorch_tanh_q4(gate) * up;
+        if (tiisg == 0) {
+            dst_f32[first_row + row] = gelu;
         }
     }
 }
 
-// Fused gate+up+GeLU for Q4_K weights (Q4_K_M MLP gate/up are both Q4_K).
-// One dispatch computes y[row] = GeLU(gate[row]·x) * (up[row]·x), reading the
-// (RMSNorm'd) activation once and reusing it for both projections. Mirrors the
-// Q4_0 `matvec_q4_dual_gelu` path. W0=gate, W1=up; both share the args shape.
 kernel void matvec_ggml_q4_K_gelu_mul(
     device const char * W0 [[buffer(0)]],
     device const char * W1 [[buffer(1)]],
@@ -1183,75 +1375,5 @@ kernel void matvec_ggml_q4_K_gelu_mul(
     uint tiisg  [[thread_index_in_simdgroup]],
     uint sgitg  [[simdgroup_index_in_threadgroup]]
 ) {
-    const int nb        = args.ne00 / QK_K;
-    const int first_row = (int)(tgpig.x * KQ_NSG + sgitg) * KQ_NR0;
-    if (first_row >= args.ne01) return;
-    const int r1 = tgpig.y;
-
-    device const float * yr = (device const float *) x + (uint) r1 * args.ne10;
-
-    const int sb   = tiisg >> 2;
-    const int col0 = (int)(tiisg & 3) * 8;
-    const int g    = sb >> 1;
-    const int hi   = sb & 1;
-
-    const int act_off = g * 64 + hi * 32 + col0;
-
-    float sgate[KQ_NR0];
-    float sup[KQ_NR0];
-    for (int r = 0; r < KQ_NR0; ++r) { sgate[r] = 0.f; sup[r] = 0.f; }
-
-    for (int ib = 0; ib < nb; ++ib) {
-        device const float * yy = yr + ib * QK_K + act_off;
-        float yl[8];
-        for (int i = 0; i < 8; ++i) yl[i] = yy[i];
-
-        for (int r = 0; r < KQ_NR0; ++r) {
-            const int row = first_row + r;
-            if (row >= args.ne01) break;
-            device const block_q4_K * bg = (device const block_q4_K *) W0 + (uint)row * nb + ib;
-            device const block_q4_K * bu = (device const block_q4_K *) W1 + (uint)row * nb + ib;
-            uint8_t scu, mnu;
-            kq_scale_min_k4(sb, bg->scales, scu, mnu);
-            const float dsg = (float) bg->d * scu;
-            const float mng = (float) bg->dmin * mnu;
-            kq_scale_min_k4(sb, bu->scales, scu, mnu);
-            const float dsu = (float) bu->d * scu;
-            const float mnu_ = (float) bu->dmin * mnu;
-            device const uint * qg = (device const uint *)(bg->qs + g * 32 + col0);
-            device const uint * qu = (device const uint *)(bu->qs + g * 32 + col0);
-            const uint g0 = qg[0], g1 = qg[1];
-            const uint u0 = qu[0], u1 = qu[1];
-            float ag = 0.f, au = 0.f;
-            // Low half (bytes from g0/u0)
-            for (int i = 0; i < 4; ++i) {
-                const uint gb = (g0 >> (i * 8)) & 0xFF;
-                const uint ub = (u0 >> (i * 8)) & 0xFF;
-                const float gn = hi == 0 ? (float)(gb & 0x0F) : (float)((gb >> 4) & 0x0F);
-                const float un = hi == 0 ? (float)(ub & 0x0F) : (float)((ub >> 4) & 0x0F);
-                ag += (dsg * gn - mng) * yl[i];
-                au += (dsu * un - mnu_) * yl[i];
-            }
-            // High half (bytes from g1/u1)
-            for (int i = 0; i < 4; ++i) {
-                const uint gb = (g1 >> (i * 8)) & 0xFF;
-                const uint ub = (u1 >> (i * 8)) & 0xFF;
-                const float gn = hi == 0 ? (float)(gb & 0x0F) : (float)((gb >> 4) & 0x0F);
-                const float un = hi == 0 ? (float)(ub & 0x0F) : (float)((ub >> 4) & 0x0F);
-                ag += (dsg * gn - mng) * yl[i + 4];
-                au += (dsu * un - mnu_) * yl[i + 4];
-            }
-            sgate[r] += ag;
-            sup[r]   += au;
-        }
-    }
-    for (int r = 0; r < KQ_NR0; ++r) {
-        const int row = first_row + r;
-        const float gtot = simd_sum(sgate[r]);
-        const float utot = simd_sum(sup[r]);
-        if (tiisg == 0 && row < args.ne01) {
-            ((device float *) y)[(uint) r1 * args.ne0 + row] =
-                gelu_pytorch_tanh_q4(gtot) * utot;
-        }
-    }
+    mul_vec_q4_K_gelu_f32_impl<KQ_NR0>(args, W0, W1, x, y, tgpig, tiisg, sgitg);
 }

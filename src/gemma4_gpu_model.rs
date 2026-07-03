@@ -3332,7 +3332,6 @@ impl Gemma4GpuModel {
             } // !fused_qkv fallback
 
             let use_fused_q_attn = layer.weight_format.is_quantized()
-                && !layer.weight_format.is_kquant()
                 && matches!(self.kv_cache_type, KvCacheType::Q4_0)
                 && self.ctx.use_flash_attention
                 && crate::gpu::fused_q_attn_enabled()
