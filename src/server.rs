@@ -43,8 +43,10 @@ impl StopSequences {
 pub struct ChatCompletionRequest {
     pub model: Option<String>,
     pub messages: Vec<Message>,
-    #[serde(default = "default_max_tokens")]
-    pub max_tokens: usize,
+    #[serde(default)]
+    pub max_tokens: Option<usize>,
+    #[serde(default)]
+    pub max_completion_tokens: Option<usize>,
     #[serde(default = "default_temperature")]
     pub temperature: f32,
     #[serde(default)]
@@ -67,6 +69,14 @@ pub struct ChatCompletionRequest {
     // Accepted for OpenAI compatibility; tool selection is left to the model.
     #[serde(default)]
     pub tool_choice: Option<serde_json::Value>,
+    #[serde(default)]
+    pub stream_options: Option<StreamOptions>,
+}
+
+#[derive(Deserialize, Default)]
+pub struct StreamOptions {
+    #[serde(default)]
+    pub include_usage: bool,
 }
 
 #[derive(Deserialize, Clone)]
@@ -101,16 +111,1162 @@ pub struct FunctionCall {
 }
 
 #[derive(Serialize, Clone)]
+pub struct FunctionCallDelta {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub arguments: Option<String>,
+}
+
+#[derive(Serialize, Clone)]
 pub struct ToolCallDelta {
     pub index: usize,
-    pub id: String,
-    #[serde(rename = "type")]
-    pub call_type: String,
-    pub function: FunctionCall,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
+    #[serde(rename = "type", skip_serializing_if = "Option::is_none")]
+    pub call_type: Option<String>,
+    pub function: FunctionCallDelta,
+}
+
+#[derive(Serialize)]
+struct AssistantMessageOut {
+    role: String,
+    content: Option<serde_json::Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reasoning_content: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tool_calls: Option<Vec<ToolCall>>,
+}
+
+fn strip_native_tool_calls(text: &mut String) {
+    while let Some(start) = text.find(NATIVE_TOOL_CALL_PREFIX) {
+        let suffix_start = text[start..].find(NATIVE_TOOL_CALL_SUFFIX);
+        match suffix_start {
+            Some(end) => {
+                text.replace_range(start..start + end + NATIVE_TOOL_CALL_SUFFIX.len(), "");
+            }
+            None => break,
+        }
+    }
+    *text = text.trim().to_string();
 }
 
 fn default_max_tokens() -> usize {
     1024
+}
+
+fn effective_max_tokens(req: &ChatCompletionRequest) -> usize {
+    req.max_completion_tokens
+        .or(req.max_tokens)
+        .unwrap_or_else(default_max_tokens)
+}
+
+fn response_model(req: &ChatCompletionRequest) -> &str {
+    req.model.as_deref().unwrap_or("gemma-4-e4b-q4")
+}
+
+fn assistant_message_out(text: String, tool_calls: Vec<ToolCall>) -> AssistantMessageOut {
+    let (reasoning, mut content) = if !tool_calls.is_empty() {
+        split_tool_generation_output(&text)
+    } else {
+        split_reasoning_and_content(&text)
+    };
+    strip_native_tool_calls(&mut content);
+    let mut reasoning_content = if reasoning.is_empty() {
+        None
+    } else {
+        Some(reasoning.clone())
+    };
+    if tool_calls.is_empty() && content.is_empty() && !reasoning.is_empty() {
+        content = reasoning;
+        reasoning_content = None;
+    }
+
+    if !tool_calls.is_empty() {
+        AssistantMessageOut {
+            role: "assistant".to_string(),
+            content: Some(serde_json::Value::Null),
+            reasoning_content,
+            tool_calls: Some(tool_calls),
+        }
+    } else {
+        AssistantMessageOut {
+            role: "assistant".to_string(),
+            content: Some(serde_json::Value::String(content)),
+            reasoning_content,
+            tool_calls: None,
+        }
+    }
+}
+
+fn strip_thinking_content(text: &mut String) {
+    let (_, content) = split_reasoning_and_content(text);
+    *text = content;
+}
+
+fn split_reasoning_and_content(text: &str) -> (String, String) {
+    if let Some(start) = text.find(CHANNEL_START) {
+        let after_start = &text[start + CHANNEL_START.len()..];
+        if let Some(end_rel) = after_start.find(CHANNEL_END) {
+            let channel_body = &after_start[..end_rel];
+            let mut tail = after_start[end_rel + CHANNEL_END.len()..].to_string();
+            if let Some(newline) = channel_body.find('\n') {
+                let channel_name = channel_body[..newline].trim();
+                let channel_text = channel_body[newline + 1..].trim().to_string();
+                if channel_name == "final" {
+                    trim_stop_sequences(&mut tail, None);
+                    let mut content = channel_text;
+                    if !tail.is_empty() {
+                        if !content.is_empty() {
+                            content.push('\n');
+                        }
+                        content.push_str(&tail);
+                    }
+                    trim_stop_sequences(&mut content, None);
+                    return (String::new(), content);
+                }
+                if channel_name == "thought" {
+                    trim_stop_sequences(&mut tail, None);
+                    return (channel_text, tail);
+                }
+            }
+            let mut reasoning = channel_body
+                .trim_start_matches("thought")
+                .trim_start_matches('\n')
+                .to_string();
+            trim_stop_sequences(&mut reasoning, None);
+            trim_stop_sequences(&mut tail, None);
+            return (reasoning, tail);
+        }
+        if after_start.starts_with("final") {
+            let mut content = after_start
+                .trim_start_matches("final")
+                .trim_start_matches('\n')
+                .to_string();
+            trim_stop_sequences(&mut content, None);
+            return (String::new(), content);
+        }
+        let mut reasoning = after_start
+            .trim_start_matches("thought")
+            .trim_start_matches('\n')
+            .to_string();
+        trim_stop_sequences(&mut reasoning, None);
+        return (reasoning, String::new());
+    }
+
+    let mut content = text.to_string();
+    trim_stop_sequences(&mut content, None);
+    (String::new(), content)
+}
+
+/// When tools are enabled, model output before a tool call is reasoning (even if the
+/// prompt already closed an empty `<|channel>thought` block).
+fn split_tool_generation_output(text: &str) -> (String, String) {
+    if let Some(idx) = text.find(NATIVE_TOOL_CALL_TRIGGER) {
+        let mut reasoning = text[..idx].to_string();
+        trim_stop_sequences(&mut reasoning, None);
+        return (reasoning, String::new());
+    }
+    if looks_like_tool_code_output(text) {
+        if let Some(idx) = text.to_ascii_lowercase().find("tool_code") {
+            let reasoning = text[..idx].trim().to_string();
+            return (reasoning, String::new());
+        }
+        return (String::new(), String::new());
+    }
+    if text.contains(CHANNEL_START) {
+        return split_reasoning_and_content(text);
+    }
+    let mut reasoning = text.to_string();
+    trim_stop_sequences(&mut reasoning, None);
+    (reasoning, String::new())
+}
+
+fn compute_stream_deltas(
+    visible_text: &str,
+    emitted_reasoning_len: usize,
+    emitted_content_len: usize,
+    for_tools: bool,
+) -> (String, String, usize, usize) {
+    let (reasoning, content) = if for_tools {
+        split_tool_generation_output(visible_text)
+    } else {
+        split_reasoning_and_content(visible_text)
+    };
+    if for_tools {
+        let new_reasoning = if reasoning.len() > emitted_reasoning_len {
+            reasoning[emitted_reasoning_len..].to_string()
+        } else {
+            String::new()
+        };
+        let new_content = if content.len() > emitted_content_len {
+            content[emitted_content_len..].to_string()
+        } else {
+            String::new()
+        };
+        (new_reasoning, new_content, reasoning.len(), content.len())
+    } else {
+        // Answer turn: stream thought-channel text as `content` when pi/model skip final channel.
+        let answer = if content.is_empty() { reasoning } else { content };
+        let new_content = if answer.len() > emitted_content_len {
+            answer[emitted_content_len..].to_string()
+        } else {
+            String::new()
+        };
+        (String::new(), new_content, 0, answer.len())
+    }
+}
+
+fn gemma4_string(value: &str) -> String {
+    format!("<|\"|>{}<|\"|>", value)
+}
+
+fn json_value_to_gemma4(value: &serde_json::Value) -> String {
+    match value {
+        serde_json::Value::String(s) => gemma4_string(s),
+        serde_json::Value::Number(n) => n.to_string(),
+        serde_json::Value::Bool(b) => b.to_string(),
+        serde_json::Value::Null => "null".to_string(),
+        serde_json::Value::Array(items) => {
+            let inner = items
+                .iter()
+                .map(json_value_to_gemma4)
+                .collect::<Vec<_>>()
+                .join(",");
+            format!("[{inner}]")
+        }
+        serde_json::Value::Object(map) => {
+            let inner = map
+                .iter()
+                .map(|(k, v)| format!("{k}:{}", json_value_to_gemma4(v)))
+                .collect::<Vec<_>>()
+                .join(",");
+            format!("{{{inner}}}")
+        }
+    }
+}
+
+fn json_schema_to_gemma4_params(schema: &serde_json::Value) -> String {
+    let Some(obj) = schema.as_object() else {
+        return json_value_to_gemma4(schema);
+    };
+
+    let mut members = Vec::new();
+    if let Some(properties) = obj.get("properties").and_then(|v| v.as_object()) {
+        let props: Vec<String> = properties
+            .iter()
+            .map(|(key, value)| gemma4_schema_property(key, value))
+            .collect();
+        members.push(format!("properties:{{{}}}", props.join(",")));
+    }
+    if let Some(required) = obj.get("required").and_then(|v| v.as_array()) {
+        let req: Vec<String> = required
+            .iter()
+            .filter_map(|value| value.as_str().map(gemma4_string))
+            .collect();
+        members.push(format!("required:[{}]", req.join(",")));
+    }
+    if let Some(typ) = obj.get("type").and_then(|v| v.as_str()) {
+        members.push(format!("type:{}", gemma4_string(&typ.to_uppercase())));
+    }
+
+    if members.is_empty() {
+        "{}".to_string()
+    } else {
+        format!("{{{}}}", members.join(","))
+    }
+}
+
+fn gemma4_schema_property(name: &str, schema: &serde_json::Value) -> String {
+    let mut parts = Vec::new();
+    if let Some(description) = schema.get("description").and_then(|v| v.as_str()) {
+        parts.push(format!("description:{}", gemma4_string(description)));
+    }
+    if let Some(typ) = schema.get("type").and_then(|v| v.as_str()) {
+        parts.push(format!("type:{}", gemma4_string(&typ.to_uppercase())));
+    }
+    format!("{name}:{{{}}}", parts.join(","))
+}
+
+fn looks_like_tool_code_output(text: &str) -> bool {
+    let lower = text.trim_start().to_ascii_lowercase();
+    lower.starts_with("tool_code") || "tool_code".starts_with(&lower)
+}
+
+fn parse_tool_code_fallback(text: &str) -> Option<ToolCall> {
+    let mut lines = text
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty());
+    let first = lines.next()?;
+    if !first.eq_ignore_ascii_case("tool_code") {
+        return None;
+    }
+    let name = lines.next()?.to_string();
+    let command = lines.collect::<Vec<_>>().join(" ");
+    let arguments = if name == "bash" {
+        let cmd = match command.as_str() {
+            "" => "ls -F".to_string(),
+            "ls" => "ls -F".to_string(),
+            other => other.to_string(),
+        };
+        serde_json::json!({ "command": cmd }).to_string()
+    } else {
+        "{}".to_string()
+    };
+    Some(ToolCall {
+        id: format!("call_{}", uuid::Uuid::new_v4().simple()),
+        call_type: "function".to_string(),
+        function: FunctionCall { name, arguments },
+    })
+}
+
+fn render_gemma4_tool_declarations(tools: &[Tool]) -> String {
+    let mut s = String::new();
+    for tool in tools {
+        let f = &tool.function;
+        let description = gemma4_string(f.description.as_deref().unwrap_or(""));
+        let parameters = f
+            .parameters
+            .as_ref()
+            .map(json_schema_to_gemma4_params)
+            .unwrap_or_else(|| "{}".to_string());
+        s.push_str(GEMMA4_TOOL_START);
+        s.push_str("declaration:");
+        s.push_str(&f.name);
+        s.push_str("{description:");
+        s.push_str(&description);
+        s.push_str(",parameters:");
+        s.push_str(&parameters);
+        s.push('}');
+        s.push_str(GEMMA4_TOOL_END);
+    }
+    s
+}
+
+fn render_assistant_tool_call_native(tc: &ToolCall) -> String {
+    let args = serde_json::from_str::<serde_json::Value>(&tc.function.arguments)
+        .unwrap_or_else(|_| serde_json::json!({}));
+    format!(
+        "{NATIVE_TOOL_CALL_PREFIX}{}{}<tool_call|>",
+        tc.function.name,
+        json_value_to_gemma4(&args)
+    )
+}
+
+fn render_tool_response_native(name: &str, content: &str) -> String {
+    format!(
+        "{NATIVE_TOOL_RESPONSE_PREFIX}{name}{{value:{}}}{NATIVE_TOOL_RESPONSE_SUFFIX}",
+        gemma4_string(content)
+    )
+}
+
+/// Best-effort JSON args string from a partial or complete gemma4 dict (`{key:<|"|>val...`).
+fn gemma4_dict_to_json_args_incremental(dict: &str) -> String {
+    const S: &str = "<|\"|>";
+    let trimmed = dict.trim();
+    let has_close = trimmed.ends_with('}');
+    let body = trimmed
+        .trim_start_matches('{')
+        .trim_end_matches('}')
+        .trim_end_matches(',');
+
+    let mut json = String::from("{");
+    let mut rest = body;
+    let mut first = true;
+
+    while !rest.is_empty() {
+        let Some(colon) = rest.find(':') else {
+            break;
+        };
+        let key = rest[..colon].trim();
+        if key.is_empty() {
+            break;
+        }
+        rest = rest[colon + 1..].trim_start();
+
+        if !first {
+            json.push(',');
+        }
+        first = false;
+        json.push('"');
+        json.push_str(key);
+        json.push_str("\":");
+
+        if rest.starts_with(S) {
+            let after = &rest[S.len()..];
+            if let Some(end) = after.find(S) {
+                json.push('"');
+                for ch in after[..end].chars() {
+                    match ch {
+                        '"' => json.push_str("\\\""),
+                        '\\' => json.push_str("\\\\"),
+                        c => json.push(c),
+                    }
+                }
+                json.push('"');
+                rest = after[end + S.len()..].trim_start();
+                if rest.starts_with(',') {
+                    rest = rest[1..].trim_start();
+                }
+            } else {
+                json.push('"');
+                for ch in after.chars() {
+                    match ch {
+                        '"' => json.push_str("\\\""),
+                        '\\' => json.push_str("\\\\"),
+                        c => json.push(c),
+                    }
+                }
+                break;
+            }
+        } else if rest.starts_with("true") {
+            json.push_str("true");
+            rest = rest[4..].trim_start();
+            if rest.starts_with(',') {
+                rest = rest[1..].trim_start();
+            }
+        } else if rest.starts_with("false") {
+            json.push_str("false");
+            rest = rest[5..].trim_start();
+            if rest.starts_with(',') {
+                rest = rest[1..].trim_start();
+            }
+        } else if rest.starts_with("null") {
+            json.push_str("null");
+            rest = rest[4..].trim_start();
+            if rest.starts_with(',') {
+                rest = rest[1..].trim_start();
+            }
+        } else {
+            let end = rest
+                .find(',')
+                .unwrap_or(rest.len());
+            let num = rest[..end].trim();
+            if !num.is_empty() && num.chars().all(|c| c.is_ascii_digit() || c == '.' || c == '-' || c == 'e' || c == 'E' || c == '+')
+            {
+                json.push_str(num);
+                rest = rest[end..].trim_start();
+                if rest.starts_with(',') {
+                    rest = rest[1..].trim_start();
+                }
+            } else {
+                break;
+            }
+        }
+    }
+
+    if has_close {
+        json.push('}');
+    }
+    json
+}
+
+fn extract_active_tool_call(text: &str) -> Option<(String, String)> {
+    let idx = text.rfind(NATIVE_TOOL_CALL_TRIGGER)?;
+    let after_trigger = &text[idx + NATIVE_TOOL_CALL_TRIGGER.len()..];
+    let after = after_trigger
+        .strip_prefix("call:")
+        .or_else(|| after_trigger.strip_prefix("call"))?;
+    let brace = after.find('{')?;
+    let name = after[..brace].trim();
+    if name.is_empty() {
+        return None;
+    }
+    let end = after.find(NATIVE_TOOL_CALL_SUFFIX).unwrap_or(after.len());
+    let dict = after[brace..end].to_string();
+    Some((name.to_string(), dict))
+}
+
+fn allowed_tool_names(tools: &[Tool]) -> Vec<String> {
+    tools.iter().map(|t| t.function.name.clone()).collect()
+}
+
+fn is_allowed_tool_name(name: &str, allowed: &[String]) -> bool {
+    allowed.iter().any(|n| n == name)
+}
+
+fn is_complete_json_object(arguments: &str) -> bool {
+    let trimmed = arguments.trim();
+    trimmed.starts_with('{') && trimmed.ends_with('}')
+}
+
+fn bash_args_missing_command(arguments: &str) -> bool {
+    let trimmed = arguments.trim();
+    if trimmed.is_empty() || trimmed == "{" {
+        return false;
+    }
+    if trimmed == "{}" {
+        return true;
+    }
+    match serde_json::from_str::<serde_json::Value>(trimmed) {
+        Ok(serde_json::Value::Object(map)) => map
+            .get("command")
+            .and_then(|v| v.as_str())
+            .map(|s| s.trim().is_empty())
+            .unwrap_or(true),
+        Ok(_) => true,
+        Err(_) => trimmed.ends_with('}') && !trimmed.contains("command:"),
+    }
+}
+
+fn fill_default_tool_args(name: &str, arguments: &str) -> (String, String) {
+    if name == "bash"
+        && is_complete_json_object(arguments)
+        && bash_args_missing_command(arguments)
+    {
+        return (
+            name.to_string(),
+            r#"{"command":"ls -F"}"#.to_string(),
+        );
+    }
+    (name.to_string(), arguments.to_string())
+}
+
+fn tool_call_arguments_header(json_args: &str) -> String {
+    if is_complete_json_object(json_args) {
+        json_args.to_string()
+    } else if json_args.starts_with('{') {
+        "{".to_string()
+    } else {
+        String::new()
+    }
+}
+
+fn tool_call_arguments_delta(emitted: &str, target: &str) -> Option<String> {
+    if target.len() <= emitted.len() {
+        return None;
+    }
+    if !target.starts_with(emitted) {
+        return None;
+    }
+    let delta = &target[emitted.len()..];
+    let accumulated = format!("{}{}", emitted, delta);
+    if accumulated == "{}" {
+        return None;
+    }
+    Some(delta.to_string())
+}
+
+/// Map hallucinated tool names (e.g. `list_files`) to declared tools (`bash`).
+fn normalize_tool_call(name: &str, arguments: &str, allowed: &[String]) -> (String, String) {
+    if allowed.is_empty() || is_allowed_tool_name(name, allowed) {
+        return fill_default_tool_args(name, arguments);
+    }
+
+    let lower = name.to_lowercase().replace('-', "_");
+    let args_empty = arguments.trim().is_empty() || arguments.trim() == "{}";
+
+    if (lower.contains("list") || lower == "ls" || lower == "dir")
+        && allowed.iter().any(|n| n == "bash")
+    {
+        let args = if args_empty {
+            r#"{"command":"ls -F"}"#.to_string()
+        } else {
+            arguments.to_string()
+        };
+        return fill_default_tool_args("bash", &args);
+    }
+
+    if lower.contains("read") && allowed.iter().any(|n| n == "read") {
+        return fill_default_tool_args("read", arguments);
+    }
+
+    if lower.contains("write") && allowed.iter().any(|n| n == "write") {
+        return fill_default_tool_args("write", arguments);
+    }
+
+    if lower.contains("edit") && allowed.iter().any(|n| n == "edit") {
+        return fill_default_tool_args("edit", arguments);
+    }
+
+    if (lower.contains("bash")
+        || lower.contains("shell")
+        || lower.contains("exec")
+        || lower.contains("run"))
+        && allowed.iter().any(|n| n == "bash")
+    {
+        return fill_default_tool_args("bash", arguments);
+    }
+
+    if let Some(best) = allowed.iter().find(|n| {
+        let nl = n.to_lowercase();
+        lower.starts_with(&nl) || nl.starts_with(&lower)
+    }) {
+        return fill_default_tool_args(best, arguments);
+    }
+
+    fill_default_tool_args(name, arguments)
+}
+
+fn normalize_tool_calls(calls: Vec<ToolCall>, allowed: &[String]) -> Vec<ToolCall> {
+    if allowed.is_empty() {
+        return calls;
+    }
+    calls
+        .into_iter()
+        .map(|mut tc| {
+            let (name, args) =
+                normalize_tool_call(&tc.function.name, &tc.function.arguments, allowed);
+            tc.function.name = name;
+            tc.function.arguments = args;
+            tc
+        })
+        .collect()
+}
+
+struct IncrementalToolCallEmitter {
+    call_id: String,
+    index: usize,
+    json_args_emitted: String,
+    header_sent: bool,
+}
+
+impl IncrementalToolCallEmitter {
+    fn new(index: usize) -> Self {
+        Self {
+            call_id: format!("call_{}", uuid::Uuid::new_v4().simple()),
+            index,
+            json_args_emitted: String::new(),
+            header_sent: false,
+        }
+    }
+
+    fn update(
+        &mut self,
+        decoded_text: &str,
+        id: &str,
+        created: i64,
+        model: &str,
+        allowed_tools: &[String],
+    ) -> Vec<String> {
+        let mut chunks = Vec::new();
+        let Some((raw_name, dict)) = extract_active_tool_call(decoded_text) else {
+            return chunks;
+        };
+
+        let json_args = gemma4_dict_to_json_args_incremental(&dict);
+        let (name, json_args) = normalize_tool_call(&raw_name, &json_args, allowed_tools);
+
+        if !self.header_sent {
+            if !dict.contains('{') && json_args.is_empty() {
+                return chunks;
+            }
+            self.header_sent = true;
+            let first_args = tool_call_arguments_header(&json_args);
+            chunks.push(stream_chunk_json(
+                id,
+                created,
+                model,
+                serde_json::json!({
+                    "tool_calls": [{
+                        "index": self.index,
+                        "id": self.call_id,
+                        "type": "function",
+                        "function": {
+                            "name": name,
+                            "arguments": first_args
+                        }
+                    }]
+                }),
+                None,
+            ));
+            self.json_args_emitted = first_args.clone();
+            if let Some(delta) = tool_call_arguments_delta(&self.json_args_emitted, &json_args) {
+                chunks.push(stream_chunk_json(
+                    id,
+                    created,
+                    model,
+                    serde_json::json!({
+                        "tool_calls": [{
+                            "index": self.index,
+                            "function": {
+                                "arguments": delta
+                            }
+                        }]
+                    }),
+                    None,
+                ));
+                self.json_args_emitted = json_args.clone();
+            }
+            return chunks;
+        }
+
+        if let Some(delta) = tool_call_arguments_delta(&self.json_args_emitted, &json_args) {
+            chunks.push(stream_chunk_json(
+                id,
+                created,
+                model,
+                serde_json::json!({
+                    "tool_calls": [{
+                        "index": self.index,
+                        "function": {
+                            "arguments": delta
+                        }
+                    }]
+                }),
+                None,
+            ));
+            self.json_args_emitted = json_args;
+        }
+
+        chunks
+    }
+
+    fn finalize(
+        &mut self,
+        decoded_text: &str,
+        id: &str,
+        created: i64,
+        model: &str,
+        allowed_tools: &[String],
+    ) -> Vec<String> {
+        let mut chunks = self.update(decoded_text, id, created, model, allowed_tools);
+        let parsed = parse_tool_calls(
+            decoded_text,
+            if allowed_tools.is_empty() {
+                None
+            } else {
+                Some(allowed_tools)
+            },
+        );
+        let Some(tc) = parsed.first() else {
+            return chunks;
+        };
+        if let Some(delta) = tool_call_arguments_delta(&self.json_args_emitted, &tc.function.arguments) {
+            chunks.push(stream_chunk_json(
+                id,
+                created,
+                model,
+                serde_json::json!({
+                    "tool_calls": [{
+                        "index": self.index,
+                        "function": {
+                            "arguments": delta
+                        }
+                    }]
+                }),
+                None,
+            ));
+            self.json_args_emitted = tc.function.arguments.clone();
+        }
+        chunks
+    }
+}
+
+fn gemma4_dict_to_json_object(dict: &str) -> Option<serde_json::Value> {
+    const GEMMA4_STR: &str = "<|\"|>";
+    let mut out = String::new();
+    let mut rest = dict.trim();
+    while let Some(start) = rest.find(GEMMA4_STR) {
+        out.push_str(&rest[..start]);
+        let after = &rest[start + GEMMA4_STR.len()..];
+        let end = after.find(GEMMA4_STR)?;
+        out.push('"');
+        out.push_str(&after[..end]);
+        out.push('"');
+        rest = &after[end + GEMMA4_STR.len()..];
+    }
+    out.push_str(rest);
+
+    let body = out.trim().trim_start_matches('{').trim_end_matches('}');
+    if body.is_empty() {
+        return Some(serde_json::json!({}));
+    }
+
+    let mut map = serde_json::Map::new();
+    for pair in body.split(',') {
+        let (key, value) = pair.split_once(':')?;
+        let key = key.trim().trim_matches('"');
+        let value = value.trim();
+        let parsed = if value.starts_with('"') {
+            serde_json::from_str(value).ok()?
+        } else if value == "true" || value == "false" {
+            serde_json::Value::Bool(value == "true")
+        } else if value == "null" {
+            serde_json::Value::Null
+        } else if let Ok(n) = value.parse::<f64>() {
+            serde_json::Number::from_f64(n)
+                .map(serde_json::Value::Number)
+                .unwrap_or_else(|| serde_json::Value::String(value.to_string()))
+        } else {
+            serde_json::Value::String(value.to_string())
+        };
+        map.insert(key.to_string(), parsed);
+    }
+    Some(serde_json::Value::Object(map))
+}
+
+fn decode_output_text(
+    tokenizer: &tokenizers::Tokenizer,
+    output_tokens: &[u32],
+    request_stop: Option<&[String]>,
+) -> String {
+    let mut text = tokenizer
+        .decode(output_tokens, true)
+        .unwrap_or_default();
+    trim_stop_sequences(&mut text, request_stop);
+    strip_thinking_content(&mut text);
+    text
+}
+
+fn stream_chunk_json(
+    id: &str,
+    created: i64,
+    model: &str,
+    delta: serde_json::Value,
+    finish_reason: Option<&str>,
+) -> String {
+    serde_json::json!({
+        "id": id,
+        "object": "chat.completion.chunk",
+        "created": created,
+        "model": model,
+        "system_fingerprint": SYSTEM_FINGERPRINT,
+        "choices": [{
+            "index": 0,
+            "delta": delta,
+            "finish_reason": finish_reason,
+        }],
+    })
+    .to_string()
+}
+
+struct StreamTimingsSnapshot {
+    prompt_ms: f64,
+    predicted_ms: f64,
+    prompt_tokens: usize,
+    completion_tokens: usize,
+}
+
+fn stream_usage_chunk_json(
+    id: &str,
+    created: i64,
+    model: &str,
+    timings: &StreamTimingsSnapshot,
+) -> String {
+    let prompt_per_token_ms = if timings.prompt_tokens > 0 {
+        timings.prompt_ms / timings.prompt_tokens as f64
+    } else {
+        0.0
+    };
+    let predicted_per_token_ms = if timings.completion_tokens > 0 {
+        timings.predicted_ms / timings.completion_tokens as f64
+    } else {
+        0.0
+    };
+    serde_json::json!({
+        "id": id,
+        "object": "chat.completion.chunk",
+        "created": created,
+        "model": model,
+        "system_fingerprint": SYSTEM_FINGERPRINT,
+        "choices": [],
+        "usage": {
+            "prompt_tokens": timings.prompt_tokens,
+            "completion_tokens": timings.completion_tokens,
+            "total_tokens": timings.prompt_tokens + timings.completion_tokens,
+            "prompt_tokens_details": { "cached_tokens": 0 },
+        },
+        "timings": {
+            "cache_n": 0,
+            "prompt_n": timings.prompt_tokens,
+            "prompt_ms": timings.prompt_ms,
+            "prompt_per_token_ms": prompt_per_token_ms,
+            "prompt_per_second": if timings.prompt_ms > 0.0 {
+                timings.prompt_tokens as f64 / (timings.prompt_ms / 1000.0)
+            } else { 0.0 },
+            "predicted_n": timings.completion_tokens,
+            "predicted_ms": timings.predicted_ms,
+            "predicted_per_token_ms": predicted_per_token_ms,
+            "predicted_per_second": if timings.predicted_ms > 0.0 {
+                timings.completion_tokens as f64 / (timings.predicted_ms / 1000.0)
+            } else { 0.0 },
+        }
+    })
+    .to_string()
+}
+
+fn should_include_stream_usage(stream_options: Option<&StreamOptions>) -> bool {
+    stream_options.map(|opts| opts.include_usage).unwrap_or(true)
+}
+
+fn stream_tool_call_chunks(
+    id: &str,
+    created: i64,
+    model: &str,
+    tool_calls: &[ToolCall],
+) -> Vec<String> {
+    let mut chunks = Vec::new();
+    for (index, tc) in tool_calls.iter().enumerate() {
+        chunks.push(stream_chunk_json(
+            id,
+            created,
+            model,
+            serde_json::json!({
+                "tool_calls": [{
+                    "index": index,
+                    "id": tc.id,
+                    "type": tc.call_type,
+                    "function": {
+                        "name": tc.function.name,
+                        "arguments": "",
+                    }
+                }]
+            }),
+            None,
+        ));
+        chunks.push(stream_chunk_json(
+            id,
+            created,
+            model,
+            serde_json::json!({
+                "tool_calls": [{
+                    "index": index,
+                    "function": {
+                        "arguments": tc.function.arguments,
+                    }
+                }]
+            }),
+            None,
+        ));
+    }
+    chunks
+}
+
+fn tool_choice_is_required(tool_choice: Option<&serde_json::Value>) -> bool {
+    matches!(
+        tool_choice,
+        Some(serde_json::Value::String(value)) if value == "required"
+    )
+}
+
+fn tool_choice_is_none(tool_choice: Option<&serde_json::Value>) -> bool {
+    matches!(
+        tool_choice,
+        Some(serde_json::Value::String(value)) if value == "none"
+    )
+}
+
+fn should_require_tool_call(
+    messages: &[Message],
+    tools: Option<&[Tool]>,
+    tool_choice: Option<&serde_json::Value>,
+) -> bool {
+    if tool_choice_is_none(tool_choice) {
+        return false;
+    }
+    if tool_choice_is_required(tool_choice) {
+        return true;
+    }
+    let has_tools = tools.map(|t| !t.is_empty()).unwrap_or(false);
+    if !has_tools {
+        return false;
+    }
+    matches!(messages.last().map(|m| m.role.as_str()), Some("user"))
+}
+
+/// Pi inlines `@file` references as `<file name="path">...</file>` in the user message.
+fn user_message_has_inlined_pi_file(messages: &[Message]) -> bool {
+    last_user_message_content(messages)
+        .is_some_and(|content| content.contains("<file name="))
+}
+
+fn should_force_tool_call(
+    messages: &[Message],
+    tools: Option<&[Tool]>,
+    tool_choice: Option<&serde_json::Value>,
+) -> bool {
+    should_require_tool_call(messages, tools, tool_choice)
+        && !user_message_has_inlined_pi_file(messages)
+}
+
+fn last_user_message_content(messages: &[Message]) -> Option<&str> {
+    messages
+        .iter()
+        .rev()
+        .find(|m| m.role == "user")
+        .and_then(|m| m.content.as_deref())
+}
+
+fn user_wants_directory_listing(messages: &[Message]) -> bool {
+    last_user_message_content(messages)
+        .map(|content| {
+            let lower = content.to_ascii_lowercase();
+            lower.contains("list file")
+                || lower.contains("list files")
+                || lower.contains("list dir")
+                || lower.contains("list directory")
+                || lower.trim() == "ls"
+        })
+        .unwrap_or(false)
+}
+
+fn make_bash_tool_call(command: &str) -> ToolCall {
+    ToolCall {
+        id: format!("call_{}", uuid::Uuid::new_v4().simple()),
+        call_type: "function".to_string(),
+        function: FunctionCall {
+            name: "bash".to_string(),
+            arguments: serde_json::json!({ "command": command }).to_string(),
+        },
+    }
+}
+
+fn make_read_tool_call(path: &str) -> ToolCall {
+    ToolCall {
+        id: format!("call_{}", uuid::Uuid::new_v4().simple()),
+        call_type: "function".to_string(),
+        function: FunctionCall {
+            name: "read".to_string(),
+            arguments: serde_json::json!({ "path": path }).to_string(),
+        },
+    }
+}
+
+/// Pi-style file reference: `@"path/with spaces.md"` or `@test.md`.
+fn extract_at_file_path(content: &str) -> Option<String> {
+    if let Some(start) = content.find("@\"") {
+        let rest = &content[start + 2..];
+        let end = rest.find('"')?;
+        let path = rest[..end].trim();
+        if !path.is_empty() {
+            return Some(path.to_string());
+        }
+    }
+
+    let at = content.find('@')?;
+    let rest = &content[at + 1..];
+    if rest.starts_with('"') {
+        return None;
+    }
+    let end = rest
+        .char_indices()
+        .find(|(_, c)| c.is_whitespace())
+        .map(|(i, _)| i)
+        .unwrap_or(rest.len());
+    let path = rest[..end].trim_end_matches(|c: char| matches!(c, '.' | ',' | ';' | ':'));
+    if path.is_empty() {
+        return None;
+    }
+    Some(path.to_string())
+}
+
+fn infer_read_path_from_user(messages: &[Message]) -> Option<String> {
+    let content = last_user_message_content(messages)?;
+    extract_at_file_path(content)
+}
+
+fn user_wants_summary(messages: &[Message]) -> bool {
+    last_user_message_content(messages).is_some_and(|content| {
+        let lower = content.to_ascii_lowercase();
+        lower.contains("summar") || lower.contains("tl;dr") || lower.contains("tldr")
+    })
+}
+
+fn min_decode_tokens_for_request(
+    messages: &[Message],
+    tools: Option<&[Tool]>,
+    tool_choice: Option<&serde_json::Value>,
+) -> usize {
+    if should_force_tool_call(messages, tools, tool_choice) {
+        0
+    } else if user_wants_summary(messages) {
+        128
+    } else {
+        0
+    }
+}
+
+fn user_message_implies_read(messages: &[Message]) -> bool {
+    last_user_message_content(messages).is_some_and(|content| {
+        if extract_at_file_path(content).is_some() {
+            return true;
+        }
+        let lower = content.to_ascii_lowercase();
+        lower.contains("summar") || lower.contains("read file") || lower.contains("read the file")
+    })
+}
+
+fn parse_plain_read_invocation(text: &str) -> Option<ToolCall> {
+    for line in text.lines() {
+        let line = line.trim();
+        let Some(path) = line
+            .strip_prefix("read ")
+            .or_else(|| line.strip_prefix("read_file "))
+        else {
+            continue;
+        };
+        let path = path.trim();
+        if path.is_empty() || path.starts_with('{') || path.contains("<|tool_call>") {
+            continue;
+        }
+        return Some(make_read_tool_call(path));
+    }
+    None
+}
+
+fn infer_tool_call_from_context(
+    messages: &[Message],
+    tools: Option<&[Tool]>,
+    text: &str,
+) -> Option<ToolCall> {
+    let names: Vec<String> = tools?.iter().map(|t| t.function.name.clone()).collect();
+    if names.is_empty() {
+        return None;
+    }
+
+    if names.iter().any(|n| n == "bash") && user_wants_directory_listing(messages) {
+        return Some(make_bash_tool_call("ls -F"));
+    }
+
+    let lower = text.to_ascii_lowercase();
+    if names.iter().any(|n| n == "bash")
+        && user_wants_directory_listing(messages)
+        && (lower.contains("bash") || lower.contains("`ls`") || lower.contains(" ls "))
+    {
+        return Some(make_bash_tool_call("ls -F"));
+    }
+
+    if names.iter().any(|n| n == "read") && user_message_implies_read(messages) {
+        if user_message_has_inlined_pi_file(messages) {
+            return None;
+        }
+        if let Some(path) = infer_read_path_from_user(messages) {
+            return Some(make_read_tool_call(&path));
+        }
+    }
+
+    None
+}
+
+fn resolve_tool_calls(
+    text: &str,
+    messages: &[Message],
+    tools: Option<&[Tool]>,
+    tool_choice: Option<&serde_json::Value>,
+) -> Vec<ToolCall> {
+    let allowed_names = tools.map(allowed_tool_names);
+    let allowed_ref = allowed_names.as_deref();
+    let calls = parse_tool_calls(text, allowed_ref);
+    if !calls.is_empty() {
+        return calls;
+    }
+    if should_force_tool_call(messages, tools, tool_choice) {
+        if let Some(call) = infer_tool_call_from_context(messages, tools, text) {
+            return finish_parse_tool_calls(vec![call], allowed_ref);
+        }
+    }
+    calls
+}
+
+/// Tool calls we can derive from the request alone (pi `@"path"`, `list files`, etc.).
+fn infer_tool_calls_without_generation(
+    messages: &[Message],
+    tools: Option<&[Tool]>,
+    tool_choice: Option<&serde_json::Value>,
+) -> Vec<ToolCall> {
+    resolve_tool_calls("", messages, tools, tool_choice)
 }
 fn default_temperature() -> f32 {
     1.0
@@ -195,7 +1351,7 @@ pub struct ChatCompletionResponse {
 #[derive(Serialize)]
 pub struct Choice {
     pub index: usize,
-    pub message: Message,
+    pub message: AssistantMessageOut,
     pub finish_reason: String,
 }
 
@@ -348,7 +1504,7 @@ impl ServerRuntimeConfig {
                 .max(1),
             request_timeout: Duration::from_secs(
                 parse_u64(&mut lookup, "LLAMA_REQUEST_TIMEOUT_SECS")
-                    .unwrap_or(60)
+                    .unwrap_or(300)
                     .max(1),
             ),
             max_prefill_tokens_per_tick: parse_usize(&mut lookup, "LLAMA_PREFILL_TOKENS_PER_TICK")
@@ -392,20 +1548,88 @@ fn parse_u64(lookup: &mut impl FnMut(&str) -> Option<String>, name: &str) -> Opt
 
 // ─── Chat template ───────────────────────────────────────────────────────────
 
-const BUILT_IN_STOP_SEQUENCES: &[&str] = &[
+// Gemma 4 chat control tokens (see GGUF: <|turn>=105, <turn|>=106).
+const TURN_START: &str = "<|turn>";
+const TURN_END: &str = "<turn|>";
+const CHANNEL_START: &str = "<|channel>";
+const CHANNEL_END: &str = "<channel|>";
+const GEMMA4_TOOL_START: &str = "<|tool>";
+const GEMMA4_TOOL_END: &str = "<tool|>";
+const NATIVE_TOOL_CALL_PREFIX: &str = "<|tool_call>call:";
+const NATIVE_TOOL_CALL_TRIGGER: &str = "<|tool_call>";
+const NATIVE_TOOL_CALL_SUFFIX: &str = "<tool_call|>";
+const NATIVE_TOOL_RESPONSE_PREFIX: &str = "<|tool_response>response:";
+const NATIVE_TOOL_RESPONSE_SUFFIX: &str = "<tool_response|>";
+const SYSTEM_FINGERPRINT: &str = "local-7f3a2c1b";
+/// Gemma4 jinja primes the model turn with an empty thought channel when thinking is off.
+const EMPTY_THOUGHT_PREFIX: &str = "<|channel>thought\n<channel|>";
+/// Direct answer generation after tool results or when file content is already in context.
+const FINAL_CHANNEL_PREFIX: &str = "<|channel>final\n";
+
+fn generation_priming_suffix(
+    messages: &[Message],
+    tools: Option<&[Tool]>,
+    tool_choice: Option<&serde_json::Value>,
+) -> &'static str {
+    if should_force_tool_call(messages, tools, tool_choice) {
+        EMPTY_THOUGHT_PREFIX
+    } else {
+        FINAL_CHANNEL_PREFIX
+    }
+}
+
+const BUILT_IN_OUTPUT_TRIM_SEQUENCES: &[&str] = &[
+    TURN_END,
+    TURN_START,
+    CHANNEL_START,
+    CHANNEL_END,
+    NATIVE_TOOL_CALL_SUFFIX,
     "<end_of_turn>",
     "<eos>",
     "<start_of_turn>",
     "</start_of_turn>",
 ];
 
-fn render_tool_instructions(tools: &[Tool]) -> String {
+// Only these end the underlying sampler loop. Channel / tool markup tokens are
+// normal model output and must not cancel generation mid-turn.
+const BUILT_IN_GENERATION_STOP_SEQUENCES: &[&str] = &[TURN_END, TURN_START];
+
+const TURN_STOP_PREFIXES: &[&str] = &["<", "<|", "<|t", "<|tu", "<|tur", "<|turn"];
+const OTHER_OUTPUT_TRIM_PREFIXES: &[&str] = &[
+    "<e",
+    "<en",
+    "<end",
+    "<end_",
+    "<end_o",
+    "<end_of",
+    "<end_of_",
+    "<end_of_t",
+    "<end_of_tu",
+    "<end_of_turn",
+];
+const TOOL_CALL_STOP_PREFIXES: &[&str] = &[
+    "<",
+    "<t",
+    "<to",
+    "<too",
+    "<tool",
+    "<tool_",
+    "<tool_c",
+    "<tool_ca",
+    "<tool_cal",
+    "<tool_call",
+    "<tool_call|",
+    "<tool_call|>",
+];
+
+fn render_tool_instructions(tools: &[Tool], tool_choice: Option<&serde_json::Value>) -> String {
     let mut s = String::new();
     s.push_str(
         "You have access to the following tools. When you need to use a tool, \
 respond with one or more fenced code blocks tagged `tool_call`, each containing \
-a single JSON object with \"name\" and \"arguments\" keys. Emit nothing else when \
-calling a tool. Only call tools from this list.\n\n",
+a single JSON object with \"name\" and \"arguments\" keys. You may also emit a bare \
+JSON object with \"name\" and \"arguments\". Emit nothing else when calling a tool. \
+Only call tools from this list.\n\n",
     );
     s.push_str("Available tools:\n");
     for tool in tools {
@@ -423,88 +1647,160 @@ calling a tool. Only call tools from this list.\n\n",
             s.push('\n');
         }
     }
+    if let Some(first) = tools.first() {
+        s.push_str(&format!(
+            "\nExample:\n```tool_call\n{{\"name\": \"{}\", \"arguments\": {{}}}}\n```\n",
+            first.function.name
+        ));
+    }
     s.push_str(
         "\nTo call a tool, output exactly:\n```tool_call\n{\"name\": \"tool_name\", \
 \"arguments\": {\"arg\": \"value\"}}\n```\n",
     );
+    if tool_choice_is_required(tool_choice) {
+        s.push_str("\nYou must call a tool to answer this request.\n");
+    }
     s
 }
 
-fn apply_chat_template(messages: &[Message], tools: Option<&[Tool]>) -> String {
+fn apply_chat_template(
+    messages: &[Message],
+    tools: Option<&[Tool]>,
+    tool_choice: Option<&serde_json::Value>,
+) -> String {
     let mut prompt = String::new();
 
-    // Gemma has no dedicated system/tool roles. Fold tool definitions and any
-    // system messages into a preamble prepended to the first user turn.
-    let mut preamble = String::new();
-    if let Some(tools) = tools {
-        if !tools.is_empty() {
-            preamble.push_str(&render_tool_instructions(tools));
-        }
-    }
+    let mut system_parts = Vec::new();
     for msg in messages {
         if msg.role == "system" {
             if let Some(content) = &msg.content {
                 if !content.is_empty() {
-                    if !preamble.is_empty() {
-                        preamble.push_str("\n\n");
-                    }
-                    preamble.push_str(content);
+                    system_parts.push(content.clone());
                 }
             }
         }
     }
-    let mut preamble_pending = !preamble.is_empty();
 
-    for msg in messages {
-        match msg.role.as_str() {
-            "system" => continue,
-            "tool" => {
-                let name = msg.name.as_deref().unwrap_or("tool");
-                prompt.push_str("<start_of_turn>user\n");
-                prompt.push_str(&format!("Tool result for {}:\n", name));
-                if let Some(content) = &msg.content {
+    let has_tools = tools.map(|t| !t.is_empty()).unwrap_or(false);
+    if has_tools || !system_parts.is_empty() {
+        prompt.push_str(TURN_START);
+        prompt.push_str("system\n");
+        if !system_parts.is_empty() {
+            prompt.push_str(&system_parts.join("\n\n"));
+            if has_tools {
+                prompt.push('\n');
+            }
+        }
+        if let Some(tools) = tools {
+            if !tools.is_empty() {
+                prompt.push_str(&render_gemma4_tool_declarations(tools));
+            }
+        }
+        if should_force_tool_call(messages, tools, tool_choice) {
+            prompt.push_str("\nYou must call a tool to answer this request.");
+        } else if user_wants_summary(messages) {
+            prompt.push_str(
+                "\nWhen summarizing, write a clear multi-paragraph summary covering the main topics, \
+structure, and key details of the document.",
+            );
+        }
+        prompt.push_str(TURN_END);
+        prompt.push('\n');
+    }
+
+    let mut ends_in_open_model_turn = false;
+    let mut i = 0;
+    while i < messages.len() {
+        let msg = &messages[i];
+        if msg.role == "system" {
+            i += 1;
+            continue;
+        }
+
+        if msg.role == "tool" {
+            let name = msg.name.as_deref().unwrap_or("tool");
+            prompt.push_str(&render_tool_response_native(
+                name,
+                msg.content.as_deref().unwrap_or(""),
+            ));
+            i += 1;
+            continue;
+        }
+
+        if msg.role == "user" {
+            ends_in_open_model_turn = false;
+        }
+
+        let mapped = if msg.role == "assistant" {
+            "model"
+        } else {
+            "user"
+        };
+        prompt.push_str(TURN_START);
+        prompt.push_str(mapped);
+        prompt.push('\n');
+        if let Some(content) = &msg.content {
+            prompt.push_str(content);
+        }
+        if let Some(tool_calls) = &msg.tool_calls {
+            for tc in tool_calls {
+                prompt.push_str(&render_assistant_tool_call_native(tc));
+            }
+        }
+        i += 1;
+
+        if msg.role == "assistant" && msg.tool_calls.as_ref().is_some_and(|t| !t.is_empty()) {
+            ends_in_open_model_turn = true;
+            while i < messages.len() && messages[i].role == "tool" {
+                let tm = &messages[i];
+                let name = tm.name.as_deref().unwrap_or("tool");
+                prompt.push_str(&render_tool_response_native(
+                    name,
+                    tm.content.as_deref().unwrap_or(""),
+                ));
+                i += 1;
+            }
+            while i < messages.len()
+                && messages[i].role == "assistant"
+                && messages[i]
+                    .tool_calls
+                    .as_ref()
+                    .map_or(true, |t| t.is_empty())
+            {
+                if let Some(content) = &messages[i].content {
                     prompt.push_str(content);
                 }
-                prompt.push_str("<end_of_turn>\n");
+                ends_in_open_model_turn = false;
+                i += 1;
             }
-            role => {
-                let mapped = if role == "assistant" { "model" } else { "user" };
-                prompt.push_str(&format!("<start_of_turn>{}\n", mapped));
-                if mapped == "user" && preamble_pending {
-                    prompt.push_str(&preamble);
-                    prompt.push_str("\n\n");
-                    preamble_pending = false;
-                }
-                if let Some(content) = &msg.content {
-                    prompt.push_str(content);
-                }
-                if let Some(tool_calls) = &msg.tool_calls {
-                    for tc in tool_calls {
-                        prompt.push_str(&format!(
-                            "\n```tool_call\n{{\"name\": \"{}\", \"arguments\": {}}}\n```",
-                            tc.function.name, tc.function.arguments
-                        ));
-                    }
-                }
-                prompt.push_str("<end_of_turn>\n");
-            }
+        }
+
+        if !ends_in_open_model_turn {
+            prompt.push_str(TURN_END);
+            prompt.push('\n');
         }
     }
 
-    if preamble_pending {
-        prompt.push_str("<start_of_turn>user\n");
-        prompt.push_str(&preamble);
-        prompt.push_str("<end_of_turn>\n");
+    if ends_in_open_model_turn {
+        if user_wants_summary(messages) && !should_force_tool_call(messages, tools, tool_choice) {
+            prompt.push_str(
+                "Write a thorough summary of the file content above covering main topics and key details.\n",
+            );
+        }
+        prompt.push_str(generation_priming_suffix(messages, tools, tool_choice));
+    } else {
+        prompt.push_str(TURN_START);
+        prompt.push_str("model\n");
+        prompt.push_str(generation_priming_suffix(messages, tools, tool_choice));
     }
 
-    prompt.push_str("<start_of_turn>model\n");
     prompt
 }
 
 /// Parse tool calls emitted by the model. Supports the prompted
 /// ```` ```tool_call ```` fenced-block format as well as
 /// `<tool_call>...</tool_call>` tags, with one JSON object per block.
-fn parse_tool_calls(text: &str) -> Vec<ToolCall> {
+fn parse_tool_calls(text: &str, allowed_names: Option<&[String]>) -> Vec<ToolCall> {
     let mut calls = Vec::new();
 
     fn push_from_json(calls: &mut Vec<ToolCall>, json_str: &str) {
@@ -517,6 +1813,50 @@ fn parse_tool_calls(text: &str) -> Vec<ToolCall> {
                 calls.push(call);
             }
         }
+    }
+
+    // Gemma4 native: <|tool_call>call:read{path:<|"|>a<|"|>}<tool_call|>
+    let mut rest = text;
+    while let Some(start) = rest.find(NATIVE_TOOL_CALL_TRIGGER) {
+        let after_trigger = &rest[start + NATIVE_TOOL_CALL_TRIGGER.len()..];
+        let after = after_trigger
+            .strip_prefix("call:")
+            .or_else(|| after_trigger.strip_prefix("call"))
+            .unwrap_or(after_trigger);
+        let body = if let Some(end) = after.find(NATIVE_TOOL_CALL_SUFFIX) {
+            &after[..end]
+        } else {
+            after.trim()
+        };
+        if let Some(brace) = body.find('{') {
+            let name = body[..brace].trim();
+            let dict = &body[brace..];
+            if let Some(args_val) = gemma4_dict_to_json_object(dict) {
+                push_unique_call(
+                    &mut calls,
+                    ToolCall {
+                        id: format!("call_{}", uuid::Uuid::new_v4()),
+                        call_type: "function".to_string(),
+                        function: FunctionCall {
+                            name: name.to_string(),
+                            arguments: serde_json::to_string(&args_val).unwrap_or_default(),
+                        },
+                    },
+                );
+            }
+        }
+        let advance = if let Some(end) = after.find(NATIVE_TOOL_CALL_SUFFIX) {
+            start + NATIVE_TOOL_CALL_TRIGGER.len() + end + NATIVE_TOOL_CALL_SUFFIX.len()
+        } else {
+            rest.len()
+        };
+        if advance <= start {
+            break;
+        }
+        rest = &rest[advance..];
+    }
+    if !calls.is_empty() {
+        return finish_parse_tool_calls(calls, allowed_names.as_deref());
     }
 
     // Fenced ```tool_call blocks.
@@ -543,10 +1883,140 @@ fn parse_tool_calls(text: &str) -> Vec<ToolCall> {
         }
     }
 
-    calls
+    if calls.is_empty() {
+        let mut rest = text;
+        while let Some(start) = rest.find("```json") {
+            let after = &rest[start + "```json".len()..];
+            let json_body = after.strip_prefix('\n').unwrap_or(after);
+            if let Some(end) = json_body.find("```") {
+                push_from_json(&mut calls, &json_body[..end]);
+                rest = &json_body[end + 3..];
+            } else {
+                break;
+            }
+        }
+
+        for val in iter_json_objects(text) {
+            if let Some(call) = tool_call_from_value(&val) {
+                push_unique_call(&mut calls, call);
+            }
+        }
+    }
+
+    if calls.is_empty() {
+        if let Some(call) = parse_plain_read_invocation(text) {
+            calls.push(call);
+        }
+    }
+
+    if calls.is_empty() {
+        if let Some(call) = parse_tool_code_fallback(text) {
+            calls.push(call);
+        }
+    }
+
+    finish_parse_tool_calls(calls, allowed_names.as_deref())
+}
+
+fn finish_parse_tool_calls(calls: Vec<ToolCall>, allowed_names: Option<&[String]>) -> Vec<ToolCall> {
+    match allowed_names {
+        Some(names) if !names.is_empty() => normalize_tool_calls(calls, names),
+        _ => calls,
+    }
+}
+
+fn push_unique_call(calls: &mut Vec<ToolCall>, call: ToolCall) {
+    if !calls
+        .iter()
+        .any(|existing| {
+            existing.function.name == call.function.name
+                && existing.function.arguments == call.function.arguments
+        })
+    {
+        calls.push(call);
+    }
+}
+
+fn iter_json_objects(text: &str) -> Vec<serde_json::Value> {
+    let mut objects = Vec::new();
+    let mut i = 0;
+    while i < text.len() {
+        if text.as_bytes().get(i) == Some(&b'{') {
+            if let Some((end, json_str)) = extract_balanced_json(&text[i..]) {
+                if let Ok(val) = serde_json::from_str::<serde_json::Value>(json_str) {
+                    if val.is_object() {
+                        objects.push(val);
+                    }
+                }
+                i += end;
+                continue;
+            }
+        }
+        i += 1;
+    }
+    objects
+}
+
+fn extract_balanced_json(s: &str) -> Option<(usize, &str)> {
+    let bytes = s.as_bytes();
+    let mut depth = 0i32;
+    let mut in_string = false;
+    let mut escape = false;
+    for (i, &b) in bytes.iter().enumerate() {
+        if in_string {
+            if escape {
+                escape = false;
+                continue;
+            }
+            if b == b'\\' {
+                escape = true;
+                continue;
+            }
+            if b == b'"' {
+                in_string = false;
+            }
+            continue;
+        }
+        match b {
+            b'"' => in_string = true,
+            b'{' => depth += 1,
+            b'}' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some((i + 1, &s[..=i]));
+                }
+            }
+            _ => {}
+        }
+    }
+    None
 }
 
 fn tool_call_from_value(val: &serde_json::Value) -> Option<ToolCall> {
+    if let Some(items) = val.get("tool_calls").and_then(|v| v.as_array()) {
+        return items.iter().find_map(tool_call_from_value);
+    }
+
+    if val.get("type").and_then(|t| t.as_str()) == Some("function") {
+        if let Some(func) = val.get("function") {
+            let name = func.get("name")?.as_str()?.to_string();
+            let arguments = match func.get("arguments") {
+                Some(args) if args.is_string() => args.as_str().unwrap_or("").to_string(),
+                Some(args) => serde_json::to_string(args).unwrap_or_else(|_| "{}".to_string()),
+                None => "{}".to_string(),
+            };
+            return Some(ToolCall {
+                id: val
+                    .get("id")
+                    .and_then(|id| id.as_str())
+                    .map(|id| id.to_string())
+                    .unwrap_or_else(|| format!("call_{}", uuid::Uuid::new_v4().simple())),
+                call_type: "function".to_string(),
+                function: FunctionCall { name, arguments },
+            });
+        }
+    }
+
     let name = val.get("name")?.as_str()?.to_string();
     let arguments = match val.get("arguments").or_else(|| val.get("parameters")) {
         Some(args) if args.is_string() => args.as_str().unwrap_or("").to_string(),
@@ -560,11 +2030,36 @@ fn tool_call_from_value(val: &serde_json::Value) -> Option<ToolCall> {
     })
 }
 
-fn find_stop_position(text: &str, request_stop: Option<&[String]>) -> Option<usize> {
-    let mut earliest = BUILT_IN_STOP_SEQUENCES
-        .iter()
-        .filter_map(|stop| text.find(stop))
-        .min();
+fn find_stop_position(text: &str, stops: &[&str], request_stop: Option<&[String]>) -> Option<usize> {
+    let mut earliest = stops.iter().filter_map(|stop| text.find(stop)).min();
+
+    if let Some(request_stop) = request_stop {
+        let request_earliest = request_stop
+            .iter()
+            .filter(|stop| !stop.is_empty())
+            .filter_map(|stop| text.find(stop))
+            .min();
+        earliest = match (earliest, request_earliest) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (Some(a), None) => Some(a),
+            (None, Some(b)) => Some(b),
+            (None, None) => None,
+        };
+    }
+
+    earliest
+}
+
+fn find_generation_stop_position(text: &str, request_stop: Option<&[String]>) -> Option<usize> {
+    let mut earliest = find_stop_position(text, BUILT_IN_GENERATION_STOP_SEQUENCES, None);
+
+    // A completed native tool call ends the assistant turn.
+    if let Some(tool_end) = text.find(NATIVE_TOOL_CALL_SUFFIX) {
+        earliest = Some(match earliest {
+            Some(pos) => pos.min(tool_end),
+            None => tool_end,
+        });
+    }
 
     if let Some(request_stop) = request_stop {
         let request_earliest = request_stop
@@ -584,42 +2079,56 @@ fn find_stop_position(text: &str, request_stop: Option<&[String]>) -> Option<usi
 }
 
 fn trim_stop_sequences(text: &mut String, request_stop: Option<&[String]>) -> bool {
-    if let Some(pos) = find_stop_position(text, request_stop) {
+    if let Some(pos) = find_stop_position(text, BUILT_IN_OUTPUT_TRIM_SEQUENCES, request_stop) {
         text.truncate(pos);
         return true;
     }
     false
 }
 
-fn stop_prefix_holdback_len(text: &str, request_stop: Option<&[String]>) -> usize {
-    let mut max_len = 0;
+fn stop_prefix_holdback_len(
+    text: &str,
+    in_tool_call: bool,
+    request_stop: Option<&[String]>,
+) -> usize {
+    let prefixes = if in_tool_call {
+        TOOL_CALL_STOP_PREFIXES
+    } else {
+        TURN_STOP_PREFIXES
+    };
 
+    let mut max_len = 0;
     for (start, _) in text.char_indices() {
         let suffix = &text[start..];
-        if BUILT_IN_STOP_SEQUENCES
-            .iter()
-            .any(|stop| stop.starts_with(suffix))
-            || request_stop
-                .map(|stops| {
-                    stops
-                        .iter()
-                        .any(|stop| !stop.is_empty() && stop.starts_with(suffix))
-                })
-                .unwrap_or(false)
+        if prefixes.iter().any(|prefix| *prefix == suffix)
+            || (!in_tool_call
+                && OTHER_OUTPUT_TRIM_PREFIXES
+                    .iter()
+                    .any(|prefix| *prefix == suffix))
         {
             max_len = max_len.max(text.len() - start);
         }
+        if request_stop.is_some_and(|stops| {
+            stops
+                .iter()
+                .any(|stop| !stop.is_empty() && stop.starts_with(suffix))
+        }) {
+            max_len = max_len.max(text.len() - start);
+        }
     }
-
     max_len
 }
 
-fn trim_stream_safe_text(text: &mut String, request_stop: Option<&[String]>) -> bool {
+fn trim_stream_safe_text(
+    text: &mut String,
+    request_stop: Option<&[String]>,
+    in_tool_call: bool,
+) -> bool {
     if trim_stop_sequences(text, request_stop) {
         return true;
     }
 
-    let holdback_len = stop_prefix_holdback_len(text, request_stop);
+    let holdback_len = stop_prefix_holdback_len(text, in_tool_call, request_stop);
     if holdback_len > 0 {
         text.truncate(text.len() - holdback_len);
     }
@@ -677,13 +2186,18 @@ fn generation_params_from_request(
     validate_request(req)?;
 
     Ok(GenerationParams {
-        max_tokens: req.max_tokens,
+        max_tokens: effective_max_tokens(req),
         temperature: req.temperature,
         min_p: req.min_p,
         top_k: req.top_k,
         repetition_penalty: req.repetition_penalty,
         frequency_penalty: req.frequency_penalty,
         eos_token_ids: vec![1, 106],
+        min_decode_tokens: min_decode_tokens_for_request(
+            &req.messages,
+            req.tools.as_deref(),
+            req.tool_choice.as_ref(),
+        ),
         request_timeout,
     })
 }
@@ -696,7 +2210,7 @@ fn validate_request(req: &ChatCompletionRequest) -> Result<(), ApiError> {
         ));
     }
 
-    if req.max_tokens == 0 {
+    if effective_max_tokens(req) == 0 {
         return Err(ApiError::bad_request(
             "invalid_max_tokens",
             "max_tokens must be greater than 0",
@@ -740,12 +2254,152 @@ fn validate_request(req: &ChatCompletionRequest) -> Result<(), ApiError> {
     Ok(())
 }
 
+const TOOL_CONTENT_TRUNCATION_NOTICE: &str =
+    "\n\n[... file content truncated to fit context window ...]";
+
+fn truncate_content_to_budget(content: &mut String, target_len: usize) {
+    if content.len() <= target_len {
+        return;
+    }
+    let notice = TOOL_CONTENT_TRUNCATION_NOTICE;
+    let budget = target_len.saturating_sub(notice.len() + 32);
+    if budget < 512 {
+        content.truncate(target_len.saturating_sub(notice.len()));
+        if !content.contains("truncated to fit context window") {
+            content.push_str(notice);
+        }
+        return;
+    }
+    let head = budget * 70 / 100;
+    let tail = budget - head;
+    let head_end = content
+        .char_indices()
+        .nth(head)
+        .map(|(i, _)| i)
+        .unwrap_or(content.len());
+    let tail_start = content
+        .char_indices()
+        .nth(content.chars().count().saturating_sub(tail))
+        .map(|(i, _)| i)
+        .unwrap_or(head_end);
+    let new_content = format!(
+        "{}\n\n[... middle of file omitted for context limit ...]\n\n{}{}",
+        &content[..head_end],
+        &content[tail_start..],
+        notice
+    );
+    *content = new_content;
+}
+
+fn count_prompt_tokens(
+    tokenizer: &tokenizers::Tokenizer,
+    messages: &[Message],
+    tools: Option<&[Tool]>,
+    tool_choice: Option<&serde_json::Value>,
+) -> Result<usize, ApiError> {
+    let prompt = apply_chat_template(messages, tools, tool_choice);
+    let encoding = tokenizer.encode(prompt.as_str(), true).map_err(|err| {
+        ApiError::bad_request(
+            "tokenizer_error",
+            format!("failed to tokenize prompt: {}", err),
+        )
+    })?;
+    Ok(encoding.get_ids().len())
+}
+
+/// Shrink `role: tool` payloads so the rendered prompt fits the KV budget.
+fn fit_messages_to_context(
+    messages: &[Message],
+    tools: Option<&[Tool]>,
+    tool_choice: Option<&serde_json::Value>,
+    tokenizer: &tokenizers::Tokenizer,
+    max_prompt_tokens: usize,
+) -> Result<Vec<Message>, ApiError> {
+    let mut fitted = messages.to_vec();
+    if count_prompt_tokens(tokenizer, &fitted, tools, tool_choice)? <= max_prompt_tokens {
+        return Ok(fitted);
+    }
+
+    for _ in 0..48 {
+        let current = count_prompt_tokens(tokenizer, &fitted, tools, tool_choice)?;
+        if current <= max_prompt_tokens {
+            return Ok(fitted);
+        }
+
+        let Some((index, _)) = fitted
+            .iter()
+            .enumerate()
+            .filter_map(|(index, msg)| {
+                let content = msg.content.as_ref()?;
+                if content.len() < 512 {
+                    return None;
+                }
+                if msg.role == "tool"
+                    || (msg.role == "user" && content.contains("<file name="))
+                {
+                    Some((index, content.len()))
+                } else {
+                    None
+                }
+            })
+            .max_by_key(|(_, len)| *len)
+        else {
+            break;
+        };
+
+        let shrink_ratio = max_prompt_tokens as f64 / current as f64;
+        let content = fitted[index].content.as_mut().expect("tool content");
+        let min_chars = 512;
+        if content.len() <= min_chars {
+            break;
+        }
+        let target_len = ((content.len() as f64) * shrink_ratio * 0.92) as usize;
+        let target_len = target_len.clamp(min_chars, content.len().saturating_sub(1));
+        truncate_content_to_budget(content, target_len);
+    }
+
+    let final_count = count_prompt_tokens(tokenizer, &fitted, tools, tool_choice)?;
+    if final_count > max_prompt_tokens {
+        return Err(ApiError::bad_request(
+            "context_length_exceeded",
+            format!(
+                "prompt has {} tokens after truncating tool results; context limit is {}",
+                final_count, max_prompt_tokens
+            ),
+        ));
+    }
+    if fitted.iter().any(|msg| {
+        msg.content.as_deref().is_some_and(|c| {
+            c.contains("truncated to fit context window")
+        })
+    }) {
+        eprintln!(
+            "   Prompt fit: truncated tool content to {} tokens (budget {})",
+            final_count, max_prompt_tokens
+        );
+    }
+    Ok(fitted)
+}
+
 fn encode_prompt(
     state: &AppState,
     messages: &[Message],
     tools: Option<&[Tool]>,
+    tool_choice: Option<&serde_json::Value>,
+    max_tokens: usize,
 ) -> Result<Vec<usize>, ApiError> {
-    let prompt = apply_chat_template(messages, tools);
+    let max_prompt_tokens = state
+        .max_context_len
+        .saturating_sub(max_tokens)
+        .max(1);
+    let fitted = fit_messages_to_context(
+        messages,
+        tools,
+        tool_choice,
+        &state.tokenizer,
+        max_prompt_tokens,
+    )?;
+    let prompt = apply_chat_template(&fitted, tools, tool_choice);
     let encoding = state
         .tokenizer
         .encode(prompt.as_str(), true)
@@ -811,7 +2465,13 @@ async fn chat_completions_sync(
     req: ChatCompletionRequest,
 ) -> Result<Json<ChatCompletionResponse>, ApiError> {
     let generation_params = generation_params_from_request(&req, state.request_timeout())?;
-    let input_ids = encode_prompt(&state, &req.messages, req.tools.as_deref())?;
+    let input_ids = encode_prompt(
+        &state,
+        &req.messages,
+        req.tools.as_deref(),
+        req.tool_choice.as_ref(),
+        generation_params.max_tokens,
+    )?;
     let prompt_tokens = input_ids.len();
     validate_context_len(
         prompt_tokens,
@@ -819,24 +2479,51 @@ async fn chat_completions_sync(
         state.max_context_len,
     )?;
     let has_tools = req.tools.as_ref().map(|t| !t.is_empty()).unwrap_or(false);
+    let model_name = response_model(&req).to_string();
     let request_stop = req.stop.map(StopSequences::into_vec);
+
+    let inferred_tool_calls = if has_tools {
+        infer_tool_calls_without_generation(
+            &req.messages,
+            req.tools.as_deref(),
+            req.tool_choice.as_ref(),
+        )
+    } else {
+        Vec::new()
+    };
+    if !inferred_tool_calls.is_empty() {
+        let message = assistant_message_out(String::new(), inferred_tool_calls.clone());
+        return Ok(Json(ChatCompletionResponse {
+            id: format!("chatcmpl-{}", uuid::Uuid::new_v4()),
+            object: "chat.completion".to_string(),
+            created: chrono::Utc::now().timestamp(),
+            model: model_name,
+            choices: vec![Choice {
+                index: 0,
+                message,
+                finish_reason: "tool_calls".to_string(),
+            }],
+            usage: Usage {
+                prompt_tokens,
+                completion_tokens: 0,
+                total_tokens: prompt_tokens,
+            },
+        }));
+    }
 
     let (mut response_rx, cancel) = enqueue_request(&state, input_ids, generation_params)?;
     let mut output_tokens = Vec::new();
-    let mut decoded_text = String::new();
     let mut finish_reason = "stop".to_string();
 
     while let Some(event) = response_rx.recv().await {
         match event {
             StreamEvent::Token { token_id } => {
                 output_tokens.push(token_id as u32);
-
-                let tok_str = state
+                let decoded_text = state
                     .tokenizer
-                    .decode(&[token_id as u32], false)
+                    .decode(&output_tokens.iter().map(|&t| t).collect::<Vec<u32>>(), false)
                     .unwrap_or_default();
-                decoded_text.push_str(&tok_str);
-                if find_stop_position(&decoded_text, request_stop.as_deref()).is_some() {
+                if find_generation_stop_position(&decoded_text, request_stop.as_deref()).is_some() {
                     cancel.store(CANCEL_STOP, Ordering::Relaxed);
                     break;
                 }
@@ -851,57 +2538,38 @@ async fn chat_completions_sync(
         }
     }
 
-    let mut text = state
-        .tokenizer
-        .decode(&output_tokens, true)
-        .unwrap_or_default();
-    trim_stop_sequences(&mut text, request_stop.as_deref());
-    // Strip thinking/reasoning content (Gemma4 thinking mode)
-    if text.starts_with("thought\n") {
-        // Find the end of thinking block - look for double newline or end
-        if let Some(end_pos) = text.find("\n...end_of_turn") {
-            text = text[end_pos..]
-                .trim_start_matches("\n...end_of_turn")
-                .to_string();
-        } else if let Some(end_pos) = text.rfind("\n\n") {
-            // Take only the last paragraph as the actual response
-            text = text[end_pos..].trim().to_string();
-        }
-    }
+    let text = {
+        let mut raw = state
+            .tokenizer
+            .decode(&output_tokens.iter().map(|&t| t).collect::<Vec<u32>>(), true)
+            .unwrap_or_default();
+        trim_stop_sequences(&mut raw, request_stop.as_deref());
+        raw
+    };
     let completion_tokens = output_tokens.len();
 
     let tool_calls = if has_tools {
-        parse_tool_calls(&text)
+        resolve_tool_calls(
+            &text,
+            &req.messages,
+            req.tools.as_deref(),
+            req.tool_choice.as_ref(),
+        )
     } else {
         Vec::new()
     };
 
-    let (message, finish_reason) = if !tool_calls.is_empty() {
-        (
-            Message {
-                role: "assistant".to_string(),
-                content: None,
-                tool_calls: Some(tool_calls),
-                ..Default::default()
-            },
-            "tool_calls".to_string(),
-        )
-    } else {
-        (
-            Message {
-                role: "assistant".to_string(),
-                content: Some(text),
-                ..Default::default()
-            },
-            finish_reason,
-        )
-    };
+    if !tool_calls.is_empty() {
+        finish_reason = "tool_calls".to_string();
+    }
+
+    let message = assistant_message_out(text, tool_calls);
 
     let response = ChatCompletionResponse {
         id: format!("chatcmpl-{}", uuid::Uuid::new_v4()),
         object: "chat.completion".to_string(),
         created: chrono::Utc::now().timestamp(),
-        model: "gemma-4-e4b-q4".to_string(),
+        model: model_name,
         choices: vec![Choice {
             index: 0,
             message,
@@ -926,42 +2594,130 @@ async fn chat_completions_stream(
     let chat_id = format!("chatcmpl-{}", uuid::Uuid::new_v4());
     let created = chrono::Utc::now().timestamp();
     let generation_params = generation_params_from_request(&req, state.request_timeout())?;
-    let input_ids = encode_prompt(&state, &req.messages, req.tools.as_deref())?;
+    let input_ids = encode_prompt(
+        &state,
+        &req.messages,
+        req.tools.as_deref(),
+        req.tool_choice.as_ref(),
+        generation_params.max_tokens,
+    )?;
     validate_context_len(
         input_ids.len(),
         generation_params.max_tokens,
         state.max_context_len,
     )?;
     let has_tools = req.tools.as_ref().map(|t| !t.is_empty()).unwrap_or(false);
+    let model_name = response_model(&req).to_string();
     let request_stop = req.stop.map(StopSequences::into_vec);
+    let include_usage = should_include_stream_usage(req.stream_options.as_ref());
+    let prompt_tokens = input_ids.len();
+    let allowed_tool_names = req
+        .tools
+        .as_ref()
+        .map(|tools| allowed_tool_names(tools.as_slice()))
+        .unwrap_or_default();
+    let messages_for_resolve = req.messages.clone();
+    let tools_for_resolve = req.tools.clone();
+    let tool_choice_for_resolve = req.tool_choice.clone();
+
+    let inferred_tool_calls = if has_tools {
+        infer_tool_calls_without_generation(
+            &req.messages,
+            req.tools.as_deref(),
+            req.tool_choice.as_ref(),
+        )
+    } else {
+        Vec::new()
+    };
+    if !inferred_tool_calls.is_empty() {
+        tokio::spawn(async move {
+            let role_chunk_data = stream_chunk_json(
+                &chat_id,
+                created,
+                &model_name,
+                serde_json::json!({"role": "assistant", "content": null}),
+                None,
+            );
+            let _ = tx
+                .send(Ok(Event::default().data(role_chunk_data)))
+                .await;
+            for chunk_data in
+                stream_tool_call_chunks(&chat_id, created, &model_name, &inferred_tool_calls)
+            {
+                let _ = tx
+                    .send(Ok(Event::default().data(chunk_data)))
+                    .await;
+            }
+            let done_chunk_data = stream_chunk_json(
+                &chat_id,
+                created,
+                &model_name,
+                serde_json::json!({}),
+                Some("tool_calls"),
+            );
+            let _ = tx
+                .send(Ok(Event::default().data(done_chunk_data)))
+                .await;
+            if include_usage {
+                let timings = StreamTimingsSnapshot {
+                    prompt_ms: 0.0,
+                    predicted_ms: 0.0,
+                    prompt_tokens,
+                    completion_tokens: 0,
+                };
+                let usage_chunk_data =
+                    stream_usage_chunk_json(&chat_id, created, &model_name, &timings);
+                let _ = tx
+                    .send(Ok(Event::default().data(usage_chunk_data)))
+                    .await;
+            }
+            let _ = tx
+                .send(Ok(Event::default().data("[DONE]".to_string())))
+                .await;
+        });
+        return Ok(sse_stream(rx));
+    }
+
     let request_result = enqueue_request(&state, input_ids, generation_params)?;
 
     tokio::spawn(async move {
-        // Send role delta first
-        let role_chunk = ChatCompletionChunk {
-            id: chat_id.clone(),
-            object: "chat.completion.chunk".to_string(),
-            created,
-            model: "gemma-4-e4b-q4".to_string(),
-            choices: vec![ChunkChoice {
-                index: 0,
-                delta: Delta {
-                    role: Some("assistant".to_string()),
-                    content: None,
-                    tool_calls: None,
-                },
-                finish_reason: None,
-            }],
+        let stream_started = Instant::now();
+        let tool_generation_mode = has_tools
+            && should_force_tool_call(
+                &messages_for_resolve,
+                tools_for_resolve.as_deref(),
+                tool_choice_for_resolve.as_ref(),
+            );
+        let role_chunk_data = if has_tools {
+            stream_chunk_json(
+                &chat_id,
+                created,
+                &model_name,
+                serde_json::json!({"role": "assistant", "content": null}),
+                None,
+            )
+        } else {
+            stream_chunk_json(
+                &chat_id,
+                created,
+                &model_name,
+                serde_json::json!({"role": "assistant"}),
+                None,
+            )
         };
         let _ = tx
-            .send(Ok(
-                Event::default().data(serde_json::to_string(&role_chunk).unwrap())
-            ))
+            .send(Ok(Event::default().data(role_chunk_data)))
             .await;
 
         let mut output_tokens = Vec::new();
         let mut decoded_text = String::new();
-        let mut emitted_text = String::new();
+        let mut emitted_reasoning_len = 0usize;
+        let mut emitted_content_len = 0usize;
+        let mut first_token_at: Option<Instant> = None;
+        let mut saw_tool_call_marker = false;
+        let mut in_tool_call = false;
+        let mut tool_emitter: Option<IncrementalToolCallEmitter> = None;
+        let mut early_tool_calls: Option<Vec<ToolCall>> = None;
 
         let mut finish_reason = "stop".to_string();
 
@@ -970,6 +2726,9 @@ async fn chat_completions_stream(
             match event {
                 StreamEvent::Token { token_id } => {
                     output_tokens.push(token_id as u32);
+                    if first_token_at.is_none() {
+                        first_token_at = Some(Instant::now());
+                    }
 
                     let tok_str = state
                         .tokenizer
@@ -977,51 +2736,104 @@ async fn chat_completions_stream(
                         .unwrap_or_default();
                     decoded_text.push_str(&tok_str);
 
-                    // When tools are enabled we cannot stream raw text: it may be
-                    // a `tool_call` block that must be parsed and re-emitted as a
-                    // structured tool call. Buffer everything and finalize on Done.
-                    if has_tools {
-                        if find_stop_position(&decoded_text, request_stop.as_deref()).is_some() {
-                            cancel.store(CANCEL_STOP, Ordering::Relaxed);
-                            break;
-                        }
-                        continue;
-                    }
-
                     let mut visible_text = decoded_text.clone();
-                    let stopped = trim_stream_safe_text(&mut visible_text, request_stop.as_deref());
-                    let tok_str = if visible_text.starts_with(&emitted_text) {
-                        visible_text[emitted_text.len()..].to_string()
-                    } else {
-                        String::new()
-                    };
-                    emitted_text = visible_text;
+                    if visible_text.contains(NATIVE_TOOL_CALL_TRIGGER) {
+                        in_tool_call = true;
+                        saw_tool_call_marker = true;
+                    }
+                    let stopped = trim_stream_safe_text(
+                        &mut visible_text,
+                        request_stop.as_deref(),
+                        in_tool_call,
+                    );
 
-                    if !tok_str.is_empty() {
-                        let chunk = ChatCompletionChunk {
-                            id: chat_id.clone(),
-                            object: "chat.completion.chunk".to_string(),
+                    let (new_reasoning, new_content, new_er, new_ec) = compute_stream_deltas(
+                        &visible_text,
+                        emitted_reasoning_len,
+                        emitted_content_len,
+                        tool_generation_mode,
+                    );
+                    emitted_reasoning_len = new_er;
+                    emitted_content_len = new_ec;
+
+                    if !new_reasoning.is_empty() {
+                        let chunk_data = stream_chunk_json(
+                            &chat_id,
                             created,
-                            model: "gemma-4-e4b-q4".to_string(),
-                            choices: vec![ChunkChoice {
-                                index: 0,
-                                delta: Delta {
-                                    role: None,
-                                    content: Some(tok_str),
-                                    tool_calls: None,
-                                },
-                                finish_reason: None,
-                            }],
-                        };
-
+                            &model_name,
+                            serde_json::json!({"reasoning_content": new_reasoning}),
+                            None,
+                        );
                         if tx
-                            .send(Ok(
-                                Event::default().data(serde_json::to_string(&chunk).unwrap())
-                            ))
+                            .send(Ok(Event::default().data(chunk_data)))
                             .await
                             .is_err()
                         {
                             cancel.store(CANCEL_CLIENT, Ordering::Relaxed);
+                            break;
+                        }
+                    }
+
+                    if !new_content.is_empty() && !tool_generation_mode {
+                        let chunk_data = stream_chunk_json(
+                            &chat_id,
+                            created,
+                            &model_name,
+                            serde_json::json!({"content": new_content}),
+                            None,
+                        );
+                        if tx
+                            .send(Ok(Event::default().data(chunk_data)))
+                            .await
+                            .is_err()
+                        {
+                            cancel.store(CANCEL_CLIENT, Ordering::Relaxed);
+                            break;
+                        }
+                    }
+
+                    if has_tools && in_tool_call {
+                        if tool_emitter.is_none() {
+                            tool_emitter = Some(IncrementalToolCallEmitter::new(0));
+                        }
+                        if let Some(emitter) = &mut tool_emitter {
+                            for chunk_data in emitter.update(
+                                &decoded_text,
+                                &chat_id,
+                                created,
+                                &model_name,
+                                &allowed_tool_names,
+                            ) {
+                                if tx
+                                    .send(Ok(Event::default().data(chunk_data)))
+                                    .await
+                                    .is_err()
+                                {
+                                    cancel.store(CANCEL_CLIENT, Ordering::Relaxed);
+                                    break;
+                                }
+                            }
+                        }
+                    }
+
+                    if find_generation_stop_position(&decoded_text, request_stop.as_deref()).is_some() {
+                        cancel.store(CANCEL_STOP, Ordering::Relaxed);
+                        break;
+                    }
+
+                    if tool_generation_mode
+                        && !saw_tool_call_marker
+                        && tool_emitter.as_ref().is_none_or(|e| !e.header_sent)
+                    {
+                        let resolved = resolve_tool_calls(
+                            &decoded_text,
+                            &messages_for_resolve,
+                            tools_for_resolve.as_deref(),
+                            tool_choice_for_resolve.as_ref(),
+                        );
+                        if !resolved.is_empty() {
+                            early_tool_calls = Some(resolved);
+                            cancel.store(CANCEL_STOP, Ordering::Relaxed);
                             break;
                         }
                     }
@@ -1044,99 +2856,117 @@ async fn chat_completions_stream(
             }
         }
 
-        // For tool-enabled requests, parse the buffered output and emit either a
-        // tool_calls delta or the buffered text as a single content delta.
-        if has_tools {
-            let mut text = state
+        let raw_text = {
+            let mut full = state
                 .tokenizer
                 .decode(&output_tokens, true)
                 .unwrap_or_default();
-            trim_stop_sequences(&mut text, request_stop.as_deref());
-            let tool_calls = parse_tool_calls(&text);
+            trim_stop_sequences(&mut full, request_stop.as_deref());
+            full
+        };
 
-            if !tool_calls.is_empty() {
-                let tool_call_deltas: Vec<ToolCallDelta> = tool_calls
-                    .into_iter()
-                    .enumerate()
-                    .map(|(index, tc)| ToolCallDelta {
-                        index,
-                        id: tc.id,
-                        call_type: tc.call_type,
-                        function: tc.function,
-                    })
-                    .collect();
+        if has_tools {
+            if let Some(emitter) = &mut tool_emitter {
+                for chunk_data in emitter.finalize(
+                    &raw_text,
+                    &chat_id,
+                    created,
+                    &model_name,
+                    &allowed_tool_names,
+                ) {
+                    let _ = tx
+                        .send(Ok(Event::default().data(chunk_data)))
+                        .await;
+                }
+            }
+
+            let streamed_tool_call = tool_emitter
+                .as_ref()
+                .is_some_and(|e| e.header_sent);
+
+            if streamed_tool_call {
                 finish_reason = "tool_calls".to_string();
-                let chunk = ChatCompletionChunk {
-                    id: chat_id.clone(),
-                    object: "chat.completion.chunk".to_string(),
-                    created,
-                    model: "gemma-4-e4b-q4".to_string(),
-                    choices: vec![ChunkChoice {
-                        index: 0,
-                        delta: Delta {
-                            role: None,
-                            content: None,
-                            tool_calls: Some(tool_call_deltas),
-                        },
-                        finish_reason: None,
-                    }],
-                };
-                let _ = tx
-                    .send(Ok(
-                        Event::default().data(serde_json::to_string(&chunk).unwrap())
-                    ))
-                    .await;
-            } else if !text.is_empty() {
-                let chunk = ChatCompletionChunk {
-                    id: chat_id.clone(),
-                    object: "chat.completion.chunk".to_string(),
-                    created,
-                    model: "gemma-4-e4b-q4".to_string(),
-                    choices: vec![ChunkChoice {
-                        index: 0,
-                        delta: Delta {
-                            role: None,
-                            content: Some(text),
-                            tool_calls: None,
-                        },
-                        finish_reason: None,
-                    }],
-                };
-                let _ = tx
-                    .send(Ok(
-                        Event::default().data(serde_json::to_string(&chunk).unwrap())
-                    ))
-                    .await;
+            } else if let Some(tool_calls) = early_tool_calls {
+                finish_reason = "tool_calls".to_string();
+                for chunk_data in
+                    stream_tool_call_chunks(&chat_id, created, &model_name, &tool_calls)
+                {
+                    let _ = tx
+                        .send(Ok(Event::default().data(chunk_data)))
+                        .await;
+                }
+            } else {
+                let tool_calls = resolve_tool_calls(
+                    &raw_text,
+                    &messages_for_resolve,
+                    tools_for_resolve.as_deref(),
+                    tool_choice_for_resolve.as_ref(),
+                );
+                if !tool_calls.is_empty() {
+                    finish_reason = "tool_calls".to_string();
+                    for chunk_data in
+                        stream_tool_call_chunks(&chat_id, created, &model_name, &tool_calls)
+                    {
+                        let _ = tx
+                            .send(Ok(Event::default().data(chunk_data)))
+                            .await;
+                    }
+                }
             }
         }
 
-        // Send final chunk with finish_reason
-        let done_chunk = ChatCompletionChunk {
-            id: chat_id,
-            object: "chat.completion.chunk".to_string(),
+        let done_chunk_data = stream_chunk_json(
+            &chat_id,
             created,
-            model: "gemma-4-e4b-q4".to_string(),
-            choices: vec![ChunkChoice {
-                index: 0,
-                delta: Delta {
-                    role: None,
-                    content: None,
-                    tool_calls: None,
-                },
-                finish_reason: Some(finish_reason),
-            }],
-        };
+            &model_name,
+            serde_json::json!({}),
+            Some(&finish_reason),
+        );
         let _ = tx
-            .send(Ok(
-                Event::default().data(serde_json::to_string(&done_chunk).unwrap())
-            ))
+            .send(Ok(Event::default().data(done_chunk_data)))
             .await;
+
+        if include_usage {
+            let stream_end = Instant::now();
+            let prompt_ms = first_token_at
+                .map(|t| t.duration_since(stream_started).as_secs_f64() * 1000.0)
+                .unwrap_or_else(|| stream_end.duration_since(stream_started).as_secs_f64() * 1000.0);
+            let predicted_ms = first_token_at
+                .map(|t| stream_end.duration_since(t).as_secs_f64() * 1000.0)
+                .unwrap_or(0.0);
+            let timings = StreamTimingsSnapshot {
+                prompt_ms,
+                predicted_ms,
+                prompt_tokens,
+                completion_tokens: output_tokens.len(),
+            };
+            let usage_chunk_data = stream_usage_chunk_json(
+                &chat_id,
+                created,
+                &model_name,
+                &timings,
+            );
+            let _ = tx
+                .send(Ok(Event::default().data(usage_chunk_data)))
+                .await;
+        }
+
         let _ = tx
             .send(Ok(Event::default().data("[DONE]".to_string())))
             .await;
     });
 
-    Ok(Sse::new(ReceiverStream::new(rx)))
+    Ok(sse_stream(rx))
+}
+
+fn sse_stream(
+    rx: tokio::sync::mpsc::Receiver<Result<Event, std::convert::Infallible>>,
+) -> Sse<impl Stream<Item = Result<Event, std::convert::Infallible>>> {
+    Sse::new(ReceiverStream::new(rx)).keep_alive(
+        axum::response::sse::KeepAlive::new()
+            .interval(Duration::from_secs(15))
+            .text("keep-alive"),
+    )
 }
 
 // ─── Router ──────────────────────────────────────────────────────────────────
@@ -1191,6 +3021,10 @@ pub async fn run_server(model: Gemma4GpuModel, tokenizer: tokenizers::Tokenizer,
             .map(|tokens| tokens.to_string())
             .unwrap_or_else(|| "model_default".to_string()),
     );
+    println!(
+        "   Context: {} tokens max (override with LLAMA_CTX_SIZE)",
+        max_context_len
+    );
 
     let listener = tokio::net::TcpListener::bind(&addr).await.unwrap();
     axum::serve(listener, app).await.unwrap();
@@ -1208,7 +3042,8 @@ mod tests {
                 content: Some("hello".to_string()),
                 ..Default::default()
             }],
-            max_tokens: 16,
+            max_tokens: Some(16),
+            max_completion_tokens: None,
             temperature: 0.7,
             stream: false,
             stop: None,
@@ -1219,18 +3054,29 @@ mod tests {
             top_p: None,
             tools: None,
             tool_choice: None,
+            stream_options: None,
         }
+    }
+
+    fn should_include_stream_usage_defaults_true() {
+        assert!(should_include_stream_usage(None));
+        assert!(should_include_stream_usage(Some(&StreamOptions {
+            include_usage: true,
+        })));
+        assert!(!should_include_stream_usage(Some(&StreamOptions {
+            include_usage: false,
+        })));
     }
 
     #[test]
     fn trim_stop_sequences_prefers_earliest_builtin_or_request_stop() {
         let request_stop = vec!["CUSTOM_STOP".to_string()];
-        let mut text = "hello CUSTOM_STOP ignored <end_of_turn>".to_string();
+        let mut text = "hello CUSTOM_STOP ignored <turn|>".to_string();
 
         assert!(trim_stop_sequences(&mut text, Some(&request_stop)));
         assert_eq!(text, "hello ");
 
-        let mut built_in_first = "hello <end_of_turn> CUSTOM_STOP".to_string();
+        let mut built_in_first = "hello <turn|> CUSTOM_STOP".to_string();
         assert!(trim_stop_sequences(
             &mut built_in_first,
             Some(&request_stop)
@@ -1243,36 +3089,88 @@ mod tests {
         let request_stop = vec!["CUSTOM_STOP".to_string()];
         let mut text = "hello <end".to_string();
 
-        assert!(!trim_stream_safe_text(&mut text, Some(&request_stop)));
+        assert!(!trim_stream_safe_text(&mut text, Some(&request_stop), false));
         assert_eq!(text, "hello ");
 
         let mut custom = "hello CUSTOM_".to_string();
-        assert!(!trim_stream_safe_text(&mut custom, Some(&request_stop)));
+        assert!(!trim_stream_safe_text(&mut custom, Some(&request_stop), false));
         assert_eq!(custom, "hello ");
+    }
+
+    #[test]
+    fn generation_does_not_stop_at_channel_end() {
+        let text = "<|channel>thought\nhello<channel|><|tool_call>call:bash{command:<|\"|>ls<|\"|>}";
+        assert!(find_generation_stop_position(text, None).is_none());
+    }
+
+    #[test]
+    fn generation_stops_after_complete_native_tool_call() {
+        let text = "<|tool_call>call:bash{command:<|\"|>ls<|\"|>}<tool_call|>";
+        assert_eq!(
+            find_generation_stop_position(text, None),
+            Some(text.find(NATIVE_TOOL_CALL_SUFFIX).unwrap())
+        );
     }
 
     #[test]
     fn parse_tool_calls_handles_fenced_and_tagged_blocks() {
         let fenced = "Sure!\n```tool_call\n{\"name\": \"read\", \"arguments\": {\"path\": \"a.txt\"}}\n```";
-        let calls = parse_tool_calls(fenced);
+        let calls = parse_tool_calls(fenced, None);
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].function.name, "read");
         assert_eq!(calls[0].call_type, "function");
         assert_eq!(calls[0].function.arguments, "{\"path\":\"a.txt\"}");
 
         let tagged = "<tool_call>{\"name\": \"bash\", \"arguments\": {\"command\": \"ls\"}}</tool_call>";
-        let calls = parse_tool_calls(tagged);
+        let calls = parse_tool_calls(tagged, None);
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].function.name, "bash");
 
         let multi = "```tool_call\n{\"name\": \"a\", \"arguments\": {}}\n```\n```tool_call\n{\"name\": \"b\", \"arguments\": {}}\n```";
-        assert_eq!(parse_tool_calls(multi).len(), 2);
+        assert_eq!(parse_tool_calls(multi, None).len(), 2);
 
-        assert!(parse_tool_calls("just a normal answer").is_empty());
+        assert!(parse_tool_calls("just a normal answer", None).is_empty());
+
+        let bare = r#"{"name": "read_file", "arguments": {"path": "package.json"}}"#;
+        let calls = parse_tool_calls(bare, None);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].function.name, "read_file");
     }
 
     #[test]
-    fn apply_chat_template_injects_tools_into_first_user_turn() {
+    fn effective_max_tokens_prefers_max_completion_tokens() {
+        let mut req = valid_request();
+        req.max_tokens = Some(100);
+        req.max_completion_tokens = Some(256);
+        assert_eq!(effective_max_tokens(&req), 256);
+
+        req.max_completion_tokens = None;
+        assert_eq!(effective_max_tokens(&req), 100);
+
+        req.max_tokens = None;
+        assert_eq!(effective_max_tokens(&req), 1024);
+    }
+
+    #[test]
+    fn assistant_message_out_uses_null_content_for_tool_calls() {
+        let message = assistant_message_out(
+            String::new(),
+            vec![ToolCall {
+                id: "call_1".to_string(),
+                call_type: "function".to_string(),
+                function: FunctionCall {
+                    name: "read".to_string(),
+                    arguments: "{}".to_string(),
+                },
+            }],
+        );
+        let json = serde_json::to_value(message).unwrap();
+        assert!(json.get("content").unwrap().is_null());
+        assert_eq!(json.get("tool_calls").unwrap().as_array().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn apply_chat_template_uses_peg_gemma4_system_turn() {
         let messages = vec![
             Message {
                 role: "system".to_string(),
@@ -1294,13 +3192,384 @@ mod tests {
             },
         }];
 
-        let prompt = apply_chat_template(&messages, Some(&tools));
-        assert!(prompt.contains("Available tools:"));
-        assert!(prompt.contains("- read: Read a file"));
+        let prompt = apply_chat_template(&messages, Some(&tools), None);
+        assert!(prompt.contains("<|turn>system\n"));
+        assert!(!prompt.contains("<|think|>"));
         assert!(prompt.contains("be helpful"));
-        // System content is merged into the user turn, not its own turn.
-        assert!(!prompt.contains("<start_of_turn>system"));
-        assert!(prompt.trim_end().ends_with("<start_of_turn>model"));
+        assert!(prompt.contains("<|tool>declaration:read"));
+        assert!(prompt.contains("<|turn>user\nhi<turn|>"));
+        assert!(prompt.ends_with(EMPTY_THOUGHT_PREFIX));
+    }
+
+    #[test]
+    fn apply_chat_template_primes_empty_thought_for_tools_only_request() {
+        let messages = vec![Message {
+            role: "user".to_string(),
+            content: Some("list files".to_string()),
+            ..Default::default()
+        }];
+        let tools = vec![Tool {
+            tool_type: Some("function".to_string()),
+            function: FunctionDef {
+                name: "bash".to_string(),
+                description: None,
+                parameters: Some(serde_json::json!({
+                    "type": "object",
+                    "required": ["command"],
+                    "properties": {
+                        "command": { "type": "string" }
+                    }
+                })),
+            },
+        }];
+
+        let prompt = apply_chat_template(&messages, Some(&tools), None);
+        assert!(prompt.contains("<|turn>system\n"));
+        assert!(!prompt.contains("<|think|>"));
+        assert!(prompt.contains("<|tool>declaration:bash"));
+        assert!(prompt.contains("<|turn>user\nlist files<turn|>"));
+        assert!(prompt.ends_with("<|turn>model\n<|channel>thought\n<channel|>"));
+    }
+
+    #[test]
+    fn extract_at_file_path_handles_quoted_and_unquoted_pi_references() {
+        assert_eq!(
+            extract_at_file_path(r#"summarize @"Sports Highlights.md""#),
+            Some("Sports Highlights.md".to_string())
+        );
+        assert_eq!(
+            extract_at_file_path("summarize @test.md"),
+            Some("test.md".to_string())
+        );
+        assert_eq!(
+            extract_at_file_path("read @src/foo.rs please"),
+            Some("src/foo.rs".to_string())
+        );
+    }
+
+    #[test]
+    fn infer_tool_calls_without_generation_handles_pi_summarize_at_file() {
+        let messages = vec![Message {
+            role: "user".to_string(),
+            content: Some(
+                "summarize @\"Sports Highlights — Catch Up to Live Highlights Design.md\""
+                    .to_string(),
+            ),
+            ..Default::default()
+        }];
+        let tools = vec![Tool {
+            tool_type: Some("function".to_string()),
+            function: FunctionDef {
+                name: "read".to_string(),
+                description: None,
+                parameters: None,
+            },
+        }];
+        let calls =
+            infer_tool_calls_without_generation(&messages, Some(&tools), None);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].function.name, "read");
+        assert_eq!(
+            calls[0].function.arguments,
+            r#"{"path":"Sports Highlights — Catch Up to Live Highlights Design.md"}"#
+        );
+    }
+
+    #[test]
+    fn infer_tool_calls_without_generation_handles_unquoted_at_file() {
+        let messages = vec![Message {
+            role: "user".to_string(),
+            content: Some("summarize @test.md".to_string()),
+            ..Default::default()
+        }];
+        let tools = vec![Tool {
+            tool_type: Some("function".to_string()),
+            function: FunctionDef {
+                name: "read".to_string(),
+                description: None,
+                parameters: None,
+            },
+        }];
+        let calls =
+            infer_tool_calls_without_generation(&messages, Some(&tools), None);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].function.name, "read");
+        assert_eq!(calls[0].function.arguments, r#"{"path":"test.md"}"#);
+    }
+
+    #[test]
+    fn resolve_tool_calls_infers_read_for_pi_at_file_summarize() {
+        let messages = vec![Message {
+            role: "user".to_string(),
+            content: Some(
+                "summarize @\"Sports Highlights — Catch Up to Live Highlights Design.md\""
+                    .to_string(),
+            ),
+            ..Default::default()
+        }];
+        let tools = vec![
+            Tool {
+                tool_type: Some("function".to_string()),
+                function: FunctionDef {
+                    name: "read".to_string(),
+                    description: None,
+                    parameters: None,
+                },
+            },
+            Tool {
+                tool_type: Some("function".to_string()),
+                function: FunctionDef {
+                    name: "bash".to_string(),
+                    description: None,
+                    parameters: None,
+                },
+            },
+        ];
+        let prose = "The user wants me to summarize the file. I need to use the read tool first.";
+        let calls = resolve_tool_calls(prose, &messages, Some(&tools), None);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].function.name, "read");
+        assert_eq!(
+            calls[0].function.arguments,
+            r#"{"path":"Sports Highlights — Catch Up to Live Highlights Design.md"}"#
+        );
+    }
+
+    #[test]
+    fn parse_plain_read_invocation_handles_read_line() {
+        let text = "I will read the file.\nread Sports Highlights.md\n";
+        let calls = parse_tool_calls(text, Some(&["read".to_string()]));
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].function.name, "read");
+        assert_eq!(
+            calls[0].function.arguments,
+            r#"{"path":"Sports Highlights.md"}"#
+        );
+    }
+
+    #[test]
+    fn resolve_tool_calls_infers_bash_ls_for_list_files_request() {
+        let messages = vec![Message {
+            role: "user".to_string(),
+            content: Some("list files".to_string()),
+            ..Default::default()
+        }];
+        let tools = vec![Tool {
+            tool_type: Some("function".to_string()),
+            function: FunctionDef {
+                name: "bash".to_string(),
+                description: None,
+                parameters: None,
+            },
+        }];
+        let prose = "I need to list the files. I will use the `bash` tool to execute `ls`.";
+        let calls = resolve_tool_calls(prose, &messages, Some(&tools), None);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].function.name, "bash");
+        assert_eq!(calls[0].function.arguments, r#"{"command":"ls -F"}"#);
+    }
+
+    #[test]
+    fn split_reasoning_and_content_treats_final_channel_as_content() {
+        let text = "<|channel>final\nSummary of the document.<channel|>";
+        let (reasoning, content) = split_reasoning_and_content(text);
+        assert!(reasoning.is_empty());
+        assert_eq!(content, "Summary of the document.");
+    }
+
+    #[test]
+    fn generation_priming_suffix_uses_final_channel_for_post_tool_answer() {
+        let messages = vec![
+            Message {
+                role: "user".to_string(),
+                content: Some("summarize @test.md".to_string()),
+                ..Default::default()
+            },
+            Message {
+                role: "assistant".to_string(),
+                content: None,
+                tool_calls: Some(vec![ToolCall {
+                    id: "call_1".to_string(),
+                    call_type: "function".to_string(),
+                    function: FunctionCall {
+                        name: "read".to_string(),
+                        arguments: r#"{"path":"test.md"}"#.to_string(),
+                    },
+                }]),
+                ..Default::default()
+            },
+            Message {
+                role: "tool".to_string(),
+                content: Some("file body".to_string()),
+                name: Some("read".to_string()),
+                tool_call_id: Some("call_1".to_string()),
+                ..Default::default()
+            },
+        ];
+        let tools = vec![Tool {
+            tool_type: Some("function".to_string()),
+            function: FunctionDef {
+                name: "read".to_string(),
+                description: None,
+                parameters: None,
+            },
+        }];
+        assert_eq!(
+            generation_priming_suffix(&messages, Some(&tools), None),
+            FINAL_CHANNEL_PREFIX
+        );
+    }
+
+    #[test]
+    fn infer_tool_calls_skips_read_when_pi_inlined_file_in_user_message() {
+        let messages = vec![Message {
+            role: "user".to_string(),
+            content: Some(
+                "<file name=\"/proj/Sports Highlights.md\">\n# Big doc\n\nLots of text.\n</file>\n\
+                 summarize @\"Sports Highlights.md\""
+                    .to_string(),
+            ),
+            ..Default::default()
+        }];
+        let tools = vec![Tool {
+            tool_type: Some("function".to_string()),
+            function: FunctionDef {
+                name: "read".to_string(),
+                description: None,
+                parameters: None,
+            },
+        }];
+        let calls =
+            infer_tool_calls_without_generation(&messages, Some(&tools), None);
+        assert!(calls.is_empty());
+    }
+
+    #[test]
+    fn compute_stream_deltas_streams_thought_as_content_on_answer_turn() {
+        let text = "<|channel>thought\nHere is the summary.<channel|>";
+        let (new_reasoning, new_content, _, _) = compute_stream_deltas(text, 0, 0, false);
+        assert!(new_reasoning.is_empty());
+        assert_eq!(new_content, "Here is the summary.");
+    }
+
+    #[test]
+    fn compute_stream_deltas_streams_content_after_tool_result_turn() {
+        let text = "Here is a concise summary of the document.";
+        let (new_reasoning, new_content, _, _) = compute_stream_deltas(text, 0, 0, false);
+        assert!(new_reasoning.is_empty());
+        assert_eq!(new_content, text);
+    }
+
+    #[test]
+    fn split_tool_generation_output_treats_pre_tool_text_as_reasoning() {
+        let text = "I will list files.<|tool_call>call:bash{command:<|\"|>ls -F<|\"|>}";
+        let (reasoning, content) = split_tool_generation_output(text);
+        assert_eq!(reasoning, "I will list files.");
+        assert!(content.is_empty());
+    }
+
+    #[test]
+    fn parse_tool_calls_handles_tool_code_fallback_format() {
+        let allowed = vec!["bash".to_string()];
+        let text = "tool_code\nbash\nls\n";
+        let calls = parse_tool_calls(text, Some(&allowed));
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].function.name, "bash");
+        assert_eq!(calls[0].function.arguments, r#"{"command":"ls -F"}"#);
+    }
+
+    #[test]
+    fn gemma4_tool_parameters_match_jinja_shape() {
+        let schema = serde_json::json!({
+            "type": "object",
+            "required": ["command"],
+            "properties": {
+                "command": { "type": "string" }
+            }
+        });
+        let rendered = json_schema_to_gemma4_params(&schema);
+        assert!(rendered.contains("properties:{command:{type:<|\"|>STRING<|\"|>}"));
+        assert!(rendered.contains("required:[<|\"|>command<|\"|>]"));
+        assert!(rendered.contains("type:<|\"|>OBJECT<|\"|>"));
+    }
+
+    #[test]
+    fn gemma4_dict_to_json_args_incremental_handles_partial_and_complete() {
+        let partial = "{command:<|\"|>ls -F";
+        assert_eq!(
+            gemma4_dict_to_json_args_incremental(partial),
+            r#"{"command":"ls -F"#
+        );
+
+        let complete = r#"{command:<|"|>ls -F<|"|>}"#;
+        assert_eq!(
+            gemma4_dict_to_json_args_incremental(complete),
+            r#"{"command":"ls -F"}"#
+        );
+    }
+
+    #[test]
+    fn tool_call_arguments_delta_skips_bare_empty_object() {
+        assert_eq!(
+            tool_call_arguments_delta("{", r#"{"command":"ls -F"}"#).as_deref(),
+            Some(r#""command":"ls -F"}"#)
+        );
+        assert!(tool_call_arguments_delta("{", "{}").is_none());
+    }
+
+    #[test]
+    fn incremental_tool_call_emitter_finalize_after_stop_suffix() {
+        let mut emitter = IncrementalToolCallEmitter::new(0);
+        let allowed = vec![
+            "read".to_string(),
+            "bash".to_string(),
+            "edit".to_string(),
+            "write".to_string(),
+        ];
+        // Simulate streaming `bash{` then generation stopping on `<tool_call|>`.
+        let partial = r#"<|channel>thought
+think<channel|><|tool_call>call:bash{"#;
+        let early = emitter.update(partial, "id", 1, "model", &allowed);
+        let full = r#"<|channel>thought
+think<channel|><|tool_call>call:bash{}<tool_call|>"#;
+        let late = emitter.finalize(full, "id", 1, "model", &allowed);
+        let combined_args: String = early
+            .iter()
+            .chain(late.iter())
+            .filter_map(|c| {
+                let v: serde_json::Value = serde_json::from_str(c).ok()?;
+                v["choices"][0]["delta"]["tool_calls"][0]["function"]["arguments"]
+                    .as_str()
+                    .map(|s| s.to_string())
+            })
+            .collect();
+        assert_eq!(combined_args, r#"{"command":"ls -F"}"#);
+    }
+
+    #[test]
+    fn incremental_tool_call_emitter_streams_argument_deltas() {
+        let mut emitter = IncrementalToolCallEmitter::new(0);
+        let text = r#"<|channel>thought
+think<channel|><|tool_call>call:bash{command:<|"|>ls -F<|"|>}"#;
+        let allowed = vec![
+            "read".to_string(),
+            "bash".to_string(),
+            "edit".to_string(),
+            "write".to_string(),
+        ];
+        let chunks = emitter.update(text, "id", 1, "model", &allowed);
+        assert!(emitter.header_sent);
+        assert!(!chunks.is_empty());
+        let combined_args: String = chunks
+            .iter()
+            .filter_map(|c| {
+                let v: serde_json::Value = serde_json::from_str(c).ok()?;
+                v["choices"][0]["delta"]["tool_calls"][0]["function"]["arguments"]
+                    .as_str()
+                    .map(|s| s.to_string())
+            })
+            .collect();
+        assert_eq!(combined_args, r#"{"command":"ls -F"}"#);
     }
 
     #[test]
@@ -1333,11 +3602,180 @@ mod tests {
             },
         ];
 
-        let prompt = apply_chat_template(&messages, None);
-        assert!(prompt.contains("<start_of_turn>model\n"));
-        assert!(prompt.contains("```tool_call"));
-        assert!(prompt.contains("\"name\": \"read\""));
-        assert!(prompt.contains("Tool result for read:\nfile contents"));
+        let prompt = apply_chat_template(&messages, None, None);
+        assert!(prompt.contains("<|turn>model\n"));
+        assert!(prompt.contains("<|tool_call>call:read{"));
+        assert!(prompt.contains("<|tool_response>response:read{value:"));
+        assert!(prompt.contains("file contents"));
+        assert!(!prompt.contains("Tool result for"));
+    }
+
+    #[test]
+    fn apply_chat_template_primes_generation_after_tool_result_in_open_turn() {
+        let messages = vec![
+            Message {
+                role: "user".to_string(),
+                content: Some("summarize @test.md".to_string()),
+                ..Default::default()
+            },
+            Message {
+                role: "assistant".to_string(),
+                content: None,
+                tool_calls: Some(vec![ToolCall {
+                    id: "call_1".to_string(),
+                    call_type: "function".to_string(),
+                    function: FunctionCall {
+                        name: "read".to_string(),
+                        arguments: r#"{"path":"test.md"}"#.to_string(),
+                    },
+                }]),
+                ..Default::default()
+            },
+            Message {
+                role: "tool".to_string(),
+                content: Some("# Title\n\nLong file body.".to_string()),
+                name: Some("read".to_string()),
+                tool_call_id: Some("call_1".to_string()),
+                ..Default::default()
+            },
+        ];
+        let tools = vec![Tool {
+            tool_type: Some("function".to_string()),
+            function: FunctionDef {
+                name: "read".to_string(),
+                description: None,
+                parameters: None,
+            },
+        }];
+
+        let prompt = apply_chat_template(&messages, Some(&tools), None);
+        assert!(prompt.contains("<|tool_response>response:read{value:"));
+        assert!(prompt.ends_with(FINAL_CHANNEL_PREFIX));
+        assert!(!prompt.ends_with("<turn|>\n"));
+    }
+
+    #[test]
+    fn apply_chat_template_merges_tool_response_into_model_turn() {
+        let messages = vec![
+            Message {
+                role: "user".to_string(),
+                content: Some("list files".to_string()),
+                ..Default::default()
+            },
+            Message {
+                role: "assistant".to_string(),
+                content: None,
+                tool_calls: Some(vec![ToolCall {
+                    id: "call_1".to_string(),
+                    call_type: "function".to_string(),
+                    function: FunctionCall {
+                        name: "bash".to_string(),
+                        arguments: r#"{"command":"ls -F"}"#.to_string(),
+                    },
+                }]),
+                ..Default::default()
+            },
+            Message {
+                role: "tool".to_string(),
+                content: Some("a.md\nb.csv".to_string()),
+                name: Some("bash".to_string()),
+                tool_call_id: Some("call_1".to_string()),
+                ..Default::default()
+            },
+            Message {
+                role: "assistant".to_string(),
+                content: Some("I have listed the files.".to_string()),
+                ..Default::default()
+            },
+            Message {
+                role: "user".to_string(),
+                content: Some("list files".to_string()),
+                ..Default::default()
+            },
+        ];
+
+        let prompt = apply_chat_template(&messages, None, None);
+        assert!(prompt.contains(
+            "<|tool_call>call:bash{command:<|\"|>ls -F<|\"|>}<tool_call|><|tool_response>response:bash{value:<|\"|>a.md\nb.csv<|\"|>}<tool_response|>I have listed the files.<turn|>"
+        ));
+    }
+
+    #[test]
+    fn parse_tool_calls_handles_gemma4_native_format() {
+        let native = r#"<|tool_call>call:read{path:<|"|>package.json<|"|>}<tool_call|>"#;
+        let calls = parse_tool_calls(native, None);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].function.name, "read");
+        assert_eq!(calls[0].function.arguments, r#"{"path":"package.json"}"#);
+
+        let without_suffix =
+            r#"<|tool_call>call:bash{command:<|"|>ls -F<|"|>}"#;
+        let calls = parse_tool_calls(without_suffix, None);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].function.name, "bash");
+        assert_eq!(calls[0].function.arguments, r#"{"command":"ls -F"}"#);
+    }
+
+    #[test]
+    fn parse_tool_calls_remaps_hallucinated_list_files_to_bash() {
+        let allowed = vec![
+            "read".to_string(),
+            "bash".to_string(),
+            "edit".to_string(),
+            "write".to_string(),
+        ];
+        let native = r#"<|tool_call>call:list_files{}<tool_call|>"#;
+        let calls = parse_tool_calls(native, Some(&allowed));
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].function.name, "bash");
+        assert_eq!(calls[0].function.arguments, r#"{"command":"ls -F"}"#);
+    }
+
+    #[test]
+    fn parse_tool_calls_fills_empty_bash_args_with_ls() {
+        let allowed = vec![
+            "read".to_string(),
+            "bash".to_string(),
+            "edit".to_string(),
+            "write".to_string(),
+        ];
+        let native = r#"<|tool_call>call:bash{}<tool_call|>"#;
+        let calls = parse_tool_calls(native, Some(&allowed));
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].function.name, "bash");
+        assert_eq!(calls[0].function.arguments, r#"{"command":"ls -F"}"#);
+    }
+
+    #[test]
+    fn incremental_tool_call_emitter_fills_empty_bash_args() {
+        let mut emitter = IncrementalToolCallEmitter::new(0);
+        let text = r#"<|channel>thought
+think<channel|><|tool_call>call:bash{}<tool_call|>"#;
+        let allowed = vec![
+            "read".to_string(),
+            "bash".to_string(),
+            "edit".to_string(),
+            "write".to_string(),
+        ];
+        let chunks = emitter.update(text, "id", 1, "model", &allowed);
+        let combined_args: String = chunks
+            .iter()
+            .filter_map(|c| {
+                let v: serde_json::Value = serde_json::from_str(c).ok()?;
+                v["choices"][0]["delta"]["tool_calls"][0]["function"]["arguments"]
+                    .as_str()
+                    .map(|s| s.to_string())
+            })
+            .collect();
+        assert_eq!(combined_args, r#"{"command":"ls -F"}"#);
+    }
+
+    #[test]
+    fn split_reasoning_and_content_splits_channel_tags() {
+        let text = "<|channel>thought\nThe user said hi.<channel|>Hello!";
+        let (reasoning, content) = split_reasoning_and_content(text);
+        assert_eq!(reasoning, "The user said hi.");
+        assert_eq!(content, "Hello!");
     }
 
     #[test]
@@ -1365,7 +3803,7 @@ mod tests {
         assert_eq!(err.code, "empty_messages");
 
         let mut req = valid_request();
-        req.max_tokens = 0;
+        req.max_tokens = Some(0);
         assert_eq!(
             validate_request(&req).unwrap_err().code,
             "invalid_max_tokens"
@@ -1416,7 +3854,7 @@ mod tests {
 
         assert_eq!(config.queue_depth, 32);
         assert_eq!(config.kv_pool_slots, 4);
-        assert_eq!(config.request_timeout, Duration::from_secs(60));
+        assert_eq!(config.request_timeout, Duration::from_secs(300));
         assert_eq!(config.max_prefill_tokens_per_tick, None);
     }
 

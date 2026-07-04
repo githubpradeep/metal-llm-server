@@ -67,7 +67,7 @@ fn encode_proj_norm_residual(
     }
 }
 
-const DEFAULT_MAX_PREFILL_SEQ: usize = 128;
+const DEFAULT_MAX_PREFILL_SEQ: usize = 512;
 const DEFAULT_MAX_DECODE_BATCH: usize = 4;
 
 /// Cumulative per-phase GPU time (ms) and token count for PROFILE_PHASES.
@@ -159,6 +159,16 @@ fn configured_max_prefill_seq(kv_capacity: u32) -> usize {
         .filter(|&value| value > 0)
         .unwrap_or(DEFAULT_MAX_PREFILL_SEQ)
         .min(kv_capacity as usize)
+}
+
+/// KV cache slot count (context window). Override with `LLAMA_CTX_SIZE`.
+fn configured_kv_capacity(max_position_embeddings: usize) -> u32 {
+    const DEFAULT_KV_CAPACITY: usize = 16384;
+    let requested = std::env::var("LLAMA_CTX_SIZE")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(DEFAULT_KV_CAPACITY);
+    requested.clamp(256, max_position_embeddings) as u32
 }
 
 /// Gemma 4 E4B GPU-resident model with persistent KV cache on Metal.
@@ -1252,7 +1262,7 @@ impl Gemma4GpuModel {
 
         // KV cache: f16 precision to halve memory bandwidth
         let kv_cache_type = KvCacheType::from_env();
-        let kv_capacity = config.max_position_embeddings.min(4096) as u32;
+        let kv_capacity = configured_kv_capacity(config.max_position_embeddings);
         let mut k_cache = Vec::with_capacity(num_layers);
         let mut v_cache = Vec::with_capacity(num_layers);
         for i in 0..num_layers {
@@ -2451,7 +2461,7 @@ impl Gemma4GpuModel {
         let k_normed_buf = ctx.buffer_empty(max_kv_out);
 
         let kv_cache_type = KvCacheType::from_env();
-        let kv_capacity = config.max_position_embeddings.min(4096) as u32;
+        let kv_capacity = configured_kv_capacity(config.max_position_embeddings);
         let mut k_cache = Vec::with_capacity(num_layers);
         let mut v_cache = Vec::with_capacity(num_layers);
         for i in 0..num_layers {

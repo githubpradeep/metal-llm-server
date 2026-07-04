@@ -175,19 +175,26 @@ def check_stream_chat(base_url):
 
     assert chunks, "stream returned no chunks"
     assert chunks[-1] == "[DONE]"
+    json_chunks = [chunk for chunk in chunks if chunk != "[DONE]"]
+    finish_chunks = [
+        chunk for chunk in json_chunks if chunk.get("choices") and chunk["choices"][0].get("finish_reason")
+    ]
+    assert finish_chunks, "stream did not include finish_reason chunk"
+    assert finish_chunks[-1]["choices"][0]["finish_reason"] == "stop"
+    usage_chunks = [chunk for chunk in json_chunks if chunk.get("usage")]
+    assert usage_chunks, "stream did not include usage chunk"
     role_chunks = [
-        chunk for chunk in chunks if chunk != "[DONE]" and chunk["choices"][0]["delta"].get("role")
+        chunk for chunk in json_chunks
+        if chunk.get("choices") and chunk["choices"][0]["delta"].get("role")
     ]
     assert role_chunks, "stream did not include assistant role delta"
 
     text = "".join(
         chunk["choices"][0]["delta"].get("content", "")
-        for chunk in chunks
-        if chunk != "[DONE]"
+        for chunk in json_chunks
+        if chunk.get("choices") and chunk["choices"][0]["delta"].get("content")
     )
-    assert "<end_of_turn>" not in text
-    final = chunks[-2]
-    assert final["choices"][0]["finish_reason"] == "stop"
+    assert "<turn|>" not in text
     print("ok stream chat")
 
 

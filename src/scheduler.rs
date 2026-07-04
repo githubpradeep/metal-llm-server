@@ -25,6 +25,7 @@ pub struct GenerationParams {
     pub repetition_penalty: f32,
     pub frequency_penalty: f32,
     pub eos_token_ids: Vec<usize>,
+    pub min_decode_tokens: usize,
     pub request_timeout: Duration,
 }
 
@@ -610,17 +611,50 @@ fn prepare_decode_token(active: &mut ActiveRequest) -> DecodePreparation {
         return DecodePreparation::Finish(active.finish("stop"));
     }
 
-    let next_token = sampling::sample_with_params(
-        &active.logits,
-        &SamplingParams {
-            temperature: active.request.params.temperature,
-            min_p: active.request.params.min_p,
-            top_k: active.request.params.top_k,
-            repetition_penalty: active.request.params.repetition_penalty,
-            frequency_penalty: active.request.params.frequency_penalty,
-        },
-        &active.generated_tokens,
-    );
+    let sampling_params = SamplingParams {
+        temperature: active.request.params.temperature,
+        min_p: active.request.params.min_p,
+        top_k: active.request.params.top_k,
+        repetition_penalty: active.request.params.repetition_penalty,
+        frequency_penalty: active.request.params.frequency_penalty,
+    };
+
+    let mut next_token =
+        sampling::sample_with_params(&active.logits, &sampling_params, &active.generated_tokens);
+
+    while active.completion_tokens < active.request.params.min_decode_tokens
+        && active.request.params.eos_token_ids.contains(&next_token)
+    {
+        let mut masked_logits = active.logits.clone();
+        for eos in &active.request.params.eos_token_ids {
+            if *eos < masked_logits.len() {
+                masked_logits[*eos] = f32::NEG_INFINITY;
+            }
+        }
+        next_token = sampling::sample_with_params(
+            &masked_logits,
+            &sampling_params,
+            &active.generated_tokens,
+        );
+    }
+
+    // After long prefills the model can spuriously sample <turn|> (106) before any text.
+    if active.completion_tokens == 0
+        && active.request.params.min_decode_tokens == 0
+        && active.request.params.eos_token_ids.contains(&next_token)
+    {
+        let mut masked_logits = active.logits.clone();
+        for eos in &active.request.params.eos_token_ids {
+            if *eos < masked_logits.len() {
+                masked_logits[*eos] = f32::NEG_INFINITY;
+            }
+        }
+        next_token = sampling::sample_with_params(
+            &masked_logits,
+            &sampling_params,
+            &active.generated_tokens,
+        );
+    }
 
     if active.request.params.eos_token_ids.contains(&next_token) {
         let _ = active.request.response_tx.blocking_send(StreamEvent::Done {
