@@ -21,6 +21,7 @@ mod scheduler;
 mod weights;
 mod generation;
 mod server;
+mod token_printer;
 
 use std::io::{self, Write};
 use std::time::Instant;
@@ -180,15 +181,16 @@ fn main() {
         println!("Prompt ids ({}): {:?}", ids.len(), ids);
         let mut next = model.forward_prefill_sample_last(&ids, 0.0, 0.0, 0);
         let eos: &[usize] = &[1, 106];
-        let mut out = String::new();
+        let printer = token_printer::TokenPrinter::spawn(&tok);
         for _ in 0..60 {
             if eos.contains(&next) {
                 break;
             }
-            out.push_str(&tok.decode(&[next as u32], false).unwrap_or_default());
+            printer.send(next as u32);
             next = model.forward_single_token_sample(next, 0.0, 0.0, 0);
         }
-        println!("=== GGUF greedy generation ===\n{}", out);
+        let out = printer.finish();
+        println!("\n=== GGUF greedy generation ===\n{}", out);
         return;
     }
 
@@ -329,22 +331,23 @@ fn generate_gpu(
     // Batched prefill: process all prompt tokens at once
     let token_ids: Vec<usize> = input_ids.iter().map(|&t| t as usize).collect();
     let mut logits = model.forward_prefill(&token_ids);
+    let mut next_token = sampling::min_p_sampling(&logits, 0.1);
 
-    // Decode loop
+    let printer = token_printer::TokenPrinter::spawn(tokenizer);
+
+    // Decode loop: GPU first, print on background thread
     let start_time = Instant::now();
     let mut tokens_generated = 0;
 
     for _ in 0..max_tokens {
-        let next_token = sampling::min_p_sampling(&logits, 0.1);
-
-        let tok_str = tokenizer.decode(&[next_token as u32], false).unwrap_or_default();
-        print!("{}", tok_str);
-        io::stdout().flush().unwrap();
+        printer.send(next_token as u32);
         tokens_generated += 1;
 
         logits = model.forward_single_token(next_token);
+        next_token = sampling::min_p_sampling(&logits, 0.1);
     }
 
+    printer.finish();
     let elapsed = start_time.elapsed().as_secs_f64();
     let tps = if elapsed > 0.0 { tokens_generated as f64 / elapsed } else { 0.0 };
 
@@ -438,24 +441,24 @@ fn generate_gemma4_gpu(
     let start_time = Instant::now();
     let mut tokens_generated = 0;
 
-    // Gemma4 stop tokens: <eos> (1), <end_of_turn> (107)
+    // Gemma4 stop tokens: <eos> (1), <end_of_turn> (106)
     let eos_tokens: &[usize] = &[1, 106];
 
+    let printer = token_printer::TokenPrinter::spawn(tokenizer);
+
     for _ in 0..max_tokens {
-        // Stop at EOS or end-of-turn
         if eos_tokens.contains(&next_token) {
             break;
         }
 
-        let tok_str = tokenizer.decode(&[next_token as u32], false).unwrap_or_default();
-        print!("{}", tok_str);
-        io::stdout().flush().unwrap();
+        printer.send(next_token as u32);
         tokens_generated += 1;
 
         let seed: u32 = rng.gen();
         next_token = model.forward_single_token_sample(next_token, 0.7, 0.1, seed);
     }
 
+    printer.finish();
     let elapsed = start_time.elapsed().as_secs_f64();
     let tps = if elapsed > 0.0 { tokens_generated as f64 / elapsed } else { 0.0 };
 
