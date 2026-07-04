@@ -15,6 +15,9 @@ pub struct Gemma4TextConfig {
     #[serde(default = "default_global_head_dim")]
     pub global_head_dim: usize,
     pub intermediate_size: usize,
+    /// Per-layer FFN width when the model uses variable MLP sizes (E2B double-wide).
+    #[serde(default)]
+    pub intermediate_sizes: Vec<usize>,
     pub vocab_size: usize,
     pub hidden_activation: String,
     pub rms_norm_eps: f64,
@@ -98,6 +101,21 @@ impl std::fmt::Display for KvCacheType {
 }
 
 impl Gemma4TextConfig {
+    pub fn layer_intermediate_size(&self, layer_idx: usize) -> usize {
+        self.intermediate_sizes
+            .get(layer_idx)
+            .copied()
+            .unwrap_or(self.intermediate_size)
+    }
+
+    pub fn max_intermediate_size(&self) -> usize {
+        self.intermediate_sizes
+            .iter()
+            .copied()
+            .max()
+            .unwrap_or(self.intermediate_size)
+    }
+
     pub fn num_kv_groups(&self) -> usize {
         self.num_attention_heads / self.num_key_value_heads
     }

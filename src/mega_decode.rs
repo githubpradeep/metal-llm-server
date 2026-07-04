@@ -460,7 +460,7 @@ impl MegaDecodeGraph {
         let cfg = &model.config;
         let device = &model.ctx.device;
         let hidden = cfg.hidden_size as u32;
-        let inter = cfg.intermediate_size as u32;
+        let inter = cfg.max_intermediate_size() as u32;
         let num_heads = cfg.num_attention_heads as u32;
         let num_kv = cfg.num_key_value_heads as u32;
         let head_dim = cfg.head_dim as u32;
@@ -556,10 +556,10 @@ impl MegaDecodeGraph {
                 buf::HIDDEN,
                 buf::NORMED,
             );
-            builder.matvec(&layer.gate_proj, inter, hidden, buf::NORMED, buf::GATE, wf);
-            builder.matvec(&layer.up_proj, inter, hidden, buf::NORMED, buf::UP, wf);
-            builder.gelu_mul(inter, buf::GATE, buf::UP, buf::GELU);
-            builder.matvec(&layer.down_proj, hidden, inter, buf::GELU, buf::DOWN, wf);
+            builder.matvec(&layer.gate_proj, layer.intermediate_size as u32, hidden, buf::NORMED, buf::GATE, wf);
+            builder.matvec(&layer.up_proj, layer.intermediate_size as u32, hidden, buf::NORMED, buf::UP, wf);
+            builder.gelu_mul(layer.intermediate_size as u32, buf::GATE, buf::UP, buf::GELU);
+            builder.matvec(&layer.down_proj, hidden, layer.intermediate_size as u32, buf::GELU, buf::DOWN, wf);
             builder.rmsnorm(
                 &layer.post_feedforward_layernorm_weight,
                 hidden,

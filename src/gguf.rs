@@ -336,6 +336,33 @@ impl Gguf {
         }
     }
 
+    pub fn get_arr_u32(&self, key: &str) -> Option<&[u32]> {
+        match self.metadata.get(key)? {
+            MetaValue::ArrU32(v) => Some(v.as_slice()),
+            _ => None,
+        }
+    }
+
+    pub fn get_arr_i32(&self, key: &str) -> Option<&[i32]> {
+        match self.metadata.get(key)? {
+            MetaValue::ArrI32(v) => Some(v.as_slice()),
+            _ => None,
+        }
+    }
+
+    /// `gemma4.feed_forward_length` is a scalar on E4B and a per-layer array on E2B
+    /// (double-wide MLP on KV-shared layers).
+    pub fn get_usize_list(&self, key: &str) -> Option<Vec<usize>> {
+        match self.metadata.get(key)? {
+            MetaValue::U32(v) => Some(vec![*v as usize]),
+            MetaValue::I32(v) => Some(vec![*v as usize]),
+            MetaValue::U64(v) => Some(vec![*v as usize]),
+            MetaValue::ArrU32(v) => Some(v.iter().map(|&x| x as usize).collect()),
+            MetaValue::ArrI32(v) => Some(v.iter().map(|&x| x as usize).collect()),
+            _ => None,
+        }
+    }
+
     pub fn get_arr_str(&self, key: &str) -> Option<&[String]> {
         match self.metadata.get(key)? {
             MetaValue::ArrStr(v) => Some(v.as_slice()),
@@ -346,13 +373,6 @@ impl Gguf {
     pub fn get_arr_f32(&self, key: &str) -> Option<&[f32]> {
         match self.metadata.get(key)? {
             MetaValue::ArrF32(v) => Some(v.as_slice()),
-            _ => None,
-        }
-    }
-
-    pub fn get_arr_i32(&self, key: &str) -> Option<&[i32]> {
-        match self.metadata.get(key)? {
-            MetaValue::ArrI32(v) => Some(v.as_slice()),
             _ => None,
         }
     }

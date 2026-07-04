@@ -697,6 +697,7 @@ pub struct Gemma4GpuLayer {
     pub head_dim: usize,
     pub q_out_dim: usize,
     pub kv_out_dim: usize,
+    pub intermediate_size: usize,
     pub weight_format: WeightFormat,
 }
 
@@ -1101,6 +1102,7 @@ impl Gemma4GpuModel {
                     ctx.buffer_from_f32_as_q4(data, rows, cols)
                 }
             };
+            let layer_inter = config.layer_intermediate_size(layer_idx);
 
             let layer = Gemma4GpuLayer {
                 q_proj: BufferView::from_buffer(q_weight(&q_proj_data, q_out, hidden_size)),
@@ -1108,10 +1110,10 @@ impl Gemma4GpuModel {
                 v_proj: BufferView::from_buffer(q_weight(&v_proj_data, kv_out, hidden_size)),
                 o_proj: BufferView::from_buffer(q_weight(&o_proj_data, hidden_size, q_out)),
 
-                gate_proj: BufferView::from_buffer(q_weight(&gate_proj_data, intermediate_size, hidden_size)),
-                up_proj: BufferView::from_buffer(q_weight(&up_proj_data, intermediate_size, hidden_size)),
+                gate_proj: BufferView::from_buffer(q_weight(&gate_proj_data, layer_inter, hidden_size)),
+                up_proj: BufferView::from_buffer(q_weight(&up_proj_data, layer_inter, hidden_size)),
                 gate_up_proj: BufferView::from_buffer(ctx.buffer_empty(1)),
-                down_proj: BufferView::from_buffer(q_weight(&down_proj_data, hidden_size, intermediate_size)),
+                down_proj: BufferView::from_buffer(q_weight(&down_proj_data, hidden_size, layer_inter)),
 
                 input_layernorm_weight: BufferView::from_buffer(ctx.buffer_from_slice(&input_ln)),
                 post_attention_layernorm_weight: BufferView::from_buffer(ctx.buffer_from_slice(&post_attn_ln)),
@@ -1140,6 +1142,7 @@ impl Gemma4GpuModel {
                 head_dim,
                 q_out_dim: q_out,
                 kv_out_dim: kv_out,
+                intermediate_size: layer_inter,
                 weight_format: if is_q3 { WeightFormat::Q3_0 } else { WeightFormat::Q4_0 },
             };
 
@@ -1176,7 +1179,6 @@ impl Gemma4GpuModel {
         let hidden_size = config.hidden_size;
         let num_heads = config.num_attention_heads;
         let num_kv_heads = config.num_key_value_heads;
-        let intermediate_size = config.intermediate_size;
         let vocab_size = config.vocab_size;
         let num_layers = config.num_hidden_layers;
         let ple_dim = config.hidden_size_per_layer_input;
@@ -1204,12 +1206,13 @@ impl Gemma4GpuModel {
             layers[i].kv_source_layer = i;
         }
 
-        let layers = Self::pack_layers_gate_up(
-            &ctx,
-            layers,
-            intermediate_size as u32,
-            hidden_size as u32,
-        );
+        let layers = Self::pack_layers_gate_up(&ctx, layers, hidden_size as u32);
+
+        let max_intermediate_size = layers
+            .iter()
+            .map(|layer| layer.intermediate_size)
+            .max()
+            .unwrap_or_else(|| config.max_intermediate_size());
 
         println!(
             "  KV sharing: layers 0-{} have own KV, layers {}-{} share",
@@ -1227,9 +1230,9 @@ impl Gemma4GpuModel {
         let v_buf = ctx.buffer_empty(max_kv_out);
         let attn_out_buf = ctx.buffer_empty(max_q_out);
         let o_out_buf = ctx.buffer_empty(hidden_size);
-        let gate_buf = ctx.buffer_empty(intermediate_size);
-        let up_buf = ctx.buffer_empty(intermediate_size);
-        let gelu_buf = ctx.buffer_empty(intermediate_size);
+        let gate_buf = ctx.buffer_empty(max_intermediate_size);
+        let up_buf = ctx.buffer_empty(max_intermediate_size);
+        let gelu_buf = ctx.buffer_empty(max_intermediate_size);
         let down_buf = ctx.buffer_empty(hidden_size);
         let logits_buf = ctx.buffer_empty(vocab_size);
         let sample_out_buf = ctx.buffer_empty_u32(1);
@@ -1281,7 +1284,7 @@ impl Gemma4GpuModel {
             hidden_size,
             max_q_out,
             max_kv_out,
-            intermediate_size,
+            max_intermediate_size,
             vocab_size,
             num_layers,
             ple_dim,
@@ -1292,7 +1295,7 @@ impl Gemma4GpuModel {
             hidden_size,
             max_q_out,
             max_kv_out,
-            intermediate_size,
+            max_intermediate_size,
             vocab_size,
             num_layers,
             ple_dim,
@@ -1572,14 +1575,15 @@ impl Gemma4GpuModel {
             };
 
             let layer_scalar = g.dequant_to_f32(&p("layer_output_scale.weight"))[0];
+            let layer_inter = config.layer_intermediate_size(layer_idx);
 
             let q_proj = qw(p("attn_q.weight"), q_out, hidden_size);
             let k_proj = qw(p("attn_k.weight"), kv_out, hidden_size);
             let v_proj = qw(p("attn_v.weight"), kv_out, hidden_size);
             let o_proj = qw(p("attn_output.weight"), hidden_size, q_out);
-            let gate_proj = qw(p("ffn_gate.weight"), intermediate_size, hidden_size);
-            let up_proj = qw(p("ffn_up.weight"), intermediate_size, hidden_size);
-            let down_proj = qw(p("ffn_down.weight"), hidden_size, intermediate_size);
+            let gate_proj = qw(p("ffn_gate.weight"), layer_inter, hidden_size);
+            let up_proj = qw(p("ffn_up.weight"), layer_inter, hidden_size);
+            let down_proj = qw(p("ffn_down.weight"), hidden_size, layer_inter);
             let per_layer_input_gate_weight = qw(p("inp_gate.weight"), ple_dim, hidden_size);
             let per_layer_projection_weight = qw(p("proj.weight"), hidden_size, ple_dim);
 
@@ -1624,6 +1628,7 @@ impl Gemma4GpuModel {
                 head_dim,
                 q_out_dim: q_out,
                 kv_out_dim: kv_out,
+                intermediate_size: layer_inter,
                 weight_format: if any_kquant {
                     WeightFormat::KQuant
                 } else {
@@ -1731,6 +1736,7 @@ impl Gemma4GpuModel {
                 &mut section_offset,
                 &device,
                 config.num_hidden_layers,
+                config.hidden_size,
                 true,
                 Some(&weights_buf),
                 0,
@@ -2065,6 +2071,7 @@ impl Gemma4GpuModel {
         offset: &mut usize,
         device: &Device,
         num_layers: usize,
+        hidden_size: usize,
         aligned_layout: bool,
         parent: Option<&Buffer>,
         parent_base: usize,
@@ -2142,6 +2149,7 @@ impl Gemma4GpuModel {
             let v_proj = read_buf(offset);
             let o_proj = read_buf(offset);
             let gate_proj = read_buf(offset);
+            let layer_inter = Self::infer_mlp_intermediate(&gate_proj, hidden_size);
             let up_proj = read_buf(offset);
             let down_proj = read_buf(offset);
             let input_layernorm_weight = read_buf(offset);
@@ -2212,6 +2220,7 @@ impl Gemma4GpuModel {
                 head_dim,
                 q_out_dim,
                 kv_out_dim,
+                intermediate_size: layer_inter,
                 weight_format: wf,
             });
         }
@@ -2287,6 +2296,7 @@ impl Gemma4GpuModel {
             &mut offset,
             device,
             num_layers,
+            config.hidden_size,
             false,
             None,
             weights_mmap_offset,
@@ -2399,16 +2409,15 @@ impl Gemma4GpuModel {
         load_start: Instant,
         load_label: &str,
     ) -> Self {
-        let layers = Self::pack_layers_gate_up(
-            &ctx,
-            layers,
-            config.intermediate_size as u32,
-            config.hidden_size as u32,
-        );
+        let layers = Self::pack_layers_gate_up(&ctx, layers, config.hidden_size as u32);
+        let max_intermediate_size = layers
+            .iter()
+            .map(|layer| layer.intermediate_size)
+            .max()
+            .unwrap_or_else(|| config.max_intermediate_size());
         let hidden_size = config.hidden_size;
         let num_heads = config.num_attention_heads;
         let num_kv_heads = config.num_key_value_heads;
-        let intermediate_size = config.intermediate_size;
         let vocab_size = config.vocab_size;
         let num_layers = config.num_hidden_layers;
         let ple_dim = config.hidden_size_per_layer_input;
@@ -2424,9 +2433,9 @@ impl Gemma4GpuModel {
         let v_buf = ctx.buffer_empty(max_kv_out);
         let attn_out_buf = ctx.buffer_empty(max_q_out);
         let o_out_buf = ctx.buffer_empty(hidden_size);
-        let gate_buf = ctx.buffer_empty(intermediate_size);
-        let up_buf = ctx.buffer_empty(intermediate_size);
-        let gelu_buf = ctx.buffer_empty(intermediate_size);
+        let gate_buf = ctx.buffer_empty(max_intermediate_size);
+        let up_buf = ctx.buffer_empty(max_intermediate_size);
+        let gelu_buf = ctx.buffer_empty(max_intermediate_size);
         let down_buf = ctx.buffer_empty(hidden_size);
         let logits_buf = ctx.buffer_empty(vocab_size);
         let sample_out_buf = ctx.buffer_empty_u32(1);
@@ -2477,7 +2486,7 @@ impl Gemma4GpuModel {
             hidden_size,
             max_q_out,
             max_kv_out,
-            intermediate_size,
+            max_intermediate_size,
             vocab_size,
             num_layers,
             ple_dim,
@@ -2488,7 +2497,7 @@ impl Gemma4GpuModel {
             hidden_size,
             max_q_out,
             max_kv_out,
-            intermediate_size,
+            max_intermediate_size,
             vocab_size,
             num_layers,
             ple_dim,
@@ -2633,7 +2642,6 @@ impl Gemma4GpuModel {
     fn pack_layers_gate_up(
         ctx: &MetalContext,
         mut layers: Vec<Gemma4GpuLayer>,
-        m: u32,
         k: u32,
     ) -> Vec<Gemma4GpuLayer> {
         if !crate::gpu::packed_mlp_gate_up_enabled() {
@@ -2645,8 +2653,12 @@ impl Gemma4GpuModel {
         let pack_start = std::time::Instant::now();
         for layer in layers.iter_mut() {
             if Self::use_packed_mlp_gate_up(layer) {
-                layer.gate_up_proj =
-                    ctx.pack_gate_up_interleaved_q4(&layer.gate_proj, &layer.up_proj, m, k);
+                layer.gate_up_proj = ctx.pack_gate_up_interleaved_q4(
+                    &layer.gate_proj,
+                    &layer.up_proj,
+                    layer.intermediate_size as u32,
+                    k,
+                );
             } else {
                 layer.gate_up_proj = BufferView::from_buffer(ctx.buffer_empty(1));
             }
@@ -2660,6 +2672,18 @@ impl Gemma4GpuModel {
 
     fn use_packed_mlp_gate_up(layer: &Gemma4GpuLayer) -> bool {
         crate::gpu::packed_mlp_gate_up_enabled() && layer.weight_format == WeightFormat::Q4_0
+    }
+
+    /// Infer MLP output width (rows) from a gate projection buffer.
+    fn infer_mlp_intermediate(gate: &BufferView, hidden_size: usize) -> usize {
+        use crate::gpu::weight_fmt;
+        let (epb, bpb) = match gate.format {
+            weight_fmt::Q4_K => (256, 144),
+            weight_fmt::Q6_K => (256, 210),
+            _ => (32, 18),
+        };
+        let blocks = gate.length as usize / bpb;
+        blocks * epb / hidden_size
     }
 
     /// Dispatch a plain quantized matvec for a layer's weight (Q4 or Q3).
@@ -2855,6 +2879,7 @@ impl Gemma4GpuModel {
                 &mut section_offset,
                 device,
                 num_layers,
+                config.hidden_size,
                 true,
                 Some(&weights_buf),
                 0,
@@ -2869,6 +2894,7 @@ impl Gemma4GpuModel {
                 &mut offset,
                 device,
                 num_layers,
+                config.hidden_size,
                 false,
                 None,
                 4,
@@ -2995,7 +3021,7 @@ impl Gemma4GpuModel {
         let num_heads = self.config.num_attention_heads;
         let num_kv_heads = self.config.num_key_value_heads;
         let num_kv_groups = (num_heads / num_kv_heads) as u32;
-        let intermediate_size = self.config.intermediate_size;
+        let intermediate_size = self.config.max_intermediate_size();
         let vocab_size = self.config.vocab_size;
         let eps = self.config.rms_norm_eps as f32;
         let ple_dim = self.config.hidden_size_per_layer_input;
@@ -3210,6 +3236,7 @@ impl Gemma4GpuModel {
                 cb_split_idx += 1;
             }
             let layer = &self.layers[layer_idx];
+            let intermediate_size = layer.intermediate_size;
             let head_dim = layer.head_dim;
             let q_out = layer.q_out_dim;
             let kv_out = layer.kv_out_dim;
@@ -4445,6 +4472,7 @@ impl Gemma4GpuModel {
 
         for layer_idx in 0..self.layers.len() {
             let layer = &self.layers[layer_idx];
+            let intermediate_size = layer.intermediate_size;
             let head_dim = layer.head_dim;
             let half_dim = head_dim / 2;
             let is_full = layer.is_full_attention;
@@ -4561,6 +4589,7 @@ impl Gemma4GpuModel {
     fn prepare_decode_batch_rotary(&mut self, slot_views: &[KvSlotView]) -> Result<(), String> {
         for layer_idx in 0..self.layers.len() {
             let layer = &self.layers[layer_idx];
+            let intermediate_size = layer.intermediate_size;
             let head_dim = layer.head_dim;
             let half_dim = head_dim / 2;
             let is_full = layer.is_full_attention;
@@ -4667,7 +4696,7 @@ impl Gemma4GpuModel {
 
     fn decode_batch_row_offsets(&self, batch_idx: usize) -> DecodeBatchRowOffsets {
         let hidden_size = self.config.hidden_size;
-        let intermediate_size = self.config.intermediate_size;
+        let intermediate_size = self.config.max_intermediate_size();
         let ple_dim = self.config.hidden_size_per_layer_input;
         let ple_total_dim = self.config.num_hidden_layers * ple_dim;
         let max_q_out = self
@@ -4700,7 +4729,7 @@ impl Gemma4GpuModel {
 
     fn prefill_row_offsets(&self, token_idx: usize) -> PrefillRowOffsets {
         let hidden_size = self.config.hidden_size;
-        let intermediate_size = self.config.intermediate_size;
+        let intermediate_size = self.config.max_intermediate_size();
         let ple_dim = self.config.hidden_size_per_layer_input;
         let ple_total_dim = self.config.num_hidden_layers * ple_dim;
         let max_q_out = self
@@ -5004,7 +5033,7 @@ impl Gemma4GpuModel {
             .get(layer_idx)
             .ok_or_else(|| format!("invalid layer index {}", layer_idx))?;
         let hidden_size = self.config.hidden_size;
-        let intermediate_size = self.config.intermediate_size;
+        let intermediate_size = self.config.max_intermediate_size();
         let num_heads = self.config.num_attention_heads;
         let num_kv_heads = self.config.num_key_value_heads;
         let num_kv_groups = (num_heads / num_kv_heads) as u32;
@@ -5398,7 +5427,7 @@ impl Gemma4GpuModel {
             .get(layer_idx)
             .ok_or_else(|| format!("invalid layer index {}", layer_idx))?;
         let hidden_size = self.config.hidden_size;
-        let intermediate_size = self.config.intermediate_size;
+        let intermediate_size = self.config.max_intermediate_size();
         let num_heads = self.config.num_attention_heads;
         let num_kv_heads = self.config.num_key_value_heads;
         let num_kv_groups = (num_heads / num_kv_heads) as u32;
@@ -5824,7 +5853,7 @@ impl Gemma4GpuModel {
                 .layers
                 .get(layer_idx)
                 .ok_or_else(|| format!("invalid layer index {}", layer_idx))?;
-            let intermediate_size = self.config.intermediate_size;
+            let intermediate_size = self.config.max_intermediate_size();
             let num_heads = self.config.num_attention_heads;
             let num_kv_heads = self.config.num_key_value_heads;
             let num_kv_groups = (num_heads / num_kv_heads) as u32;
@@ -6254,7 +6283,7 @@ impl Gemma4GpuModel {
         }
 
         let hidden_size = self.config.hidden_size;
-        let intermediate_size = self.config.intermediate_size;
+        let intermediate_size = self.config.max_intermediate_size();
         let vocab_size = self.config.vocab_size;
         let num_layers = self.config.num_hidden_layers;
         let num_heads = self.config.num_attention_heads;
@@ -6327,6 +6356,7 @@ impl Gemma4GpuModel {
 
         for layer_idx in 0..self.layers.len() {
             let layer = &self.layers[layer_idx];
+            let intermediate_size = layer.intermediate_size;
             let head_dim = layer.head_dim;
             let q_out = layer.q_out_dim;
             let kv_out = layer.kv_out_dim;
@@ -7653,7 +7683,30 @@ fn gemma4_config_from_gguf(g: &crate::gguf::Gguf) -> Gemma4TextConfig {
     let num_key_value_heads = mu("gemma4.attention.head_count_kv");
     let head_dim = mu("gemma4.attention.key_length_swa"); // sliding head dim (e.g. 256)
     let global_head_dim = mu("gemma4.attention.key_length"); // full head dim (e.g. 512)
-    let intermediate_size = mu("gemma4.feed_forward_length");
+    let intermediate_sizes = g
+        .get_usize_list("gemma4.feed_forward_length")
+        .unwrap_or_else(|| panic!("gguf missing gemma4.feed_forward_length"));
+    let intermediate_size = intermediate_sizes.iter().copied().max().unwrap_or(0);
+    assert!(
+        !intermediate_sizes.is_empty(),
+        "gemma4.feed_forward_length must not be empty"
+    );
+    if intermediate_sizes.len() == 1 {
+        // Uniform FFN (E4B): keep only the scalar in config.intermediate_size.
+    } else {
+        assert_eq!(
+            intermediate_sizes.len(),
+            num_hidden_layers,
+            "feed_forward_length length {} != block_count {}",
+            intermediate_sizes.len(),
+            num_hidden_layers
+        );
+    }
+    let uniform_intermediate = if intermediate_sizes.len() == 1 {
+        intermediate_sizes[0]
+    } else {
+        intermediate_size
+    };
     let vocab_size = g
         .tensor("token_embd.weight")
         .map(|t| t.n_rows())
@@ -7720,7 +7773,12 @@ fn gemma4_config_from_gguf(g: &crate::gguf::Gguf) -> Gemma4TextConfig {
         num_key_value_heads,
         head_dim,
         global_head_dim,
-        intermediate_size,
+        intermediate_size: uniform_intermediate,
+        intermediate_sizes: if intermediate_sizes.len() > 1 {
+            intermediate_sizes
+        } else {
+            Vec::new()
+        },
         vocab_size,
         hidden_activation: "gelu_pytorch_tanh".to_string(),
         rms_norm_eps,
