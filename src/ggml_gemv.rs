@@ -210,6 +210,19 @@ pub fn mul_mv_k_dispatch(m: u32, batch: u32) -> (u64, u64, u64, u64, u64) {
     (tg_x, batch as u64, 1, 32, KQ_NSG as u64)
 }
 
+/// Threadgroups for fused K-quant pre-attn RMSNorm + Q/K/V matvec (decode).
+pub fn kquant_fused_qkv_dispatch(m_q: u32, m_kv: u32, has_kv: bool) -> (u64, u64, u64) {
+    let rows_per_tg = KQ_NSG * KQ_NR0;
+    let q_tgs = (m_q + rows_per_tg - 1) / rows_per_tg;
+    let kv_tgs = if has_kv {
+        (m_kv + rows_per_tg - 1) / rows_per_tg
+    } else {
+        0
+    };
+    let total = q_tgs + 2 * kv_tgs;
+    (total as u64, 32, KQ_NSG as u64)
+}
+
 /// Threadgroups for mul_mv_ext (r1ptg=4, nsg=2).
 pub fn mul_mv_ext_dispatch(m: u32, batch: u32, nxpsg: i16) -> (u64, u64, u64, u64, u64) {
     let nypsg = 32 / nxpsg as u32;

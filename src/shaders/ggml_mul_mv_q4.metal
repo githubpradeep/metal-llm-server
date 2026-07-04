@@ -1377,3 +1377,440 @@ kernel void matvec_ggml_q4_K_gelu_mul(
 ) {
     mul_vec_q4_K_gelu_f32_impl<KQ_NR0>(args, W0, W1, x, y, tgpig, tiisg, sgitg);
 }
+
+// ─── K-quant RMSNorm fusion helpers (QKV + MLP) ─────────────────────────────
+
+constant uint WFMT_Q4_K = 3;
+constant uint WFMT_Q6_K = 4;
+
+inline float kquant_rms_y(
+    device const float * hidden,
+    device const float * norm_weight,
+    float inv_rms,
+    int k_idx
+) {
+    return hidden[k_idx] * norm_weight[k_idx] * inv_rms;
+}
+
+// Fused pre-FF RMSNorm + gate∥up Q4_K + GeLU (decode). inv_rms via rmsnorm_inv_rms.
+template<short nr0>
+void mul_vec_q4_K_rmsnorm_gelu_f32_impl(
+        uint K,
+        uint M,
+        device const char * src0_gate,
+        device const char * src0_up,
+        device const float * hidden,
+        device const float * norm_weight,
+        float inv_rms,
+        device float * dst,
+        uint3  tgpig,
+        ushort tiisg,
+        ushort sgitg) {
+    const short NSG = KQ_NSG;
+
+    constexpr uint16_t kmask1 = 0x3f3f;
+    constexpr uint16_t kmask2 = 0x0f0f;
+    constexpr uint16_t kmask3 = 0xc0c0;
+
+    const short ix = tiisg/8;
+    const short it = tiisg%8;
+    const short iq = it/4;
+    const short ir = it%4;
+
+    const int nb = int(K)/QK_K;
+    const uint64_t nb01 = (uint64_t)(K / QK_K) * 144;
+
+    const int r0 = tgpig.x;
+    const int first_row = (r0 * NSG + sgitg) * nr0;
+
+    device const block_q4_K * xg = (device const block_q4_K *)(src0_gate + first_row * nb01);
+    device const block_q4_K * xu = (device const block_q4_K *)(src0_up   + first_row * nb01);
+
+    float yl[16];
+    float yh[16];
+    float sumf_gate[nr0] = {0.f};
+    float sumf_up[nr0] = {0.f};
+
+    int k_block = ix * QK_K + 64 * iq + 8 * ir;
+
+    uint16_t sc16[4];
+    thread const uint8_t * sc8 = (thread const uint8_t *)sc16;
+
+    for (int ib = ix; ib < nb; ib += 4) {
+        float4 sumy = {0.f, 0.f, 0.f, 0.f};
+
+        for (short i = 0; i < 8; ++i) {
+            yl[i+0] = kquant_rms_y(hidden, norm_weight, inv_rms, k_block + i);       sumy[0] += yl[i+0];
+            yl[i+8] = kquant_rms_y(hidden, norm_weight, inv_rms, k_block + i + 32);  sumy[1] += yl[i+8];
+            yh[i+0] = kquant_rms_y(hidden, norm_weight, inv_rms, k_block + i + 128); sumy[2] += yh[i+0];
+            yh[i+8] = kquant_rms_y(hidden, norm_weight, inv_rms, k_block + i + 160); sumy[3] += yh[i+8];
+        }
+
+        device const uint16_t * sc_g = (device const uint16_t *)xg[ib].scales + iq;
+        device const uint16_t * q1_g = (device const uint16_t *)xg[ib].qs + 16 * iq + 4 * ir;
+        device const half     * dh_g = &xg[ib].d;
+
+        device const uint16_t * sc_u = (device const uint16_t *)xu[ib].scales + iq;
+        device const uint16_t * q1_u = (device const uint16_t *)xu[ib].qs + 16 * iq + 4 * ir;
+        device const half     * dh_u = &xu[ib].d;
+
+        for (short row = 0; row < nr0; row++) {
+            float4 acc1_g = {0.f, 0.f, 0.f, 0.f};
+            float4 acc2_g = {0.f, 0.f, 0.f, 0.f};
+            float4 acc1_u = {0.f, 0.f, 0.f, 0.f};
+            float4 acc2_u = {0.f, 0.f, 0.f, 0.f};
+
+            sc16[0] = sc_g[0] & kmask1;
+            sc16[1] = sc_g[2] & kmask1;
+            sc16[2] = ((sc_g[4] >> 0) & kmask2) | ((sc_g[0] & kmask3) >> 2);
+            sc16[3] = ((sc_g[4] >> 4) & kmask2) | ((sc_g[2] & kmask3) >> 2);
+
+            device const uint16_t * q2_g = q1_g + 32;
+
+            #pragma unroll
+            for (short i = 0; i < 4; ++i) {
+                acc1_g[0] += yl[2*i + 0] * (q1_g[i] & 0x000F);
+                acc1_g[1] += yl[2*i + 1] * (q1_g[i] & 0x0F00);
+                acc1_g[2] += yl[2*i + 8] * (q1_g[i] & 0x00F0);
+                acc1_g[3] += yl[2*i + 9] * (q1_g[i] & 0xF000);
+                acc2_g[0] += yh[2*i + 0] * (q2_g[i] & 0x000F);
+                acc2_g[1] += yh[2*i + 1] * (q2_g[i] & 0x0F00);
+                acc2_g[2] += yh[2*i + 8] * (q2_g[i] & 0x00F0);
+                acc2_g[3] += yh[2*i + 9] * (q2_g[i] & 0xF000);
+            }
+
+            sumf_gate[row] += dh_g[0] * ((acc1_g[0] + 1.f/256.f * acc1_g[1]) * sc8[0] +
+                                         (acc1_g[2] + 1.f/256.f * acc1_g[3]) * sc8[1] * 1.f/16.f +
+                                         (acc2_g[0] + 1.f/256.f * acc2_g[1]) * sc8[4] +
+                                         (acc2_g[2] + 1.f/256.f * acc2_g[3]) * sc8[5] * 1.f/16.f) -
+                            dh_g[1] * (sumy[0] * sc8[2] + sumy[1] * sc8[3] + sumy[2] * sc8[6] + sumy[3] * sc8[7]);
+
+            sc16[0] = sc_u[0] & kmask1;
+            sc16[1] = sc_u[2] & kmask1;
+            sc16[2] = ((sc_u[4] >> 0) & kmask2) | ((sc_u[0] & kmask3) >> 2);
+            sc16[3] = ((sc_u[4] >> 4) & kmask2) | ((sc_u[2] & kmask3) >> 2);
+
+            device const uint16_t * q2_u = q1_u + 32;
+
+            #pragma unroll
+            for (short i = 0; i < 4; ++i) {
+                acc1_u[0] += yl[2*i + 0] * (q1_u[i] & 0x000F);
+                acc1_u[1] += yl[2*i + 1] * (q1_u[i] & 0x0F00);
+                acc1_u[2] += yl[2*i + 8] * (q1_u[i] & 0x00F0);
+                acc1_u[3] += yl[2*i + 9] * (q1_u[i] & 0xF000);
+                acc2_u[0] += yh[2*i + 0] * (q2_u[i] & 0x000F);
+                acc2_u[1] += yh[2*i + 1] * (q2_u[i] & 0x0F00);
+                acc2_u[2] += yh[2*i + 8] * (q2_u[i] & 0x00F0);
+                acc2_u[3] += yh[2*i + 9] * (q2_u[i] & 0xF000);
+            }
+
+            sumf_up[row] += dh_u[0] * ((acc1_u[0] + 1.f/256.f * acc1_u[1]) * sc8[0] +
+                                       (acc1_u[2] + 1.f/256.f * acc1_u[3]) * sc8[1] * 1.f/16.f +
+                                       (acc2_u[0] + 1.f/256.f * acc2_u[1]) * sc8[4] +
+                                       (acc2_u[2] + 1.f/256.f * acc2_u[3]) * sc8[5] * 1.f/16.f) -
+                          dh_u[1] * (sumy[0] * sc8[2] + sumy[1] * sc8[3] + sumy[2] * sc8[6] + sumy[3] * sc8[7]);
+
+            q1_g += nb01/2;
+            sc_g += nb01/2;
+            dh_g += nb01/2;
+            q1_u += nb01/2;
+            sc_u += nb01/2;
+            dh_u += nb01/2;
+        }
+
+        k_block += 4 * QK_K;
+    }
+
+    for (int row = 0; row < nr0 && first_row + row < int(M); ++row) {
+        const float gate = simd_sum(sumf_gate[row]);
+        const float up   = simd_sum(sumf_up[row]);
+        const float gelu = gelu_pytorch_tanh_q4(gate) * up;
+        if (tiisg == 0) {
+            dst[first_row + row] = gelu;
+        }
+    }
+}
+
+kernel void matvec_ggml_q4_K_rmsnorm_gelu_mul(
+    device const char * W_gate [[buffer(0)]],
+    device const char * W_up [[buffer(1)]],
+    device const float * hidden [[buffer(2)]],
+    device const float * norm_weight [[buffer(3)]],
+    device const float * inv_rms_ptr [[buffer(4)]],
+    device float * y [[buffer(5)]],
+    constant uint& M [[buffer(6)]],
+    constant uint& K [[buffer(7)]],
+    uint3 tgpig [[threadgroup_position_in_grid]],
+    ushort tiisg [[thread_index_in_simdgroup]],
+    ushort sgitg [[simdgroup_index_in_threadgroup]]
+) {
+    float inv_rms = *inv_rms_ptr;
+    mul_vec_q4_K_rmsnorm_gelu_f32_impl<KQ_NR0>(
+        K, M, W_gate, W_up, hidden, norm_weight, inv_rms, y, tgpig, tiisg, sgitg);
+}
+
+// ─── Fused pre-attn RMSNorm + K-quant Q/K/V (decode) ────────────────────────
+
+template<short nr0>
+void mul_vec_q4_K_rmsnorm_hidden_impl(
+        uint K,
+        uint M,
+        device const char * src0,
+        device const float * hidden,
+        device const float * norm_weight,
+        float inv_rms,
+        device float * dst,
+        uint3  tgpig,
+        ushort tiisg,
+        ushort sgitg) {
+    const short NSG = KQ_NSG;
+
+    constexpr uint16_t kmask1 = 0x3f3f;
+    constexpr uint16_t kmask2 = 0x0f0f;
+    constexpr uint16_t kmask3 = 0xc0c0;
+
+    const short ix = tiisg/8;
+    const short it = tiisg%8;
+    const short iq = it/4;
+    const short ir = it%4;
+
+    const int nb = int(K)/QK_K;
+    const uint64_t nb01 = (uint64_t)(K / QK_K) * 144;
+
+    const int r0 = tgpig.x;
+    const int first_row = (r0 * NSG + sgitg) * nr0;
+
+    device const block_q4_K * x = (device const block_q4_K *)(src0 + first_row * nb01);
+
+    float yl[16];
+    float yh[16];
+    float sumf[nr0] = {0.f};
+
+    int k_block = ix * QK_K + 64 * iq + 8 * ir;
+
+    uint16_t sc16[4];
+    thread const uint8_t * sc8 = (thread const uint8_t *)sc16;
+
+    for (int ib = ix; ib < nb; ib += 4) {
+        float4 sumy = {0.f, 0.f, 0.f, 0.f};
+
+        for (short i = 0; i < 8; ++i) {
+            yl[i+0] = kquant_rms_y(hidden, norm_weight, inv_rms, k_block + i);       sumy[0] += yl[i+0];
+            yl[i+8] = kquant_rms_y(hidden, norm_weight, inv_rms, k_block + i + 32);  sumy[1] += yl[i+8];
+            yh[i+0] = kquant_rms_y(hidden, norm_weight, inv_rms, k_block + i + 128); sumy[2] += yh[i+0];
+            yh[i+8] = kquant_rms_y(hidden, norm_weight, inv_rms, k_block + i + 160); sumy[3] += yh[i+8];
+        }
+
+        device const uint16_t * sc = (device const uint16_t *)x[ib].scales + iq;
+        device const uint16_t * q1 = (device const uint16_t *)x[ib].qs + 16 * iq + 4 * ir;
+        device const half     * dh = &x[ib].d;
+
+        for (short row = 0; row < nr0; row++) {
+            sc16[0] = sc[0] & kmask1;
+            sc16[1] = sc[2] & kmask1;
+            sc16[2] = ((sc[4] >> 0) & kmask2) | ((sc[0] & kmask3) >> 2);
+            sc16[3] = ((sc[4] >> 4) & kmask2) | ((sc[2] & kmask3) >> 2);
+
+            device const uint16_t * q2 = q1 + 32;
+
+            float4 acc1 = {0.f, 0.f, 0.f, 0.f};
+            float4 acc2 = {0.f, 0.f, 0.f, 0.f};
+
+            #pragma unroll
+            for (short i = 0; i < 4; ++i) {
+                acc1[0] += yl[2*i + 0] * (q1[i] & 0x000F);
+                acc1[1] += yl[2*i + 1] * (q1[i] & 0x0F00);
+                acc1[2] += yl[2*i + 8] * (q1[i] & 0x00F0);
+                acc1[3] += yl[2*i + 9] * (q1[i] & 0xF000);
+                acc2[0] += yh[2*i + 0] * (q2[i] & 0x000F);
+                acc2[1] += yh[2*i + 1] * (q2[i] & 0x0F00);
+                acc2[2] += yh[2*i + 8] * (q2[i] & 0x00F0);
+                acc2[3] += yh[2*i + 9] * (q2[i] & 0xF000);
+            }
+
+            sumf[row] += dh[0] * ((acc1[0] + 1.f/256.f * acc1[1]) * sc8[0] +
+                                  (acc1[2] + 1.f/256.f * acc1[3]) * sc8[1] * 1.f/16.f +
+                                  (acc2[0] + 1.f/256.f * acc2[1]) * sc8[4] +
+                                  (acc2[2] + 1.f/256.f * acc2[3]) * sc8[5] * 1.f/16.f) -
+                         dh[1] * (sumy[0] * sc8[2] + sumy[1] * sc8[3] + sumy[2] * sc8[6] + sumy[3] * sc8[7]);
+
+            q1 += nb01/2;
+            sc += nb01/2;
+            dh += nb01/2;
+        }
+
+        k_block += 4 * QK_K;
+    }
+
+    for (int row = 0; row < nr0 && first_row + row < int(M); ++row) {
+        float sum_all = simd_sum(sumf[row]);
+        if (tiisg == 0) {
+            dst[first_row + row] = sum_all;
+        }
+    }
+}
+
+template<short nr0>
+void mul_vec_q6_K_rmsnorm_hidden_impl(
+        uint K,
+        uint M,
+        device const char * src0,
+        device const float * hidden,
+        device const float * norm_weight,
+        float inv_rms,
+        device float * dst,
+        uint3  tgpig,
+        ushort tiisg,
+        ushort sgitg) {
+    const short NSG = KQ_NSG;
+
+    constexpr uint8_t kmask1 = 0x03;
+    constexpr uint8_t kmask2 = 0x0C;
+    constexpr uint8_t kmask3 = 0x30;
+    constexpr uint8_t kmask4 = 0xC0;
+
+    const int nb = int(K)/QK_K;
+    const uint64_t nb01 = (uint64_t)(K / QK_K) * 210;
+
+    const int r0 = tgpig.x;
+    const int first_row = (r0 * NSG + sgitg) * nr0;
+
+    device const block_q6_K * x = (device const block_q6_K *)(src0 + first_row * nb01);
+
+    float sumf[nr0] = {0.f};
+    float yl[16];
+
+    const short tid = tiisg/2;
+    const short ix  = tiisg%2;
+    const short ip  = tid/8;
+    const short il  = tid%8;
+    const short l0  = 4*il;
+    const short is  = 8*ip + l0/16;
+
+    const short y_offset   = 128*ip + l0;
+    const short q_offset_l =  64*ip + l0;
+    const short q_offset_h =  32*ip + l0;
+
+    for (int i = ix; i < nb; i += 2) {
+        device const uint8_t * q1 = x[i].ql + q_offset_l;
+        device const uint8_t * q2 = q1 + 32;
+        device const uint8_t * qh = x[i].qh + q_offset_h;
+        device const int8_t  * sc = x[i].scales + is;
+        device const half    * dh = &x[i].d;
+
+        const int k_base = i * QK_K + y_offset;
+        for (short l = 0; l < 4; ++l) {
+            yl[4*l + 0] = kquant_rms_y(hidden, norm_weight, inv_rms, k_base + l +  0);
+            yl[4*l + 1] = kquant_rms_y(hidden, norm_weight, inv_rms, k_base + l + 32);
+            yl[4*l + 2] = kquant_rms_y(hidden, norm_weight, inv_rms, k_base + l + 64);
+            yl[4*l + 3] = kquant_rms_y(hidden, norm_weight, inv_rms, k_base + l + 96);
+        }
+
+        for (short row = 0; row < nr0; ++row) {
+            float4 sums = {0.f, 0.f, 0.f, 0.f};
+
+            #pragma unroll
+            for (short l = 0; l < 4; ++l) {
+                sums[0] += yl[4*l + 0] * ((int8_t)((q1[l] & 0xF) | ((qh[l] & kmask1) << 4)) - 32);
+                sums[1] += yl[4*l + 1] * ((int8_t)((q2[l] & 0xF) | ((qh[l] & kmask2) << 2)) - 32);
+                sums[2] += yl[4*l + 2] * ((int8_t)((q1[l]  >> 4) | ((qh[l] & kmask3) << 0)) - 32);
+                sums[3] += yl[4*l + 3] * ((int8_t)((q2[l]  >> 4) | ((qh[l] & kmask4) >> 2)) - 32);
+            }
+
+            sumf[row] += dh[0] * (sums[0] * sc[0] + sums[1] * sc[2] + sums[2] * sc[4] + sums[3] * sc[6]);
+
+            q1 += nb01;
+            q2 += nb01;
+            qh += nb01;
+            sc += nb01;
+            dh += nb01/2;
+        }
+    }
+
+    for (int row = 0; row < nr0 && first_row + row < int(M); ++row) {
+        float sum_all = simd_sum(sumf[row]);
+        if (tiisg == 0) {
+            dst[first_row + row] = sum_all;
+        }
+    }
+}
+
+inline void kquant_rmsnorm_matvec_dispatch(
+    uint fmt,
+    uint K,
+    uint M,
+    device const char * W,
+    device const float * hidden,
+    device const float * norm_weight,
+    float inv_rms,
+    device float * out,
+    uint3 tgpig,
+    ushort tiisg,
+    ushort sgitg) {
+    if (fmt == WFMT_Q6_K) {
+        mul_vec_q6_K_rmsnorm_hidden_impl<KQ_NR0>(
+            K, M, W, hidden, norm_weight, inv_rms, out, tgpig, tiisg, sgitg);
+    } else {
+        mul_vec_q4_K_rmsnorm_hidden_impl<KQ_NR0>(
+            K, M, W, hidden, norm_weight, inv_rms, out, tgpig, tiisg, sgitg);
+    }
+}
+
+kernel void matvec_q_rmsnorm_inv_kquant(
+    device const float* hidden [[buffer(0)]],
+    device const float* norm_weight [[buffer(1)]],
+    device const float* inv_rms_ptr [[buffer(2)]],
+    device const char* Wq [[buffer(3)]],
+    device float* q_out [[buffer(4)]],
+    constant uint& M_q [[buffer(5)]],
+    constant uint& K [[buffer(6)]],
+    constant uint& q_fmt [[buffer(7)]],
+    uint3 tgpig [[threadgroup_position_in_grid]],
+    ushort tiisg [[thread_index_in_simdgroup]],
+    ushort sgitg [[simdgroup_index_in_threadgroup]]
+) {
+    float inv_rms = *inv_rms_ptr;
+    kquant_rmsnorm_matvec_dispatch(
+        q_fmt, K, M_q, Wq, hidden, norm_weight, inv_rms, q_out,
+        tgpig, tiisg, sgitg);
+}
+
+kernel void matvec_qkv_rmsnorm_inv_kquant(
+    device const float* hidden [[buffer(0)]],
+    device const float* norm_weight [[buffer(1)]],
+    device const float* inv_rms_ptr [[buffer(2)]],
+    device const char* Wq [[buffer(3)]],
+    device const char* Wk [[buffer(4)]],
+    device const char* Wv [[buffer(5)]],
+    device float* q_out [[buffer(6)]],
+    device float* k_out [[buffer(7)]],
+    device float* v_out [[buffer(8)]],
+    constant uint& M_q [[buffer(9)]],
+    constant uint& M_kv [[buffer(10)]],
+    constant uint& K [[buffer(11)]],
+    constant uint& q_fmt [[buffer(12)]],
+    constant uint& k_fmt [[buffer(13)]],
+    constant uint& v_fmt [[buffer(14)]],
+    uint3 tgpig [[threadgroup_position_in_grid]],
+    ushort tiisg [[thread_index_in_simdgroup]],
+    ushort sgitg [[simdgroup_index_in_threadgroup]]
+) {
+    float inv_rms = *inv_rms_ptr;
+    const uint rows_per_tg = KQ_NSG * KQ_NR0;
+    const uint q_tgs = (M_q + rows_per_tg - 1u) / rows_per_tg;
+    const uint kv_tgs = (M_kv + rows_per_tg - 1u) / rows_per_tg;
+
+    if (tgpig.x < q_tgs) {
+        kquant_rmsnorm_matvec_dispatch(
+            q_fmt, K, M_q, Wq, hidden, norm_weight, inv_rms, q_out,
+            uint3(tgpig.x, 0, 0), tiisg, sgitg);
+    } else if (tgpig.x < q_tgs + kv_tgs) {
+        kquant_rmsnorm_matvec_dispatch(
+            k_fmt, K, M_kv, Wk, hidden, norm_weight, inv_rms, k_out,
+            uint3(tgpig.x - q_tgs, 0, 0), tiisg, sgitg);
+    } else if (tgpig.x < q_tgs + 2u * kv_tgs) {
+        kquant_rmsnorm_matvec_dispatch(
+            v_fmt, K, M_kv, Wv, hidden, norm_weight, inv_rms, v_out,
+            uint3(tgpig.x - q_tgs - kv_tgs, 0, 0), tiisg, sgitg);
+    }
+}

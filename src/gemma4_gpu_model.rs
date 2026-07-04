@@ -3223,8 +3223,39 @@ impl Gemma4GpuModel {
             // needed; the add reads hidden in place.
 
             if !__ablate.skip_attn() {
-            // Pre-attention norm + Q/K/V projections (fused when Q4 + FUSED_QKV=1).
-            if layer.weight_format == WeightFormat::Q4_0 && crate::gpu::fused_qkv_enabled() {
+            // Pre-attention norm + Q/K/V projections (fused when Q4_0 or K-quant + FUSED_QKV=1).
+            if layer.weight_format.is_kquant() && crate::gpu::fused_qkv_enabled() {
+                if layer.has_kv {
+                    self.ctx.encode_rmsnorm_qkv_kquant_view(
+                        encoder,
+                        &self.hidden_buf,
+                        &layer.input_layernorm_weight,
+                        &self.inv_rms_buf,
+                        &layer.q_proj,
+                        &layer.k_proj,
+                        &layer.v_proj,
+                        &self.q_buf,
+                        &self.k_buf,
+                        &self.v_buf,
+                        q_out as u32,
+                        kv_out as u32,
+                        hidden_size as u32,
+                        eps,
+                    );
+                } else {
+                    self.ctx.encode_rmsnorm_q_kquant_view(
+                        encoder,
+                        &self.hidden_buf,
+                        &layer.input_layernorm_weight,
+                        &self.inv_rms_buf,
+                        &layer.q_proj,
+                        &self.q_buf,
+                        q_out as u32,
+                        hidden_size as u32,
+                        eps,
+                    );
+                }
+            } else if layer.weight_format == WeightFormat::Q4_0 && crate::gpu::fused_qkv_enabled() {
                 if layer.has_kv {
                     self.ctx.encode_rmsnorm_qkv_q4_view(
                         encoder,
@@ -3804,19 +3835,37 @@ impl Gemma4GpuModel {
                     intermediate_size as u32,
                 );
             } else if layer.weight_format.is_kquant() {
-                // K-quant (Q4_K_M): per-tensor matvec. Gate/up (both Q4_K) are
-                // fused into one GeLU dispatch; down (Q6_K) is a plain matvec.
-                self.ctx.encode_rmsnorm_view(
-                    encoder,
-                    &self.hidden_buf,
-                    &layer.pre_feedforward_layernorm_weight,
-                    &self.normed_buf,
-                    hidden_size as u32,
-                    eps,
-                );
+                // K-quant (Q4_K_M): gate/up (Q4_K) fused with optional pre-FF RMSNorm;
+                // down (Q6_K) is a plain matvec.
                 if layer.gate_proj.format == crate::gpu::weight_fmt::Q4_K
                     && layer.up_proj.format == crate::gpu::weight_fmt::Q4_K
+                    && crate::gpu::fused_rmsnorm_mlp_kquant_enabled()
                 {
+                    self.ctx.encode_rmsnorm_qk_gelu_mul_kquant_at_view(
+                        encoder,
+                        &layer.gate_proj,
+                        &layer.up_proj,
+                        &self.hidden_buf,
+                        0,
+                        &layer.pre_feedforward_layernorm_weight,
+                        &self.inv_rms_buf,
+                        &self.gelu_buf,
+                        0,
+                        intermediate_size as u32,
+                        hidden_size as u32,
+                        eps,
+                    );
+                } else if layer.gate_proj.format == crate::gpu::weight_fmt::Q4_K
+                    && layer.up_proj.format == crate::gpu::weight_fmt::Q4_K
+                {
+                    self.ctx.encode_rmsnorm_view(
+                        encoder,
+                        &self.hidden_buf,
+                        &layer.pre_feedforward_layernorm_weight,
+                        &self.normed_buf,
+                        hidden_size as u32,
+                        eps,
+                    );
                     self.ctx.encode_matvec_qk_gelu_mul_at_view(
                         encoder,
                         &layer.gate_proj,
@@ -3829,6 +3878,14 @@ impl Gemma4GpuModel {
                         hidden_size as u32,
                     );
                 } else {
+                    self.ctx.encode_rmsnorm_view(
+                        encoder,
+                        &self.hidden_buf,
+                        &layer.pre_feedforward_layernorm_weight,
+                        &self.normed_buf,
+                        hidden_size as u32,
+                        eps,
+                    );
                     self.encode_matvec_quant(
                         encoder,
                         &layer.gate_proj,
@@ -6781,22 +6838,38 @@ impl Gemma4GpuModel {
                         intermediate_size as u32,
                     );
                 } else if layer.weight_format.is_kquant() {
-                    // K-quant (Q4_K_M): per-tensor matvec, no Q4_0 fusion.
-                    // Gate and up (both Q4_K in standard Q4_K_M) are fused into
-                    // one GeLU dispatch; down (Q6_K) is a plain matvec.
-                    self.ctx.encode_rmsnorm_at_view(
-                        encoder,
-                        &self.decode_batch_scratch.hidden_buf,
-                        offsets.hidden,
-                        &layer.pre_feedforward_layernorm_weight,
-                        &self.decode_batch_scratch.normed_buf,
-                        offsets.hidden,
-                        hidden_size as u32,
-                        eps,
-                    );
+                    // K-quant (Q4_K_M): gate/up fused; optional pre-FF RMSNorm fold.
                     if layer.gate_proj.format == crate::gpu::weight_fmt::Q4_K
                         && layer.up_proj.format == crate::gpu::weight_fmt::Q4_K
+                        && crate::gpu::fused_rmsnorm_mlp_kquant_enabled()
                     {
+                        self.ctx.encode_rmsnorm_qk_gelu_mul_kquant_at_view(
+                            encoder,
+                            &layer.gate_proj,
+                            &layer.up_proj,
+                            &self.decode_batch_scratch.hidden_buf,
+                            offsets.hidden,
+                            &layer.pre_feedforward_layernorm_weight,
+                            &self.inv_rms_buf,
+                            &self.decode_batch_scratch.gelu_buf,
+                            offsets.intermediate,
+                            intermediate_size as u32,
+                            hidden_size as u32,
+                            eps,
+                        );
+                    } else if layer.gate_proj.format == crate::gpu::weight_fmt::Q4_K
+                        && layer.up_proj.format == crate::gpu::weight_fmt::Q4_K
+                    {
+                        self.ctx.encode_rmsnorm_at_view(
+                            encoder,
+                            &self.decode_batch_scratch.hidden_buf,
+                            offsets.hidden,
+                            &layer.pre_feedforward_layernorm_weight,
+                            &self.decode_batch_scratch.normed_buf,
+                            offsets.hidden,
+                            hidden_size as u32,
+                            eps,
+                        );
                         self.ctx.encode_matvec_qk_gelu_mul_at_view(
                             encoder,
                             &layer.gate_proj,
@@ -6809,6 +6882,16 @@ impl Gemma4GpuModel {
                             hidden_size as u32,
                         );
                     } else {
+                        self.ctx.encode_rmsnorm_at_view(
+                            encoder,
+                            &self.decode_batch_scratch.hidden_buf,
+                            offsets.hidden,
+                            &layer.pre_feedforward_layernorm_weight,
+                            &self.decode_batch_scratch.normed_buf,
+                            offsets.hidden,
+                            hidden_size as u32,
+                            eps,
+                        );
                         self.encode_matvec_quant_at(
                             encoder,
                             &layer.gate_proj,

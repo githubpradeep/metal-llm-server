@@ -276,6 +276,14 @@ pub fn fused_rmsnorm_mlp_enabled() -> bool {
     )
 }
 
+/// Fuse pre-FF RMSNorm into Q4_K gate∥up+GeLU on K-quant decode (default on).
+pub fn fused_rmsnorm_mlp_kquant_enabled() -> bool {
+    !matches!(
+        std::env::var("FUSED_RMSNORM_MLP_KQUANT").as_deref(),
+        Ok("0") | Ok("false") | Ok("FALSE")
+    )
+}
+
 /// Fuse gate+up+GeLU+down MLP in one encoder call (default on).
 /// Phase 1: parallel dual_gelu → gelu scratch. Phase 2: down matvec.
 /// Set FUSED_MLP_GELU_DOWN=0 to use separate dispatches via FUSED_MLP_PLE.
@@ -416,6 +424,8 @@ pub struct MetalContext {
     pub matvec_ggml_q4_f16x_pipeline: ComputePipelineState,
     pub matvec_q_rmsnorm_inv_q4_pipeline: ComputePipelineState,
     pub matvec_qkv_rmsnorm_inv_q4_pipeline: ComputePipelineState,
+    pub matvec_q_rmsnorm_inv_kquant_pipeline: ComputePipelineState,
+    pub matvec_qkv_rmsnorm_inv_kquant_pipeline: ComputePipelineState,
     pub ple_matvec_gelu_q4_pipeline: ComputePipelineState,
     pub matvec_ggml_q4_pipeline: ComputePipelineState,
     pub matvec_ggml_q4_dual_pipeline: ComputePipelineState,
@@ -425,6 +435,7 @@ pub struct MetalContext {
     pub matvec_ggml_q4k_pipeline: ComputePipelineState,
     pub matvec_ggml_q6k_pipeline: ComputePipelineState,
     pub matvec_ggml_q4k_gelu_mul_pipeline: ComputePipelineState,
+    pub matvec_ggml_q4k_rmsnorm_gelu_mul_pipeline: ComputePipelineState,
     // Q3_0 pipelines
     pub matvec_ggml_q3_pipeline: ComputePipelineState,
     pub matvec_ggml_q3_dual_pipeline: ComputePipelineState,
@@ -579,6 +590,8 @@ impl MetalContext {
         let matvec_ggml_q4_f16x_pipeline = get_fn("matvec_ggml_q4_0_f16x");
         let matvec_q_rmsnorm_inv_q4_pipeline = get_fn("matvec_q_rmsnorm_inv_q4");
         let matvec_qkv_rmsnorm_inv_q4_pipeline = get_fn("matvec_qkv_rmsnorm_inv_q4");
+        let matvec_q_rmsnorm_inv_kquant_pipeline = get_fn("matvec_q_rmsnorm_inv_kquant");
+        let matvec_qkv_rmsnorm_inv_kquant_pipeline = get_fn("matvec_qkv_rmsnorm_inv_kquant");
         let ple_matvec_gelu_q4_pipeline = get_fn("ple_matvec_gelu_q4");
         let matvec_ggml_q4_pipeline = get_fn("matvec_ggml_q4_0");
         let matvec_ggml_q4_dual_pipeline = get_fn("matvec_ggml_q4_0_dual");
@@ -587,6 +600,7 @@ impl MetalContext {
         let matvec_ggml_q4k_pipeline = get_fn("matvec_ggml_q4_K");
         let matvec_ggml_q6k_pipeline = get_fn("matvec_ggml_q6_K");
         let matvec_ggml_q4k_gelu_mul_pipeline = get_fn("matvec_ggml_q4_K_gelu_mul");
+        let matvec_ggml_q4k_rmsnorm_gelu_mul_pipeline = get_fn("matvec_ggml_q4_K_rmsnorm_gelu_mul");
         let matvec_ggml_q3_pipeline = get_fn("matvec_ggml_q3_0");
         let matvec_ggml_q3_dual_pipeline = get_fn("matvec_ggml_q3_0_dual");
         let matvec_ggml_q3_gelu_mul_pipeline = get_fn("matvec_ggml_q3_0_gelu_mul");
@@ -775,6 +789,9 @@ impl MetalContext {
             if mlp_fused_gelu_ggml_r2s4_enabled() {
                 println!("  Fused gate+up+GeLU r2s4 layout (MLP_FUSED_GELU_GGML_R2S4=0 to disable)");
             }
+            if fused_rmsnorm_mlp_kquant_enabled() {
+                println!("  Fused pre-FF RMSNorm + Q4_K gate∥up+GeLU on K-quant (FUSED_RMSNORM_MLP_KQUANT=0 to disable)");
+            }
             if fused_rmsnorm_mlp_enabled() {
                 println!("  Fused pre-FF RMSNorm + gate∥up+GeLU (FUSED_RMSNORM_MLP=0 to disable)");
             }
@@ -787,7 +804,7 @@ impl MetalContext {
                 println!("  Fused post-attn/post-MLP RMSNorm+residual (FUSED_RMSNORM_ACC=0 to disable)");
             }
             if fused_qkv_enabled() {
-                println!("  Fused pre-attn RMSNorm + Q4 Q/K/V projections (FUSED_QKV=0 to disable)");
+                println!("  Fused pre-attn RMSNorm + Q/K/V projections (Q4_0 + K-quant; FUSED_QKV=0 to disable)");
             }
             if fused_q_attn_enabled() {
                 println!("  Fused QK-norm + RoPE into Q4 flash attention (FUSED_Q_ATTN=0 to disable)");
@@ -815,6 +832,8 @@ impl MetalContext {
             matvec_ggml_q4_f16x_pipeline,
             matvec_q_rmsnorm_inv_q4_pipeline,
             matvec_qkv_rmsnorm_inv_q4_pipeline,
+            matvec_q_rmsnorm_inv_kquant_pipeline,
+            matvec_qkv_rmsnorm_inv_kquant_pipeline,
             ple_matvec_gelu_q4_pipeline,
             matvec_ggml_q4_pipeline,
             matvec_ggml_q4_dual_pipeline,
@@ -823,6 +842,7 @@ impl MetalContext {
             matvec_ggml_q4k_pipeline,
             matvec_ggml_q6k_pipeline,
             matvec_ggml_q4k_gelu_mul_pipeline,
+            matvec_ggml_q4k_rmsnorm_gelu_mul_pipeline,
             matvec_ggml_q3_pipeline,
             matvec_ggml_q3_dual_pipeline,
             matvec_ggml_q3_gelu_mul_pipeline,
@@ -1747,6 +1767,49 @@ impl MetalContext {
         );
     }
 
+    /// Fused pre-FF RMSNorm + Q4_K gate∥up + GeLU(gate)*up (K-quant MLP decode).
+    pub fn encode_rmsnorm_qk_gelu_mul_kquant_at_view(
+        &self,
+        encoder: &metal::ComputeCommandEncoderRef,
+        gate: &BufferView,
+        up: &BufferView,
+        hidden: &Buffer,
+        hidden_offset: u64,
+        norm_weight: &BufferView,
+        inv_rms_buf: &Buffer,
+        gelu_out: &Buffer,
+        gelu_offset: u64,
+        m: u32,
+        k: u32,
+        eps: f32,
+    ) {
+        debug_assert_eq!(gate.format, weight_fmt::Q4_K);
+        debug_assert_eq!(up.format, weight_fmt::Q4_K);
+        self.encode_rmsnorm_inv_rms_at_view(
+            encoder,
+            hidden,
+            hidden_offset,
+            inv_rms_buf,
+            0,
+            k,
+            eps,
+        );
+        encoder.set_compute_pipeline_state(&self.matvec_ggml_q4k_rmsnorm_gelu_mul_pipeline);
+        encoder.set_buffer(0, Some(&gate.buffer), gate.offset);
+        encoder.set_buffer(1, Some(&up.buffer), up.offset);
+        encoder.set_buffer(2, Some(hidden), hidden_offset);
+        encoder.set_buffer(3, Some(&norm_weight.buffer), norm_weight.offset);
+        encoder.set_buffer(4, Some(inv_rms_buf), 0);
+        encoder.set_buffer(5, Some(gelu_out), gelu_offset);
+        encoder.set_bytes(6, 4, &m as *const u32 as *const _);
+        encoder.set_bytes(7, 4, &k as *const u32 as *const _);
+        let (tg_x, tg_y, tg_z, tw, nsg) = crate::ggml_gemv::mul_mv_k_dispatch(m, 1);
+        encoder.dispatch_thread_groups(
+            metal::MTLSize::new(tg_x, tg_y, tg_z),
+            metal::MTLSize::new(tw, nsg, 1),
+        );
+    }
+
     // ─── Q3_0 matvec dispatch ────────────────────────────────────────────────
 
     /// Q3_0 weight matvec: W is 3-bit quantized, x and y are f32.
@@ -2006,6 +2069,82 @@ impl MetalContext {
         let num_tgs = MTLSize::new(total_tgs as u64, 1, 1);
         let tg_size = MTLSize::new(256, 1, 1);
         encoder.dispatch_thread_groups(num_tgs, tg_size);
+    }
+
+    /// Fused pre-attn RMSNorm + K-quant Q projection (shared-KV layers).
+    pub fn encode_rmsnorm_q_kquant_view(
+        &self,
+        encoder: &metal::ComputeCommandEncoderRef,
+        hidden: &Buffer,
+        norm_weight: &BufferView,
+        inv_rms_buf: &Buffer,
+        q_weight: &BufferView,
+        q_out: &Buffer,
+        m_q: u32,
+        k: u32,
+        eps: f32,
+    ) {
+        self.encode_rmsnorm_inv_rms_at_view(encoder, hidden, 0, inv_rms_buf, 0, k, eps);
+        encoder.set_compute_pipeline_state(&self.matvec_q_rmsnorm_inv_kquant_pipeline);
+        encoder.set_buffer(0, Some(hidden), 0);
+        encoder.set_buffer(1, Some(&norm_weight.buffer), norm_weight.offset);
+        encoder.set_buffer(2, Some(inv_rms_buf), 0);
+        encoder.set_buffer(3, Some(&q_weight.buffer), q_weight.offset);
+        encoder.set_buffer(4, Some(q_out), 0);
+        encoder.set_bytes(5, 4, &m_q as *const u32 as *const _);
+        encoder.set_bytes(6, 4, &k as *const u32 as *const _);
+        let q_fmt = q_weight.format as u32;
+        encoder.set_bytes(7, 4, &q_fmt as *const u32 as *const _);
+        let (tg_x, tw, nsg) = crate::ggml_gemv::kquant_fused_qkv_dispatch(m_q, 0, false);
+        encoder.dispatch_thread_groups(
+            metal::MTLSize::new(tg_x, 1, 1),
+            metal::MTLSize::new(tw, nsg, 1),
+        );
+    }
+
+    /// Fused pre-attn RMSNorm + K-quant Q/K/V projections (has_kv layers).
+    pub fn encode_rmsnorm_qkv_kquant_view(
+        &self,
+        encoder: &metal::ComputeCommandEncoderRef,
+        hidden: &Buffer,
+        norm_weight: &BufferView,
+        inv_rms_buf: &Buffer,
+        q_weight: &BufferView,
+        k_weight: &BufferView,
+        v_weight: &BufferView,
+        q_out: &Buffer,
+        k_out: &Buffer,
+        v_out: &Buffer,
+        m_q: u32,
+        m_kv: u32,
+        k: u32,
+        eps: f32,
+    ) {
+        self.encode_rmsnorm_inv_rms_at_view(encoder, hidden, 0, inv_rms_buf, 0, k, eps);
+        encoder.set_compute_pipeline_state(&self.matvec_qkv_rmsnorm_inv_kquant_pipeline);
+        encoder.set_buffer(0, Some(hidden), 0);
+        encoder.set_buffer(1, Some(&norm_weight.buffer), norm_weight.offset);
+        encoder.set_buffer(2, Some(inv_rms_buf), 0);
+        encoder.set_buffer(3, Some(&q_weight.buffer), q_weight.offset);
+        encoder.set_buffer(4, Some(&k_weight.buffer), k_weight.offset);
+        encoder.set_buffer(5, Some(&v_weight.buffer), v_weight.offset);
+        encoder.set_buffer(6, Some(q_out), 0);
+        encoder.set_buffer(7, Some(k_out), 0);
+        encoder.set_buffer(8, Some(v_out), 0);
+        encoder.set_bytes(9, 4, &m_q as *const u32 as *const _);
+        encoder.set_bytes(10, 4, &m_kv as *const u32 as *const _);
+        encoder.set_bytes(11, 4, &k as *const u32 as *const _);
+        let q_fmt = q_weight.format as u32;
+        let k_fmt = k_weight.format as u32;
+        let v_fmt = v_weight.format as u32;
+        encoder.set_bytes(12, 4, &q_fmt as *const u32 as *const _);
+        encoder.set_bytes(13, 4, &k_fmt as *const u32 as *const _);
+        encoder.set_bytes(14, 4, &v_fmt as *const u32 as *const _);
+        let (tg_x, tw, nsg) = crate::ggml_gemv::kquant_fused_qkv_dispatch(m_q, m_kv, true);
+        encoder.dispatch_thread_groups(
+            metal::MTLSize::new(tg_x, 1, 1),
+            metal::MTLSize::new(tw, nsg, 1),
+        );
     }
 
     /// Fused gate+up Q4 matvec + GeLU(gate)*up → single output (MLP decode).
