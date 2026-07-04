@@ -5033,7 +5033,7 @@ impl Gemma4GpuModel {
             .get(layer_idx)
             .ok_or_else(|| format!("invalid layer index {}", layer_idx))?;
         let hidden_size = self.config.hidden_size;
-        let intermediate_size = self.config.max_intermediate_size();
+        let intermediate_size = layer.intermediate_size;
         let num_heads = self.config.num_attention_heads;
         let num_kv_heads = self.config.num_key_value_heads;
         let num_kv_groups = (num_heads / num_kv_heads) as u32;
@@ -5427,7 +5427,7 @@ impl Gemma4GpuModel {
             .get(layer_idx)
             .ok_or_else(|| format!("invalid layer index {}", layer_idx))?;
         let hidden_size = self.config.hidden_size;
-        let intermediate_size = self.config.max_intermediate_size();
+        let intermediate_size = layer.intermediate_size;
         let num_heads = self.config.num_attention_heads;
         let num_kv_heads = self.config.num_key_value_heads;
         let num_kv_groups = (num_heads / num_kv_heads) as u32;
@@ -5853,7 +5853,7 @@ impl Gemma4GpuModel {
                 .layers
                 .get(layer_idx)
                 .ok_or_else(|| format!("invalid layer index {}", layer_idx))?;
-            let intermediate_size = self.config.max_intermediate_size();
+            let intermediate_size = layer.intermediate_size;
             let num_heads = self.config.num_attention_heads;
             let num_kv_heads = self.config.num_key_value_heads;
             let num_kv_groups = (num_heads / num_kv_heads) as u32;
