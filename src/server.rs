@@ -165,11 +165,16 @@ fn response_model(req: &ChatCompletionRequest) -> &str {
     req.model.as_deref().unwrap_or("gemma-4-e4b-q4")
 }
 
-fn assistant_message_out(text: String, tool_calls: Vec<ToolCall>) -> AssistantMessageOut {
+fn assistant_message_out(
+    text: String,
+    tool_calls: Vec<ToolCall>,
+    split_mode: ChannelSplitMode,
+) -> AssistantMessageOut {
     let (reasoning, mut content) = if !tool_calls.is_empty() {
         split_tool_generation_output(&text)
     } else {
-        split_reasoning_and_content(&text)
+        let (reasoning, content) = split_reasoning_and_content_with_mode(&text, split_mode);
+        finalize_reasoning_content_split(reasoning, content, &text, split_mode)
     };
     strip_native_tool_calls(&mut content);
     let mut reasoning_content = if reasoning.is_empty() {
@@ -177,10 +182,6 @@ fn assistant_message_out(text: String, tool_calls: Vec<ToolCall>) -> AssistantMe
     } else {
         Some(reasoning.clone())
     };
-    if tool_calls.is_empty() && content.is_empty() && !reasoning.is_empty() {
-        content = reasoning;
-        reasoning_content = None;
-    }
 
     if !tool_calls.is_empty() {
         AssistantMessageOut {
@@ -204,59 +205,272 @@ fn strip_thinking_content(text: &mut String) {
     *text = content;
 }
 
-fn split_reasoning_and_content(text: &str) -> (String, String) {
-    if let Some(start) = text.find(CHANNEL_START) {
-        let after_start = &text[start + CHANNEL_START.len()..];
-        if let Some(end_rel) = after_start.find(CHANNEL_END) {
-            let channel_body = &after_start[..end_rel];
-            let mut tail = after_start[end_rel + CHANNEL_END.len()..].to_string();
-            if let Some(newline) = channel_body.find('\n') {
-                let channel_name = channel_body[..newline].trim();
-                let channel_text = channel_body[newline + 1..].trim().to_string();
-                if channel_name == "final" {
-                    trim_stop_sequences(&mut tail, None);
-                    let mut content = channel_text;
-                    if !tail.is_empty() {
-                        if !content.is_empty() {
-                            content.push('\n');
-                        }
-                        content.push_str(&tail);
+#[derive(Clone, Copy, Default)]
+struct ChannelSplitMode {
+    /// Plain text with no channel markup is reasoning (tool-awaiting / primed-thought turn).
+    plain_text_as_reasoning: bool,
+}
+
+fn has_channel_markup(text: &str) -> bool {
+    text.contains(CHANNEL_START) || text.contains(CHANNEL_END)
+}
+
+fn parse_named_channel_body(body: &str) -> (String, String) {
+    if let Some(newline) = body.find('\n') {
+        (
+            body[..newline].trim().to_string(),
+            body[newline + 1..].trim().to_string(),
+        )
+    } else {
+        (body.trim().to_string(), String::new())
+    }
+}
+
+fn join_visible_parts(parts: &[String]) -> String {
+    parts
+        .iter()
+        .map(String::as_str)
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Split only when `<|channel>final` is present. Standalone `<channel|>` closes a
+/// thought segment but does not start the visible answer; text after an explicit
+/// `<|channel>thought` block is treated as content.
+fn split_channel_markup(text: &str) -> (String, String) {
+    let mut reasoning_parts: Vec<String> = Vec::new();
+    let mut content_parts: Vec<String> = Vec::new();
+    let mut rest = text;
+    let mut after_explicit_thought = false;
+
+    loop {
+        if let Some(start) = rest.find(CHANNEL_START) {
+            if start > 0 {
+                let segment = rest[..start].trim();
+                if !segment.is_empty() {
+                    if after_explicit_thought {
+                        content_parts.push(segment.to_string());
+                        after_explicit_thought = false;
+                    } else {
+                        reasoning_parts.push(segment.to_string());
                     }
-                    trim_stop_sequences(&mut content, None);
-                    return (String::new(), content);
-                }
-                if channel_name == "thought" {
-                    trim_stop_sequences(&mut tail, None);
-                    return (channel_text, tail);
                 }
             }
-            let mut reasoning = channel_body
-                .trim_start_matches("thought")
-                .trim_start_matches('\n')
-                .to_string();
-            trim_stop_sequences(&mut reasoning, None);
-            trim_stop_sequences(&mut tail, None);
-            return (reasoning, tail);
+            rest = &rest[start + CHANNEL_START.len()..];
+            if let Some(end) = rest.find(CHANNEL_END) {
+                let body = &rest[..end];
+                rest = &rest[end + CHANNEL_END.len()..];
+                let (name, body_text) = parse_named_channel_body(body);
+                match name.as_str() {
+                    "final" => {
+                        after_explicit_thought = false;
+                        if !body_text.is_empty() {
+                            content_parts.push(body_text);
+                        }
+                    }
+                    "thought" => {
+                        after_explicit_thought = true;
+                        if !body_text.is_empty() {
+                            reasoning_parts.push(body_text);
+                        }
+                    }
+                    _ => {
+                        after_explicit_thought = false;
+                        if !body_text.is_empty() {
+                            reasoning_parts.push(body_text);
+                        }
+                    }
+                }
+                continue;
+            }
+
+            let (name, body_text) = parse_named_channel_body(rest);
+            match name.as_str() {
+                "final" => {
+                    if !body_text.is_empty() {
+                        content_parts.push(body_text);
+                    }
+                }
+                "thought" => {
+                    if !body_text.is_empty() {
+                        reasoning_parts.push(body_text);
+                    }
+                }
+                _ => {
+                    if !body_text.is_empty() {
+                        reasoning_parts.push(body_text);
+                    }
+                }
+            }
+            break;
         }
-        if after_start.starts_with("final") {
-            let mut content = after_start
-                .trim_start_matches("final")
-                .trim_start_matches('\n')
-                .to_string();
-            trim_stop_sequences(&mut content, None);
-            return (String::new(), content);
+
+        if let Some(end) = rest.find(CHANNEL_END) {
+            let segment = rest[..end].trim();
+            if !segment.is_empty() {
+                reasoning_parts.push(segment.to_string());
+            }
+            rest = &rest[end + CHANNEL_END.len()..];
+            after_explicit_thought = false;
+            continue;
         }
-        let mut reasoning = after_start
-            .trim_start_matches("thought")
-            .trim_start_matches('\n')
-            .to_string();
-        trim_stop_sequences(&mut reasoning, None);
-        return (reasoning, String::new());
+
+        let segment = rest.trim();
+        if !segment.is_empty() {
+            if after_explicit_thought {
+                content_parts.push(segment.to_string());
+            } else if content_parts.is_empty() {
+                reasoning_parts.push(segment.to_string());
+            } else {
+                content_parts.push(segment.to_string());
+            }
+        }
+        break;
     }
 
-    let mut content = text.to_string();
+    let mut reasoning = join_visible_parts(&reasoning_parts);
+    let mut content = join_visible_parts(&content_parts);
+    trim_stop_sequences(&mut reasoning, None);
     trim_stop_sequences(&mut content, None);
-    (String::new(), content)
+    (reasoning, content)
+}
+
+fn find_implicit_answer_start(text: &str) -> Option<usize> {
+    const MARKERS: &[&str] = &[
+        "\n\nThis is ",
+        "\n\nHere is ",
+        "\n\nThe film ",
+        "\n\n The film ",
+        "\n\nThe movie ",
+        "\n\n The movie ",
+        "\n\nOnce Upon ",
+        "coherent summary.\n\n",
+        "concise summary.\n\n",
+        ".\nThis is ",
+        ".\nHere is ",
+        ".\nThe film ",
+        ".\nThe movie ",
+        "\nThis is ",
+        "\nHere is ",
+        "\nThe film ",
+        "\nThe movie ",
+        ".This is ",
+        ".Here is ",
+    ];
+    let marker_start = MARKERS
+        .iter()
+        .filter_map(|marker| {
+            text.rfind(marker).map(|idx| {
+                if let Some(after_newline) = marker.rfind('\n') {
+                    idx + after_newline + 1
+                } else {
+                    idx + 1
+                }
+            })
+        })
+        .max();
+    match (marker_start, find_paragraph_answer_start(text)) {
+        (Some(a), Some(b)) => Some(a.max(b)),
+        (Some(a), None) => Some(a),
+        (None, Some(b)) => Some(b),
+        (None, None) => None,
+    }
+}
+
+/// After a blank line, treat non-planning paragraphs as the deliverable answer.
+fn find_paragraph_answer_start(text: &str) -> Option<usize> {
+    const PLANNING_PREFIXES: &[&str] = &[
+        "User ",
+        "The user ",
+        "I need ",
+        "I will ",
+        "I should ",
+        "Let me ",
+        "**Analysis",
+        "Analysis",
+        "Okay",
+        "Ok,",
+        "First,",
+        "Step ",
+    ];
+
+    let mut best: Option<usize> = None;
+    let bytes = text.as_bytes();
+    let mut i = 0;
+    while i + 1 < bytes.len() {
+        if bytes[i] == b'\n' && bytes[i + 1] == b'\n' {
+            let mut para_start = i + 2;
+            while para_start < bytes.len() && bytes[para_start] == b' ' {
+                para_start += 1;
+            }
+            if para_start < bytes.len() {
+                let rest = text[para_start..].trim_start();
+                if !rest.is_empty() {
+                    let is_planning = PLANNING_PREFIXES
+                        .iter()
+                        .any(|prefix| rest.starts_with(prefix));
+                    if !is_planning && rest.len() >= 15 {
+                        let actual_start = para_start + (text[para_start..].len() - rest.len());
+                        best = Some(best.map_or(actual_start, |b| b.max(actual_start)));
+                    }
+                }
+            }
+            i = para_start.max(i + 2);
+        } else {
+            i += 1;
+        }
+    }
+    best
+}
+
+fn finalize_reasoning_content_split(
+    reasoning: String,
+    content: String,
+    raw: &str,
+    mode: ChannelSplitMode,
+) -> (String, String) {
+    if !content.is_empty() {
+        return (reasoning, content);
+    }
+    if !has_channel_markup(raw) && !mode.plain_text_as_reasoning {
+        return (String::new(), reasoning);
+    }
+    apply_implicit_answer_split(reasoning, content)
+}
+
+fn apply_implicit_answer_split(reasoning: String, content: String) -> (String, String) {
+    if !content.is_empty() {
+        return (reasoning, content);
+    }
+    if let Some(idx) = find_implicit_answer_start(&reasoning) {
+        let answer = reasoning[idx..].trim().to_string();
+        let kept = reasoning[..idx].trim().to_string();
+        if !answer.is_empty() {
+            return (kept, answer);
+        }
+    }
+    (reasoning, content)
+}
+
+fn split_reasoning_and_content_with_mode(
+    text: &str,
+    mode: ChannelSplitMode,
+) -> (String, String) {
+    if !has_channel_markup(text) {
+        let mut plain = text.to_string();
+        trim_stop_sequences(&mut plain, None);
+        if mode.plain_text_as_reasoning {
+            return apply_implicit_answer_split(plain, String::new());
+        }
+        return (String::new(), plain);
+    }
+    let (reasoning, content) = split_channel_markup(text);
+    apply_implicit_answer_split(reasoning, content)
+}
+
+fn split_reasoning_and_content(text: &str) -> (String, String) {
+    split_reasoning_and_content_with_mode(text, ChannelSplitMode::default())
 }
 
 /// When tools are enabled, model output before a tool call is reasoning (even if the
@@ -274,12 +488,37 @@ fn split_tool_generation_output(text: &str) -> (String, String) {
         }
         return (String::new(), String::new());
     }
-    if text.contains(CHANNEL_START) {
-        return split_reasoning_and_content(text);
+    if text.contains(CHANNEL_START) || text.contains(CHANNEL_END) {
+        return split_reasoning_and_content_with_mode(
+            text,
+            ChannelSplitMode {
+                plain_text_as_reasoning: true,
+            },
+        );
     }
     let mut reasoning = text.to_string();
     trim_stop_sequences(&mut reasoning, None);
     (reasoning, String::new())
+}
+
+/// During streaming on a tool-awaiting turn, use channel tags for reasoning/content
+/// when the model emits them. Fall back to tool-style split only for plain pre-tool
+/// preamble or while a native tool call is being streamed.
+fn use_tool_generation_stream_split(
+    visible_text: &str,
+    in_tool_call: bool,
+    tool_generation_mode: bool,
+) -> bool {
+    if in_tool_call {
+        return true;
+    }
+    if !tool_generation_mode {
+        return false;
+    }
+    if visible_text.contains(CHANNEL_START) || visible_text.contains(CHANNEL_END) {
+        return false;
+    }
+    true
 }
 
 fn compute_stream_deltas(
@@ -287,11 +526,12 @@ fn compute_stream_deltas(
     emitted_reasoning_len: usize,
     emitted_content_len: usize,
     for_tools: bool,
+    split_mode: ChannelSplitMode,
 ) -> (String, String, usize, usize) {
     let (reasoning, content) = if for_tools {
         split_tool_generation_output(visible_text)
     } else {
-        split_reasoning_and_content(visible_text)
+        split_reasoning_and_content_with_mode(visible_text, split_mode)
     };
     if for_tools {
         let new_reasoning = if reasoning.len() > emitted_reasoning_len {
@@ -306,14 +546,26 @@ fn compute_stream_deltas(
         };
         (new_reasoning, new_content, reasoning.len(), content.len())
     } else {
-        // Answer turn: stream thought-channel text as `content` when pi/model skip final channel.
-        let answer = if content.is_empty() { reasoning } else { content };
-        let new_content = if answer.len() > emitted_content_len {
-            answer[emitted_content_len..].to_string()
+        let new_reasoning = if reasoning.len() > emitted_reasoning_len {
+            reasoning[emitted_reasoning_len..].to_string()
         } else {
             String::new()
         };
-        (String::new(), new_content, 0, answer.len())
+        let new_content = if content.len() > emitted_content_len {
+            content[emitted_content_len..].to_string()
+        } else {
+            String::new()
+        };
+        // When content shrinks (reclassified from content to reasoning
+        // because the model just emitted a standalone `<channel|>`
+        // delimiter), suppress the duplicate re-emission — the text was
+        // already sent as content in earlier deltas.
+        let new_reasoning = if content.len() < emitted_content_len {
+            String::new()
+        } else {
+            new_reasoning
+        };
+        (new_reasoning, new_content, reasoning.len(), content.len())
     }
 }
 
@@ -829,6 +1081,7 @@ impl IncrementalToolCallEmitter {
             } else {
                 Some(allowed_tools)
             },
+            true,
         );
         let Some(tc) = parsed.first() else {
             return chunks;
@@ -1066,10 +1319,27 @@ fn should_require_tool_call(
     matches!(messages.last().map(|m| m.role.as_str()), Some("user"))
 }
 
-/// Pi inlines `@file` references as `<file name="path">...</file>` in the user message.
-fn user_message_has_inlined_pi_file(messages: &[Message]) -> bool {
-    last_user_message_content(messages)
-        .is_some_and(|content| content.contains("<file name="))
+/// True when the conversation still needs a tool call before an answer turn
+/// (user asked, no tool result yet). False once a tool message follows the request,
+/// even if the client appended a trailing empty user continuation message.
+fn awaits_tool_call(messages: &[Message]) -> bool {
+    let mut seen_tool = false;
+    for msg in messages.iter().rev() {
+        match msg.role.as_str() {
+            "tool" => seen_tool = true,
+            "user" => {
+                if msg.content.as_ref().is_some_and(|c| c.trim().is_empty()) {
+                    continue;
+                }
+                return !seen_tool;
+            }
+            "assistant" if msg.tool_calls.as_ref().is_some_and(|t| !t.is_empty()) => {
+                return !seen_tool;
+            }
+            _ => {}
+        }
+    }
+    false
 }
 
 fn should_force_tool_call(
@@ -1077,8 +1347,7 @@ fn should_force_tool_call(
     tools: Option<&[Tool]>,
     tool_choice: Option<&serde_json::Value>,
 ) -> bool {
-    should_require_tool_call(messages, tools, tool_choice)
-        && !user_message_has_inlined_pi_file(messages)
+    should_require_tool_call(messages, tools, tool_choice) && awaits_tool_call(messages)
 }
 
 fn last_user_message_content(messages: &[Message]) -> Option<&str> {
@@ -1157,25 +1426,12 @@ fn infer_read_path_from_user(messages: &[Message]) -> Option<String> {
     extract_at_file_path(content)
 }
 
-fn user_wants_summary(messages: &[Message]) -> bool {
-    last_user_message_content(messages).is_some_and(|content| {
-        let lower = content.to_ascii_lowercase();
-        lower.contains("summar") || lower.contains("tl;dr") || lower.contains("tldr")
-    })
-}
-
 fn min_decode_tokens_for_request(
-    messages: &[Message],
-    tools: Option<&[Tool]>,
-    tool_choice: Option<&serde_json::Value>,
+    _messages: &[Message],
+    _tools: Option<&[Tool]>,
+    _tool_choice: Option<&serde_json::Value>,
 ) -> usize {
-    if should_force_tool_call(messages, tools, tool_choice) {
-        0
-    } else if user_wants_summary(messages) {
-        128
-    } else {
-        0
-    }
+    0
 }
 
 fn user_message_implies_read(messages: &[Message]) -> bool {
@@ -1229,9 +1485,6 @@ fn infer_tool_call_from_context(
     }
 
     if names.iter().any(|n| n == "read") && user_message_implies_read(messages) {
-        if user_message_has_inlined_pi_file(messages) {
-            return None;
-        }
         if let Some(path) = infer_read_path_from_user(messages) {
             return Some(make_read_tool_call(&path));
         }
@@ -1248,7 +1501,8 @@ fn resolve_tool_calls(
 ) -> Vec<ToolCall> {
     let allowed_names = tools.map(allowed_tool_names);
     let allowed_ref = allowed_names.as_deref();
-    let calls = parse_tool_calls(text, allowed_ref);
+    let infer_plain_read = awaits_tool_call(messages);
+    let calls = parse_tool_calls(text, allowed_ref, infer_plain_read);
     if !calls.is_empty() {
         return calls;
     }
@@ -1561,34 +1815,69 @@ const NATIVE_TOOL_CALL_SUFFIX: &str = "<tool_call|>";
 const NATIVE_TOOL_RESPONSE_PREFIX: &str = "<|tool_response>response:";
 const NATIVE_TOOL_RESPONSE_SUFFIX: &str = "<tool_response|>";
 const SYSTEM_FINGERPRINT: &str = "local-7f3a2c1b";
-/// Gemma4 jinja primes the model turn with an empty thought channel when thinking is off.
+/// Gemma4 jinja primes every model generation with an empty thought channel when
+/// thinking is off; the model then emits optional thought text and/or final content.
 const EMPTY_THOUGHT_PREFIX: &str = "<|channel>thought\n<channel|>";
-/// Direct answer generation after tool results or when file content is already in context.
-const FINAL_CHANNEL_PREFIX: &str = "<|channel>final\n";
 
 fn generation_priming_suffix(
-    messages: &[Message],
-    tools: Option<&[Tool]>,
-    tool_choice: Option<&serde_json::Value>,
+    _messages: &[Message],
+    _tools: Option<&[Tool]>,
+    _tool_choice: Option<&serde_json::Value>,
 ) -> &'static str {
-    if should_force_tool_call(messages, tools, tool_choice) {
-        EMPTY_THOUGHT_PREFIX
-    } else {
-        FINAL_CHANNEL_PREFIX
-    }
+    EMPTY_THOUGHT_PREFIX
 }
 
 const BUILT_IN_OUTPUT_TRIM_SEQUENCES: &[&str] = &[
     TURN_END,
     TURN_START,
-    CHANNEL_START,
-    CHANNEL_END,
     NATIVE_TOOL_CALL_SUFFIX,
     "<end_of_turn>",
     "<eos>",
     "<start_of_turn>",
     "</start_of_turn>",
 ];
+
+/// Strips channel markup from text so the visible content flows correctly in
+/// SSE streaming. Handles two cases:
+///   1. Paired `<|channel>...<channel|>` blocks (model's internal deliberation).
+///   2. Standalone `<channel|>` tags the model emits as a terminator.
+fn strip_channel_blocks(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    loop {
+        // First handle any paired block.
+        match rest.find(CHANNEL_START) {
+            Some(start) => {
+                out.push_str(&rest[..start]);
+                let after_start = &rest[start + CHANNEL_START.len()..];
+                match after_start.find(CHANNEL_END) {
+                    Some(end) => {
+                        rest = &after_start[end + CHANNEL_END.len()..];
+                        continue;
+                    }
+                    None => {
+                        // Unclosed channel opening — discard it and everything after.
+                        break;
+                    }
+                }
+            }
+            None => {}
+        }
+        // No (more) opening tag. Strip any standalone closing tag.
+        match rest.find(CHANNEL_END) {
+            Some(pos) => {
+                out.push_str(&rest[..pos]);
+                rest = &rest[pos + CHANNEL_END.len()..];
+                // Loop to handle another closing tag that may follow.
+            }
+            None => {
+                out.push_str(rest);
+                break;
+            }
+        }
+    }
+    out
+}
 
 // Only these end the underlying sampler loop. Channel / tool markup tokens are
 // normal model output and must not cancel generation mid-turn.
@@ -1682,27 +1971,24 @@ fn apply_chat_template(
     }
 
     let has_tools = tools.map(|t| !t.is_empty()).unwrap_or(false);
-    if has_tools || !system_parts.is_empty() {
+    let include_tool_declarations = has_tools && awaits_tool_call(messages);
+    if include_tool_declarations || !system_parts.is_empty() {
         prompt.push_str(TURN_START);
         prompt.push_str("system\n");
+        prompt.push_str("<|think|>\n");
         if !system_parts.is_empty() {
             prompt.push_str(&system_parts.join("\n\n"));
-            if has_tools {
+            if include_tool_declarations {
                 prompt.push('\n');
             }
         }
         if let Some(tools) = tools {
-            if !tools.is_empty() {
+            if include_tool_declarations && !tools.is_empty() {
                 prompt.push_str(&render_gemma4_tool_declarations(tools));
             }
         }
         if should_force_tool_call(messages, tools, tool_choice) {
             prompt.push_str("\nYou must call a tool to answer this request.");
-        } else if user_wants_summary(messages) {
-            prompt.push_str(
-                "\nWhen summarizing, write a clear multi-paragraph summary covering the main topics, \
-structure, and key details of the document.",
-            );
         }
         prompt.push_str(TURN_END);
         prompt.push('\n');
@@ -1782,11 +2068,6 @@ structure, and key details of the document.",
     }
 
     if ends_in_open_model_turn {
-        if user_wants_summary(messages) && !should_force_tool_call(messages, tools, tool_choice) {
-            prompt.push_str(
-                "Write a thorough summary of the file content above covering main topics and key details.\n",
-            );
-        }
         prompt.push_str(generation_priming_suffix(messages, tools, tool_choice));
     } else {
         prompt.push_str(TURN_START);
@@ -1800,7 +2081,11 @@ structure, and key details of the document.",
 /// Parse tool calls emitted by the model. Supports the prompted
 /// ```` ```tool_call ```` fenced-block format as well as
 /// `<tool_call>...</tool_call>` tags, with one JSON object per block.
-fn parse_tool_calls(text: &str, allowed_names: Option<&[String]>) -> Vec<ToolCall> {
+fn parse_tool_calls(
+    text: &str,
+    allowed_names: Option<&[String]>,
+    infer_plain_read: bool,
+) -> Vec<ToolCall> {
     let mut calls = Vec::new();
 
     fn push_from_json(calls: &mut Vec<ToolCall>, json_str: &str) {
@@ -1903,7 +2188,7 @@ fn parse_tool_calls(text: &str, allowed_names: Option<&[String]>) -> Vec<ToolCal
         }
     }
 
-    if calls.is_empty() {
+    if calls.is_empty() && infer_plain_read {
         if let Some(call) = parse_plain_read_invocation(text) {
             calls.push(call);
         }
@@ -2334,9 +2619,7 @@ fn fit_messages_to_context(
                 if content.len() < 512 {
                     return None;
                 }
-                if msg.role == "tool"
-                    || (msg.role == "user" && content.contains("<file name="))
-                {
+                if msg.role == "tool" {
                     Some((index, content.len()))
                 } else {
                     None
@@ -2492,7 +2775,11 @@ async fn chat_completions_sync(
         Vec::new()
     };
     if !inferred_tool_calls.is_empty() {
-        let message = assistant_message_out(String::new(), inferred_tool_calls.clone());
+        let message = assistant_message_out(
+            String::new(),
+            inferred_tool_calls.clone(),
+            ChannelSplitMode::default(),
+        );
         return Ok(Json(ChatCompletionResponse {
             id: format!("chatcmpl-{}", uuid::Uuid::new_v4()),
             object: "chat.completion".to_string(),
@@ -2563,7 +2850,10 @@ async fn chat_completions_sync(
         finish_reason = "tool_calls".to_string();
     }
 
-    let message = assistant_message_out(text, tool_calls);
+    let split_mode = ChannelSplitMode {
+        plain_text_as_reasoning: awaits_tool_call(&req.messages),
+    };
+    let message = assistant_message_out(text, tool_calls, split_mode);
 
     let response = ChatCompletionResponse {
         id: format!("chatcmpl-{}", uuid::Uuid::new_v4()),
@@ -2688,23 +2978,16 @@ async fn chat_completions_stream(
                 tools_for_resolve.as_deref(),
                 tool_choice_for_resolve.as_ref(),
             );
-        let role_chunk_data = if has_tools {
-            stream_chunk_json(
-                &chat_id,
-                created,
-                &model_name,
-                serde_json::json!({"role": "assistant", "content": null}),
-                None,
-            )
-        } else {
-            stream_chunk_json(
-                &chat_id,
-                created,
-                &model_name,
-                serde_json::json!({"role": "assistant"}),
-                None,
-            )
+        let split_mode = ChannelSplitMode {
+            plain_text_as_reasoning: awaits_tool_call(&messages_for_resolve),
         };
+        let role_chunk_data = stream_chunk_json(
+            &chat_id,
+            created,
+            &model_name,
+            serde_json::json!({"role": "assistant", "content": null}),
+            None,
+        );
         let _ = tx
             .send(Ok(Event::default().data(role_chunk_data)))
             .await;
@@ -2741,20 +3024,29 @@ async fn chat_completions_stream(
                         in_tool_call = true;
                         saw_tool_call_marker = true;
                     }
-                    let stopped = trim_stream_safe_text(
+                    let mut stopped = trim_stream_safe_text(
                         &mut visible_text,
                         request_stop.as_deref(),
                         in_tool_call,
                     );
 
-                    let (new_reasoning, new_content, new_er, new_ec) = compute_stream_deltas(
+                    let use_tool_split = use_tool_generation_stream_split(
                         &visible_text,
-                        emitted_reasoning_len,
-                        emitted_content_len,
+                        in_tool_call,
                         tool_generation_mode,
                     );
-                    emitted_reasoning_len = new_er;
-                    emitted_content_len = new_ec;
+                    let (new_reasoning, new_content, new_er, new_ec) = {
+                        let (nr, nc, er, ec) = compute_stream_deltas(
+                            &visible_text,
+                            emitted_reasoning_len,
+                            emitted_content_len,
+                            use_tool_split,
+                            split_mode,
+                        );
+                        emitted_reasoning_len = er;
+                        emitted_content_len = ec;
+                        (nr, nc, er, ec)
+                    };
 
                     if !new_reasoning.is_empty() {
                         let chunk_data = stream_chunk_json(
@@ -2774,7 +3066,7 @@ async fn chat_completions_stream(
                         }
                     }
 
-                    if !new_content.is_empty() && !tool_generation_mode {
+                    if !new_content.is_empty() && !in_tool_call {
                         let chunk_data = stream_chunk_json(
                             &chat_id,
                             created,
@@ -2852,6 +3144,58 @@ async fn chat_completions_stream(
                 StreamEvent::Error { message } => {
                     finish_reason = format!("error: {}", message);
                     break;
+                }
+            }
+        }
+
+        // Promote any trailing answer text that only became visible at stream end.
+        if !in_tool_call && !decoded_text.is_empty() {
+            let mut flush_text = decoded_text.clone();
+            trim_stop_sequences(&mut flush_text, request_stop.as_deref());
+            if !flush_text.is_empty() {
+                let use_tool_split = use_tool_generation_stream_split(
+                    &flush_text,
+                    in_tool_call,
+                    tool_generation_mode,
+                );
+                let (mut reasoning, mut content) = if use_tool_split {
+                    split_tool_generation_output(&flush_text)
+                } else {
+                    split_reasoning_and_content_with_mode(&flush_text, split_mode)
+                };
+                (reasoning, content) =
+                    finalize_reasoning_content_split(reasoning, content, &flush_text, split_mode);
+
+                let new_reasoning = if reasoning.len() > emitted_reasoning_len {
+                    reasoning[emitted_reasoning_len..].to_string()
+                } else {
+                    String::new()
+                };
+                let new_content = if content.len() > emitted_content_len {
+                    content[emitted_content_len..].to_string()
+                } else {
+                    String::new()
+                };
+
+                if !new_reasoning.is_empty() {
+                    let chunk_data = stream_chunk_json(
+                        &chat_id,
+                        created,
+                        &model_name,
+                        serde_json::json!({"reasoning_content": new_reasoning}),
+                        None,
+                    );
+                    let _ = tx.send(Ok(Event::default().data(chunk_data))).await;
+                }
+                if !new_content.is_empty() {
+                    let chunk_data = stream_chunk_json(
+                        &chat_id,
+                        created,
+                        &model_name,
+                        serde_json::json!({"content": new_content}),
+                        None,
+                    );
+                    let _ = tx.send(Ok(Event::default().data(chunk_data))).await;
                 }
             }
         }
@@ -3115,24 +3459,24 @@ mod tests {
     #[test]
     fn parse_tool_calls_handles_fenced_and_tagged_blocks() {
         let fenced = "Sure!\n```tool_call\n{\"name\": \"read\", \"arguments\": {\"path\": \"a.txt\"}}\n```";
-        let calls = parse_tool_calls(fenced, None);
+        let calls = parse_tool_calls(fenced, None, true);
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].function.name, "read");
         assert_eq!(calls[0].call_type, "function");
         assert_eq!(calls[0].function.arguments, "{\"path\":\"a.txt\"}");
 
         let tagged = "<tool_call>{\"name\": \"bash\", \"arguments\": {\"command\": \"ls\"}}</tool_call>";
-        let calls = parse_tool_calls(tagged, None);
+        let calls = parse_tool_calls(tagged, None, true);
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].function.name, "bash");
 
         let multi = "```tool_call\n{\"name\": \"a\", \"arguments\": {}}\n```\n```tool_call\n{\"name\": \"b\", \"arguments\": {}}\n```";
-        assert_eq!(parse_tool_calls(multi, None).len(), 2);
+        assert_eq!(parse_tool_calls(multi, None, true).len(), 2);
 
-        assert!(parse_tool_calls("just a normal answer", None).is_empty());
+        assert!(parse_tool_calls("just a normal answer", None, true).is_empty());
 
         let bare = r#"{"name": "read_file", "arguments": {"path": "package.json"}}"#;
-        let calls = parse_tool_calls(bare, None);
+        let calls = parse_tool_calls(bare, None, true);
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].function.name, "read_file");
     }
@@ -3163,6 +3507,7 @@ mod tests {
                     arguments: "{}".to_string(),
                 },
             }],
+            ChannelSplitMode::default(),
         );
         let json = serde_json::to_value(message).unwrap();
         assert!(json.get("content").unwrap().is_null());
@@ -3194,7 +3539,7 @@ mod tests {
 
         let prompt = apply_chat_template(&messages, Some(&tools), None);
         assert!(prompt.contains("<|turn>system\n"));
-        assert!(!prompt.contains("<|think|>"));
+        assert!(prompt.contains("<|think|>"));
         assert!(prompt.contains("be helpful"));
         assert!(prompt.contains("<|tool>declaration:read"));
         assert!(prompt.contains("<|turn>user\nhi<turn|>"));
@@ -3225,7 +3570,7 @@ mod tests {
 
         let prompt = apply_chat_template(&messages, Some(&tools), None);
         assert!(prompt.contains("<|turn>system\n"));
-        assert!(!prompt.contains("<|think|>"));
+        assert!(prompt.contains("<|think|>"));
         assert!(prompt.contains("<|tool>declaration:bash"));
         assert!(prompt.contains("<|turn>user\nlist files<turn|>"));
         assert!(prompt.ends_with("<|turn>model\n<|channel>thought\n<channel|>"));
@@ -3338,7 +3683,7 @@ mod tests {
     #[test]
     fn parse_plain_read_invocation_handles_read_line() {
         let text = "I will read the file.\nread Sports Highlights.md\n";
-        let calls = parse_tool_calls(text, Some(&["read".to_string()]));
+        let calls = parse_tool_calls(text, Some(&["read".to_string()]), true);
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].function.name, "read");
         assert_eq!(
@@ -3378,7 +3723,7 @@ mod tests {
     }
 
     #[test]
-    fn generation_priming_suffix_uses_final_channel_for_post_tool_answer() {
+    fn generation_priming_suffix_uses_empty_thought_for_post_tool_answer() {
         let messages = vec![
             Message {
                 role: "user".to_string(),
@@ -3416,21 +3761,114 @@ mod tests {
         }];
         assert_eq!(
             generation_priming_suffix(&messages, Some(&tools), None),
-            FINAL_CHANNEL_PREFIX
+            EMPTY_THOUGHT_PREFIX
         );
     }
 
     #[test]
-    fn infer_tool_calls_skips_read_when_pi_inlined_file_in_user_message() {
-        let messages = vec![Message {
-            role: "user".to_string(),
-            content: Some(
-                "<file name=\"/proj/Sports Highlights.md\">\n# Big doc\n\nLots of text.\n</file>\n\
-                 summarize @\"Sports Highlights.md\""
-                    .to_string(),
-            ),
-            ..Default::default()
-        }];
+    fn awaits_tool_call_false_after_read_tool_result() {
+        let messages = vec![
+            Message {
+                role: "user".to_string(),
+                content: Some("summarize @test.md".to_string()),
+                ..Default::default()
+            },
+            Message {
+                role: "assistant".to_string(),
+                content: None,
+                tool_calls: Some(vec![ToolCall {
+                    id: "call_1".to_string(),
+                    call_type: "function".to_string(),
+                    function: FunctionCall {
+                        name: "read".to_string(),
+                        arguments: r#"{"path":"test.md"}"#.to_string(),
+                    },
+                }]),
+                ..Default::default()
+            },
+            Message {
+                role: "tool".to_string(),
+                content: Some("# Title\n\nBody.".to_string()),
+                name: Some("read".to_string()),
+                tool_call_id: Some("call_1".to_string()),
+                ..Default::default()
+            },
+        ];
+        assert!(!awaits_tool_call(&messages));
+        assert!(!should_force_tool_call(&messages, Some(&[Tool {
+            tool_type: Some("function".to_string()),
+            function: FunctionDef {
+                name: "read".to_string(),
+                description: None,
+                parameters: None,
+            },
+        }]), None));
+    }
+
+    #[test]
+    fn awaits_tool_call_false_with_trailing_empty_user_after_tool() {
+        let messages = vec![
+            Message {
+                role: "user".to_string(),
+                content: Some("summarize @test.md".to_string()),
+                ..Default::default()
+            },
+            Message {
+                role: "assistant".to_string(),
+                content: None,
+                tool_calls: Some(vec![ToolCall {
+                    id: "call_1".to_string(),
+                    call_type: "function".to_string(),
+                    function: FunctionCall {
+                        name: "read".to_string(),
+                        arguments: r#"{"path":"test.md"}"#.to_string(),
+                    },
+                }]),
+                ..Default::default()
+            },
+            Message {
+                role: "tool".to_string(),
+                content: Some("file body".to_string()),
+                name: Some("read".to_string()),
+                ..Default::default()
+            },
+            Message {
+                role: "user".to_string(),
+                content: Some(String::new()),
+                ..Default::default()
+            },
+        ];
+        assert!(!awaits_tool_call(&messages));
+    }
+
+    #[test]
+    fn resolve_tool_calls_does_not_reinfer_read_on_answer_turn() {
+        let messages = vec![
+            Message {
+                role: "user".to_string(),
+                content: Some("summarize @test.md".to_string()),
+                ..Default::default()
+            },
+            Message {
+                role: "assistant".to_string(),
+                content: None,
+                tool_calls: Some(vec![ToolCall {
+                    id: "call_1".to_string(),
+                    call_type: "function".to_string(),
+                    function: FunctionCall {
+                        name: "read".to_string(),
+                        arguments: r#"{"path":"test.md"}"#.to_string(),
+                    },
+                }]),
+                ..Default::default()
+            },
+            Message {
+                role: "tool".to_string(),
+                content: Some("# Sports Highlights\n\nCatch-up to live.".to_string()),
+                name: Some("read".to_string()),
+                ..Default::default()
+            },
+        ];
         let tools = vec![Tool {
             tool_type: Some("function".to_string()),
             function: FunctionDef {
@@ -3439,25 +3877,154 @@ mod tests {
                 parameters: None,
             },
         }];
-        let calls =
-            infer_tool_calls_without_generation(&messages, Some(&tools), None);
+        let calls = resolve_tool_calls(
+            "read Sports Highlights — Catch Up to Live Highlights Design.md",
+            &messages,
+            Some(&tools),
+            None,
+        );
         assert!(calls.is_empty());
     }
 
     #[test]
-    fn compute_stream_deltas_streams_thought_as_content_on_answer_turn() {
+    fn apply_chat_template_omits_tool_declarations_on_post_tool_summarize() {
+        let messages = vec![
+            Message {
+                role: "user".to_string(),
+                content: Some("summarize @test.md".to_string()),
+                ..Default::default()
+            },
+            Message {
+                role: "assistant".to_string(),
+                content: None,
+                tool_calls: Some(vec![ToolCall {
+                    id: "call_1".to_string(),
+                    call_type: "function".to_string(),
+                    function: FunctionCall {
+                        name: "read".to_string(),
+                        arguments: r#"{"path":"test.md"}"#.to_string(),
+                    },
+                }]),
+                ..Default::default()
+            },
+            Message {
+                role: "tool".to_string(),
+                content: Some("# Title\n\nBody.".to_string()),
+                name: Some("read".to_string()),
+                tool_call_id: Some("call_1".to_string()),
+                ..Default::default()
+            },
+        ];
+        let tools = vec![Tool {
+            tool_type: Some("function".to_string()),
+            function: FunctionDef {
+                name: "read".to_string(),
+                description: Some("Read a file".to_string()),
+                parameters: None,
+            },
+        }];
+        let prompt = apply_chat_template(&messages, Some(&tools), None);
+        assert!(!prompt.contains("declaration:read"));
+        assert!(prompt.contains("# Title"));
+        assert!(prompt.ends_with(EMPTY_THOUGHT_PREFIX));
+    }
+
+    #[test]
+    fn compute_stream_deltas_streams_thought_as_reasoning_on_answer_turn() {
         let text = "<|channel>thought\nHere is the summary.<channel|>";
-        let (new_reasoning, new_content, _, _) = compute_stream_deltas(text, 0, 0, false);
-        assert!(new_reasoning.is_empty());
+        let (new_reasoning, new_content, _, _) =
+            compute_stream_deltas(text, 0, 0, false, ChannelSplitMode::default());
+        assert_eq!(new_reasoning, "Here is the summary.");
+        assert!(new_content.is_empty());
+    }
+
+    #[test]
+    fn compute_stream_deltas_keeps_post_channel_text_in_reasoning_until_final() {
+        let text = "Plan.<channel|>Still planning.";
+        let mode = ChannelSplitMode {
+            plain_text_as_reasoning: true,
+        };
+        let (new_reasoning, new_content, _, _) =
+            compute_stream_deltas(text, 0, 0, false, mode);
+        assert_eq!(new_reasoning, "Plan.\nStill planning.");
+        assert!(new_content.is_empty());
+    }
+
+    #[test]
+    fn split_reasoning_keeps_analysis_in_reasoning_after_standalone_channel_close() {
+        let text = "The user wants a summary.<channel|>The user provided details.\n\n**Analysis:**\n* bullet";
+        let (reasoning, content) = split_reasoning_and_content_with_mode(
+            text,
+            ChannelSplitMode {
+                plain_text_as_reasoning: true,
+            },
+        );
+        assert!(content.is_empty());
+        assert!(reasoning.contains("Analysis"));
+        assert!(reasoning.contains("The user provided"));
+    }
+
+    #[test]
+    fn split_reasoning_promotes_implicit_final_answer_after_channel_markup() {
+        let text = "Plan.<channel|>More plan.I will synthesize this into a concise summary.This is a description of the film.";
+        let (reasoning, content) = split_reasoning_and_content_with_mode(
+            text,
+            ChannelSplitMode {
+                plain_text_as_reasoning: true,
+            },
+        );
+        assert!(reasoning.contains("Plan."));
+        assert!(reasoning.contains("synthesize"));
+        assert_eq!(content, "This is a description of the film.");
+    }
+
+    #[test]
+    fn compute_stream_deltas_streams_final_channel_as_content_on_answer_turn() {
+        let text = "<|channel>thought\nPlanning the summary.<channel|><|channel>final\nHere is the summary.<channel|>";
+        let (new_reasoning, new_content, _, _) =
+            compute_stream_deltas(text, 0, 0, false, ChannelSplitMode::default());
+        assert_eq!(new_reasoning, "Planning the summary.");
         assert_eq!(new_content, "Here is the summary.");
     }
 
     #[test]
     fn compute_stream_deltas_streams_content_after_tool_result_turn() {
         let text = "Here is a concise summary of the document.";
-        let (new_reasoning, new_content, _, _) = compute_stream_deltas(text, 0, 0, false);
+        let (new_reasoning, new_content, _, _) =
+            compute_stream_deltas(text, 0, 0, false, ChannelSplitMode::default());
         assert!(new_reasoning.is_empty());
         assert_eq!(new_content, text);
+    }
+
+    #[test]
+    fn split_reasoning_promotes_plain_text_answer_without_channel_markup() {
+        let text = "Plan.\n\nI will synthesize this into a concise summary.\nThis is a description of the film.";
+        let (reasoning, content) = split_reasoning_and_content_with_mode(
+            text,
+            ChannelSplitMode {
+                plain_text_as_reasoning: true,
+            },
+        );
+        assert!(reasoning.contains("synthesize"));
+        assert_eq!(content, "This is a description of the film.");
+    }
+
+    #[test]
+    fn split_reasoning_promotes_movie_summary_after_planning_paragraph() {
+        let text = concat!(
+            "User wants me to summarize the provided text about the movie \"Once Upon a Time\".\n",
+            "The user has provided a descriptive text about the film.\n",
+            "I need to synthesize this information into a coherent summary.\n\n",
+            "The movie \"Once Upon a Time\" is described as a film set in 1969 Los Angeles.",
+        );
+        let (reasoning, content) = split_reasoning_and_content_with_mode(
+            text,
+            ChannelSplitMode {
+                plain_text_as_reasoning: true,
+            },
+        );
+        assert!(reasoning.contains("synthesize"));
+        assert!(content.starts_with("The movie \"Once Upon a Time\""));
     }
 
     #[test]
@@ -3469,10 +4036,48 @@ mod tests {
     }
 
     #[test]
+    fn use_tool_generation_stream_split_prefers_channel_tags_on_tool_turn() {
+        assert!(!use_tool_generation_stream_split(
+            "<|channel>final\nHere is the summary.",
+            false,
+            true,
+        ));
+        assert!(!use_tool_generation_stream_split(
+            "planning<channel|>answer",
+            false,
+            true,
+        ));
+        assert!(use_tool_generation_stream_split(
+            "plain preamble before tool call",
+            false,
+            true,
+        ));
+        assert!(use_tool_generation_stream_split(
+            "streaming tool args",
+            true,
+            true,
+        ));
+        assert!(!use_tool_generation_stream_split(
+            "plain answer text",
+            false,
+            false,
+        ));
+    }
+
+    #[test]
+    fn compute_stream_deltas_streams_content_on_tool_turn_with_final_channel() {
+        let text = "<|channel>final\nHere is the summary.";
+        let (new_reasoning, new_content, _, _) =
+            compute_stream_deltas(text, 0, 0, false, ChannelSplitMode::default());
+        assert!(new_reasoning.is_empty());
+        assert_eq!(new_content, "Here is the summary.");
+    }
+
+    #[test]
     fn parse_tool_calls_handles_tool_code_fallback_format() {
         let allowed = vec!["bash".to_string()];
         let text = "tool_code\nbash\nls\n";
-        let calls = parse_tool_calls(text, Some(&allowed));
+        let calls = parse_tool_calls(text, Some(&allowed), true);
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].function.name, "bash");
         assert_eq!(calls[0].function.arguments, r#"{"command":"ls -F"}"#);
@@ -3650,7 +4255,7 @@ think<channel|><|tool_call>call:bash{command:<|"|>ls -F<|"|>}"#;
 
         let prompt = apply_chat_template(&messages, Some(&tools), None);
         assert!(prompt.contains("<|tool_response>response:read{value:"));
-        assert!(prompt.ends_with(FINAL_CHANNEL_PREFIX));
+        assert!(prompt.ends_with(EMPTY_THOUGHT_PREFIX));
         assert!(!prompt.ends_with("<turn|>\n"));
     }
 
@@ -3703,14 +4308,14 @@ think<channel|><|tool_call>call:bash{command:<|"|>ls -F<|"|>}"#;
     #[test]
     fn parse_tool_calls_handles_gemma4_native_format() {
         let native = r#"<|tool_call>call:read{path:<|"|>package.json<|"|>}<tool_call|>"#;
-        let calls = parse_tool_calls(native, None);
+        let calls = parse_tool_calls(native, None, true);
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].function.name, "read");
         assert_eq!(calls[0].function.arguments, r#"{"path":"package.json"}"#);
 
         let without_suffix =
             r#"<|tool_call>call:bash{command:<|"|>ls -F<|"|>}"#;
-        let calls = parse_tool_calls(without_suffix, None);
+        let calls = parse_tool_calls(without_suffix, None, true);
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].function.name, "bash");
         assert_eq!(calls[0].function.arguments, r#"{"command":"ls -F"}"#);
@@ -3725,7 +4330,7 @@ think<channel|><|tool_call>call:bash{command:<|"|>ls -F<|"|>}"#;
             "write".to_string(),
         ];
         let native = r#"<|tool_call>call:list_files{}<tool_call|>"#;
-        let calls = parse_tool_calls(native, Some(&allowed));
+        let calls = parse_tool_calls(native, Some(&allowed), true);
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].function.name, "bash");
         assert_eq!(calls[0].function.arguments, r#"{"command":"ls -F"}"#);
@@ -3740,7 +4345,7 @@ think<channel|><|tool_call>call:bash{command:<|"|>ls -F<|"|>}"#;
             "write".to_string(),
         ];
         let native = r#"<|tool_call>call:bash{}<tool_call|>"#;
-        let calls = parse_tool_calls(native, Some(&allowed));
+        let calls = parse_tool_calls(native, Some(&allowed), true);
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].function.name, "bash");
         assert_eq!(calls[0].function.arguments, r#"{"command":"ls -F"}"#);
