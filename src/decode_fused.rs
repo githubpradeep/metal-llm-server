@@ -304,7 +304,7 @@ impl Gemma4GpuModel {
 
         if layer.has_kv
             && matches!(head_dim, 128 | 256 | 512)
-            && !gpu::attention_use_ggml_for_layer(true)
+            && !gpu::attention_use_ggml_for_layer_kv(true, effective_kv_seq)
         {
             self.ctx.encode_attention_full_fused_q4_0(
                 encoder,
@@ -336,7 +336,7 @@ impl Gemma4GpuModel {
             n += 1;
         } else if !layer.has_kv
             && matches!(head_dim, 128 | 256 | 512)
-            && !gpu::attention_use_ggml_for_layer(false)
+            && !gpu::attention_use_ggml_for_layer_kv(false, effective_kv_seq)
         {
             self.ctx.encode_attention_qknorm_rope_q4_0(
                 encoder,
@@ -444,7 +444,7 @@ impl Gemma4GpuModel {
                 }
             }
 
-            if gpu::attention_use_ggml_for_layer(layer.has_kv)
+            if gpu::attention_use_ggml_for_layer_kv(layer.has_kv, effective_kv_seq)
                 && matches!(head_dim, 128 | 256 | 512)
                 && self.ctx.use_flash_attention
             {

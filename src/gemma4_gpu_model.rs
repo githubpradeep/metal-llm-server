@@ -3376,7 +3376,7 @@ impl Gemma4GpuModel {
                 && matches!(self.kv_cache_type, KvCacheType::Q4_0)
                 && self.ctx.use_flash_attention
                 && crate::gpu::fused_q_attn_enabled()
-                && !crate::gpu::attention_use_ggml_for_layer(layer.has_kv)
+                && !crate::gpu::attention_use_ggml_for_layer_kv(layer.has_kv, kv_seq + 1)
                 && matches!(head_dim, 128 | 256 | 512);
             let use_fused_k_attn =
                 use_fused_q_attn && layer.has_kv && crate::gpu::fused_k_attn_enabled();
@@ -3675,7 +3675,7 @@ impl Gemma4GpuModel {
                             row_bytes,
                             eps,
                         );
-                    } else if crate::gpu::attention_use_ggml_for_layer(layer.has_kv)
+                    } else if crate::gpu::attention_use_ggml_for_layer_kv(layer.has_kv, effective_kv_seq)
                         && self.ctx.use_flash_attention
                     {
                         self.ctx.encode_attention_ggml_q4_0(
@@ -6649,7 +6649,7 @@ impl Gemma4GpuModel {
                     KvCacheType::Q4_0 => {
                         let groups_per_row = (head_dim / 32) as u32;
                         let row_bytes = groups_per_row * 18;
-                        if crate::gpu::attention_use_ggml_for_layer(layer.has_kv)
+                        if crate::gpu::attention_use_ggml_for_layer_kv(layer.has_kv, effective_kv_seq)
                         && self.ctx.use_flash_attention
                     {
                             self.ctx.encode_attention_ggml_q4_0_at(

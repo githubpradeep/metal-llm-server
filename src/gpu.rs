@@ -174,7 +174,7 @@ fn flash_attention_enabled() -> bool {
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum AttentionKernelMode {
-    /// Shared-KV (full-attn) layers → ggml FA; has_kv layers → fused specialized h256.
+    /// Hybrid by KV length: fused below 128 tokens, ggml MWG at/above 128.
     Auto,
     Ggml,
     Specialized,
@@ -191,13 +191,18 @@ fn attention_kernel_mode() -> AttentionKernelMode {
     }
 }
 
-/// llama.cpp flash_attn_ext_vec for this layer (default auto: shared-KV layers only).
-pub fn attention_use_ggml_for_layer(has_kv: bool) -> bool {
+/// Auto mode hybrid (all layers): fused attention below 128 KV tokens, ggml MWG at/above.
+pub fn attention_use_ggml_for_layer_kv(has_kv: bool, kv_seq: u32) -> bool {
+    let _ = has_kv;
     match attention_kernel_mode() {
         AttentionKernelMode::Ggml => true,
         AttentionKernelMode::Specialized | AttentionKernelMode::Generic => false,
-        AttentionKernelMode::Auto => !has_kv,
+        AttentionKernelMode::Auto => kv_seq >= 128,
     }
+}
+
+pub fn attention_use_ggml_for_layer(has_kv: bool) -> bool {
+    attention_use_ggml_for_layer_kv(has_kv, 0)
 }
 
 /// True when every layer uses ggml FA (ATTENTION_KERNEL=ggml).
@@ -758,7 +763,7 @@ impl MetalContext {
                 }
                 AttentionKernelMode::Auto => {
                     println!(
-                        "  Q4 decode attention: auto — fused h256 (has_kv) + ggml h512 (ATTENTION_KERNEL=auto)"
+                        "  Q4 decode attention: auto hybrid — fused <128 tok, ggml MWG ≥128 (ATTENTION_KERNEL=auto)"
                     );
                 }
                 AttentionKernelMode::Specialized if attention_q4_hd_specialized() => {
