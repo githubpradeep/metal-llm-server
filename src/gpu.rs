@@ -523,6 +523,9 @@ pub struct MetalContext {
     pub flash_attn_ggml_q4_h256_pipeline: ComputePipelineState,
     pub flash_attn_ggml_q4_h128_pipeline: ComputePipelineState,
     pub flash_attn_ggml_q4_h512_pipeline: ComputePipelineState,
+    pub flash_attn_ggml_reduce_h256_pipeline: ComputePipelineState,
+    pub flash_attn_ggml_reduce_h128_pipeline: ComputePipelineState,
+    pub flash_attn_ggml_reduce_h512_pipeline: ComputePipelineState,
     pub attention_causal_q4_0_pipeline: ComputePipelineState,
     pub attention_causal_strided_q4_0_pipeline: ComputePipelineState,
     pub embed_gather_bf16_pipeline: ComputePipelineState,
@@ -730,6 +733,9 @@ impl MetalContext {
         let flash_attn_ggml_q4_h256_pipeline = get_fn("flash_attn_ggml_q4_0_h256");
         let flash_attn_ggml_q4_h128_pipeline = get_fn("flash_attn_ggml_q4_0_h128");
         let flash_attn_ggml_q4_h512_pipeline = get_fn("flash_attn_ggml_q4_0_h512");
+        let flash_attn_ggml_reduce_h256_pipeline = get_fn("flash_attn_ggml_q4_0_reduce_h256");
+        let flash_attn_ggml_reduce_h128_pipeline = get_fn("flash_attn_ggml_q4_0_reduce_h128");
+        let flash_attn_ggml_reduce_h512_pipeline = get_fn("flash_attn_ggml_q4_0_reduce_h512");
         let attention_causal_q4_0_pipeline = get_fn(if use_flash_attention {
             "attention_flash_causal_q4_0"
         } else {
@@ -748,7 +754,7 @@ impl MetalContext {
             println!("  FlashAttention-style tiled kernels enabled (FLASH_ATTN=legacy to disable)");
             match attention_kernel_mode() {
                 AttentionKernelMode::Ggml => {
-                    println!("  Q4 decode attention: ggml flash_attn_ext_vec (ATTENTION_KERNEL=ggml)");
+                    println!("  Q4 decode attention: ggml flash_attn_ext_vec nwg=32 (ATTENTION_KERNEL=ggml)");
                 }
                 AttentionKernelMode::Auto => {
                     println!(
@@ -928,6 +934,9 @@ impl MetalContext {
             flash_attn_ggml_q4_h256_pipeline,
             flash_attn_ggml_q4_h128_pipeline,
             flash_attn_ggml_q4_h512_pipeline,
+            flash_attn_ggml_reduce_h256_pipeline,
+            flash_attn_ggml_reduce_h128_pipeline,
+            flash_attn_ggml_reduce_h512_pipeline,
             attention_causal_q4_0_pipeline,
             attention_causal_strided_q4_0_pipeline,
             embed_gather_bf16_pipeline,
@@ -3949,12 +3958,22 @@ impl MetalContext {
         }
     }
 
+    fn flash_attn_ggml_reduce_pipeline_for(&self, head_dim: u32) -> &ComputePipelineState {
+        match head_dim {
+            256 => &self.flash_attn_ggml_reduce_h256_pipeline,
+            128 => &self.flash_attn_ggml_reduce_h128_pipeline,
+            512 => &self.flash_attn_ggml_reduce_h512_pipeline,
+            _ => panic!("ggml flash attention reduce unsupported head_dim {head_dim}"),
+        }
+    }
+
     pub fn encode_attention_ggml_q4_0(
         &self,
         encoder: &metal::ComputeCommandEncoderRef,
         q_buf: &Buffer,
         k_cache_buf: &Buffer,
         v_cache_buf: &Buffer,
+        tmp_buf: &Buffer,
         out_buf: &Buffer,
         num_heads: u32,
         num_kv_heads: u32,
@@ -3972,6 +3991,8 @@ impl MetalContext {
             k_cache_buf,
             0,
             v_cache_buf,
+            0,
+            tmp_buf,
             0,
             out_buf,
             0,
@@ -3995,6 +4016,8 @@ impl MetalContext {
         k_offset: u64,
         v_cache_buf: &Buffer,
         v_offset: u64,
+        tmp_buf: &Buffer,
+        tmp_offset: u64,
         out_buf: &Buffer,
         out_offset: u64,
         num_heads: u32,
@@ -4006,7 +4029,10 @@ impl MetalContext {
         kv_start: u32,
         row_bytes: u32,
     ) {
-        use crate::ggml_flash_attn::{flash_attn_args, flash_attn_dispatch, flash_attn_smem_bytes};
+        use crate::ggml_flash_attn::{
+            flash_attn_args, flash_attn_dispatch, flash_attn_reduce_dispatch, flash_attn_smem_bytes,
+            GgmlFlashAttnReduceArgs,
+        };
 
         let args = flash_attn_args(
             num_heads,
@@ -4027,12 +4053,29 @@ impl MetalContext {
         encoder.set_buffer(1, Some(q_buf), q_offset);
         encoder.set_buffer(2, Some(k_cache_buf), k_offset + kv_off);
         encoder.set_buffer(3, Some(v_cache_buf), v_offset + kv_off);
-        encoder.set_buffer(4, Some(out_buf), out_offset);
+        encoder.set_buffer(4, Some(tmp_buf), tmp_offset);
         encoder.set_threadgroup_memory_length(0, flash_attn_smem_bytes(head_dim));
         let (tg_x, tg_y, tg_z, tw, nsg) = flash_attn_dispatch(num_heads);
         encoder.dispatch_thread_groups(
             metal::MTLSize::new(tg_x, tg_y, tg_z),
             metal::MTLSize::new(tw, nsg, 1),
+        );
+
+        let reduce_args = GgmlFlashAttnReduceArgs {
+            nrows: num_heads as i32,
+        };
+        encoder.set_compute_pipeline_state(self.flash_attn_ggml_reduce_pipeline_for(head_dim));
+        encoder.set_bytes(
+            0,
+            std::mem::size_of::<GgmlFlashAttnReduceArgs>() as u64,
+            &reduce_args as *const _ as *const _,
+        );
+        encoder.set_buffer(1, Some(tmp_buf), tmp_offset);
+        encoder.set_buffer(2, Some(out_buf), out_offset);
+        let (rtg_x, rtg_y, rtg_z, rtw, rnsg, _) = flash_attn_reduce_dispatch(num_heads);
+        encoder.dispatch_thread_groups(
+            metal::MTLSize::new(rtg_x, rtg_y, rtg_z),
+            metal::MTLSize::new(rtw, rnsg, 1),
         );
     }
 

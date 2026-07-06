@@ -33,6 +33,14 @@ pub struct GgmlFlashAttnArgs {
     pub logit_softcap: f32,
 }
 
+/// Must match `ggml_flash_attn_reduce_args` in ggml_flash_attn.metal.
+#[repr(C)]
+pub struct GgmlFlashAttnReduceArgs {
+    pub nrows: i32,
+}
+
+/// llama.cpp decode default: 32 workgroups partition KV (C=32 tokens each).
+pub const NWG: u64 = 32;
 const NCPSG: u64 = 32;
 const NSG: u64 = 1;
 
@@ -46,6 +54,15 @@ pub fn flash_attn_smem_bytes(head_dim: u32) -> u64 {
     let ne20 = head_dim as u64;
     let inner = (pad_to(ne00, 128) + 4 * NCPSG + 2 * pad_to(ne20, 128)) * NSG * 2;
     pad_to(inner, 16)
+}
+
+/// Temp buffer for multi-WG path: ne01_max * ne02 * ne03 * nwg * (head_dim + 2) f32.
+pub fn flash_attn_tmp_bytes(num_heads: u32, head_dim: u32) -> u64 {
+    let ne01_max = 1u64;
+    let ne02 = num_heads as u64;
+    let ne03 = 1u64;
+    let ne20 = head_dim as u64;
+    ne01_max * ne02 * ne03 * NWG * (ne20 + 2) * std::mem::size_of::<f32>() as u64
 }
 
 pub fn flash_attn_args(
@@ -90,7 +107,13 @@ pub fn flash_attn_args(
     }
 }
 
-/// Dispatch geometry: one threadgroup per head, nwg=1 decode path.
+/// Main kernel dispatch: one threadgroup per head × NWG KV partitions.
 pub fn flash_attn_dispatch(num_heads: u32) -> (u64, u64, u64, u64, u64) {
-    (1, num_heads as u64, 1, 32, NSG)
+    (1, num_heads as u64, NWG, 32, NSG)
+}
+
+/// Reduce kernel dispatch after multi-WG main pass.
+pub fn flash_attn_reduce_dispatch(num_heads: u32) -> (u64, u64, u64, u64, u64, u64) {
+    let nrows = num_heads as u64;
+    (nrows, 1, 1, 32 * NWG, 1, 1)
 }

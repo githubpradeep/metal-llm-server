@@ -18,7 +18,11 @@ struct ggml_flash_attn_args {
     float max_bias; float m0; float m1; int32_t n_head_log2; float logit_softcap;
 };
 
-template<short DK, short DV, short NE_FA, short NSG_FA, short NS10_FA, short NS20_FA>
+struct ggml_flash_attn_reduce_args {
+    int32_t nrows;
+};
+
+template<short DK, short DV, short NE_FA, short NSG_FA, short NS10_FA, short NS20_FA, short NWG_FA>
 void flash_attn_ext_vec_impl(
     constant ggml_flash_attn_args & args,
     device const char * q,
@@ -29,10 +33,10 @@ void flash_attn_ext_vec_impl(
     uint3 tgpig,
     ushort tiisg,
     ushort sgitg) {
-#define NWG 1
-#define NSG NSG_FA
-#define NS10 NS10_FA
-#define NS20 NS20_FA
+    constexpr short NWG = NWG_FA;
+    constexpr short NSG = NSG_FA;
+    constexpr short NS10 = NS10_FA;
+    constexpr short NS20 = NS20_FA;
 
 #define NE NE_FA
 #define C 32
@@ -309,59 +313,91 @@ typedef block_q4_0 vd4_t;
  const int64_t rid = iq3*args.ne2*args.ne1 + iq2 + iq1*args.ne1;
 
  device float4 * dst4 = (device float4 *) dst;
+ device float  * dst1 = (device float  *) dst + nrows*DV*NWG;
 
  const float S = NWG == 1 ? (ss[0] == 0.0f ? 0.0f : 1.0f/ss[0]) : 1.0f;
 
  for (short i = tiisg; i < DV4; i += NW) {
  dst4[rid*DV4*NWG + NWG*i + iwg] = (float4) so4[i]*S;
  }
+
+ if (NWG > 1) {
+ if (tiisg == 0) {
+ dst1[rid*(2*NWG) + 2*iwg + 0] = ss[0];
+ dst1[rid*(2*NWG) + 2*iwg + 1] = ss[1];
+ }
+ }
  }
 
-#undef NWG
-#undef NSG
-#undef NS10
-#undef NS20
 #undef NE
 #undef C
 #undef nl_k
 #undef nl_v
 }
 
-kernel void flash_attn_ggml_q4_0_h256(
-    constant ggml_flash_attn_args & args [[buffer(0)]],
-    device const char * q [[buffer(1)]],
-    device const char * k [[buffer(2)]],
-    device const char * v [[buffer(3)]],
-    device char * dst [[buffer(4)]],
-    threadgroup half * shmem_f16 [[threadgroup(0)]],
-    uint3 tgpig [[threadgroup_position_in_grid]],
-    ushort tiisg [[thread_index_in_simdgroup]],
-    ushort sgitg [[simdgroup_index_in_threadgroup]]) {
-    flash_attn_ext_vec_impl<256, 256, 1, 1, 8, 8>(args, q, k, v, dst, shmem_f16, tgpig, tiisg, sgitg);
+template<short DV, short NWG_FA>
+void flash_attn_ext_vec_reduce_impl(
+    constant ggml_flash_attn_reduce_args & args,
+    device const char * htmp,
+    device char * dst,
+    uint tgpig,
+    ushort tiisg,
+    ushort sgitg) {
+    constexpr short NWG = NWG_FA;
+    constexpr short DV4 = DV/4;
+
+    const uint64_t rid = tgpig;
+    const short iwg = tiisg;
+
+    device const float * ss = (device const float *) htmp + (uint64_t)args.nrows*DV*NWG;
+
+    float S = ss[rid*(2*NWG) + 2*iwg + 0];
+    float M = ss[rid*(2*NWG) + 2*iwg + 1];
+
+    const float m  = simd_max(M);
+    const float ms = exp(M - m);
+
+    S = simd_sum(S*ms);
+    S = S == 0.0f ? 0.0f : 1.0f/S;
+
+    device const float4 * htmp4 = (device const float4 *) htmp + rid*DV4*NWG;
+    device       float4 * dst4  = (device       float4 *) dst  + rid*DV4;
+
+    for (short i = sgitg; i < DV4; i += NWG) {
+        const float4 v = simd_sum(htmp4[i*NWG + iwg]*ms);
+
+        if (iwg == 0) {
+            dst4[i] = v*S;
+        }
+    }
 }
 
-kernel void flash_attn_ggml_q4_0_h128(
-    constant ggml_flash_attn_args & args [[buffer(0)]],
-    device const char * q [[buffer(1)]],
-    device const char * k [[buffer(2)]],
-    device const char * v [[buffer(3)]],
-    device char * dst [[buffer(4)]],
-    threadgroup half * shmem_f16 [[threadgroup(0)]],
-    uint3 tgpig [[threadgroup_position_in_grid]],
-    ushort tiisg [[thread_index_in_simdgroup]],
-    ushort sgitg [[simdgroup_index_in_threadgroup]]) {
-    flash_attn_ext_vec_impl<128, 128, 1, 1, 4, 4>(args, q, k, v, dst, shmem_f16, tgpig, tiisg, sgitg);
+#define GGML_FA_KERNEL(DK, DV, NS10, NS20, NWG) \
+kernel void flash_attn_ggml_q4_0_h##DK( \
+    constant ggml_flash_attn_args & args [[buffer(0)]], \
+    device const char * q [[buffer(1)]], \
+    device const char * k [[buffer(2)]], \
+    device const char * v [[buffer(3)]], \
+    device char * dst [[buffer(4)]], \
+    threadgroup half * shmem_f16 [[threadgroup(0)]], \
+    uint3 tgpig [[threadgroup_position_in_grid]], \
+    ushort tiisg [[thread_index_in_simdgroup]], \
+    ushort sgitg [[simdgroup_index_in_threadgroup]]) { \
+    flash_attn_ext_vec_impl<DK, DV, 1, 1, NS10, NS20, NWG>( \
+        args, q, k, v, dst, shmem_f16, tgpig, tiisg, sgitg); \
+} \
+kernel void flash_attn_ggml_q4_0_reduce_h##DK( \
+    constant ggml_flash_attn_reduce_args & args [[buffer(0)]], \
+    device const char * htmp [[buffer(1)]], \
+    device char * dst [[buffer(2)]], \
+    uint tgpig [[threadgroup_position_in_grid]], \
+    ushort tiisg [[thread_index_in_simdgroup]], \
+    ushort sgitg [[simdgroup_index_in_threadgroup]]) { \
+    flash_attn_ext_vec_reduce_impl<DV, NWG>(args, htmp, dst, tgpig, tiisg, sgitg); \
 }
 
-kernel void flash_attn_ggml_q4_0_h512(
-    constant ggml_flash_attn_args & args [[buffer(0)]],
-    device const char * q [[buffer(1)]],
-    device const char * k [[buffer(2)]],
-    device const char * v [[buffer(3)]],
-    device char * dst [[buffer(4)]],
-    threadgroup half * shmem_f16 [[threadgroup(0)]],
-    uint3 tgpig [[threadgroup_position_in_grid]],
-    ushort tiisg [[thread_index_in_simdgroup]],
-    ushort sgitg [[simdgroup_index_in_threadgroup]]) {
-    flash_attn_ext_vec_impl<512, 512, 1, 1, 16, 16>(args, q, k, v, dst, shmem_f16, tgpig, tiisg, sgitg);
-}
+GGML_FA_KERNEL(128, 128, 4, 4, 32)
+GGML_FA_KERNEL(256, 256, 8, 8, 32)
+GGML_FA_KERNEL(512, 512, 16, 16, 32)
+
+#undef GGML_FA_KERNEL

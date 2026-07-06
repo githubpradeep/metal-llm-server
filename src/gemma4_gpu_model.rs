@@ -237,6 +237,7 @@ pub struct Gemma4GpuModel {
     // QK norm scratch
     pub q_normed_buf: Buffer,
     pub k_normed_buf: Buffer,
+    pub ggml_fa_tmp_buf: Buffer,
 
     // GPU-resident KV cache per layer
     pub k_cache: Vec<Buffer>,
@@ -315,6 +316,7 @@ pub struct DecodeBatchScratch {
     pub ple_combined_buf: Buffer,
     pub q_normed_buf: Buffer,
     pub k_normed_buf: Buffer,
+    pub ggml_fa_tmp_buf: Buffer,
 }
 
 struct BatchedTokenInputs {
@@ -358,7 +360,13 @@ impl DecodeBatchScratch {
         vocab_size: usize,
         num_layers: usize,
         ple_dim: usize,
+        num_heads: u32,
+        max_head_dim: u32,
     ) -> Self {
+        let ggml_fa_tmp_elems = (crate::ggml_flash_attn::flash_attn_tmp_bytes(
+            num_heads,
+            max_head_dim,
+        ) / 4) as usize;
         Self {
             max_batch_size,
             hidden_buf: ctx.buffer_empty(max_batch_size * hidden_size),
@@ -380,6 +388,7 @@ impl DecodeBatchScratch {
             ple_combined_buf: ctx.buffer_empty(max_batch_size * num_layers * ple_dim),
             q_normed_buf: ctx.buffer_empty(max_batch_size * max_q_out),
             k_normed_buf: ctx.buffer_empty(max_batch_size * max_kv_out),
+            ggml_fa_tmp_buf: ctx.buffer_empty(ggml_fa_tmp_elems),
         }
     }
 }
@@ -1255,6 +1264,11 @@ impl Gemma4GpuModel {
         // QK norm scratch (max head_dim per head)
         let q_normed_buf = ctx.buffer_empty(max_q_out);
         let k_normed_buf = ctx.buffer_empty(max_kv_out);
+        let ggml_fa_tmp_elems = (crate::ggml_flash_attn::flash_attn_tmp_bytes(
+            num_heads as u32,
+            max_head_dim as u32,
+        ) / 4) as usize;
+        let ggml_fa_tmp_buf = ctx.buffer_empty(ggml_fa_tmp_elems);
 
         // KV cache: f16 precision to halve memory bandwidth
         let kv_cache_type = KvCacheType::from_env();
@@ -1305,6 +1319,8 @@ impl Gemma4GpuModel {
             vocab_size,
             num_layers,
             ple_dim,
+            num_heads as u32,
+            max_head_dim as u32,
         );
         // Rotary buffers (allocate for max head_dim)
         let cos_buf = ctx.buffer_empty(max_head_dim);
@@ -1395,6 +1411,7 @@ impl Gemma4GpuModel {
             ple_combined_buf,
             q_normed_buf,
             k_normed_buf,
+            ggml_fa_tmp_buf,
             k_cache,
             v_cache,
             kv_seq_len: 0,
@@ -2454,6 +2471,11 @@ impl Gemma4GpuModel {
         let ple_combined_buf = ctx.buffer_empty(num_layers * ple_dim);
         let q_normed_buf = ctx.buffer_empty(max_q_out);
         let k_normed_buf = ctx.buffer_empty(max_kv_out);
+        let ggml_fa_tmp_elems = (crate::ggml_flash_attn::flash_attn_tmp_bytes(
+            num_heads as u32,
+            max_head_dim as u32,
+        ) / 4) as usize;
+        let ggml_fa_tmp_buf = ctx.buffer_empty(ggml_fa_tmp_elems);
 
         let kv_cache_type = KvCacheType::from_env();
         let kv_capacity = configured_kv_capacity(config.max_position_embeddings);
@@ -2506,6 +2528,8 @@ impl Gemma4GpuModel {
             vocab_size,
             num_layers,
             ple_dim,
+            num_heads as u32,
+            max_head_dim as u32,
         );
 
         let cos_buf = ctx.buffer_empty(max_head_dim);
@@ -2590,6 +2614,7 @@ impl Gemma4GpuModel {
             ple_combined_buf,
             q_normed_buf,
             k_normed_buf,
+            ggml_fa_tmp_buf,
             k_cache,
             v_cache,
             kv_seq_len: 0,
@@ -3658,6 +3683,7 @@ impl Gemma4GpuModel {
                             &self.q_normed_buf,
                             &self.k_cache[layer.kv_source_layer],
                             &self.v_cache[layer.kv_source_layer],
+                            &self.ggml_fa_tmp_buf,
                             &self.attn_out_buf,
                             num_heads as u32,
                             num_kv_heads as u32,
@@ -6633,6 +6659,8 @@ impl Gemma4GpuModel {
                                 k_cache,
                                 0,
                                 v_cache,
+                                0,
+                                &self.decode_batch_scratch.ggml_fa_tmp_buf,
                                 0,
                                 &self.decode_batch_scratch.attn_out_buf,
                                 offsets.q,

@@ -444,7 +444,27 @@ impl Gemma4GpuModel {
                 }
             }
 
-            if gpu::attention_gqa_q4_0_enabled(num_kv_groups) {
+            if gpu::attention_use_ggml_for_layer(layer.has_kv)
+                && matches!(head_dim, 128 | 256 | 512)
+                && self.ctx.use_flash_attention
+            {
+                self.ctx.encode_attention_ggml_q4_0(
+                    encoder,
+                    scratch.q_normed,
+                    &self.k_cache[layer.kv_source_layer],
+                    &self.v_cache[layer.kv_source_layer],
+                    &self.ggml_fa_tmp_buf,
+                    scratch.attn_out,
+                    num_heads,
+                    num_kv_heads,
+                    head_dim,
+                    effective_kv_seq,
+                    self.kv_capacity,
+                    scale,
+                    kv_start,
+                    row_bytes,
+                );
+            } else if gpu::attention_gqa_q4_0_enabled(num_kv_groups) {
                 self.ctx.encode_attention_with_offset_q4_0_gqa(
                     encoder,
                     scratch.q_normed,
