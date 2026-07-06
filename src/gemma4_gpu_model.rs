@@ -11,7 +11,6 @@ use serde::Deserialize;
 use crate::gemma4_config::{Gemma4TextConfig, KvCacheType, RopeConfig, RopeParameters};
 use crate::gpu::{BufferView, GpuTimestampProfiler, MetalContext, ProfileAblate, profile_gpu_enabled};
 use crate::kv_pool::{KvCachePool, KvPoolError, KvSlot, KvSlotView};
-use crate::mega_decode::{mega_kernel_enabled, MegaDecodeGraph, MegaScratchBuffers};
 
 /// Fused 3→1 operation: projection + norm + residual add
 /// 
@@ -271,9 +270,6 @@ pub struct Gemma4GpuModel {
     weights_mmap_offset: Option<usize>,
     embed_decode_scratch: Vec<f32>,
     ple_decode_scratch: Vec<f32>,
-
-    /// Single-dispatch decode graph (MEGA_KERNEL=1).
-    mega_graph: Option<MegaDecodeGraph>,
 }
 
 pub struct PrefillScratch {
@@ -1364,7 +1360,7 @@ impl Gemma4GpuModel {
         );
         println!("  Gemma4 model loaded successfully (Q4_0 quantized on Metal)");
 
-        let mut model = Gemma4GpuModel {
+        let model = Gemma4GpuModel {
             ctx,
             config,
             embed_tables,
@@ -1422,10 +1418,11 @@ impl Gemma4GpuModel {
             weights_mmap_offset: None,
             embed_decode_scratch: vec![0.0f32; hidden_size],
             ple_decode_scratch: vec![0.0f32; num_layers * ple_dim],
-            mega_graph: None,
         };
 
-        model.attach_mega_graph_if_enabled();
+        if model.fused_decode_eligible() {
+            println!("  Fused decode executor enabled (orchestration path, not a new Metal kernel)");
+        }
         model
     }
 
@@ -1806,7 +1803,7 @@ impl Gemma4GpuModel {
         )
     }
 
-    fn decode_rope_byte_offset(&self, layer_idx: usize) -> u64 {
+    pub(crate) fn decode_rope_byte_offset(&self, layer_idx: usize) -> u64 {
         (layer_idx * self.rope_max_head_dim * std::mem::size_of::<f32>()) as u64
     }
 
@@ -2560,7 +2557,7 @@ impl Gemma4GpuModel {
             load_start.elapsed().as_secs_f64()
         );
 
-        let mut model = Gemma4GpuModel {
+        let model = Gemma4GpuModel {
             ctx,
             config,
             embed_tables,
@@ -2618,34 +2615,11 @@ impl Gemma4GpuModel {
             weights_mmap_offset,
             embed_decode_scratch: vec![0.0f32; hidden_size],
             ple_decode_scratch: vec![0.0f32; num_layers * ple_dim],
-            mega_graph: None,
         };
-        model.attach_mega_graph_if_enabled();
+        if model.fused_decode_eligible() {
+            println!("  Fused decode executor enabled (orchestration path, not a new Metal kernel)");
+        }
         model
-    }
-
-    fn attach_mega_graph_if_enabled(&mut self) {
-        if !mega_kernel_enabled() {
-            return;
-        }
-        // The mega decode graph is hard-wired to Q4_0 block layout; K-quant
-        // (Q4_K_M) layers are served by the per-tensor matvec path instead.
-        if self.layers.iter().any(|l| l.weight_format.is_kquant()) {
-            eprintln!("  MEGA_KERNEL ignored: K-quant weights use the per-tensor matvec path");
-            return;
-        }
-        match MegaDecodeGraph::build(self) {
-            Ok(graph) => {
-                println!(
-                    "  Mega decode enabled ({} ops, single command buffer)",
-                    graph.ops.len()
-                );
-                self.mega_graph = Some(graph);
-            }
-            Err(e) => {
-                eprintln!("  MEGA_KERNEL=1 but mega graph build failed: {e}");
-            }
-        }
     }
 
     /// Build interleaved gate∥up Q4 buffers for decode MLP (uzu-style packing).
@@ -2654,7 +2628,9 @@ impl Gemma4GpuModel {
         mut layers: Vec<Gemma4GpuLayer>,
         k: u32,
     ) -> Vec<Gemma4GpuLayer> {
-        if !crate::gpu::packed_mlp_gate_up_enabled() {
+        if !crate::gpu::packed_mlp_gate_up_enabled()
+            && !crate::decode_fused::fused_decode_enabled()
+        {
             for layer in layers.iter_mut() {
                 layer.gate_up_proj = BufferView::from_buffer(ctx.buffer_empty(1));
             }
@@ -2680,8 +2656,9 @@ impl Gemma4GpuModel {
         layers
     }
 
-    fn use_packed_mlp_gate_up(layer: &Gemma4GpuLayer) -> bool {
-        crate::gpu::packed_mlp_gate_up_enabled() && layer.weight_format == WeightFormat::Q4_0
+    pub(crate) fn use_packed_mlp_gate_up(layer: &Gemma4GpuLayer) -> bool {
+        (crate::gpu::packed_mlp_gate_up_enabled() || crate::decode_fused::fused_decode_enabled())
+            && layer.weight_format == WeightFormat::Q4_0
     }
 
     /// Infer MLP output width (rows) from a gate projection buffer.
@@ -3080,86 +3057,6 @@ impl Gemma4GpuModel {
             p.mark(&encoder);
         }
 
-        if self.mega_graph.is_some()
-            && !__pp
-            && !__ablate.active()
-            && __gpu_prof.is_none()
-            && !matches!(mode, DecodeMode::Advance)
-        {
-            let cap = self.config.final_logit_softcapping;
-            let sliding = self.config.sliding_window as u32;
-            let sample = match mode {
-                DecodeMode::Sample(t, mp, s) => Some((t, mp, s)),
-                DecodeMode::Logits => None,
-                DecodeMode::Advance => unreachable!(),
-            };
-            let scratch = MegaScratchBuffers {
-                hidden: &self.hidden_buf,
-                normed: &self.normed_buf,
-                q: &self.q_buf,
-                k: &self.k_buf,
-                v: &self.v_buf,
-                q_normed: &self.q_normed_buf,
-                k_normed: &self.k_normed_buf,
-                gate: &self.gate_buf,
-                attn_out: &self.attn_out_buf,
-                o_out: &self.o_out_buf,
-                up: &self.up_buf,
-                gelu: &self.gelu_buf,
-                down: &self.down_buf,
-                ple_ctx: &self.ple_context_proj_buf,
-                ple_tmp: &self.ple_combined_buf,
-                ple_tok: &self.ple_token_id_buf,
-                logits: &self.logits_buf,
-                sample_out: &self.sample_out_buf,
-            };
-            let layers = &self.layers;
-            let mega = self.mega_graph.as_mut().unwrap();
-            mega.encode(
-                &self.ctx,
-                &encoder,
-                layers,
-                sliding,
-                &scratch,
-                &self.k_cache,
-                &self.v_cache,
-                &self.decode_rope_cos_packed,
-                &self.decode_rope_sin_packed,
-                self.rope_max_head_dim,
-                kv_seq,
-                sample,
-            );
-            encoder.end_encoding();
-            let __t_encode = std::time::Instant::now();
-            cmd.commit();
-            cmd.wait_until_completed();
-            let __t_gpu = std::time::Instant::now();
-            let output = match mode {
-                DecodeMode::Sample(..) => {
-                    let tok = MetalContext::read_u32(&self.sample_out_buf) as usize;
-                    if __profile {
-                        Self::profile_record(__t0, __t_prep, __t_encode, __t_gpu);
-                    }
-                    DecodeOutput::Token(tok)
-                }
-                DecodeMode::Logits => {
-                    let mut logits = MetalContext::read_buffer(&self.logits_buf, vocab_size);
-                    for l in logits.iter_mut() {
-                        let x = (*l / cap).clamp(-10.0, 10.0);
-                        *l = cap * x.tanh();
-                    }
-                    if __profile {
-                        Self::profile_record(__t0, __t_prep, __t_encode, __t_gpu);
-                    }
-                    DecodeOutput::Logits(logits)
-                }
-                DecodeMode::Advance => unreachable!(),
-            };
-            self.total_tokens += 1;
-            self.kv_seq_len += 1;
-            return output;
-        }
-
         // ─── PLE pre-pass ───
         // Produces the per-layer PLE inputs contiguously in ple_context_proj_buf;
         // each layer reads its slice directly (byte offset = layer_idx * ple_dim
@@ -3223,7 +3120,14 @@ impl Gemma4GpuModel {
             encoder = cmd.new_compute_command_encoder();
         }
 
-        let metal_n_cb = if !__pp && !__ablate.active() && __gpu_prof.is_none() {
+        let use_fused_decode = self.fused_decode_eligible()
+            && !__pp
+            && !__ablate.active()
+            && __gpu_prof.is_none();
+
+        let metal_n_cb = if use_fused_decode {
+            1
+        } else if !__pp && !__ablate.active() && __gpu_prof.is_none() {
             crate::gpu::metal_n_cb()
         } else {
             1
@@ -3237,6 +3141,54 @@ impl Gemma4GpuModel {
         };
         let mut cb_split_idx = 0usize;
 
+        if use_fused_decode {
+            static FUSED_DECODE_USED: std::sync::atomic::AtomicBool =
+                std::sync::atomic::AtomicBool::new(false);
+            if !FUSED_DECODE_USED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                eprintln!(
+                    "  Decode: fused layer executor active (~{} layers, single CB)",
+                    actual_num_layers
+                );
+            }
+            let scratch = crate::decode_fused::FusedDecodeScratch {
+                hidden: &self.hidden_buf,
+                normed: &self.normed_buf,
+                inv_rms: &self.inv_rms_buf,
+                q: &self.q_buf,
+                k: &self.k_buf,
+                v: &self.v_buf,
+                q_normed: &self.q_normed_buf,
+                k_normed: &self.k_normed_buf,
+                attn_out: &self.attn_out_buf,
+                o_out: &self.o_out_buf,
+                gate: &self.gate_buf,
+                up: &self.up_buf,
+                gelu: &self.gelu_buf,
+                down: &self.down_buf,
+                ple_ctx: &self.ple_context_proj_buf,
+                ple_normed: &self.ple_normed_buf,
+                ple_projected: &self.ple_projected_buf,
+                cos_packed: &self.decode_rope_cos_packed,
+                sin_packed: &self.decode_rope_sin_packed,
+            };
+            for layer_idx in 0..actual_num_layers {
+                self.encode_fused_decode_layer(
+                    &encoder,
+                    layer_idx,
+                    kv_seq,
+                    &scratch,
+                    __ablate.skip_attn(),
+                    __ablate.skip_mlp(),
+                    __ablate.skip_ple(),
+                );
+            }
+            if crate::decode_fused::profile_dispatches_enabled() {
+                eprintln!(
+                    "  PROFILE_DISPATCHES: {} layer dispatches this token",
+                    crate::decode_fused::take_dispatch_count()
+                );
+            }
+        } else {
         for layer_idx in 0..actual_num_layers {
             if cb_split_idx < cb_layer_splits.len() && layer_idx == cb_layer_splits[cb_split_idx] {
                 encoder.end_encoding();
@@ -4234,6 +4186,7 @@ impl Gemma4GpuModel {
                 encoder = cmd.new_compute_command_encoder();
             }
         }
+        } // !use_fused_decode
 
         if matches!(mode, DecodeMode::Advance) {
             encoder.end_encoding();
