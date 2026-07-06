@@ -3491,9 +3491,7 @@ impl Gemma4GpuModel {
                         );
                     }
                     KvCacheType::Q4_0 => {
-                        if !(self.ctx.use_flash_attention
-                            && crate::gpu::fused_kv_attention_enabled())
-                        {
+                        if crate::gpu::needs_explicit_kv_append(layer.has_kv, kv_seq + 1) {
                             self.ctx.encode_kv_append_q4_0(
                                 encoder,
                                 &self.k_normed_buf,
@@ -6569,9 +6567,7 @@ impl Gemma4GpuModel {
                             );
                         }
                         KvCacheType::Q4_0 => {
-                            if !(self.ctx.use_flash_attention
-                                && crate::gpu::fused_kv_attention_enabled())
-                            {
+                            if crate::gpu::needs_explicit_kv_append(layer.has_kv, effective_kv_seq) {
                                 self.ctx.encode_kv_append_q4_0_at(
                                     encoder,
                                     &self.decode_batch_scratch.k_normed_buf,

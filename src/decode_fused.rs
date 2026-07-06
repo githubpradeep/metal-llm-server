@@ -421,7 +421,7 @@ impl Gemma4GpuModel {
                     eps,
                 );
                 n += 3;
-                if !gpu::fused_kv_attention_enabled() {
+                if gpu::needs_explicit_kv_append(layer.has_kv, effective_kv_seq) {
                     self.ctx.encode_kv_append_q4_0(
                         encoder,
                         scratch.k_normed,

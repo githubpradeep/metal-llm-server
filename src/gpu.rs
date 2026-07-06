@@ -205,6 +205,19 @@ pub fn attention_use_ggml_for_layer(has_kv: bool) -> bool {
     attention_use_ggml_for_layer_kv(has_kv, 0)
 }
 
+/// KV-owning layers need a separate `encode_kv_append` when attention does not fuse
+/// the append (ggml MWG and decomposed flash paths). Hybrid `auto` crosses this at
+/// kv_seq ≥ 128 while `fused_kv_attention_enabled()` stays true for fused layers.
+pub fn needs_explicit_kv_append(has_kv: bool, effective_kv_seq: u32) -> bool {
+    if !has_kv {
+        return false;
+    }
+    if attention_use_ggml_for_layer_kv(has_kv, effective_kv_seq) {
+        return true;
+    }
+    !fused_kv_attention_enabled()
+}
+
 /// True when every layer uses ggml FA (ATTENTION_KERNEL=ggml).
 pub fn attention_use_ggml() -> bool {
     matches!(attention_kernel_mode(), AttentionKernelMode::Ggml)
