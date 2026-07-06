@@ -1420,9 +1420,7 @@ impl Gemma4GpuModel {
             ple_decode_scratch: vec![0.0f32; num_layers * ple_dim],
         };
 
-        if model.fused_decode_eligible() {
-            println!("  Fused decode executor enabled (orchestration path, not a new Metal kernel)");
-        }
+        crate::decode_fused::log_fused_decode_status(&model);
         model
     }
 
@@ -2616,9 +2614,7 @@ impl Gemma4GpuModel {
             embed_decode_scratch: vec![0.0f32; hidden_size],
             ple_decode_scratch: vec![0.0f32; num_layers * ple_dim],
         };
-        if model.fused_decode_eligible() {
-            println!("  Fused decode executor enabled (orchestration path, not a new Metal kernel)");
-        }
+        crate::decode_fused::log_fused_decode_status(&model);
         model
     }
 

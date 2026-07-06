@@ -61,8 +61,12 @@ impl BufferView {
 /// True when a `[m, k]` weight buffer holds Q4_0 blocks (18 bytes / 32 weights).
 /// K-quant buffers (Q4_K is byte-for-byte the same size as Q4_0) must NOT be
 /// mistaken for Q4_0 by the Q4_0-only fused kernels, so the format tag wins.
+pub fn weight_buf_is_kquant(view: &BufferView) -> bool {
+    matches!(view.format, weight_fmt::Q4_K | weight_fmt::Q6_K)
+}
+
 pub fn weight_buf_is_q4(view: &BufferView, m: u32, k: u32) -> bool {
-    if matches!(view.format, weight_fmt::Q4_K | weight_fmt::Q6_K) {
+    if weight_buf_is_kquant(view) {
         return false;
     }
     let q4_bytes = (m as u64) * (k as u64 / 32) * 18;
@@ -72,7 +76,7 @@ pub fn weight_buf_is_q4(view: &BufferView, m: u32, k: u32) -> bool {
 
 /// True when a `[m, k]` weight buffer holds Q3_0 blocks (14 bytes / 32 weights).
 pub fn weight_buf_is_q3(view: &BufferView, m: u32, k: u32) -> bool {
-    if matches!(view.format, weight_fmt::Q4_K | weight_fmt::Q6_K) {
+    if weight_buf_is_kquant(view) {
         return false;
     }
     let q3_bytes = (m as u64) * (k as u64 / 32) * 14;
