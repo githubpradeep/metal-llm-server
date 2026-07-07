@@ -5241,13 +5241,12 @@ kernel void attention_flash_decode_q4_0_gqa(
 
     threadgroup float shared_q[GQA_MAX_GROUPS * FLASH_MAX_HEAD];
     threadgroup float shared_scores[GQA_MAX_GROUPS * GQA_TILE_KV];
-    threadgroup float shared_exp[GQA_MAX_GROUPS * GQA_TILE_KV];
+    threadgroup float shared_exp[GQA_TILE_KV];
     threadgroup float shared_update[GQA_MAX_GROUPS * 4];
     threadgroup uchar shared_kv_tile[GQA_TILE_KV * GQA_MAX_ROW_BYTES];
 
     threadgroup float* q_head = shared_q + group * FLASH_MAX_HEAD;
     threadgroup float* scores_head = shared_scores + group * GQA_TILE_KV;
-    threadgroup float* exp_head = shared_exp + group * GQA_TILE_KV;
     threadgroup float* update_head = shared_update + group * 4;
 
     if (local_tid == 0) {
@@ -5282,7 +5281,7 @@ kernel void attention_flash_decode_q4_0_gqa(
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
         if (local_tid == 0) {
-            flash_softmax_tile(scores_head, exp_head, update_head, tile_count);
+            flash_softmax_tile(scores_head, shared_exp, update_head, tile_count);
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
@@ -5295,7 +5294,7 @@ kernel void attention_flash_decode_q4_0_gqa(
         float inv_l = update_head[3];
         flash_accum_v_q4_tg(
             output, q_offset, shared_kv_tile, row_bytes, head_dim,
-            tile_count, exp_head, old_factor, inv_l, local_tid, threads_per_head);
+            tile_count, shared_exp, old_factor, inv_l, local_tid, threads_per_head);
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
 }
@@ -6438,13 +6437,12 @@ kernel void attention_flash_causal_q4_0_gqa(
 
     threadgroup float shared_q[GQA_MAX_GROUPS * FLASH_MAX_HEAD];
     threadgroup float shared_scores[GQA_MAX_GROUPS * GQA_TILE_KV];
-    threadgroup float shared_exp[GQA_MAX_GROUPS * GQA_TILE_KV];
+    threadgroup float shared_exp[GQA_TILE_KV];
     threadgroup float shared_update[GQA_MAX_GROUPS * 4];
     threadgroup uchar shared_kv_tile[GQA_TILE_KV * GQA_MAX_ROW_BYTES];
 
     threadgroup float* q_head = shared_q + group * FLASH_MAX_HEAD;
     threadgroup float* scores_head = shared_scores + group * GQA_TILE_KV;
-    threadgroup float* exp_head = shared_exp + group * GQA_TILE_KV;
     threadgroup float* update_head = shared_update + group * 4;
 
     if (local_tid == 0) {
@@ -6478,7 +6476,7 @@ kernel void attention_flash_causal_q4_0_gqa(
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
         if (local_tid == 0) {
-            flash_softmax_tile(scores_head, exp_head, update_head, tile_count);
+            flash_softmax_tile(scores_head, shared_exp, update_head, tile_count);
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
@@ -6491,7 +6489,7 @@ kernel void attention_flash_causal_q4_0_gqa(
         const float inv_l = update_head[3];
         flash_accum_v_q4_tg(
             output, q_offset, shared_kv_tile, row_bytes, head_dim,
-            tile_count, exp_head, old_factor, inv_l, local_tid, threads_per_head);
+            tile_count, shared_exp, old_factor, inv_l, local_tid, threads_per_head);
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
 }

@@ -4932,9 +4932,6 @@ impl Gemma4GpuModel {
         seq_len: usize,
         kv_pool: &KvCachePool,
     ) -> bool {
-        if !crate::gpu::prefill_parallel_enabled() {
-            return false;
-        }
         if seq_len <= 1 || seq_len > self.prefill_scratch.max_seq_len {
             return false;
         }

@@ -423,16 +423,6 @@ fn prefill_gqa_attention_enabled() -> bool {
     )
 }
 
-/// Parallel batch prefill (server / KV-pool path). Off by default — the GQA flash
-/// causal kernel had a correctness bug; token-by-token prefill matches CLI.
-/// Set `PREFILL_PARALLEL=1` to opt in once parallel prefill is verified.
-pub fn prefill_parallel_enabled() -> bool {
-    matches!(
-        std::env::var("PREFILL_PARALLEL").as_deref(),
-        Ok("1") | Ok("true") | Ok("parallel") | Ok("PARALLEL")
-    )
-}
-
 fn attention_threadgroup_size(flash: bool) -> MTLSize {
     if flash {
         MTLSize::new(256, 1, 1)
@@ -809,11 +799,6 @@ impl MetalContext {
             println!("  FlashAttention-style tiled kernels enabled (FLASH_ATTN=legacy to disable)");
             if prefill_gqa_attention_enabled() {
                 println!("  Prefill attention: GQA flash causal (PREFILL_ATTN_GQA=legacy to disable)");
-            }
-            if prefill_parallel_enabled() {
-                println!("  Prefill path: parallel batch (PREFILL_PARALLEL=1, experimental)");
-            } else {
-                println!("  Prefill path: token-by-token via KV pool (set PREFILL_PARALLEL=1 for batch)");
             }
             match attention_kernel_mode() {
                 AttentionKernelMode::Ggml => {
