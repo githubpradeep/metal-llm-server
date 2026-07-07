@@ -5,6 +5,7 @@ mod batch_engine;
 mod layers;
 mod cache;
 mod ggml_gemv;
+mod ggml_matmul;
 mod ggml_flash_attn;
 mod gguf;
 mod gpu;
@@ -44,6 +45,23 @@ fn main() {
         .and_then(|i| args.get(i + 1))
         .and_then(|n| n.parse().ok())
         .unwrap_or(256);
+
+    let bench_prefill = args.iter().any(|a| a == "--bench-prefill");
+    let bench_prefill_tokens: Vec<usize> = args
+        .iter()
+        .position(|a| a == "--bench-prefill-tokens")
+        .map(|i| {
+            args.get(i + 1)
+                .map(|raw| {
+                    raw.split(',')
+                        .filter_map(|part| part.trim().parse::<usize>().ok())
+                        .filter(|&n| n > 0)
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default()
+        })
+        .filter(|sizes| !sizes.is_empty())
+        .unwrap_or_else(|| vec![128, 256, 512]);
 
     let model_dir = args.iter()
         .filter(|a| !a.starts_with("--") && *a != &args[0])
@@ -236,6 +254,11 @@ fn main() {
                 return;
             }
 
+            if bench_prefill {
+                bench_prefill_gemma4(&tokenizer, &mut gpu_model, &bench_prefill_tokens);
+                return;
+            }
+
             // Serve mode: start OpenAI-compatible HTTP server
             if args.iter().any(|a| a == "--serve") {
                 let port: u16 = args.iter()
@@ -356,6 +379,75 @@ fn generate_gpu(
     println!("  Throughput: {:.2} tok/s", tps);
     println!("  Context length: {} tokens", model.num_items());
     println!("  Elapsed: {:.2}s", elapsed);
+}
+
+fn bench_prefill_gemma4(
+    tokenizer: &tokenizers::Tokenizer,
+    model: &mut gemma4_gpu_model::Gemma4GpuModel,
+    targets: &[usize],
+) {
+    println!("\n=== Gemma4 prefill benchmark (Metal GPU) ===");
+    println!("  Target prompt tokens: {:?}", targets);
+    if crate::ggml_matmul::mul_mm_disabled() {
+        println!("  PREFILL_MATMUL=legacy (batch GEMV fallback)");
+    } else {
+        println!("  Prefill matmul: ggml simdgroup GEMM (PREFILL_MATMUL=legacy to disable)");
+    }
+
+    let mut kv_pool = model.create_kv_pool(1, model.kv_capacity);
+    let slot = kv_pool
+        .allocate()
+        .expect("Failed to allocate prefill benchmark KV slot");
+
+    for &target in targets {
+        model.reset_legacy_state();
+        let mut body = String::from(
+            "Write a structured essay about the benefits of exercise with clear sections. ",
+        );
+        let mut prompt = format!(
+            "<start_of_turn>user\n{body}<end_of_turn>\n<start_of_turn>model\n"
+        );
+        let mut token_count = tokenizer
+            .encode(prompt.as_str(), true)
+            .expect("Failed to encode bench prefill prompt")
+            .get_ids()
+            .len();
+        while token_count < target {
+            body.push_str(
+                "Discuss physical health, mental resilience, and long-term cognitive outcomes with concrete examples. ",
+            );
+            prompt = format!(
+                "<start_of_turn>user\n{body}<end_of_turn>\n<start_of_turn>model\n"
+            );
+            token_count = tokenizer
+                .encode(prompt.as_str(), true)
+                .expect("Failed to encode bench prefill prompt")
+                .get_ids()
+                .len();
+        }
+        let token_ids: Vec<usize> = tokenizer
+            .encode(prompt.as_str(), true)
+            .expect("Failed to encode bench prefill prompt")
+            .get_ids()
+            .iter()
+            .map(|&t| t as usize)
+            .collect();
+
+        let start = Instant::now();
+        let _ = model
+            .forward_prefill_chunked_with_kv_slot(&token_ids, &mut kv_pool, slot)
+            .expect("Prefill benchmark failed");
+        let secs = start.elapsed().as_secs_f64();
+        let tps = if secs > 0.0 {
+            token_count as f64 / secs
+        } else {
+            0.0
+        };
+        println!(
+            "  target={:<4} actual={:<4} | prefill={:>6.1} t/s | elapsed={:.2}s",
+            target, token_count, tps, secs
+        );
+    }
 }
 
 /// llama.cpp-style benchmark: prefill and decode timed separately, no stdout I/O

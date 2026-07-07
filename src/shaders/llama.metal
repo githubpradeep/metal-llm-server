@@ -1784,6 +1784,43 @@ struct RopeLayerParams {
 
 // Fill packed cos/sin for all layers at decode position `pos` (one thread per
 // layer × half-dimension; replaces CPU sin/cos + host write_buffer per token).
+// Fill per-token RoPE cos/sin tables for batched prefill (one layer per dispatch).
+kernel void rope_fill_batch(
+    device float* cos_buf [[buffer(0)]],
+    device float* sin_buf [[buffer(1)]],
+    constant RopeLayerParams& layer [[buffer(2)]],
+    constant uint& start_pos [[buffer(3)]],
+    constant uint& seq_len [[buffer(4)]],
+    uint2 gid [[thread_position_in_grid]]
+) {
+    uint token = gid.y;
+    uint d = gid.x;
+    if (token >= seq_len) return;
+
+    uint head_dim = layer.head_dim;
+    uint half_dim = head_dim / 2u;
+    if (d >= half_dim) return;
+
+    float pos = float(start_pos + token);
+    uint base = token * head_dim;
+
+    if (d < layer.rope_angles) {
+        float inv_freq = 1.0f / (pow(layer.theta, 2.0f * float(d) / float(head_dim))) / layer.factor;
+        float angle = pos * inv_freq;
+        float c = cos(angle);
+        float s = sin(angle);
+        cos_buf[base + d] = c;
+        cos_buf[base + d + half_dim] = c;
+        sin_buf[base + d] = s;
+        sin_buf[base + d + half_dim] = s;
+    } else {
+        cos_buf[base + d] = 1.0f;
+        cos_buf[base + d + half_dim] = 1.0f;
+        sin_buf[base + d] = 0.0f;
+        sin_buf[base + d + half_dim] = 0.0f;
+    }
+}
+
 kernel void rope_fill_decode(
     device float* cos_packed [[buffer(0)]],
     device float* sin_packed [[buffer(1)]],
