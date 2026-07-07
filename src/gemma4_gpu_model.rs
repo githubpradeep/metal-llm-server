@@ -66,7 +66,7 @@ fn encode_proj_norm_residual(
     }
 }
 
-const DEFAULT_MAX_PREFILL_SEQ: usize = 512;
+const DEFAULT_MAX_PREFILL_SEQ: usize = 1024;
 const DEFAULT_MAX_DECODE_BATCH: usize = 4;
 
 /// Cumulative per-phase GPU time (ms) and token count for PROFILE_PHASES.

@@ -6383,6 +6383,117 @@ kernel void attention_flash_causal_q4_0(
     }
 }
 
+// GQA flash causal prefill: one threadgroup per (kv_head, query_pos).
+// Shares KV tile loads across num_kv_groups query heads (4× fewer dispatches).
+kernel void attention_flash_causal_q4_0_gqa(
+    device const float* Q [[buffer(0)]],
+    device const uchar* K_cache [[buffer(1)]],
+    device const uchar* V_cache [[buffer(2)]],
+    device float* output [[buffer(3)]],
+    constant uint& num_heads [[buffer(4)]],
+    constant uint& num_kv_heads [[buffer(5)]],
+    constant uint& num_kv_groups [[buffer(6)]],
+    constant uint& head_dim [[buffer(7)]],
+    constant uint& kv_seq [[buffer(8)]],
+    constant uint& capacity [[buffer(9)]],
+    constant float& scale [[buffer(10)]],
+    constant uint& q_len [[buffer(11)]],
+    constant uint& q_start [[buffer(12)]],
+    constant uint& attention_window [[buffer(13)]],
+    constant uint& groups_per_row [[buffer(14)]],
+    constant uint& row_bytes [[buffer(15)]],
+    uint tid [[thread_index_in_threadgroup]],
+    uint tgid [[threadgroup_position_in_grid]],
+    uint sgid [[simdgroup_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]]
+) {
+    (void)groups_per_row;
+    const uint kv_h = tgid / q_len;
+    const uint qi = tgid % q_len;
+    if (kv_h >= num_kv_heads) return;
+    if (num_kv_groups == 0 || num_kv_groups > GQA_MAX_GROUPS) return;
+
+    const uint attend_len = min(q_start + qi + 1, kv_seq);
+    uint attend_start = 0u;
+    if (attention_window > 0u && attend_len > attention_window) {
+        attend_start = attend_len - attention_window;
+    }
+
+    const uint num_simds_total = FLASH_TG_SIZE / SIMD_SIZE;
+    if (num_kv_groups > num_simds_total) return;
+    if (num_simds_total % num_kv_groups != 0) return;
+
+    const uint simds_per_head = num_simds_total / num_kv_groups;
+    const uint threads_per_head = simds_per_head * SIMD_SIZE;
+    const uint group = sgid / simds_per_head;
+    const uint local_sgid = sgid % simds_per_head;
+    const uint local_tid = local_sgid * SIMD_SIZE + lane;
+    const uint h = kv_h * num_kv_groups + group;
+    if (h >= num_heads) return;
+
+    const uint q_offset = (h * q_len + qi) * head_dim;
+    const uint k_head_base = kv_h * capacity * row_bytes;
+    const uint v_head_base = kv_h * capacity * row_bytes;
+
+    threadgroup float shared_q[GQA_MAX_GROUPS * FLASH_MAX_HEAD];
+    threadgroup float shared_scores[GQA_MAX_GROUPS * GQA_TILE_KV];
+    threadgroup float shared_exp[GQA_TILE_KV];
+    threadgroup float shared_update[GQA_MAX_GROUPS * 4];
+    threadgroup uchar shared_kv_tile[GQA_TILE_KV * GQA_MAX_ROW_BYTES];
+
+    threadgroup float* q_head = shared_q + group * FLASH_MAX_HEAD;
+    threadgroup float* scores_head = shared_scores + group * GQA_TILE_KV;
+    threadgroup float* update_head = shared_update + group * 4;
+
+    if (local_tid == 0) {
+        update_head[0] = -INFINITY;
+        update_head[1] = 0.0f;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    flash_zero_output_gqa(output, q_offset, head_dim, local_tid, threads_per_head);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    flash_load_q_gqa(Q, q_offset, q_head, head_dim, local_tid, threads_per_head);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint kv_tile = attend_start; kv_tile < attend_len; kv_tile += GQA_TILE_KV) {
+        const uint tile_count = min(GQA_TILE_KV, attend_len - kv_tile);
+
+        flash_load_kv_tile_q4(
+            K_cache, k_head_base, kv_tile, tile_count, row_bytes,
+            tid, FLASH_TG_SIZE, shared_kv_tile);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        for (uint wave = local_sgid; wave < tile_count; wave += simds_per_head) {
+            const uint kv_offset = wave;
+            float partial = flash_dot_q4_k_tg(
+                shared_kv_tile + kv_offset * row_bytes, head_dim, q_head, lane);
+            partial = simd_sum(partial);
+            if (lane == 0) {
+                scores_head[kv_offset] = partial * scale;
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        if (local_tid == 0) {
+            flash_softmax_tile(scores_head, shared_exp, update_head, tile_count);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        flash_load_kv_tile_q4(
+            V_cache, v_head_base, kv_tile, tile_count, row_bytes,
+            tid, FLASH_TG_SIZE, shared_kv_tile);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        const float old_factor = update_head[2];
+        const float inv_l = update_head[3];
+        flash_accum_v_q4_tg(
+            output, q_offset, shared_kv_tile, row_bytes, head_dim,
+            tile_count, shared_exp, old_factor, inv_l, local_tid, threads_per_head);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+}
+
 // ─── Flash causal prefill (f16 KV) ─────────────────────────────────────────
 
 kernel void attention_flash_causal_f16(

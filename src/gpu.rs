@@ -416,6 +416,13 @@ pub fn fused_q_attn_enabled() -> bool {
 /// Output rows per Q4 fast matvec threadgroup (8 simdgroups × 4 rows).
 const Q4_MATVEC_ROWS_PER_TG: u32 = 32;
 
+fn prefill_gqa_attention_enabled() -> bool {
+    !matches!(
+        std::env::var("PREFILL_ATTN_GQA").as_deref(),
+        Ok("0") | Ok("false") | Ok("legacy") | Ok("LEGACY")
+    )
+}
+
 fn attention_threadgroup_size(flash: bool) -> MTLSize {
     if flash {
         MTLSize::new(256, 1, 1)
@@ -548,6 +555,7 @@ pub struct MetalContext {
     pub flash_attn_ggml_reduce_h128_pipeline: ComputePipelineState,
     pub flash_attn_ggml_reduce_h512_pipeline: ComputePipelineState,
     pub attention_causal_q4_0_pipeline: ComputePipelineState,
+    pub attention_flash_causal_q4_0_gqa_pipeline: ComputePipelineState,
     pub attention_causal_strided_q4_0_pipeline: ComputePipelineState,
     pub embed_gather_bf16_pipeline: ComputePipelineState,
     pub embed_gather_bf16_batch_pipeline: ComputePipelineState,
@@ -776,6 +784,8 @@ impl MetalContext {
         } else {
             "attention_causal_q4_0"
         });
+        let attention_flash_causal_q4_0_gqa_pipeline =
+            get_fn("attention_flash_causal_q4_0_gqa");
         let attention_causal_strided_q4_0_pipeline = get_fn(if use_flash_attention {
             "attention_flash_causal_strided_q4_0"
         } else {
@@ -787,6 +797,9 @@ impl MetalContext {
         let decode_mega_gemma4_pipeline = get_fn("decode_mega_gemma4_q4_0");
         if use_flash_attention {
             println!("  FlashAttention-style tiled kernels enabled (FLASH_ATTN=legacy to disable)");
+            if prefill_gqa_attention_enabled() {
+                println!("  Prefill attention: GQA flash causal (PREFILL_ATTN_GQA=legacy to disable)");
+            }
             match attention_kernel_mode() {
                 AttentionKernelMode::Ggml => {
                     println!("  Q4 decode attention: ggml flash_attn_ext_vec nwg=32 (ATTENTION_KERNEL=ggml)");
@@ -976,6 +989,7 @@ impl MetalContext {
             flash_attn_ggml_reduce_h128_pipeline,
             flash_attn_ggml_reduce_h512_pipeline,
             attention_causal_q4_0_pipeline,
+            attention_flash_causal_q4_0_gqa_pipeline,
             attention_causal_strided_q4_0_pipeline,
             embed_gather_bf16_pipeline,
             embed_gather_bf16_batch_pipeline,
@@ -5177,7 +5191,15 @@ impl MetalContext {
         groups_per_row: u32,
         row_bytes: u32,
     ) {
-        encoder.set_compute_pipeline_state(&self.attention_causal_q4_0_pipeline);
+        let use_gqa = self.use_flash_attention
+            && prefill_gqa_attention_enabled()
+            && num_kv_groups > 1
+            && q_len > 1;
+        if use_gqa {
+            encoder.set_compute_pipeline_state(&self.attention_flash_causal_q4_0_gqa_pipeline);
+        } else {
+            encoder.set_compute_pipeline_state(&self.attention_causal_q4_0_pipeline);
+        }
         encoder.set_buffer(0, Some(q_buf), 0);
         encoder.set_buffer(1, Some(k_cache_buf), 0);
         encoder.set_buffer(2, Some(v_cache_buf), 0);
@@ -5195,7 +5217,11 @@ impl MetalContext {
         encoder.set_bytes(14, 4, &groups_per_row as *const u32 as *const _);
         encoder.set_bytes(15, 4, &row_bytes as *const u32 as *const _);
         let tg_size = attention_threadgroup_size(self.use_flash_attention);
-        let num_tgs = num_heads * q_len;
+        let num_tgs = if use_gqa {
+            num_kv_heads * q_len
+        } else {
+            num_heads * q_len
+        };
         encoder.dispatch_thread_groups(MTLSize::new(num_tgs as u64, 1, 1), tg_size);
     }
 
