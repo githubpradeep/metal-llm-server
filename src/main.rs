@@ -212,6 +212,60 @@ fn main() {
         return;
     }
 
+    // Server-equivalent smoke test: KV pool + parallel prefill + CPU greedy sample.
+    if args.iter().any(|a| a == "--gguf-kv-gen") {
+        let mut model = gemma4_gpu_model::Gemma4GpuModel::load_from_gguf(&model_dir);
+        let tok = gguf::build_tokenizer_from_gguf(&model_dir);
+        let prompt = concat!(
+            "<|turn>user\nSay hello in one word.<turn|>\n",
+            "<|turn>model\n<|channel>thought\n<channel|>"
+        );
+        let ids: Vec<usize> = tok
+            .encode(prompt, true)
+            .expect("encode")
+            .get_ids()
+            .iter()
+            .map(|&t| t as usize)
+            .collect();
+        println!("Prompt ids ({}): {:?}", ids.len(), ids);
+
+        let mut kv_pool = model.create_kv_pool(1, model.kv_capacity);
+        let slot = kv_pool
+            .allocate()
+            .expect("Failed to allocate KV slot for --gguf-kv-gen");
+
+        let sampling_params = sampling::SamplingParams {
+            temperature: 0.0,
+            min_p: 0.0,
+            top_k: 0,
+            repetition_penalty: 1.0,
+            frequency_penalty: 0.0,
+        };
+        let eos: &[usize] = &[1, 106];
+        let mut history = Vec::new();
+        let mut logits = model
+            .forward_prefill_chunk_with_kv_slot(&ids, &mut kv_pool, slot)
+            .expect("KV prefill failed");
+        let mut next =
+            sampling::sample_with_params(&logits, &sampling_params, &history);
+
+        let printer = token_printer::TokenPrinter::spawn(&tok);
+        for _ in 0..20 {
+            if eos.contains(&next) {
+                break;
+            }
+            printer.send(next as u32);
+            history.push(next);
+            logits = model
+                .forward_single_token_with_kv_slot(next, &mut kv_pool, slot)
+                .expect("KV decode failed");
+            next = sampling::sample_with_params(&logits, &sampling_params, &history);
+        }
+        let out = printer.finish();
+        println!("\n=== GGUF KV-pool generation (server path) ===\n{}", out);
+        return;
+    }
+
     let sink_size = 4;
     let window_size = 64;
 
