@@ -187,6 +187,20 @@ pub fn prefill_use_flash_attn_ext_tiled(q_len: u32, head_dim: u32) -> bool {
     crate::ggml_flash_attn_ext::prefill_use_tiled_ext(q_len, head_dim)
 }
 
+pub fn prefill_gpu_rope_enabled() -> bool {
+    !matches!(
+        std::env::var("PREFILL_GPU_ROPE").as_deref(),
+        Ok("0") | Ok("false") | Ok("FALSE")
+    )
+}
+
+pub fn prefill_timing_enabled() -> bool {
+    matches!(
+        std::env::var("PREFILL_TIMING").as_deref(),
+        Ok("1") | Ok("true") | Ok("TRUE")
+    )
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum AttentionKernelMode {
     /// Hybrid by KV length: fused below 128 tokens, ggml MWG at/above 128.
@@ -514,6 +528,7 @@ pub struct MetalContext {
     pub attention_causal_pipeline: ComputePipelineState,
     pub rotary_pipeline: ComputePipelineState,
     pub rope_fill_decode_pipeline: ComputePipelineState,
+    pub rope_fill_prefill_batch_pipeline: ComputePipelineState,
     pub rotary_batch_pipeline: ComputePipelineState,
     pub vec_add_pipeline: ComputePipelineState,
     pub vec_add_batch_pipeline: ComputePipelineState,
@@ -711,6 +726,7 @@ impl MetalContext {
         let attention_causal_pipeline = get_fn("attention_causal");
         let rotary_pipeline = get_fn("apply_rotary");
         let rope_fill_decode_pipeline = get_fn("rope_fill_decode");
+        let rope_fill_prefill_batch_pipeline = get_fn("rope_fill_prefill_batch");
         let rotary_batch_pipeline = get_fn("apply_rotary_batch");
         let vec_add_pipeline = get_fn("vec_add");
         let vec_add_batch_pipeline = get_fn("vec_add_batch");
@@ -953,6 +969,7 @@ impl MetalContext {
             attention_causal_pipeline,
             rotary_pipeline,
             rope_fill_decode_pipeline,
+            rope_fill_prefill_batch_pipeline,
             rotary_batch_pipeline,
             vec_add_pipeline,
             vec_add_batch_pipeline,
@@ -3263,6 +3280,29 @@ impl MetalContext {
         encoder.dispatch_threads(threads, MTLSize::new(256, 1, 1));
     }
 
+    /// GPU cos/sin tables for one prefill layer × seq_len rows.
+    pub fn encode_rope_fill_prefill_batch(
+        &self,
+        encoder: &metal::ComputeCommandEncoderRef,
+        cos_buf: &Buffer,
+        sin_buf: &Buffer,
+        layer_params: &Buffer,
+        layer_idx: u32,
+        start_pos: u32,
+        seq_len: u32,
+        head_dim: u32,
+    ) {
+        encoder.set_compute_pipeline_state(&self.rope_fill_prefill_batch_pipeline);
+        encoder.set_buffer(0, Some(cos_buf), 0);
+        encoder.set_buffer(1, Some(sin_buf), 0);
+        encoder.set_buffer(2, Some(layer_params), 0);
+        encoder.set_bytes(3, 4, &layer_idx as *const u32 as *const _);
+        encoder.set_bytes(4, 4, &start_pos as *const u32 as *const _);
+        encoder.set_bytes(5, 4, &seq_len as *const u32 as *const _);
+        let threads = MTLSize::new((head_dim / 2) as u64, seq_len as u64, 1);
+        encoder.dispatch_threads(threads, MTLSize::new(256, 1, 1));
+    }
+
     pub fn encode_rotary(
         &self,
         encoder: &metal::ComputeCommandEncoderRef,
@@ -5292,6 +5332,7 @@ impl MetalContext {
         row_bytes: u32,
         fa_ext_scratch: Option<&Buffer>,
         fa_ext_layout: Option<&crate::ggml_flash_attn_ext::ScratchLayout>,
+        fa_ext_mask_cache: Option<&mut crate::ggml_flash_attn_ext::PrefillExtMaskCache>,
     ) {
         let _ = (num_kv_groups, groups_per_row);
         if prefill_flash_attn_ext_enabled()
@@ -5306,6 +5347,7 @@ impl MetalContext {
                     out_buf,
                     scratch,
                     layout,
+                    fa_ext_mask_cache,
                     num_heads,
                     num_kv_heads,
                     head_dim,
@@ -5351,6 +5393,7 @@ impl MetalContext {
         out_buf: &Buffer,
         scratch: &Buffer,
         layout: &crate::ggml_flash_attn_ext::ScratchLayout,
+        mask_cache: Option<&mut crate::ggml_flash_attn_ext::PrefillExtMaskCache>,
         num_heads: u32,
         num_kv_heads: u32,
         head_dim: u32,
@@ -5367,27 +5410,53 @@ impl MetalContext {
             FlashAttnExtArgs, FlashAttnExtBlkArgs, FlashAttnExtPadArgs, NCPSG, NQPTG,
         };
 
-        let mask_len = (q_len as usize) * (kv_seq as usize);
-        let mut mask_host = vec![0u16; mask_len];
-        fill_causal_mask(
-            &mut mask_host,
-            q_len,
-            kv_seq,
-            q_start,
-            attention_window,
-        );
-        unsafe {
-            let base = scratch.contents() as *mut u8;
-            std::ptr::copy_nonoverlapping(
-                mask_host.as_ptr() as *const u8,
-                base.add(layout.mask_off as usize),
-                mask_len * 2,
-            );
-        }
-
         let pad_off = layout.pad_off;
         let blk_off = layout.blk_off;
         let mask_off = layout.mask_off;
+
+        let need_mask_blk = match mask_cache.as_ref() {
+            Some(cache) => !cache.matches(q_len, kv_seq, q_start, attention_window),
+            None => true,
+        };
+        if need_mask_blk {
+            let mask_len = (q_len as usize) * (kv_seq as usize);
+            let mut mask_host = vec![0u16; mask_len];
+            fill_causal_mask(
+                &mut mask_host,
+                q_len,
+                kv_seq,
+                q_start,
+                attention_window,
+            );
+            unsafe {
+                let base = scratch.contents() as *mut u8;
+                std::ptr::copy_nonoverlapping(
+                    mask_host.as_ptr() as *const u8,
+                    base.add(layout.mask_off as usize),
+                    mask_len * 2,
+                );
+            }
+
+            let blk_args = blk_args(q_len, kv_seq);
+            encoder.set_compute_pipeline_state(&self.flash_attn_ext_prefill_blk_pipeline);
+            encoder.set_bytes(
+                0,
+                std::mem::size_of::<FlashAttnExtBlkArgs>() as u64,
+                &blk_args as *const _ as *const _,
+            );
+            encoder.set_buffer(1, Some(scratch), mask_off);
+            encoder.set_buffer(2, Some(scratch), blk_off);
+            let nblk1 = ((q_len + NQPTG - 1) / NQPTG) as u64;
+            let nblk0 = ((kv_seq + NCPSG - 1) / NCPSG) as u64;
+            encoder.dispatch_thread_groups(
+                metal::MTLSize::new(nblk0, nblk1, 1),
+                metal::MTLSize::new(32, 1, 1),
+            );
+
+            if let Some(cache) = mask_cache {
+                cache.mark(q_len, kv_seq, q_start, attention_window);
+            }
+        }
 
         let has_kvpad = kv_seq % NCPSG != 0;
         if has_kvpad {
@@ -5408,22 +5477,6 @@ impl MetalContext {
                 metal::MTLSize::new(32, 1, 1),
             );
         }
-
-        let blk_args = blk_args(q_len, kv_seq);
-        encoder.set_compute_pipeline_state(&self.flash_attn_ext_prefill_blk_pipeline);
-        encoder.set_bytes(
-            0,
-            std::mem::size_of::<FlashAttnExtBlkArgs>() as u64,
-            &blk_args as *const _ as *const _,
-        );
-        encoder.set_buffer(1, Some(scratch), mask_off);
-        encoder.set_buffer(2, Some(scratch), blk_off);
-        let nblk1 = ((q_len + NQPTG - 1) / NQPTG) as u64;
-        let nblk0 = ((kv_seq + NCPSG - 1) / NCPSG) as u64;
-        encoder.dispatch_thread_groups(
-            metal::MTLSize::new(nblk0, nblk1, 1),
-            metal::MTLSize::new(32, 1, 1),
-        );
 
         let nsg = nsg_for_head_dim(head_dim);
         let args = flash_attn_ext_args(

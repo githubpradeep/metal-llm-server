@@ -502,9 +502,10 @@ fn bench_prefill_gemma4(
     let filler = "The quick brown fox jumps over the lazy dog. ";
     println!("\n=== Gemma4 parallel prefill benchmark (Metal GPU) ===");
     println!(
-        "  max_parallel_prefill_seq={}  PREFILL_MUL_MM={}",
+        "  max_parallel_prefill_seq={}  PREFILL_MUL_MM={}  PREFILL_FLASH_ATTN={}",
         model.max_parallel_prefill_seq(),
-        std::env::var("PREFILL_MUL_MM").unwrap_or_else(|_| "1".into())
+        std::env::var("PREFILL_MUL_MM").unwrap_or_else(|_| "1".into()),
+        std::env::var("PREFILL_FLASH_ATTN").unwrap_or_else(|_| "0".into())
     );
 
     for &target in sizes {

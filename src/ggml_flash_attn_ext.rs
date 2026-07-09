@@ -242,6 +242,34 @@ pub struct ScratchLayout {
     pub total: u64,
 }
 
+/// Cache mask+blk prepass across layers sharing the same causal window in one chunk.
+#[derive(Clone, Copy, Default)]
+pub struct PrefillExtMaskCache {
+    pub q_len: u32,
+    pub kv_seq: u32,
+    pub q_start: u32,
+    pub attention_window: u32,
+    pub ready: bool,
+}
+
+impl PrefillExtMaskCache {
+    pub fn matches(&self, q_len: u32, kv_seq: u32, q_start: u32, attention_window: u32) -> bool {
+        self.ready
+            && self.q_len == q_len
+            && self.kv_seq == kv_seq
+            && self.q_start == q_start
+            && self.attention_window == attention_window
+    }
+
+    pub fn mark(&mut self, q_len: u32, kv_seq: u32, q_start: u32, attention_window: u32) {
+        self.q_len = q_len;
+        self.kv_seq = kv_seq;
+        self.q_start = q_start;
+        self.attention_window = attention_window;
+        self.ready = true;
+    }
+}
+
 pub fn scratch_layout(
     max_q_len: u32,
     kv_capacity: u32,

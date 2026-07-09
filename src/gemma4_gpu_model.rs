@@ -66,7 +66,7 @@ fn encode_proj_norm_residual(
     }
 }
 
-const DEFAULT_MAX_PREFILL_SEQ: usize = 512;
+const DEFAULT_MAX_PREFILL_SEQ: usize = 1024;
 const DEFAULT_MAX_DECODE_BATCH: usize = 4;
 
 /// Cumulative per-phase GPU time (ms) and token count for PROFILE_PHASES.
@@ -5011,6 +5011,31 @@ impl Gemma4GpuModel {
         Ok(())
     }
 
+    fn encode_prefill_gpu_rotary_tables(
+        &self,
+        encoder: &metal::ComputeCommandEncoderRef,
+        start_pos: usize,
+        seq_len: usize,
+    ) -> Result<(), String> {
+        for layer_idx in 0..self.layers.len() {
+            let layer = self
+                .layers
+                .get(layer_idx)
+                .ok_or_else(|| format!("invalid layer index {}", layer_idx))?;
+            self.ctx.encode_rope_fill_prefill_batch(
+                encoder,
+                &self.per_layer_prefill_cos_bufs[layer_idx],
+                &self.per_layer_prefill_sin_bufs[layer_idx],
+                &self.rope_layer_params_buf,
+                layer_idx as u32,
+                start_pos as u32,
+                seq_len as u32,
+                layer.head_dim as u32,
+            );
+        }
+        Ok(())
+    }
+
     fn can_use_parallel_prefill_chunk(
         &self,
         start_pos: usize,
@@ -5061,6 +5086,7 @@ impl Gemma4GpuModel {
         } else {
             self.config.sliding_window as u32
         };
+        let mut ext_mask_cache = crate::ggml_flash_attn_ext::PrefillExtMaskCache::default();
 
         if layer.has_kv {
             let k_cache = kv_pool
@@ -5229,6 +5255,7 @@ impl Gemma4GpuModel {
                     row_bytes,
                     fa_scratch,
                     fa_layout,
+                    Some(&mut ext_mask_cache),
                 );
             }
         }
@@ -5875,11 +5902,22 @@ impl Gemma4GpuModel {
         let vocab_size = self.config.vocab_size;
         let eps = self.config.rms_norm_eps as f32;
 
+        let timing = crate::gpu::prefill_timing_enabled();
+        let t_chunk = std::time::Instant::now();
+
         // ═══ Encode PLE + all layers (+ optional tail) in one command buffer ═══
         let cmd = self.ctx.queue.new_command_buffer();
+        if crate::gpu::prefill_gpu_rope_enabled() {
+            let rope_encoder = cmd.new_compute_command_encoder();
+            self.encode_prefill_gpu_rotary_tables(rope_encoder, start_pos, seq_len)?;
+            rope_encoder.end_encoding();
+        }
+        let t_after_rope = std::time::Instant::now();
         let ple_encoder = cmd.new_compute_command_encoder();
         self.encode_parallel_prefill_ple_context_on_encoder(ple_encoder, seq_len)?;
         ple_encoder.end_encoding();
+
+        let mut ext_mask_cache = crate::ggml_flash_attn_ext::PrefillExtMaskCache::default();
 
         for layer_idx in 0..self.layers.len() {
             let encoder = cmd.new_compute_command_encoder();
@@ -6072,6 +6110,7 @@ impl Gemma4GpuModel {
                         row_bytes,
                         fa_scratch,
                         fa_layout,
+                        Some(&mut ext_mask_cache),
                     );
                 }
             }
@@ -6316,6 +6355,26 @@ impl Gemma4GpuModel {
         // ═══ SINGLE commit + wait for PLE + all layers (+ optional tail) ═══
         cmd.commit();
         cmd.wait_until_completed();
+        let t_after_gpu = std::time::Instant::now();
+
+        if timing {
+            let rope_ms = (t_after_rope - t_chunk).as_secs_f64() * 1e3;
+            let gpu_ms = (t_after_gpu - t_after_rope).as_secs_f64() * 1e3;
+            let total_ms = (t_after_gpu - t_chunk).as_secs_f64() * 1e3;
+            eprintln!(
+                "[prefill timing] chunk seq={} start={} rope_gpu={:.1}ms layers_gpu={:.1}ms total={:.1}ms ({:.1} tok/s)",
+                seq_len,
+                start_pos,
+                rope_ms,
+                gpu_ms - rope_ms,
+                total_ms,
+                if total_ms > 0.0 {
+                    seq_len as f64 / (total_ms / 1e3)
+                } else {
+                    0.0
+                }
+            );
+        }
 
         let logits = if compute_logits {
             let mut logits =
@@ -7733,7 +7792,9 @@ impl Gemma4GpuModel {
     ) -> Result<Vec<f32>, String> {
         self.prepare_parallel_prefill_inputs(token_ids)?;
         let start_pos = kv_pool.total_tokens(slot).map_err(|err| err.to_string())?;
-        self.prepare_parallel_prefill_rotary(start_pos, token_ids.len())?;
+        if !crate::gpu::prefill_gpu_rope_enabled() {
+            self.prepare_parallel_prefill_rotary(start_pos, token_ids.len())?;
+        }
 
         if self.can_use_parallel_prefill_chunk(start_pos, token_ids.len(), kv_pool) {
             return self.forward_prefill_chunk_parallel_with_kv_slot(
