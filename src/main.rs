@@ -6,6 +6,7 @@ mod layers;
 mod cache;
 mod ggml_gemv;
 mod ggml_flash_attn;
+mod ggml_flash_attn_ext;
 mod gguf;
 mod gpu;
 mod gpu_model;

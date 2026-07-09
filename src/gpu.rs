@@ -173,6 +173,20 @@ fn flash_attention_enabled() -> bool {
     )
 }
 
+/// Tiled GQA causal prefill (flash_attn_ext-style). Opt in with PREFILL_FLASH_ATTN=1.
+pub fn prefill_flash_attn_ext_enabled() -> bool {
+    flash_attention_enabled()
+        && matches!(
+            std::env::var("PREFILL_FLASH_ATTN").as_deref(),
+            Ok("1") | Ok("true") | Ok("TRUE")
+        )
+}
+
+/// Tiled flash_attn_ext prefill when q_len ≥ 20 (llama.cpp threshold).
+pub fn prefill_use_flash_attn_ext_tiled(q_len: u32, head_dim: u32) -> bool {
+    crate::ggml_flash_attn_ext::prefill_use_tiled_ext(q_len, head_dim)
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum AttentionKernelMode {
     /// Hybrid by KV length: fused below 128 tokens, ggml MWG at/above 128.
@@ -560,6 +574,12 @@ pub struct MetalContext {
     pub flash_attn_ggml_reduce_h512_pipeline: ComputePipelineState,
     pub attention_causal_q4_0_pipeline: ComputePipelineState,
     pub attention_causal_strided_q4_0_pipeline: ComputePipelineState,
+    pub attention_causal_q4_0_gqa_h256_pipeline: ComputePipelineState,
+    pub attention_causal_q4_0_gqa_h512_pipeline: ComputePipelineState,
+    pub flash_attn_ext_prefill_pad_pipeline: ComputePipelineState,
+    pub flash_attn_ext_prefill_blk_pipeline: ComputePipelineState,
+    pub flash_attn_ext_prefill_q4_h256_pipeline: ComputePipelineState,
+    pub flash_attn_ext_prefill_q4_h512_pipeline: ComputePipelineState,
     pub embed_gather_bf16_pipeline: ComputePipelineState,
     pub embed_gather_bf16_batch_pipeline: ComputePipelineState,
     pub sample_token_pipeline: ComputePipelineState,
@@ -581,6 +601,8 @@ impl MetalContext {
         let ggml_path = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/shaders/ggml_mul_mv_q4.metal");
         let ggml_fa_path =
             Path::new(env!("CARGO_MANIFEST_DIR")).join("src/shaders/ggml_flash_attn.metal");
+        let ggml_fa_ext_path =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("src/shaders/ggml_flash_attn_ext.metal");
         let mut shader_src =
             std::fs::read_to_string(&shader_path).expect("Failed to read Metal shader file");
         shader_src.push('\n');
@@ -594,6 +616,11 @@ impl MetalContext {
         shader_src.push('\n');
         shader_src.push_str(
             &std::fs::read_to_string(&ggml_fa_path).expect("Failed to read ggml_flash_attn.metal"),
+        );
+        shader_src.push('\n');
+        shader_src.push_str(
+            &std::fs::read_to_string(&ggml_fa_ext_path)
+                .expect("Failed to read ggml_flash_attn_ext.metal"),
         );
 
         let options = CompileOptions::new();
@@ -778,12 +805,25 @@ impl MetalContext {
         } else {
             "attention_causal_strided_q4_0"
         });
+        let attention_causal_q4_0_gqa_h256_pipeline =
+            get_fn("attention_flash_causal_q4_0_gqa_h256");
+        let attention_causal_q4_0_gqa_h512_pipeline =
+            get_fn("attention_flash_causal_q4_0_gqa_h512");
+        let flash_attn_ext_prefill_pad_pipeline = get_fn("flash_attn_ext_prefill_pad_q4_0");
+        let flash_attn_ext_prefill_blk_pipeline = get_fn("flash_attn_ext_prefill_blk");
+        let flash_attn_ext_prefill_q4_h256_pipeline = get_fn("flash_attn_ext_prefill_q4_0_h256");
+        let flash_attn_ext_prefill_q4_h512_pipeline = get_fn("flash_attn_ext_prefill_q4_0_h512");
         let embed_gather_bf16_pipeline = get_fn("embed_gather_bf16");
         let embed_gather_bf16_batch_pipeline = get_fn("embed_gather_bf16_batch");
         let sample_token_pipeline = get_fn("sample_token");
         let decode_mega_gemma4_pipeline = get_fn("decode_mega_gemma4_q4_0");
         if use_flash_attention {
             println!("  FlashAttention-style tiled kernels enabled (FLASH_ATTN=legacy to disable)");
+            if prefill_flash_attn_ext_enabled() {
+                println!(
+                    "  Q4 prefill attention: llama.cpp flash_attn_ext tiled (PREFILL_FLASH_ATTN=1, q_len≥20)"
+                );
+            }
             match attention_kernel_mode() {
                 AttentionKernelMode::Ggml => {
                     println!("  Q4 decode attention: ggml flash_attn_ext_vec nwg=32 (ATTENTION_KERNEL=ggml)");
@@ -973,6 +1013,12 @@ impl MetalContext {
             flash_attn_ggml_reduce_h512_pipeline,
             attention_causal_q4_0_pipeline,
             attention_causal_strided_q4_0_pipeline,
+            attention_causal_q4_0_gqa_h256_pipeline,
+            attention_causal_q4_0_gqa_h512_pipeline,
+            flash_attn_ext_prefill_pad_pipeline,
+            flash_attn_ext_prefill_blk_pipeline,
+            flash_attn_ext_prefill_q4_h256_pipeline,
+            flash_attn_ext_prefill_q4_h512_pipeline,
             embed_gather_bf16_pipeline,
             embed_gather_bf16_batch_pipeline,
             sample_token_pipeline,
@@ -5222,6 +5268,197 @@ impl MetalContext {
         let tg_size = attention_threadgroup_size(self.use_flash_attention);
         let num_tgs = num_heads * q_len;
         encoder.dispatch_thread_groups(MTLSize::new(num_tgs as u64, 1, 1), tg_size);
+    }
+
+    /// Prefill causal Q4_0 attention: llama.cpp flash_attn_ext when q_len ≥ 20, else per-query flash.
+    pub fn encode_prefill_attention_causal_q4_0(
+        &self,
+        encoder: &metal::ComputeCommandEncoderRef,
+        q_buf: &Buffer,
+        k_cache_buf: &Buffer,
+        v_cache_buf: &Buffer,
+        out_buf: &Buffer,
+        num_heads: u32,
+        num_kv_heads: u32,
+        num_kv_groups: u32,
+        head_dim: u32,
+        kv_seq: u32,
+        capacity: u32,
+        scale: f32,
+        q_len: u32,
+        q_start: u32,
+        attention_window: u32,
+        groups_per_row: u32,
+        row_bytes: u32,
+        fa_ext_scratch: Option<&Buffer>,
+        fa_ext_layout: Option<&crate::ggml_flash_attn_ext::ScratchLayout>,
+    ) {
+        let _ = (num_kv_groups, groups_per_row);
+        if prefill_flash_attn_ext_enabled()
+            && prefill_use_flash_attn_ext_tiled(q_len, head_dim)
+        {
+            if let (Some(scratch), Some(layout)) = (fa_ext_scratch, fa_ext_layout) {
+                self.encode_prefill_flash_attn_ext_q4_0(
+                    encoder,
+                    q_buf,
+                    k_cache_buf,
+                    v_cache_buf,
+                    out_buf,
+                    scratch,
+                    layout,
+                    num_heads,
+                    num_kv_heads,
+                    head_dim,
+                    kv_seq,
+                    capacity,
+                    scale,
+                    q_len,
+                    q_start,
+                    attention_window,
+                    row_bytes as u64,
+                );
+                return;
+            }
+        }
+
+        self.encode_attention_causal_q4_0(
+            encoder,
+            q_buf,
+            k_cache_buf,
+            v_cache_buf,
+            out_buf,
+            num_heads,
+            num_kv_heads,
+            num_kv_groups,
+            head_dim,
+            kv_seq,
+            capacity,
+            scale,
+            q_len,
+            q_start,
+            attention_window,
+            groups_per_row,
+            row_bytes,
+        );
+    }
+
+    fn encode_prefill_flash_attn_ext_q4_0(
+        &self,
+        encoder: &metal::ComputeCommandEncoderRef,
+        q_buf: &Buffer,
+        k_cache_buf: &Buffer,
+        v_cache_buf: &Buffer,
+        out_buf: &Buffer,
+        scratch: &Buffer,
+        layout: &crate::ggml_flash_attn_ext::ScratchLayout,
+        num_heads: u32,
+        num_kv_heads: u32,
+        head_dim: u32,
+        kv_seq: u32,
+        capacity: u32,
+        scale: f32,
+        q_len: u32,
+        q_start: u32,
+        attention_window: u32,
+        row_bytes: u64,
+    ) {
+        use crate::ggml_flash_attn_ext::{
+            blk_args, fill_causal_mask, flash_attn_ext_args, nsg_for_head_dim, pad_args, smem_bytes,
+            FlashAttnExtArgs, FlashAttnExtBlkArgs, FlashAttnExtPadArgs, NCPSG, NQPTG,
+        };
+
+        let mask_len = (q_len as usize) * (kv_seq as usize);
+        let mut mask_host = vec![0u16; mask_len];
+        fill_causal_mask(
+            &mut mask_host,
+            q_len,
+            kv_seq,
+            q_start,
+            attention_window,
+        );
+        unsafe {
+            let base = scratch.contents() as *mut u8;
+            std::ptr::copy_nonoverlapping(
+                mask_host.as_ptr() as *const u8,
+                base.add(layout.mask_off as usize),
+                mask_len * 2,
+            );
+        }
+
+        let pad_off = layout.pad_off;
+        let blk_off = layout.blk_off;
+        let mask_off = layout.mask_off;
+
+        let has_kvpad = kv_seq % NCPSG != 0;
+        if has_kvpad {
+            let pad_args = pad_args(num_kv_heads, kv_seq, row_bytes, q_len);
+            encoder.set_compute_pipeline_state(&self.flash_attn_ext_prefill_pad_pipeline);
+            encoder.set_bytes(
+                0,
+                std::mem::size_of::<FlashAttnExtPadArgs>() as u64,
+                &pad_args as *const _ as *const _,
+            );
+            encoder.set_buffer(1, Some(k_cache_buf), 0);
+            encoder.set_buffer(2, Some(v_cache_buf), 0);
+            encoder.set_buffer(3, Some(scratch), mask_off);
+            encoder.set_buffer(4, Some(scratch), pad_off);
+            let ne12 = num_kv_heads.max(1);
+            encoder.dispatch_thread_groups(
+                metal::MTLSize::new(NCPSG as u64, ne12 as u64, 1),
+                metal::MTLSize::new(32, 1, 1),
+            );
+        }
+
+        let blk_args = blk_args(q_len, kv_seq);
+        encoder.set_compute_pipeline_state(&self.flash_attn_ext_prefill_blk_pipeline);
+        encoder.set_bytes(
+            0,
+            std::mem::size_of::<FlashAttnExtBlkArgs>() as u64,
+            &blk_args as *const _ as *const _,
+        );
+        encoder.set_buffer(1, Some(scratch), mask_off);
+        encoder.set_buffer(2, Some(scratch), blk_off);
+        let nblk1 = ((q_len + NQPTG - 1) / NQPTG) as u64;
+        let nblk0 = ((kv_seq + NCPSG - 1) / NCPSG) as u64;
+        encoder.dispatch_thread_groups(
+            metal::MTLSize::new(nblk0, nblk1, 1),
+            metal::MTLSize::new(32, 1, 1),
+        );
+
+        let nsg = nsg_for_head_dim(head_dim);
+        let args = flash_attn_ext_args(
+            num_heads,
+            num_kv_heads,
+            head_dim,
+            kv_seq,
+            capacity,
+            row_bytes,
+            q_len,
+            scale,
+        );
+        let main_pipeline = match head_dim {
+            256 => &self.flash_attn_ext_prefill_q4_h256_pipeline,
+            512 => &self.flash_attn_ext_prefill_q4_h512_pipeline,
+            _ => unreachable!("prefill flash_attn_ext only supports h256/h512"),
+        };
+        encoder.set_compute_pipeline_state(main_pipeline);
+        encoder.set_bytes(
+            0,
+            std::mem::size_of::<FlashAttnExtArgs>() as u64,
+            &args as *const _ as *const _,
+        );
+        encoder.set_buffer(1, Some(q_buf), 0);
+        encoder.set_buffer(2, Some(k_cache_buf), 0);
+        encoder.set_buffer(3, Some(v_cache_buf), 0);
+        encoder.set_buffer(4, Some(scratch), mask_off);
+        encoder.set_buffer(5, Some(scratch), pad_off);
+        encoder.set_buffer(6, Some(scratch), blk_off);
+        encoder.set_buffer(7, Some(out_buf), 0);
+        encoder.set_threadgroup_memory_length(0, smem_bytes(head_dim, nsg));
+        encoder.dispatch_thread_groups(
+            metal::MTLSize::new(((q_len + NQPTG - 1) / NQPTG) as u64, num_heads as u64, 1),
+            metal::MTLSize::new(32, nsg as u64, 1),
+        );
     }
 
     pub fn encode_attention_causal_strided_q4_0(

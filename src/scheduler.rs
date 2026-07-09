@@ -287,6 +287,7 @@ impl Scheduler {
             .map(|prepared| PrefillInput {
                 slot: prepared.input.slot,
                 token_ids: prepared.input.token_ids.clone(),
+                want_logits: prepared.input.want_logits,
             })
             .collect();
 
@@ -586,6 +587,7 @@ fn prepare_prefill_chunk(active: &ActiveRequest, chunk_size: usize) -> PrefillPr
     PrefillPreparation::Forward(PrefillInput {
         slot: active.slot,
         token_ids: active.request.input_ids[chunk_start..chunk_end].to_vec(),
+        want_logits: chunk_end >= active.request.input_ids.len(),
     })
 }
 
