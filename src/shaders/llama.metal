@@ -2543,6 +2543,229 @@ kernel void gelu_mul(
     out[gid] = gelu_pytorch_tanh(gate[gid]) * up[gid];
 }
 
+// gate_up_stacked: per token [gate_0..gate_{m-1}, up_0..up_{m-1}] (mul_mm [seq, 2*m] layout).
+kernel void gelu_mul_stacked_batch(
+    device const float* gate_up [[buffer(0)]],
+    device float* out [[buffer(1)]],
+    constant uint& m [[buffer(2)]],
+    constant uint& seq_len [[buffer(3)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    uint total = seq_len * m;
+    if (gid >= total) return;
+    uint t = gid / m;
+    uint i = gid % m;
+    uint base = t * (2u * m);
+    float gate = gate_up[base + i];
+    float up = gate_up[base + m + i];
+    out[gid] = gelu_pytorch_tanh(gate) * up;
+}
+
+// qkv_stacked: per token [q_0..q_{mq-1}, k_0..k_{mkv-1}, v_0..v_{mkv-1}] (SHD rows).
+kernel void qkv_split_stacked_batch(
+    device const float* stacked [[buffer(0)]],
+    device float* q [[buffer(1)]],
+    device float* k [[buffer(2)]],
+    device float* v [[buffer(3)]],
+    constant uint& m_q [[buffer(4)]],
+    constant uint& m_kv [[buffer(5)]],
+    constant uint& seq_len [[buffer(6)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    uint m_stacked = m_q + 2u * m_kv;
+    uint total = seq_len * m_stacked;
+    if (gid >= total) return;
+    uint t = gid / m_stacked;
+    uint i = gid % m_stacked;
+    float val = stacked[gid];
+    if (i < m_q) {
+        q[t * m_q + i] = val;
+    } else if (i < m_q + m_kv) {
+        k[t * m_kv + (i - m_q)] = val;
+    } else {
+        v[t * m_kv + (i - m_q - m_kv)] = val;
+    }
+}
+
+// Split stacked mul_mm output directly into (heads, seq, dim) HSD layout for flash_attn / rotary.
+kernel void qkv_split_stacked_to_hsd(
+    device const float* stacked [[buffer(0)]],
+    device float* q [[buffer(1)]],
+    device float* k [[buffer(2)]],
+    device float* v [[buffer(3)]],
+    constant uint& m_q [[buffer(4)]],
+    constant uint& m_kv [[buffer(5)]],
+    constant uint& head_dim [[buffer(6)]],
+    constant uint& num_heads [[buffer(7)]],
+    constant uint& num_kv_heads [[buffer(8)]],
+    constant uint& seq_len [[buffer(9)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    uint m_stacked = m_q + 2u * m_kv;
+    uint total_q = seq_len * num_heads * head_dim;
+    uint total_kv = seq_len * num_kv_heads * head_dim;
+    uint total = total_q + 2u * total_kv;
+    if (gid >= total) return;
+
+    if (gid < total_q) {
+        uint h = gid / (seq_len * head_dim);
+        uint rem = gid % (seq_len * head_dim);
+        uint s = rem / head_dim;
+        uint d = rem % head_dim;
+        uint src = s * m_stacked + h * head_dim + d;
+        q[gid] = stacked[src];
+    } else if (gid < total_q + total_kv) {
+        uint kid = gid - total_q;
+        uint h = kid / (seq_len * head_dim);
+        uint rem = kid % (seq_len * head_dim);
+        uint s = rem / head_dim;
+        uint d = rem % head_dim;
+        uint src = s * m_stacked + m_q + h * head_dim + d;
+        k[kid] = stacked[src];
+    } else {
+        uint vid = gid - total_q - total_kv;
+        uint h = vid / (seq_len * head_dim);
+        uint rem = vid % (seq_len * head_dim);
+        uint s = rem / head_dim;
+        uint d = rem % head_dim;
+        uint src = s * m_stacked + m_q + m_kv + h * head_dim + d;
+        v[vid] = stacked[src];
+    }
+}
+
+// RMSNorm on (heads, seq, dim) HSD — one threadgroup per (head, seq).
+kernel void rmsnorm_hsd_batch(
+    device const float* x [[buffer(0)]],
+    device const float* weight [[buffer(1)]],
+    device float* out [[buffer(2)]],
+    constant uint& head_dim [[buffer(3)]],
+    constant uint& seq_len [[buffer(4)]],
+    constant float& eps [[buffer(5)]],
+    uint tid [[thread_index_in_threadgroup]],
+    uint tg_size [[threads_per_threadgroup]],
+    uint tgid [[threadgroup_position_in_grid]]
+) {
+    uint row_offset = tgid * head_dim;
+    threadgroup float shared_sum[256];
+    float partial_sum = 0.0f;
+    for (uint i = tid; i < head_dim; i += tg_size) {
+        float val = x[row_offset + i];
+        partial_sum += val * val;
+    }
+    shared_sum[tid] = partial_sum;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint stride = tg_size / 2; stride > 0; stride >>= 1) {
+        if (tid < stride) shared_sum[tid] += shared_sum[tid + stride];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    float inv_rms = rsqrt(shared_sum[0] / float(head_dim) + eps);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint i = tid; i < head_dim; i += tg_size) {
+        out[row_offset + i] = x[row_offset + i] * inv_rms * weight[i];
+    }
+}
+
+kernel void rmsnorm_noweight_hsd_batch(
+    device const float* x [[buffer(0)]],
+    device float* out [[buffer(1)]],
+    constant uint& head_dim [[buffer(2)]],
+    constant uint& seq_len [[buffer(3)]],
+    constant float& eps [[buffer(4)]],
+    uint tid [[thread_index_in_threadgroup]],
+    uint tg_size [[threads_per_threadgroup]],
+    uint tgid [[threadgroup_position_in_grid]]
+) {
+    (void)seq_len;
+    uint row_offset = tgid * head_dim;
+    threadgroup float shared_sum[256];
+    float partial_sum = 0.0f;
+    for (uint i = tid; i < head_dim; i += tg_size) {
+        float val = x[row_offset + i];
+        partial_sum += val * val;
+    }
+    shared_sum[tid] = partial_sum;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint stride = tg_size / 2; stride > 0; stride >>= 1) {
+        if (tid < stride) shared_sum[tid] += shared_sum[tid + stride];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    float inv_rms = rsqrt(shared_sum[0] / float(head_dim) + eps);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint i = tid; i < head_dim; i += tg_size) {
+        out[row_offset + i] = x[row_offset + i] * inv_rms;
+    }
+}
+
+// Fused RMSNorm + (seq,heads,dim)→(heads,seq,dim) for mul_mm output rows.
+kernel void rmsnorm_shd_to_hsd(
+    device const float* x [[buffer(0)]],
+    device const float* weight [[buffer(1)]],
+    device float* out [[buffer(2)]],
+    constant uint& head_dim [[buffer(3)]],
+    constant uint& num_heads [[buffer(4)]],
+    constant uint& seq_len [[buffer(5)]],
+    constant float& eps [[buffer(6)]],
+    uint tid [[thread_index_in_threadgroup]],
+    uint tg_size [[threads_per_threadgroup]],
+    uint tgid [[threadgroup_position_in_grid]]
+) {
+    uint s = tgid / num_heads;
+    uint h = tgid % num_heads;
+    uint shd_off = tgid * head_dim;
+    uint hsd_base = (h * seq_len + s) * head_dim;
+    threadgroup float shared_sum[256];
+    float partial_sum = 0.0f;
+    for (uint i = tid; i < head_dim; i += tg_size) {
+        float val = x[shd_off + i];
+        partial_sum += val * val;
+    }
+    shared_sum[tid] = partial_sum;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint stride = tg_size / 2; stride > 0; stride >>= 1) {
+        if (tid < stride) shared_sum[tid] += shared_sum[tid + stride];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    float inv_rms = rsqrt(shared_sum[0] / float(head_dim) + eps);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint i = tid; i < head_dim; i += tg_size) {
+        out[hsd_base + i] = x[shd_off + i] * inv_rms * weight[i];
+    }
+}
+
+kernel void rmsnorm_noweight_shd_to_hsd(
+    device const float* x [[buffer(0)]],
+    device float* out [[buffer(1)]],
+    constant uint& head_dim [[buffer(2)]],
+    constant uint& num_heads [[buffer(3)]],
+    constant uint& seq_len [[buffer(4)]],
+    constant float& eps [[buffer(5)]],
+    uint tid [[thread_index_in_threadgroup]],
+    uint tg_size [[threads_per_threadgroup]],
+    uint tgid [[threadgroup_position_in_grid]]
+) {
+    uint s = tgid / num_heads;
+    uint h = tgid % num_heads;
+    uint shd_off = tgid * head_dim;
+    uint hsd_base = (h * seq_len + s) * head_dim;
+    threadgroup float shared_sum[256];
+    float partial_sum = 0.0f;
+    for (uint i = tid; i < head_dim; i += tg_size) {
+        float val = x[shd_off + i];
+        partial_sum += val * val;
+    }
+    shared_sum[tid] = partial_sum;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint stride = tg_size / 2; stride > 0; stride >>= 1) {
+        if (tid < stride) shared_sum[tid] += shared_sum[tid + stride];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    float inv_rms = rsqrt(shared_sum[0] / float(head_dim) + eps);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint i = tid; i < head_dim; i += tg_size) {
+        out[hsd_base + i] = x[shd_off + i] * inv_rms;
+    }
+}
+
 kernel void gelu_mul_f16(
     device const float* gate [[buffer(0)]],
     device const float* up [[buffer(1)]],

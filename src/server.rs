@@ -1821,10 +1821,14 @@ const EMPTY_THOUGHT_PREFIX: &str = "<|channel>thought\n<channel|>";
 
 fn generation_priming_suffix(
     _messages: &[Message],
-    _tools: Option<&[Tool]>,
+    tools: Option<&[Tool]>,
     _tool_choice: Option<&serde_json::Value>,
 ) -> &'static str {
-    EMPTY_THOUGHT_PREFIX
+    if tools.is_some_and(|t| !t.is_empty()) {
+        EMPTY_THOUGHT_PREFIX
+    } else {
+        ""
+    }
 }
 
 const BUILT_IN_OUTPUT_TRIM_SEQUENCES: &[&str] = &[
@@ -2851,7 +2855,7 @@ async fn chat_completions_sync(
     }
 
     let split_mode = ChannelSplitMode {
-        plain_text_as_reasoning: awaits_tool_call(&req.messages),
+        plain_text_as_reasoning: has_tools && awaits_tool_call(&req.messages),
     };
     let message = assistant_message_out(text, tool_calls, split_mode);
 
@@ -2979,7 +2983,7 @@ async fn chat_completions_stream(
                 tool_choice_for_resolve.as_ref(),
             );
         let split_mode = ChannelSplitMode {
-            plain_text_as_reasoning: awaits_tool_call(&messages_for_resolve),
+            plain_text_as_reasoning: has_tools && awaits_tool_call(&messages_for_resolve),
         };
         let role_chunk_data = stream_chunk_json(
             &chat_id,
@@ -3544,6 +3548,32 @@ mod tests {
         assert!(prompt.contains("<|tool>declaration:read"));
         assert!(prompt.contains("<|turn>user\nhi<turn|>"));
         assert!(prompt.ends_with(EMPTY_THOUGHT_PREFIX));
+    }
+
+    #[test]
+    fn apply_chat_template_omits_thought_priming_for_plain_chat() {
+        let messages = vec![Message {
+            role: "user".to_string(),
+            content: Some("Say hello".to_string()),
+            ..Default::default()
+        }];
+        let prompt = apply_chat_template(&messages, None, None);
+        assert!(prompt.contains("<|turn>user\nSay hello<turn|>"));
+        assert!(prompt.ends_with("<|turn>model\n"));
+        assert!(!prompt.contains(CHANNEL_START));
+    }
+
+    #[test]
+    fn split_reasoning_puts_plain_chat_in_content_without_tools() {
+        let text = "Hello! Here is a short summary.";
+        let (reasoning, content) = split_reasoning_and_content_with_mode(
+            text,
+            ChannelSplitMode {
+                plain_text_as_reasoning: false,
+            },
+        );
+        assert!(reasoning.is_empty());
+        assert_eq!(content, text);
     }
 
     #[test]

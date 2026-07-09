@@ -293,6 +293,7 @@ pub struct PrefillScratch {
     pub ple_combined_buf: Buffer,
     pub q_normed_buf: Buffer,
     pub k_normed_buf: Buffer,
+    pub qkv_stacked_buf: Buffer,
     pub fa_ext_scratch: Buffer,
     pub fa_ext_layout: crate::ggml_flash_attn_ext::ScratchLayout,
 }
@@ -428,7 +429,7 @@ impl PrefillScratch {
             v_buf: ctx.buffer_empty(max_seq_len * max_kv_out),
             attn_out_buf: ctx.buffer_empty(max_seq_len * max_q_out),
             o_out_buf: ctx.buffer_empty(max_seq_len * hidden_size),
-            gate_buf: ctx.buffer_empty(max_seq_len * intermediate_size),
+            gate_buf: ctx.buffer_empty(2 * max_seq_len * intermediate_size),
             up_buf: ctx.buffer_empty(max_seq_len * intermediate_size),
             gelu_buf: ctx.buffer_empty(max_seq_len * intermediate_size),
             down_buf: ctx.buffer_empty(max_seq_len * hidden_size),
@@ -438,6 +439,7 @@ impl PrefillScratch {
             ple_combined_buf: ctx.buffer_empty(max_seq_len * num_layers * ple_dim),
             q_normed_buf: ctx.buffer_empty(max_seq_len * max_q_out),
             k_normed_buf: ctx.buffer_empty(max_seq_len * max_kv_out),
+            qkv_stacked_buf: ctx.buffer_empty(max_seq_len * (max_q_out + 2 * max_kv_out)),
             fa_ext_scratch: ctx.buffer_empty(fa_ext_elems),
             fa_ext_layout,
         }
@@ -698,10 +700,14 @@ pub struct Gemma4GpuLayer {
     pub k_proj: BufferView,
     pub v_proj: BufferView,
     pub o_proj: BufferView,
+    /// Vertically stacked [q, k, v rows] for prefill mul_mm (K-quant, KV layers).
+    pub qkv_stacked: BufferView,
     pub gate_proj: BufferView,
     pub up_proj: BufferView,
     /// Interleaved [gate_i, up_i] Q4 rows for packed MLP matvec (decode).
     pub gate_up_proj: BufferView,
+    /// Vertically stacked [gate rows, up rows] for prefill mul_mm (K-quant).
+    pub gate_up_stacked: BufferView,
     pub down_proj: BufferView,
 
     // 4 norms per layer (Gemma-style)
@@ -1140,9 +1146,11 @@ impl Gemma4GpuModel {
                 v_proj: BufferView::from_buffer(q_weight(&v_proj_data, kv_out, hidden_size)),
                 o_proj: BufferView::from_buffer(q_weight(&o_proj_data, hidden_size, q_out)),
 
+                qkv_stacked: BufferView::from_buffer(ctx.buffer_empty(1)),
                 gate_proj: BufferView::from_buffer(q_weight(&gate_proj_data, layer_inter, hidden_size)),
                 up_proj: BufferView::from_buffer(q_weight(&up_proj_data, layer_inter, hidden_size)),
                 gate_up_proj: BufferView::from_buffer(ctx.buffer_empty(1)),
+                gate_up_stacked: BufferView::from_buffer(ctx.buffer_empty(1)),
                 down_proj: BufferView::from_buffer(q_weight(&down_proj_data, hidden_size, layer_inter)),
 
                 input_layernorm_weight: BufferView::from_buffer(ctx.buffer_from_slice(&input_ln)),
@@ -1236,7 +1244,7 @@ impl Gemma4GpuModel {
             layers[i].kv_source_layer = i;
         }
 
-        let layers = Self::pack_layers_gate_up(&ctx, layers, hidden_size as u32);
+        let layers = Self::pack_layers_prefill_stacked(&ctx, layers, hidden_size as u32);
 
         let max_intermediate_size = layers
             .iter()
@@ -1644,9 +1652,11 @@ impl Gemma4GpuModel {
                 v_proj,
                 o_proj,
 
+                qkv_stacked: BufferView::from_buffer(ctx.buffer_empty(1)),
                 gate_proj,
                 up_proj,
                 gate_up_proj: BufferView::from_buffer(ctx.buffer_empty(1)),
+                gate_up_stacked: BufferView::from_buffer(ctx.buffer_empty(1)),
                 down_proj,
 
                 input_layernorm_weight: f32buf(p("attn_norm.weight")),
@@ -2238,9 +2248,15 @@ impl Gemma4GpuModel {
                 k_proj,
                 v_proj,
                 o_proj,
+                qkv_stacked: BufferView::from_buffer(
+                    device.new_buffer(1, MTLResourceOptions::StorageModeShared),
+                ),
                 gate_proj,
                 up_proj,
                 gate_up_proj: BufferView::from_buffer(
+                    device.new_buffer(1, MTLResourceOptions::StorageModeShared),
+                ),
+                gate_up_stacked: BufferView::from_buffer(
                     device.new_buffer(1, MTLResourceOptions::StorageModeShared),
                 ),
                 down_proj,
@@ -2449,7 +2465,7 @@ impl Gemma4GpuModel {
         load_start: Instant,
         load_label: &str,
     ) -> Self {
-        let layers = Self::pack_layers_gate_up(&ctx, layers, config.hidden_size as u32);
+        let layers = Self::pack_layers_prefill_stacked(&ctx, layers, config.hidden_size as u32);
         let max_intermediate_size = layers
             .iter()
             .map(|layer| layer.intermediate_size)
@@ -2665,22 +2681,27 @@ impl Gemma4GpuModel {
     }
 
     /// Build interleaved gate∥up Q4 buffers for decode MLP (uzu-style packing).
-    fn pack_layers_gate_up(
+    /// Build stacked prefill weight buffers (gate∥up, Q∥K∥V) at load time.
+    fn pack_layers_prefill_stacked(
         ctx: &MetalContext,
         mut layers: Vec<Gemma4GpuLayer>,
         k: u32,
     ) -> Vec<Gemma4GpuLayer> {
-        if !crate::gpu::packed_mlp_gate_up_enabled()
-            && !crate::decode_fused::fused_decode_enabled()
-        {
+        let pack_interleaved = crate::gpu::packed_mlp_gate_up_enabled()
+            || crate::decode_fused::fused_decode_enabled();
+        let pack_gate_up = crate::gpu::prefill_gate_up_stacked_enabled();
+        let pack_qkv = crate::gpu::prefill_qkv_stacked_enabled();
+        if !pack_interleaved && !pack_gate_up && !pack_qkv {
             for layer in layers.iter_mut() {
                 layer.gate_up_proj = BufferView::from_buffer(ctx.buffer_empty(1));
+                layer.gate_up_stacked = BufferView::from_buffer(ctx.buffer_empty(1));
+                layer.qkv_stacked = BufferView::from_buffer(ctx.buffer_empty(1));
             }
             return layers;
         }
         let pack_start = std::time::Instant::now();
         for layer in layers.iter_mut() {
-            if Self::use_packed_mlp_gate_up(layer) {
+            if pack_interleaved && Self::use_packed_mlp_gate_up(layer) {
                 layer.gate_up_proj = ctx.pack_gate_up_interleaved_q4(
                     &layer.gate_proj,
                     &layer.up_proj,
@@ -2690,9 +2711,31 @@ impl Gemma4GpuModel {
             } else {
                 layer.gate_up_proj = BufferView::from_buffer(ctx.buffer_empty(1));
             }
+            if pack_gate_up && Self::use_prefill_gate_up_stacked(layer) {
+                layer.gate_up_stacked = ctx.pack_gate_up_stacked_kquant(
+                    &layer.gate_proj,
+                    &layer.up_proj,
+                    layer.intermediate_size as u32,
+                    k,
+                );
+            } else {
+                layer.gate_up_stacked = BufferView::from_buffer(ctx.buffer_empty(1));
+            }
+            if pack_qkv && Self::use_prefill_qkv_stacked(layer) {
+                layer.qkv_stacked = ctx.pack_qkv_stacked_kquant(
+                    &layer.q_proj,
+                    &layer.k_proj,
+                    &layer.v_proj,
+                    layer.q_out_dim as u32,
+                    layer.kv_out_dim as u32,
+                    k,
+                );
+            } else {
+                layer.qkv_stacked = BufferView::from_buffer(ctx.buffer_empty(1));
+            }
         }
         println!(
-            "  Packed interleaved gate∥up Q4 weights in {:.2}s",
+            "  Packed prefill stacked weights (gate∥up + Q∥K∥V) in {:.2}s",
             pack_start.elapsed().as_secs_f64()
         );
         layers
@@ -2701,6 +2744,180 @@ impl Gemma4GpuModel {
     pub(crate) fn use_packed_mlp_gate_up(layer: &Gemma4GpuLayer) -> bool {
         (crate::gpu::packed_mlp_gate_up_enabled() || crate::decode_fused::fused_decode_enabled())
             && layer.weight_format == WeightFormat::Q4_0
+    }
+
+    pub(crate) fn use_prefill_gate_up_stacked(layer: &Gemma4GpuLayer) -> bool {
+        use crate::gpu::weight_fmt;
+        crate::gpu::prefill_gate_up_stacked_enabled()
+            && layer.gate_proj.format == weight_fmt::Q4_K
+            && layer.up_proj.format == weight_fmt::Q4_K
+    }
+
+    pub(crate) fn use_prefill_qkv_stacked(layer: &Gemma4GpuLayer) -> bool {
+        use crate::gpu::weight_fmt;
+        crate::gpu::prefill_qkv_stacked_enabled()
+            && layer.has_kv
+            && layer.q_proj.format == weight_fmt::Q4_K
+            && layer.k_proj.format == weight_fmt::Q4_K
+            && layer.v_proj.format == weight_fmt::Q4_K
+    }
+
+    fn encode_prefill_attention_qkv(
+        &self,
+        encoder: &metal::ComputeCommandEncoderRef,
+        layer: &Gemma4GpuLayer,
+        seq_len: u32,
+        hidden_size: u32,
+    ) {
+        let q_out = layer.q_out_dim as u32;
+        let kv_out = layer.kv_out_dim as u32;
+        if layer.weight_format == WeightFormat::F16 {
+            self.ctx.encode_projection_f16_batch_view(
+                encoder,
+                &layer.q_proj,
+                &self.prefill_scratch.normed_buf,
+                &self.prefill_scratch.q_buf,
+                q_out,
+                hidden_size,
+                seq_len,
+            );
+            if layer.has_kv {
+                self.ctx.encode_projection_f16_batch_view(
+                    encoder,
+                    &layer.k_proj,
+                    &self.prefill_scratch.normed_buf,
+                    &self.prefill_scratch.k_buf,
+                    kv_out,
+                    hidden_size,
+                    seq_len,
+                );
+                self.ctx.encode_projection_f16_batch_view(
+                    encoder,
+                    &layer.v_proj,
+                    &self.prefill_scratch.normed_buf,
+                    &self.prefill_scratch.v_buf,
+                    kv_out,
+                    hidden_size,
+                    seq_len,
+                );
+            }
+        } else if Self::use_prefill_qkv_stacked(layer) {
+            self.ctx.encode_prefill_qkv_kquant_stacked(
+                encoder,
+                &layer.qkv_stacked,
+                &self.prefill_scratch.normed_buf,
+                &self.prefill_scratch.qkv_stacked_buf,
+                q_out,
+                kv_out,
+                hidden_size,
+                seq_len,
+            );
+        } else {
+            self.ctx.encode_prefill_projection_q4_batch_view(
+                encoder,
+                &layer.q_proj,
+                &self.prefill_scratch.normed_buf,
+                &self.prefill_scratch.q_buf,
+                q_out,
+                hidden_size,
+                seq_len,
+            );
+            if layer.has_kv {
+                self.ctx.encode_prefill_projection_q4_batch_view(
+                    encoder,
+                    &layer.k_proj,
+                    &self.prefill_scratch.normed_buf,
+                    &self.prefill_scratch.k_buf,
+                    kv_out,
+                    hidden_size,
+                    seq_len,
+                );
+                self.ctx.encode_prefill_projection_q4_batch_view(
+                    encoder,
+                    &layer.v_proj,
+                    &self.prefill_scratch.normed_buf,
+                    &self.prefill_scratch.v_buf,
+                    kv_out,
+                    hidden_size,
+                    seq_len,
+                );
+            }
+        }
+    }
+
+    fn encode_prefill_mlp_gate_up(
+        &self,
+        encoder: &metal::ComputeCommandEncoderRef,
+        layer: &Gemma4GpuLayer,
+        seq_len: u32,
+        intermediate_size: u32,
+        hidden_size: u32,
+    ) {
+        let total_intermediate = seq_len * intermediate_size;
+        if layer.weight_format == WeightFormat::F16 {
+            self.ctx.encode_projection_f16_batch_view(
+                encoder,
+                &layer.gate_proj,
+                &self.prefill_scratch.normed_buf,
+                &self.prefill_scratch.gate_buf,
+                intermediate_size,
+                hidden_size,
+                seq_len,
+            );
+            self.ctx.encode_projection_f16_batch_view(
+                encoder,
+                &layer.up_proj,
+                &self.prefill_scratch.normed_buf,
+                &self.prefill_scratch.up_buf,
+                intermediate_size,
+                hidden_size,
+                seq_len,
+            );
+            self.ctx.encode_gelu_mul(
+                encoder,
+                &self.prefill_scratch.gate_buf,
+                &self.prefill_scratch.up_buf,
+                &self.prefill_scratch.gelu_buf,
+                total_intermediate,
+            );
+        } else if Self::use_prefill_gate_up_stacked(layer) {
+            self.ctx.encode_prefill_gate_up_kquant_stacked(
+                encoder,
+                &layer.gate_up_stacked,
+                &self.prefill_scratch.normed_buf,
+                &self.prefill_scratch.gate_buf,
+                &self.prefill_scratch.gelu_buf,
+                intermediate_size,
+                hidden_size,
+                seq_len,
+            );
+        } else {
+            self.ctx.encode_prefill_projection_q4_batch_view(
+                encoder,
+                &layer.gate_proj,
+                &self.prefill_scratch.normed_buf,
+                &self.prefill_scratch.gate_buf,
+                intermediate_size,
+                hidden_size,
+                seq_len,
+            );
+            self.ctx.encode_prefill_projection_q4_batch_view(
+                encoder,
+                &layer.up_proj,
+                &self.prefill_scratch.normed_buf,
+                &self.prefill_scratch.up_buf,
+                intermediate_size,
+                hidden_size,
+                seq_len,
+            );
+            self.ctx.encode_gelu_mul(
+                encoder,
+                &self.prefill_scratch.gate_buf,
+                &self.prefill_scratch.up_buf,
+                &self.prefill_scratch.gelu_buf,
+                total_intermediate,
+            );
+        }
     }
 
     /// Infer MLP output width (rows) from a gate projection buffer.
@@ -4858,8 +5075,6 @@ impl Gemma4GpuModel {
         let num_heads = self.config.num_attention_heads;
         let num_kv_heads = self.config.num_key_value_heads;
         let head_dim = layer.head_dim;
-        let q_out = layer.q_out_dim;
-        let kv_out = layer.kv_out_dim;
         let eps = self.config.rms_norm_eps as f32;
 
         self.ctx.encode_rmsnorm_batch_view(
@@ -4872,128 +5087,109 @@ impl Gemma4GpuModel {
             seq_len as u32,
         );
 
-        if layer.weight_format == WeightFormat::F16 {
-            self.ctx.encode_projection_f16_batch_view(
-                encoder,
-                &layer.q_proj,
-                &self.prefill_scratch.normed_buf,
-                &self.prefill_scratch.q_buf,
-                q_out as u32,
-                hidden_size as u32,
-                seq_len as u32,
-            );
-            if layer.has_kv {
-                self.ctx.encode_projection_f16_batch_view(
-                    encoder,
-                    &layer.k_proj,
-                    &self.prefill_scratch.normed_buf,
-                    &self.prefill_scratch.k_buf,
-                    kv_out as u32,
-                    hidden_size as u32,
-                    seq_len as u32,
-                );
-                self.ctx.encode_projection_f16_batch_view(
-                    encoder,
-                    &layer.v_proj,
-                    &self.prefill_scratch.normed_buf,
-                    &self.prefill_scratch.v_buf,
-                    kv_out as u32,
-                    hidden_size as u32,
-                    seq_len as u32,
-                );
-            }
-        } else {
-            // Q4_0 and K-quant (Q4_K_M) share the batched projection entry; the
-            // K-quant guard inside picks the right kernel per tensor.
-            self.ctx.encode_prefill_projection_q4_batch_view(
-                encoder,
-                &layer.q_proj,
-                &self.prefill_scratch.normed_buf,
-                &self.prefill_scratch.q_buf,
-                q_out as u32,
-                hidden_size as u32,
-                seq_len as u32,
-            );
-            if layer.has_kv {
-                self.ctx.encode_prefill_projection_q4_batch_view(
-                    encoder,
-                    &layer.k_proj,
-                    &self.prefill_scratch.normed_buf,
-                    &self.prefill_scratch.k_buf,
-                    kv_out as u32,
-                    hidden_size as u32,
-                    seq_len as u32,
-                );
-                self.ctx.encode_prefill_projection_q4_batch_view(
-                    encoder,
-                    &layer.v_proj,
-                    &self.prefill_scratch.normed_buf,
-                    &self.prefill_scratch.v_buf,
-                    kv_out as u32,
-                    hidden_size as u32,
-                    seq_len as u32,
-                );
-            }
-        }
-
-        self.ctx.encode_rmsnorm_batch_view(
+        self.encode_prefill_attention_qkv(
             encoder,
-            &self.prefill_scratch.q_buf,
-            &layer.q_norm_weight,
-            &self.prefill_scratch.q_normed_buf,
-            head_dim as u32,
-            eps,
-            (seq_len * num_heads) as u32,
+            layer,
+            seq_len as u32,
+            hidden_size as u32,
         );
 
-        if layer.has_kv {
+        let stacked = Self::use_prefill_qkv_stacked(layer);
+        if crate::gpu::prefill_qkv_hsd_enabled() {
+            self.ctx.encode_prefill_qkv_postproj_hsd(
+                encoder,
+                if stacked {
+                    Some(&self.prefill_scratch.qkv_stacked_buf)
+                } else {
+                    None
+                },
+                &self.prefill_scratch.q_buf,
+                &self.prefill_scratch.k_buf,
+                &self.prefill_scratch.v_buf,
+                &layer.q_norm_weight,
+                &layer.k_norm_weight,
+                layer.q_out_dim as u32,
+                layer.kv_out_dim as u32,
+                num_heads as u32,
+                num_kv_heads as u32,
+                head_dim as u32,
+                seq_len as u32,
+                eps,
+                stacked,
+                layer.has_kv,
+            );
+        } else {
+            if stacked {
+                self.ctx.encode_qkv_split_stacked_batch(
+                    encoder,
+                    &self.prefill_scratch.qkv_stacked_buf,
+                    &self.prefill_scratch.q_buf,
+                    &self.prefill_scratch.k_buf,
+                    &self.prefill_scratch.v_buf,
+                    layer.q_out_dim as u32,
+                    layer.kv_out_dim as u32,
+                    seq_len as u32,
+                );
+            }
             self.ctx.encode_rmsnorm_batch_view(
                 encoder,
-                &self.prefill_scratch.k_buf,
-                &layer.k_norm_weight,
-                &self.prefill_scratch.k_normed_buf,
+                &self.prefill_scratch.q_buf,
+                &layer.q_norm_weight,
+                &self.prefill_scratch.q_normed_buf,
                 head_dim as u32,
                 eps,
-                (seq_len * num_kv_heads) as u32,
-            );
-        }
-
-        self.ctx.encode_transpose_shd(
-            encoder,
-            &self.prefill_scratch.q_normed_buf,
-            &self.prefill_scratch.q_buf,
-            seq_len as u32,
-            num_heads as u32,
-            head_dim as u32,
-        );
-
-        if layer.has_kv {
-            self.ctx.encode_transpose_shd(
-                encoder,
-                &self.prefill_scratch.k_normed_buf,
-                &self.prefill_scratch.k_buf,
-                seq_len as u32,
-                num_kv_heads as u32,
-                head_dim as u32,
+                (seq_len * num_heads) as u32,
             );
 
-            self.ctx.encode_rmsnorm_noweight_batch(
-                encoder,
-                &self.prefill_scratch.v_buf,
-                &self.prefill_scratch.k_normed_buf,
-                head_dim as u32,
-                eps,
-                (seq_len * num_kv_heads) as u32,
-            );
+            if layer.has_kv {
+                self.ctx.encode_rmsnorm_batch_view(
+                    encoder,
+                    &self.prefill_scratch.k_buf,
+                    &layer.k_norm_weight,
+                    &self.prefill_scratch.k_normed_buf,
+                    head_dim as u32,
+                    eps,
+                    (seq_len * num_kv_heads) as u32,
+                );
+            }
 
             self.ctx.encode_transpose_shd(
                 encoder,
-                &self.prefill_scratch.k_normed_buf,
-                &self.prefill_scratch.v_buf,
+                &self.prefill_scratch.q_normed_buf,
+                &self.prefill_scratch.q_buf,
                 seq_len as u32,
-                num_kv_heads as u32,
+                num_heads as u32,
                 head_dim as u32,
             );
+
+            if layer.has_kv {
+                self.ctx.encode_transpose_shd(
+                    encoder,
+                    &self.prefill_scratch.k_normed_buf,
+                    &self.prefill_scratch.k_buf,
+                    seq_len as u32,
+                    num_kv_heads as u32,
+                    head_dim as u32,
+                );
+
+                self.ctx.encode_rmsnorm_noweight_batch(
+                    encoder,
+                    &self.prefill_scratch.v_buf,
+                    &self.prefill_scratch.k_normed_buf,
+                    head_dim as u32,
+                    eps,
+                    (seq_len * num_kv_heads) as u32,
+                );
+
+                self.ctx.encode_transpose_shd(
+                    encoder,
+                    &self.prefill_scratch.k_normed_buf,
+                    &self.prefill_scratch.v_buf,
+                    seq_len as u32,
+                    num_kv_heads as u32,
+                    head_dim as u32,
+                );
+            }
         }
 
         self.ctx.encode_rotary_batch(
@@ -5320,51 +5516,12 @@ impl Gemma4GpuModel {
             eps,
             seq_len as u32,
         );
-        if layer.weight_format == WeightFormat::F16 {
-            self.ctx.encode_projection_f16_batch_view(
-                encoder,
-                &layer.gate_proj,
-                &self.prefill_scratch.normed_buf,
-                &self.prefill_scratch.gate_buf,
-                intermediate_size as u32,
-                hidden_size as u32,
-                seq_len as u32,
-            );
-            self.ctx.encode_projection_f16_batch_view(
-                encoder,
-                &layer.up_proj,
-                &self.prefill_scratch.normed_buf,
-                &self.prefill_scratch.up_buf,
-                intermediate_size as u32,
-                hidden_size as u32,
-                seq_len as u32,
-            );
-        } else {
-            self.ctx.encode_prefill_projection_q4_batch_view(
-                encoder,
-                &layer.gate_proj,
-                &self.prefill_scratch.normed_buf,
-                &self.prefill_scratch.gate_buf,
-                intermediate_size as u32,
-                hidden_size as u32,
-                seq_len as u32,
-            );
-            self.ctx.encode_prefill_projection_q4_batch_view(
-                encoder,
-                &layer.up_proj,
-                &self.prefill_scratch.normed_buf,
-                &self.prefill_scratch.up_buf,
-                intermediate_size as u32,
-                hidden_size as u32,
-                seq_len as u32,
-            );
-        }
-        self.ctx.encode_gelu_mul(
+        self.encode_prefill_mlp_gate_up(
             encoder,
-            &self.prefill_scratch.gate_buf,
-            &self.prefill_scratch.up_buf,
-            &self.prefill_scratch.gelu_buf,
-            total_intermediate,
+            layer,
+            seq_len as u32,
+            intermediate_size as u32,
+            hidden_size as u32,
         );
         if layer.weight_format == WeightFormat::F16 {
             self.ctx.encode_projection_f16_batch_view(
@@ -5735,51 +5892,12 @@ impl Gemma4GpuModel {
             eps,
             total_seq_len as u32,
         );
-        if layer.weight_format == WeightFormat::F16 {
-            self.ctx.encode_projection_f16_batch_view(
-                encoder,
-                &layer.gate_proj,
-                &self.prefill_scratch.normed_buf,
-                &self.prefill_scratch.gate_buf,
-                intermediate_size as u32,
-                hidden_size as u32,
-                total_seq_len as u32,
-            );
-            self.ctx.encode_projection_f16_batch_view(
-                encoder,
-                &layer.up_proj,
-                &self.prefill_scratch.normed_buf,
-                &self.prefill_scratch.up_buf,
-                intermediate_size as u32,
-                hidden_size as u32,
-                total_seq_len as u32,
-            );
-        } else {
-            self.ctx.encode_prefill_projection_q4_batch_view(
-                encoder,
-                &layer.gate_proj,
-                &self.prefill_scratch.normed_buf,
-                &self.prefill_scratch.gate_buf,
-                intermediate_size as u32,
-                hidden_size as u32,
-                total_seq_len as u32,
-            );
-            self.ctx.encode_prefill_projection_q4_batch_view(
-                encoder,
-                &layer.up_proj,
-                &self.prefill_scratch.normed_buf,
-                &self.prefill_scratch.up_buf,
-                intermediate_size as u32,
-                hidden_size as u32,
-                total_seq_len as u32,
-            );
-        }
-        self.ctx.encode_gelu_mul(
+        self.encode_prefill_mlp_gate_up(
             encoder,
-            &self.prefill_scratch.gate_buf,
-            &self.prefill_scratch.up_buf,
-            &self.prefill_scratch.gelu_buf,
-            total_intermediate,
+            layer,
+            total_seq_len as u32,
+            intermediate_size as u32,
+            hidden_size as u32,
         );
         if layer.weight_format == WeightFormat::F16 {
             self.ctx.encode_projection_f16_batch_view(
@@ -6175,51 +6293,12 @@ impl Gemma4GpuModel {
                 eps,
                 seq_len as u32,
             );
-        if layer.weight_format == WeightFormat::F16 {
-            self.ctx.encode_projection_f16_batch_view(
+            self.encode_prefill_mlp_gate_up(
                 encoder,
-                &layer.gate_proj,
-                    &self.prefill_scratch.normed_buf,
-                    &self.prefill_scratch.gate_buf,
-                    intermediate_size as u32,
-                    hidden_size as u32,
-                    seq_len as u32,
-                );
-                self.ctx.encode_projection_f16_batch_view(
-                    encoder,
-                    &layer.up_proj,
-                    &self.prefill_scratch.normed_buf,
-                    &self.prefill_scratch.up_buf,
-                    intermediate_size as u32,
-                    hidden_size as u32,
-                    seq_len as u32,
-                );
-            } else {
-                self.ctx.encode_prefill_projection_q4_batch_view(
-                    encoder,
-                    &layer.gate_proj,
-                    &self.prefill_scratch.normed_buf,
-                    &self.prefill_scratch.gate_buf,
-                    intermediate_size as u32,
-                    hidden_size as u32,
-                    seq_len as u32,
-                );
-                self.ctx.encode_prefill_projection_q4_batch_view(
-                    encoder,
-                    &layer.up_proj,
-                    &self.prefill_scratch.normed_buf,
-                    &self.prefill_scratch.up_buf,
-                    intermediate_size as u32,
-                    hidden_size as u32,
-                    seq_len as u32,
-                );
-            }
-            self.ctx.encode_gelu_mul(
-                encoder,
-                &self.prefill_scratch.gate_buf,
-                &self.prefill_scratch.up_buf,
-                &self.prefill_scratch.gelu_buf,
-                total_intermediate,
+                layer,
+                seq_len as u32,
+                intermediate_size as u32,
+                hidden_size as u32,
             );
         if layer.weight_format == WeightFormat::F16 {
             self.ctx.encode_projection_f16_batch_view(

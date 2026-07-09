@@ -451,6 +451,33 @@ pub fn prefill_mul_mm_enabled() -> bool {
     )
 }
 
+/// Prefill MLP gate∥up: one stacked mul_mm + stacked GeLU instead of two mul_mm + gelu_mul.
+/// Set PREFILL_GATE_UP_STACKED=0 to use separate gate/up projections.
+pub fn prefill_gate_up_stacked_enabled() -> bool {
+    !matches!(
+        std::env::var("PREFILL_GATE_UP_STACKED").as_deref(),
+        Ok("0") | Ok("false") | Ok("FALSE")
+    )
+}
+
+/// Prefill Q∥K∥V: one stacked mul_mm + split instead of three mul_mm dispatches (KV layers).
+/// Set PREFILL_QKV_STACKED=0 to use separate Q/K/V projections.
+pub fn prefill_qkv_stacked_enabled() -> bool {
+    !matches!(
+        std::env::var("PREFILL_QKV_STACKED").as_deref(),
+        Ok("0") | Ok("false") | Ok("FALSE")
+    )
+}
+
+/// Prefill Q/K/V post-projection: HSD layout + fused norm (skip SHD transposes).
+/// Set PREFILL_QKV_HSD=0 to use legacy SHD rmsnorm + transpose_shd path.
+pub fn prefill_qkv_hsd_enabled() -> bool {
+    !matches!(
+        std::env::var("PREFILL_QKV_HSD").as_deref(),
+        Ok("0") | Ok("false") | Ok("FALSE")
+    )
+}
+
 /// Output rows per Q4 fast matvec threadgroup (8 simdgroups × 4 rows).
 const Q4_MATVEC_ROWS_PER_TG: u32 = 32;
 
@@ -541,6 +568,13 @@ pub struct MetalContext {
     pub transpose_shd_pipeline: ComputePipelineState,
     pub transpose_hsd_pipeline: ComputePipelineState,
     pub gelu_mul_pipeline: ComputePipelineState,
+    pub gelu_mul_stacked_batch_pipeline: ComputePipelineState,
+    pub qkv_split_stacked_batch_pipeline: ComputePipelineState,
+    pub qkv_split_stacked_to_hsd_pipeline: ComputePipelineState,
+    pub rmsnorm_hsd_batch_pipeline: ComputePipelineState,
+    pub rmsnorm_noweight_hsd_batch_pipeline: ComputePipelineState,
+    pub rmsnorm_shd_to_hsd_pipeline: ComputePipelineState,
+    pub rmsnorm_noweight_shd_to_hsd_pipeline: ComputePipelineState,
     pub gelu_mul_f16_pipeline: ComputePipelineState,
     pub ple_gelu_mul_batch_pipeline: ComputePipelineState,
     pub vec_mul_pipeline: ComputePipelineState,
@@ -739,6 +773,13 @@ impl MetalContext {
         let transpose_shd_pipeline = get_fn("transpose_shd_to_hsd");
         let transpose_hsd_pipeline = get_fn("transpose_hsd_to_shd");
         let gelu_mul_pipeline = get_fn("gelu_mul");
+        let gelu_mul_stacked_batch_pipeline = get_fn("gelu_mul_stacked_batch");
+        let qkv_split_stacked_batch_pipeline = get_fn("qkv_split_stacked_batch");
+        let qkv_split_stacked_to_hsd_pipeline = get_fn("qkv_split_stacked_to_hsd");
+        let rmsnorm_hsd_batch_pipeline = get_fn("rmsnorm_hsd_batch");
+        let rmsnorm_noweight_hsd_batch_pipeline = get_fn("rmsnorm_noweight_hsd_batch");
+        let rmsnorm_shd_to_hsd_pipeline = get_fn("rmsnorm_shd_to_hsd");
+        let rmsnorm_noweight_shd_to_hsd_pipeline = get_fn("rmsnorm_noweight_shd_to_hsd");
         let gelu_mul_f16_pipeline = get_fn("gelu_mul_f16");
         let ple_gelu_mul_batch_pipeline = get_fn("ple_gelu_mul_batch");
         let vec_mul_pipeline = get_fn("vec_mul");
@@ -982,6 +1023,13 @@ impl MetalContext {
             transpose_shd_pipeline,
             transpose_hsd_pipeline,
             gelu_mul_pipeline,
+            gelu_mul_stacked_batch_pipeline,
+            qkv_split_stacked_batch_pipeline,
+            qkv_split_stacked_to_hsd_pipeline,
+            rmsnorm_hsd_batch_pipeline,
+            rmsnorm_noweight_hsd_batch_pipeline,
+            rmsnorm_shd_to_hsd_pipeline,
+            rmsnorm_noweight_shd_to_hsd_pipeline,
             gelu_mul_f16_pipeline,
             ple_gelu_mul_batch_pipeline,
             vec_mul_pipeline,
@@ -2882,6 +2930,385 @@ impl MetalContext {
             packed[dst + rb..dst + 2 * rb].copy_from_slice(&up_bytes[src..src + rb]);
         }
         BufferView::from_buffer(Self::buffer_from_slice_parallel(&self.device, &packed))
+    }
+
+    /// Pack gate/up K-quant rows vertically [gate_0..gate_{m-1}, up_0..up_{m-1}] for one mul_mm.
+    pub fn pack_gate_up_stacked_kquant(
+        &self,
+        gate: &BufferView,
+        up: &BufferView,
+        m: u32,
+        k: u32,
+    ) -> BufferView {
+        use crate::ggml_gemv::{Q4_K_BLOCK_BYTES, Q6_K_BLOCK_BYTES};
+        let block_bytes = match gate.format {
+            weight_fmt::Q4_K => Q4_K_BLOCK_BYTES,
+            weight_fmt::Q6_K => Q6_K_BLOCK_BYTES,
+            other => panic!("pack_gate_up_stacked_kquant: not K-quant ({})", other),
+        };
+        debug_assert_eq!(gate.format, up.format);
+        let row_bytes = (k as u64 / 256) * block_bytes;
+        let expected_per_tensor = m as u64 * row_bytes;
+        let packed_bytes = expected_per_tensor * 2;
+        assert!(
+            gate.length >= expected_per_tensor && up.length >= expected_per_tensor,
+            "gate/up buffer too small for stacked pack (m={m} k={k} need={expected_per_tensor} gate={} up={})",
+            gate.length,
+            up.length
+        );
+        let gate_bytes = gate.as_bytes();
+        let up_bytes = up.as_bytes();
+        let mut packed = vec![0u8; packed_bytes as usize];
+        let rb = row_bytes as usize;
+        packed[..rb * m as usize].copy_from_slice(&gate_bytes[..rb * m as usize]);
+        let up_off = rb * m as usize;
+        packed[up_off..up_off + rb * m as usize]
+            .copy_from_slice(&up_bytes[..rb * m as usize]);
+        BufferView::from_buffer(Self::buffer_from_slice_parallel(&self.device, &packed))
+            .with_format(gate.format)
+    }
+
+    /// Pack Q/K/V K-quant rows vertically for one prefill mul_mm.
+    pub fn pack_qkv_stacked_kquant(
+        &self,
+        q: &BufferView,
+        k: &BufferView,
+        v: &BufferView,
+        m_q: u32,
+        m_kv: u32,
+        k_dim: u32,
+    ) -> BufferView {
+        use crate::ggml_gemv::{Q4_K_BLOCK_BYTES, Q6_K_BLOCK_BYTES};
+        let block_bytes = match q.format {
+            weight_fmt::Q4_K => Q4_K_BLOCK_BYTES,
+            weight_fmt::Q6_K => Q6_K_BLOCK_BYTES,
+            other => panic!("pack_qkv_stacked_kquant: not K-quant ({})", other),
+        };
+        debug_assert_eq!(q.format, k.format);
+        debug_assert_eq!(q.format, v.format);
+        let row_bytes = (k_dim as u64 / 256) * block_bytes;
+        let q_bytes = m_q as u64 * row_bytes;
+        let kv_bytes = m_kv as u64 * row_bytes;
+        let packed_bytes = q_bytes + 2 * kv_bytes;
+        assert!(
+            q.length >= q_bytes && k.length >= kv_bytes && v.length >= kv_bytes,
+            "q/k/v buffer too small for stacked pack (m_q={m_q} m_kv={m_kv} k={k_dim})"
+        );
+        let qb = q.as_bytes();
+        let kb = k.as_bytes();
+        let vb = v.as_bytes();
+        let mut packed = vec![0u8; packed_bytes as usize];
+        let rb = row_bytes as usize;
+        let q_len = rb * m_q as usize;
+        let kv_len = rb * m_kv as usize;
+        packed[..q_len].copy_from_slice(&qb[..q_len]);
+        packed[q_len..q_len + kv_len].copy_from_slice(&kb[..kv_len]);
+        packed[q_len + kv_len..q_len + 2 * kv_len].copy_from_slice(&vb[..kv_len]);
+        BufferView::from_buffer(Self::buffer_from_slice_parallel(&self.device, &packed))
+            .with_format(q.format)
+    }
+
+    /// Prefill stacked gate∥up K-quant: one mul_mm [seq, 2*m] + stacked GeLU → gelu_buf.
+    pub fn encode_prefill_gate_up_kquant_stacked(
+        &self,
+        encoder: &metal::ComputeCommandEncoderRef,
+        gate_up_stacked: &BufferView,
+        x_buf: &Buffer,
+        gate_up_act_buf: &Buffer,
+        gelu_buf: &Buffer,
+        m: u32,
+        k: u32,
+        seq_len: u32,
+    ) {
+        let m2 = m * 2;
+        self.encode_prefill_kquant_projection(
+            encoder,
+            gate_up_stacked,
+            x_buf,
+            gate_up_act_buf,
+            m2,
+            k,
+            seq_len,
+        );
+        self.encode_gelu_mul_stacked_batch(encoder, gate_up_act_buf, gelu_buf, m, seq_len);
+    }
+
+    pub fn encode_gelu_mul_stacked_batch(
+        &self,
+        encoder: &metal::ComputeCommandEncoderRef,
+        gate_up_stacked: &Buffer,
+        out_buf: &Buffer,
+        m: u32,
+        seq_len: u32,
+    ) {
+        encoder.set_compute_pipeline_state(&self.gelu_mul_stacked_batch_pipeline);
+        encoder.set_buffer(0, Some(gate_up_stacked), 0);
+        encoder.set_buffer(1, Some(out_buf), 0);
+        encoder.set_bytes(2, 4, &m as *const u32 as *const _);
+        encoder.set_bytes(3, 4, &seq_len as *const u32 as *const _);
+        let total = (seq_len * m) as u64;
+        encoder.dispatch_threads(MTLSize::new(total, 1, 1), MTLSize::new(256, 1, 1));
+    }
+
+    /// Prefill stacked Q∥K∥V K-quant: one mul_mm [seq, m_q+2*m_kv] into scratch.
+    pub fn encode_prefill_qkv_kquant_stacked(
+        &self,
+        encoder: &metal::ComputeCommandEncoderRef,
+        qkv_stacked: &BufferView,
+        x_buf: &Buffer,
+        qkv_act_buf: &Buffer,
+        m_q: u32,
+        m_kv: u32,
+        k: u32,
+        seq_len: u32,
+    ) {
+        let m_total = m_q + m_kv * 2;
+        self.encode_prefill_kquant_projection(
+            encoder,
+            qkv_stacked,
+            x_buf,
+            qkv_act_buf,
+            m_total,
+            k,
+            seq_len,
+        );
+    }
+
+    pub fn encode_qkv_split_stacked_to_hsd(
+        &self,
+        encoder: &metal::ComputeCommandEncoderRef,
+        stacked: &Buffer,
+        q_buf: &Buffer,
+        k_buf: &Buffer,
+        v_buf: &Buffer,
+        m_q: u32,
+        m_kv: u32,
+        head_dim: u32,
+        num_heads: u32,
+        num_kv_heads: u32,
+        seq_len: u32,
+    ) {
+        encoder.set_compute_pipeline_state(&self.qkv_split_stacked_to_hsd_pipeline);
+        encoder.set_buffer(0, Some(stacked), 0);
+        encoder.set_buffer(1, Some(q_buf), 0);
+        encoder.set_buffer(2, Some(k_buf), 0);
+        encoder.set_buffer(3, Some(v_buf), 0);
+        encoder.set_bytes(4, 4, &m_q as *const u32 as *const _);
+        encoder.set_bytes(5, 4, &m_kv as *const u32 as *const _);
+        encoder.set_bytes(6, 4, &head_dim as *const u32 as *const _);
+        encoder.set_bytes(7, 4, &num_heads as *const u32 as *const _);
+        encoder.set_bytes(8, 4, &num_kv_heads as *const u32 as *const _);
+        encoder.set_bytes(9, 4, &seq_len as *const u32 as *const _);
+        let total_q = seq_len as u64 * num_heads as u64 * head_dim as u64;
+        let total_kv = seq_len as u64 * num_kv_heads as u64 * head_dim as u64;
+        let total = total_q + 2 * total_kv;
+        encoder.dispatch_threads(MTLSize::new(total, 1, 1), MTLSize::new(256, 1, 1));
+    }
+
+    pub fn encode_rmsnorm_hsd_batch_view(
+        &self,
+        encoder: &metal::ComputeCommandEncoderRef,
+        x_buf: &Buffer,
+        weight: &BufferView,
+        out_buf: &Buffer,
+        head_dim: u32,
+        num_heads: u32,
+        seq_len: u32,
+        eps: f32,
+    ) {
+        encoder.set_compute_pipeline_state(&self.rmsnorm_hsd_batch_pipeline);
+        encoder.set_buffer(0, Some(x_buf), 0);
+        encoder.set_buffer(1, Some(&weight.buffer), weight.offset);
+        encoder.set_buffer(2, Some(out_buf), 0);
+        encoder.set_bytes(3, 4, &head_dim as *const u32 as *const _);
+        encoder.set_bytes(4, 4, &seq_len as *const u32 as *const _);
+        encoder.set_bytes(5, 4, &eps as *const f32 as *const _);
+        let num_rows = num_heads as u64 * seq_len as u64;
+        encoder.dispatch_thread_groups(MTLSize::new(num_rows, 1, 1), MTLSize::new(256, 1, 1));
+    }
+
+    pub fn encode_rmsnorm_noweight_hsd_batch(
+        &self,
+        encoder: &metal::ComputeCommandEncoderRef,
+        x_buf: &Buffer,
+        out_buf: &Buffer,
+        head_dim: u32,
+        num_kv_heads: u32,
+        seq_len: u32,
+        eps: f32,
+    ) {
+        encoder.set_compute_pipeline_state(&self.rmsnorm_noweight_hsd_batch_pipeline);
+        encoder.set_buffer(0, Some(x_buf), 0);
+        encoder.set_buffer(1, Some(out_buf), 0);
+        encoder.set_bytes(2, 4, &head_dim as *const u32 as *const _);
+        encoder.set_bytes(3, 4, &seq_len as *const u32 as *const _);
+        encoder.set_bytes(4, 4, &eps as *const f32 as *const _);
+        let num_rows = num_kv_heads as u64 * seq_len as u64;
+        encoder.dispatch_thread_groups(MTLSize::new(num_rows, 1, 1), MTLSize::new(256, 1, 1));
+    }
+
+    pub fn encode_rmsnorm_shd_to_hsd_view(
+        &self,
+        encoder: &metal::ComputeCommandEncoderRef,
+        x_buf: &Buffer,
+        weight: &BufferView,
+        out_buf: &Buffer,
+        head_dim: u32,
+        num_heads: u32,
+        seq_len: u32,
+        eps: f32,
+    ) {
+        encoder.set_compute_pipeline_state(&self.rmsnorm_shd_to_hsd_pipeline);
+        encoder.set_buffer(0, Some(x_buf), 0);
+        encoder.set_buffer(1, Some(&weight.buffer), weight.offset);
+        encoder.set_buffer(2, Some(out_buf), 0);
+        encoder.set_bytes(3, 4, &head_dim as *const u32 as *const _);
+        encoder.set_bytes(4, 4, &num_heads as *const u32 as *const _);
+        encoder.set_bytes(5, 4, &seq_len as *const u32 as *const _);
+        encoder.set_bytes(6, 4, &eps as *const f32 as *const _);
+        let num_rows = seq_len as u64 * num_heads as u64;
+        encoder.dispatch_thread_groups(MTLSize::new(num_rows, 1, 1), MTLSize::new(256, 1, 1));
+    }
+
+    pub fn encode_rmsnorm_noweight_shd_to_hsd(
+        &self,
+        encoder: &metal::ComputeCommandEncoderRef,
+        x_buf: &Buffer,
+        out_buf: &Buffer,
+        head_dim: u32,
+        num_heads: u32,
+        seq_len: u32,
+        eps: f32,
+    ) {
+        encoder.set_compute_pipeline_state(&self.rmsnorm_noweight_shd_to_hsd_pipeline);
+        encoder.set_buffer(0, Some(x_buf), 0);
+        encoder.set_buffer(1, Some(out_buf), 0);
+        encoder.set_bytes(2, 4, &head_dim as *const u32 as *const _);
+        encoder.set_bytes(3, 4, &num_heads as *const u32 as *const _);
+        encoder.set_bytes(4, 4, &seq_len as *const u32 as *const _);
+        encoder.set_bytes(5, 4, &eps as *const f32 as *const _);
+        let num_rows = seq_len as u64 * num_heads as u64;
+        encoder.dispatch_thread_groups(MTLSize::new(num_rows, 1, 1), MTLSize::new(256, 1, 1));
+    }
+
+    /// Post-projection: split (if stacked) + QK-norm + layout → HSD for rotary/flash_attn.
+    pub fn encode_prefill_qkv_postproj_hsd(
+        &self,
+        encoder: &metal::ComputeCommandEncoderRef,
+        qkv_stacked_act: Option<&Buffer>,
+        q_buf: &Buffer,
+        k_buf: &Buffer,
+        v_buf: &Buffer,
+        q_norm_weight: &BufferView,
+        k_norm_weight: &BufferView,
+        m_q: u32,
+        m_kv: u32,
+        num_heads: u32,
+        num_kv_heads: u32,
+        head_dim: u32,
+        seq_len: u32,
+        eps: f32,
+        stacked: bool,
+        has_kv: bool,
+    ) {
+        if stacked {
+            let stacked_buf = qkv_stacked_act.expect("stacked QKV requires qkv_stacked_act buffer");
+            self.encode_qkv_split_stacked_to_hsd(
+                encoder,
+                stacked_buf,
+                q_buf,
+                k_buf,
+                v_buf,
+                m_q,
+                m_kv,
+                head_dim,
+                num_heads,
+                num_kv_heads,
+                seq_len,
+            );
+            self.encode_rmsnorm_hsd_batch_view(
+                encoder,
+                q_buf,
+                q_norm_weight,
+                q_buf,
+                head_dim,
+                num_heads,
+                seq_len,
+                eps,
+            );
+            self.encode_rmsnorm_hsd_batch_view(
+                encoder,
+                k_buf,
+                k_norm_weight,
+                k_buf,
+                head_dim,
+                num_kv_heads,
+                seq_len,
+                eps,
+            );
+            self.encode_rmsnorm_noweight_hsd_batch(
+                encoder, v_buf, v_buf, head_dim, num_kv_heads, seq_len, eps,
+            );
+        } else if has_kv {
+            self.encode_rmsnorm_shd_to_hsd_view(
+                encoder,
+                q_buf,
+                q_norm_weight,
+                q_buf,
+                head_dim,
+                num_heads,
+                seq_len,
+                eps,
+            );
+            self.encode_rmsnorm_shd_to_hsd_view(
+                encoder,
+                k_buf,
+                k_norm_weight,
+                k_buf,
+                head_dim,
+                num_kv_heads,
+                seq_len,
+                eps,
+            );
+            self.encode_rmsnorm_noweight_shd_to_hsd(
+                encoder, v_buf, v_buf, head_dim, num_kv_heads, seq_len, eps,
+            );
+        } else {
+            self.encode_rmsnorm_shd_to_hsd_view(
+                encoder,
+                q_buf,
+                q_norm_weight,
+                q_buf,
+                head_dim,
+                num_heads,
+                seq_len,
+                eps,
+            );
+        }
+    }
+
+    pub fn encode_qkv_split_stacked_batch(
+        &self,
+        encoder: &metal::ComputeCommandEncoderRef,
+        stacked: &Buffer,
+        q_buf: &Buffer,
+        k_buf: &Buffer,
+        v_buf: &Buffer,
+        m_q: u32,
+        m_kv: u32,
+        seq_len: u32,
+    ) {
+        encoder.set_compute_pipeline_state(&self.qkv_split_stacked_batch_pipeline);
+        encoder.set_buffer(0, Some(stacked), 0);
+        encoder.set_buffer(1, Some(q_buf), 0);
+        encoder.set_buffer(2, Some(k_buf), 0);
+        encoder.set_buffer(3, Some(v_buf), 0);
+        encoder.set_bytes(4, 4, &m_q as *const u32 as *const _);
+        encoder.set_bytes(5, 4, &m_kv as *const u32 as *const _);
+        encoder.set_bytes(6, 4, &seq_len as *const u32 as *const _);
+        let m_stacked = (m_q + m_kv * 2) as u64;
+        let total = m_stacked * seq_len as u64;
+        encoder.dispatch_threads(MTLSize::new(total, 1, 1), MTLSize::new(256, 1, 1));
     }
 
     /// Fused PLE gate Q4 matvec + GeLU(gate)*context slice.
