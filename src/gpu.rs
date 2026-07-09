@@ -1,5 +1,6 @@
 use metal::*;
 use std::path::Path;
+use std::sync::OnceLock;
 
 /// Per-tensor weight format tag carried on a `BufferView`. Mirrors
 /// `gemma4_gpu_model::WeightFormat::to_u8`. Defaults to Q4_0 so existing
@@ -413,6 +414,15 @@ pub fn fused_q_attn_enabled() -> bool {
     )
 }
 
+/// Prefill Q4_K projections use llama.cpp mul_mm when seq_len > 8 (default on).
+/// Set PREFILL_MUL_MM=0 to force matvec for A/B testing.
+pub fn prefill_mul_mm_enabled() -> bool {
+    !matches!(
+        std::env::var("PREFILL_MUL_MM").as_deref(),
+        Ok("0") | Ok("false") | Ok("FALSE") | Ok("legacy")
+    )
+}
+
 /// Output rows per Q4 fast matvec threadgroup (8 simdgroups × 4 rows).
 const Q4_MATVEC_ROWS_PER_TG: u32 = 32;
 
@@ -458,6 +468,10 @@ pub struct MetalContext {
     pub matvec_ggml_q6k_pipeline: ComputePipelineState,
     pub matvec_ggml_q4k_gelu_mul_pipeline: ComputePipelineState,
     pub matvec_ggml_q4k_rmsnorm_gelu_mul_pipeline: ComputePipelineState,
+    /// Lazy: prefill Q4_K matrix-matrix (llama.cpp `kernel_mul_mm_q4_K_f32`).
+    mul_mm_q4k_pipeline: OnceLock<ComputePipelineState>,
+    /// Lazy: prefill Q6_K matrix-matrix (llama.cpp `kernel_mul_mm_q6_K_f32`).
+    mul_mm_q6k_pipeline: OnceLock<ComputePipelineState>,
     // Q3_0 pipelines
     pub matvec_ggml_q3_pipeline: ComputePipelineState,
     pub matvec_ggml_q3_dual_pipeline: ComputePipelineState,
@@ -871,6 +885,8 @@ impl MetalContext {
             matvec_ggml_q6k_pipeline,
             matvec_ggml_q4k_gelu_mul_pipeline,
             matvec_ggml_q4k_rmsnorm_gelu_mul_pipeline,
+            mul_mm_q4k_pipeline: OnceLock::new(),
+            mul_mm_q6k_pipeline: OnceLock::new(),
             matvec_ggml_q3_pipeline,
             matvec_ggml_q3_dual_pipeline,
             matvec_ggml_q3_gelu_mul_pipeline,
@@ -963,6 +979,44 @@ impl MetalContext {
             use_flash_attention,
             decode_mega_gemma4_pipeline,
         }
+    }
+
+    /// Compile prefill mul_mm in a separate Metal library (lazy — decode never pays this cost).
+    fn compile_mul_mm_pipeline(device: &Device, entry: &str) -> ComputePipelineState {
+        let ggml_path =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("src/shaders/ggml_mul_mv_q4.metal");
+        let ggml_mm_path =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("src/shaders/ggml_mul_mm_q4.metal");
+        let mut mul_mm_src =
+            std::fs::read_to_string(&ggml_path).expect("Failed to read ggml_mul_mv_q4.metal");
+        mul_mm_src.push('\n');
+        mul_mm_src.push_str(
+            &std::fs::read_to_string(&ggml_mm_path).expect("Failed to read ggml_mul_mm_q4.metal"),
+        );
+        let options = CompileOptions::new();
+        let library = device
+            .new_library_with_source(&mul_mm_src, &options)
+            .expect("Failed to compile ggml_mul_mm Metal shaders");
+        let func = library
+            .get_function(entry, None)
+            .unwrap_or_else(|e| panic!("Failed to get mul_mm function '{}': {:?}", entry, e));
+        device
+            .new_compute_pipeline_state_with_function(&func)
+            .unwrap_or_else(|e| panic!("Failed to create mul_mm pipeline for '{}': {:?}", entry, e))
+    }
+
+    fn mul_mm_q4k_pipeline(&self) -> &ComputePipelineState {
+        self.mul_mm_q4k_pipeline.get_or_init(|| {
+            println!("  Prefill mul_mm: compiling Q4_K simdgroup matmul pipeline");
+            Self::compile_mul_mm_pipeline(&self.device, "mul_mm_q4_K_f32")
+        })
+    }
+
+    fn mul_mm_q6k_pipeline(&self) -> &ComputePipelineState {
+        self.mul_mm_q6k_pipeline.get_or_init(|| {
+            println!("  Prefill mul_mm: compiling Q6_K simdgroup matmul pipeline");
+            Self::compile_mul_mm_pipeline(&self.device, "mul_mm_q6_K_f32")
+        })
     }
 
     /// Copy a mmap'd region into a GPU-accessible shared buffer.
@@ -1510,6 +1564,88 @@ impl MetalContext {
         } else {
             self.encode_projection_f16_batch_view(encoder, weight, x_buf, y_buf, m, k, seq_len);
         }
+    }
+
+    /// Parallel prefill only — uses mul_mm for K-quant when seq_len > 8 (llama.cpp).
+    /// Decode and shared batch paths keep `encode_projection_*_batch_view`.
+    pub fn encode_prefill_projection_auto_batch_view(
+        &self,
+        encoder: &metal::ComputeCommandEncoderRef,
+        weight: &BufferView,
+        x_buf: &Buffer,
+        y_buf: &Buffer,
+        m: u32,
+        k: u32,
+        seq_len: u32,
+    ) {
+        if matches!(weight.format, weight_fmt::Q4_K | weight_fmt::Q6_K) {
+            self.encode_prefill_kquant_projection(encoder, weight, x_buf, y_buf, m, k, seq_len);
+        } else if weight_buf_is_q4(weight, m, k) {
+            self.encode_prefill_projection_q4_batch_view(
+                encoder, weight, x_buf, y_buf, m, k, seq_len,
+            );
+        } else {
+            self.encode_projection_f16_batch_view(encoder, weight, x_buf, y_buf, m, k, seq_len);
+        }
+    }
+
+    /// Prefill K-quant projection: mul_mm when seq_len > 8 (llama.cpp), else batched matvec.
+    /// Opt out with `PREFILL_MUL_MM=0`.
+    pub fn encode_prefill_kquant_projection(
+        &self,
+        encoder: &metal::ComputeCommandEncoderRef,
+        weight: &BufferView,
+        x_buf: &Buffer,
+        y_buf: &Buffer,
+        m: u32,
+        k: u32,
+        seq_len: u32,
+    ) {
+        let use_mm = prefill_mul_mm_enabled()
+            && crate::ggml_gemv::should_use_mul_mm(k, seq_len)
+            && matches!(weight.format, weight_fmt::Q4_K | weight_fmt::Q6_K);
+        if use_mm {
+            self.encode_mul_mm_kquant_at_view(encoder, weight, x_buf, y_buf, m, k, seq_len);
+        } else {
+            self.encode_matvec_qk_at_view(encoder, weight, x_buf, 0, y_buf, 0, m, k, seq_len);
+        }
+    }
+
+    /// llama.cpp `kernel_mul_mm_{q4,q6}_K_f32` dispatch for prefill projections.
+    pub fn encode_mul_mm_kquant_at_view(
+        &self,
+        encoder: &metal::ComputeCommandEncoderRef,
+        weight: &BufferView,
+        x_buf: &Buffer,
+        y_buf: &Buffer,
+        m: u32,
+        k: u32,
+        seq_len: u32,
+    ) {
+        use crate::ggml_gemv::{
+            mul_mm_args_k, mul_mm_dispatch, MUL_MM_SMEM, Q4_K_BLOCK_BYTES, Q6_K_BLOCK_BYTES,
+        };
+        let (pipeline, block_bytes) = match weight.format {
+            weight_fmt::Q4_K => (self.mul_mm_q4k_pipeline(), Q4_K_BLOCK_BYTES),
+            weight_fmt::Q6_K => (self.mul_mm_q6k_pipeline(), Q6_K_BLOCK_BYTES),
+            other => panic!("encode_mul_mm_kquant_at_view: not K-quant ({})", other),
+        };
+        let args = mul_mm_args_k(m, k, seq_len, block_bytes);
+        encoder.set_compute_pipeline_state(pipeline);
+        encoder.set_bytes(
+            0,
+            std::mem::size_of::<crate::ggml_gemv::GgmlMulMmArgs>() as u64,
+            &args as *const _ as *const _,
+        );
+        encoder.set_buffer(1, Some(&weight.buffer), weight.offset);
+        encoder.set_buffer(2, Some(x_buf), 0);
+        encoder.set_buffer(3, Some(y_buf), 0);
+        encoder.set_threadgroup_memory_length(0, MUL_MM_SMEM);
+        let (tg_x, tg_y, tg_z, tw, nsg) = mul_mm_dispatch(m, seq_len);
+        encoder.dispatch_thread_groups(
+            metal::MTLSize::new(tg_x, tg_y, tg_z),
+            metal::MTLSize::new(tw, nsg, 1),
+        );
     }
 
     pub fn encode_matvec_f16_at(
@@ -2850,6 +2986,24 @@ impl MetalContext {
         );
         let tg_size = MTLSize::new(64, 1, 1);
         encoder.dispatch_thread_groups(num_tgs, tg_size);
+    }
+
+    /// Parallel prefill only — K-quant uses mul_mm when seq_len > 8.
+    pub fn encode_prefill_projection_q4_batch_view(
+        &self,
+        encoder: &metal::ComputeCommandEncoderRef,
+        weight: &BufferView,
+        x_buf: &Buffer,
+        y_buf: &Buffer,
+        m: u32,
+        k: u32,
+        seq_len: u32,
+    ) {
+        if matches!(weight.format, weight_fmt::Q4_K | weight_fmt::Q6_K) {
+            self.encode_prefill_kquant_projection(encoder, weight, x_buf, y_buf, m, k, seq_len);
+            return;
+        }
+        self.encode_projection_q4_batch_view(encoder, weight, x_buf, y_buf, m, k, seq_len);
     }
 
     pub fn encode_rmsnorm(

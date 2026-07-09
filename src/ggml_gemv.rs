@@ -232,3 +232,73 @@ pub fn mul_mv_ext_dispatch(m: u32, batch: u32, nxpsg: i16) -> (u64, u64, u64, u6
     let tg_y = ((batch + r1ptg - 1) / r1ptg) as u64;
     (tg_x, tg_y, 1, 32, GGML_NSG_Q4_0 as u64)
 }
+
+// ─── Q4_K matrix-matrix (prefill) ───────────────────────────────────────────
+
+/// ggml_metal_kargs_mul_mm — must match `ggml_mul_mm_args` in ggml_mul_mm_q4.metal.
+#[repr(C)]
+pub struct GgmlMulMmArgs {
+    pub ne00: i32,
+    pub ne02: i32,
+    pub nb01: u64,
+    pub nb02: u64,
+    pub nb03: u64,
+    pub ne12: i32,
+    pub nb10: u64,
+    pub nb11: u64,
+    pub nb12: u64,
+    pub nb13: u64,
+    pub ne0: i32,
+    pub ne1: i32,
+    pub r2: i16,
+    pub r3: i16,
+}
+
+/// llama.cpp `ne11_mm_min`: use mul_mm when batch (seq_len) is above this.
+pub const MUL_MM_MIN_SEQ: u32 = 8;
+
+pub const MUL_MM_NR0: u32 = 64;
+pub const MUL_MM_NR1: u32 = 32;
+pub const MUL_MM_NSG: u32 = 4;
+pub const MUL_MM_SMEM: u64 = 8192;
+
+/// Prefer simdgroup matmul over matvec for prefill when seq is long enough
+/// and K is aligned (llama.cpp: ne00 >= 64 && ne11 > 8).
+pub fn should_use_mul_mm(k: u32, seq_len: u32) -> bool {
+    k >= 64 && k % 32 == 0 && seq_len > MUL_MM_MIN_SEQ
+}
+
+pub fn mul_mm_args_k(m: u32, k: u32, seq_len: u32, block_bytes: u64) -> GgmlMulMmArgs {
+    let nb01 = (k as u64 / 256) * block_bytes;
+    GgmlMulMmArgs {
+        ne00: k as i32,
+        ne02: 1,
+        nb01,
+        nb02: nb01 * m as u64,
+        nb03: 0,
+        ne12: 1,
+        nb10: 4,
+        nb11: (k as u64) * 4,
+        nb12: 0,
+        nb13: 0,
+        ne0: m as i32,
+        ne1: seq_len as i32,
+        r2: 1,
+        r3: 1,
+    }
+}
+
+pub fn mul_mm_args_q4_k(m: u32, k: u32, seq_len: u32) -> GgmlMulMmArgs {
+    mul_mm_args_k(m, k, seq_len, Q4_K_BLOCK_BYTES)
+}
+
+pub fn mul_mm_args_q6_k(m: u32, k: u32, seq_len: u32) -> GgmlMulMmArgs {
+    mul_mm_args_k(m, k, seq_len, Q6_K_BLOCK_BYTES)
+}
+
+/// Dispatch: (ceil(N/NR1), ceil(M/NR0), 1) threadgroups; 32×NSG threads.
+pub fn mul_mm_dispatch(m: u32, seq_len: u32) -> (u64, u64, u64, u64, u64) {
+    let tg_x = ((seq_len + MUL_MM_NR1 - 1) / MUL_MM_NR1) as u64;
+    let tg_y = ((m + MUL_MM_NR0 - 1) / MUL_MM_NR0) as u64;
+    (tg_x, tg_y, 1, 32, MUL_MM_NSG as u64)
+}

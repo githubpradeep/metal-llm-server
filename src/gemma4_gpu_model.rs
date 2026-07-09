@@ -4760,7 +4760,7 @@ impl Gemma4GpuModel {
         let encoder = cmd.new_compute_command_encoder();
         let total_ple = (seq_len * ple_total_dim) as u32;
 
-        self.ctx.encode_projection_q4_batch_view(
+        self.ctx.encode_prefill_projection_q4_batch_view(
             encoder,
             &self.per_layer_model_projection_weight,
             &self.prefill_scratch.hidden_buf,
@@ -4877,7 +4877,7 @@ impl Gemma4GpuModel {
         } else {
             // Q4_0 and K-quant (Q4_K_M) share the batched projection entry; the
             // K-quant guard inside picks the right kernel per tensor.
-            self.ctx.encode_projection_q4_batch_view(
+            self.ctx.encode_prefill_projection_q4_batch_view(
                 encoder,
                 &layer.q_proj,
                 &self.prefill_scratch.normed_buf,
@@ -4887,7 +4887,7 @@ impl Gemma4GpuModel {
                 seq_len as u32,
             );
             if layer.has_kv {
-                self.ctx.encode_projection_q4_batch_view(
+                self.ctx.encode_prefill_projection_q4_batch_view(
                     encoder,
                     &layer.k_proj,
                     &self.prefill_scratch.normed_buf,
@@ -4896,7 +4896,7 @@ impl Gemma4GpuModel {
                     hidden_size as u32,
                     seq_len as u32,
                 );
-                self.ctx.encode_projection_q4_batch_view(
+                self.ctx.encode_prefill_projection_q4_batch_view(
                     encoder,
                     &layer.v_proj,
                     &self.prefill_scratch.normed_buf,
@@ -5199,7 +5199,7 @@ impl Gemma4GpuModel {
             num_heads as u32,
             head_dim as u32,
         );
-        self.ctx.encode_projection_auto_batch_view(
+        self.ctx.encode_prefill_projection_auto_batch_view(
             encoder,
             &layer.o_proj,
             &self.prefill_scratch.q_normed_buf,
@@ -5260,7 +5260,7 @@ impl Gemma4GpuModel {
                 seq_len as u32,
             );
         } else {
-            self.ctx.encode_projection_q4_batch_view(
+            self.ctx.encode_prefill_projection_q4_batch_view(
                 encoder,
                 &layer.gate_proj,
                 &self.prefill_scratch.normed_buf,
@@ -5269,7 +5269,7 @@ impl Gemma4GpuModel {
                 hidden_size as u32,
                 seq_len as u32,
             );
-            self.ctx.encode_projection_q4_batch_view(
+            self.ctx.encode_prefill_projection_q4_batch_view(
                 encoder,
                 &layer.up_proj,
                 &self.prefill_scratch.normed_buf,
@@ -5297,7 +5297,7 @@ impl Gemma4GpuModel {
                 seq_len as u32,
             );
         } else {
-            self.ctx.encode_projection_q4_batch_view(
+            self.ctx.encode_prefill_projection_q4_batch_view(
                 encoder,
                 &layer.down_proj,
                 &self.prefill_scratch.gelu_buf,
@@ -5330,7 +5330,7 @@ impl Gemma4GpuModel {
             &self.prefill_scratch.residual_buf,
             total_hidden,
         );
-        self.ctx.encode_projection_auto_batch_view(
+        self.ctx.encode_prefill_projection_auto_batch_view(
             encoder,
             &layer.per_layer_input_gate_weight,
             &self.prefill_scratch.hidden_buf,
@@ -5349,7 +5349,7 @@ impl Gemma4GpuModel {
             ple_dim as u32,
             seq_len as u32,
         );
-        self.ctx.encode_projection_auto_batch_view(
+        self.ctx.encode_prefill_projection_auto_batch_view(
             encoder,
             &layer.per_layer_projection_weight,
             &self.prefill_scratch.up_buf,
@@ -5614,7 +5614,7 @@ impl Gemma4GpuModel {
             num_heads as u32,
             head_dim as u32,
         );
-        self.ctx.encode_projection_auto_batch_view(
+        self.ctx.encode_prefill_projection_auto_batch_view(
             encoder,
             &layer.o_proj,
             &self.prefill_scratch.q_normed_buf,
@@ -5675,7 +5675,7 @@ impl Gemma4GpuModel {
                 total_seq_len as u32,
             );
         } else {
-            self.ctx.encode_projection_q4_batch_view(
+            self.ctx.encode_prefill_projection_q4_batch_view(
                 encoder,
                 &layer.gate_proj,
                 &self.prefill_scratch.normed_buf,
@@ -5684,7 +5684,7 @@ impl Gemma4GpuModel {
                 hidden_size as u32,
                 total_seq_len as u32,
             );
-            self.ctx.encode_projection_q4_batch_view(
+            self.ctx.encode_prefill_projection_q4_batch_view(
                 encoder,
                 &layer.up_proj,
                 &self.prefill_scratch.normed_buf,
@@ -5712,7 +5712,7 @@ impl Gemma4GpuModel {
                 total_seq_len as u32,
             );
         } else {
-            self.ctx.encode_projection_q4_batch_view(
+            self.ctx.encode_prefill_projection_q4_batch_view(
                 encoder,
                 &layer.down_proj,
                 &self.prefill_scratch.gelu_buf,
@@ -5745,7 +5745,7 @@ impl Gemma4GpuModel {
             &self.prefill_scratch.residual_buf,
             total_hidden,
         );
-        self.ctx.encode_projection_auto_batch_view(
+        self.ctx.encode_prefill_projection_auto_batch_view(
             encoder,
             &layer.per_layer_input_gate_weight,
             &self.prefill_scratch.hidden_buf,
@@ -5764,7 +5764,7 @@ impl Gemma4GpuModel {
             ple_dim as u32,
             total_seq_len as u32,
         );
-        self.ctx.encode_projection_auto_batch_view(
+        self.ctx.encode_prefill_projection_auto_batch_view(
             encoder,
             &layer.per_layer_projection_weight,
             &self.prefill_scratch.up_buf,
@@ -6017,7 +6017,7 @@ impl Gemma4GpuModel {
                 num_heads as u32,
                 head_dim as u32,
             );
-            self.ctx.encode_projection_auto_batch_view(
+            self.ctx.encode_prefill_projection_auto_batch_view(
                 encoder,
                 &layer.o_proj,
                 &self.prefill_scratch.q_normed_buf,
@@ -6078,7 +6078,7 @@ impl Gemma4GpuModel {
                     seq_len as u32,
                 );
             } else {
-                self.ctx.encode_projection_q4_batch_view(
+                self.ctx.encode_prefill_projection_q4_batch_view(
                     encoder,
                     &layer.gate_proj,
                     &self.prefill_scratch.normed_buf,
@@ -6087,7 +6087,7 @@ impl Gemma4GpuModel {
                     hidden_size as u32,
                     seq_len as u32,
                 );
-                self.ctx.encode_projection_q4_batch_view(
+                self.ctx.encode_prefill_projection_q4_batch_view(
                     encoder,
                     &layer.up_proj,
                     &self.prefill_scratch.normed_buf,
@@ -6115,7 +6115,7 @@ impl Gemma4GpuModel {
                     seq_len as u32,
                 );
             } else {
-                self.ctx.encode_projection_q4_batch_view(
+                self.ctx.encode_prefill_projection_q4_batch_view(
                     encoder,
                     &layer.down_proj,
                     &self.prefill_scratch.gelu_buf,
@@ -6148,7 +6148,7 @@ impl Gemma4GpuModel {
                 &self.prefill_scratch.residual_buf,
                 total_hidden,
             );
-            self.ctx.encode_projection_auto_batch_view(
+            self.ctx.encode_prefill_projection_auto_batch_view(
                 encoder,
                 &layer.per_layer_input_gate_weight,
                 &self.prefill_scratch.hidden_buf,
@@ -6167,7 +6167,7 @@ impl Gemma4GpuModel {
                 ple_dim as u32,
                 seq_len as u32,
             );
-            self.ctx.encode_projection_auto_batch_view(
+            self.ctx.encode_prefill_projection_auto_batch_view(
                 encoder,
                 &layer.per_layer_projection_weight,
                 &self.prefill_scratch.up_buf,

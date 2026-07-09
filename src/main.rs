@@ -44,6 +44,13 @@ fn main() {
         .and_then(|i| args.get(i + 1))
         .and_then(|n| n.parse().ok())
         .unwrap_or(256);
+    let bench_prefill = args.iter().any(|a| a == "--bench-prefill");
+    let bench_prefill_tokens: Vec<usize> = args
+        .iter()
+        .position(|a| a == "--bench-prefill-tokens")
+        .and_then(|i| args.get(i + 1))
+        .map(|s| parse_prefill_token_sizes(s))
+        .unwrap_or_else(|| vec![128, 256, 512]);
 
     let model_dir = args.iter()
         .filter(|a| !a.starts_with("--") && *a != &args[0])
@@ -159,6 +166,57 @@ fn main() {
                 if max_rel < 1e-3 { "OK" } else { "FAIL" }
             );
             tested += 1;
+
+            // Batched mul_mm (prefill) vs CPU reference when seq > 8.
+            let seq_len: u32 = 16;
+            if crate::ggml_gemv::should_use_mul_mm(k as u32, seq_len) {
+                let x_batch: Vec<f32> = (0..seq_len as usize)
+                    .flat_map(|s| (0..k).map(move |j| ((j + s * 7) % 17) as f32 * 0.05 - 0.4))
+                    .collect();
+                let mut y_ref = vec![0.0f32; m * seq_len as usize];
+                for s in 0..seq_len as usize {
+                    for r in 0..m {
+                        let mut acc = 0.0f32;
+                        let base_w = r * k;
+                        let base_x = s * k;
+                        for j in 0..k {
+                            acc += w[base_w + j] * x_batch[base_x + j];
+                        }
+                        y_ref[s * m + r] = acc;
+                    }
+                }
+                let x_buf = ctx.buffer_from_slice(&x_batch);
+                let y_buf = ctx.buffer_empty(m * seq_len as usize);
+                let cmd = ctx.queue.new_command_buffer();
+                let enc = cmd.new_compute_command_encoder();
+                ctx.encode_mul_mm_kquant_at_view(
+                    enc,
+                    &w_view,
+                    &x_buf,
+                    &y_buf,
+                    m as u32,
+                    k as u32,
+                    seq_len,
+                );
+                enc.end_encoding();
+                cmd.commit();
+                cmd.wait_until_completed();
+                let y_gpu = unsafe {
+                    std::slice::from_raw_parts(y_buf.contents() as *const f32, m * seq_len as usize)
+                };
+                let mut mm_max_rel = 0.0f32;
+                for i in 0..y_ref.len() {
+                    let d = (y_gpu[i] - y_ref[i]).abs();
+                    let denom = y_ref[i].abs().max(1e-3);
+                    mm_max_rel = mm_max_rel.max(d / denom);
+                }
+                println!(
+                    "  mul_mm seq={:<3} max_rel_err={:.3e} {}",
+                    seq_len,
+                    mm_max_rel,
+                    if mm_max_rel < 1e-3 { "OK" } else { "FAIL" }
+                );
+            }
         }
         if tested == 0 {
             println!("No Q4_K/Q6_K tensors found in {} (nothing to test).", model_dir);
@@ -232,6 +290,15 @@ fn main() {
                     &tokenizer,
                     &mut gpu_model,
                     bench_decode_tokens,
+                );
+                return;
+            }
+
+            if bench_prefill {
+                bench_prefill_gemma4(
+                    &tokenizer,
+                    &mut gpu_model,
+                    &bench_prefill_tokens,
                 );
                 return;
             }
@@ -416,6 +483,70 @@ fn bench_decode_gemma4(
         prefill_tps, decode_tps
     );
     println!("  (llama.cpp reports the same Prompt/Generation split; no stdout in decode loop)");
+}
+
+fn parse_prefill_token_sizes(s: &str) -> Vec<usize> {
+    s.split(',')
+        .filter_map(|p| p.trim().parse::<usize>().ok())
+        .filter(|&n| n > 0)
+        .collect()
+}
+
+/// Timed parallel prefill via KV-pool path (same as server), no decode.
+fn bench_prefill_gemma4(
+    tokenizer: &tokenizers::Tokenizer,
+    model: &mut gemma4_gpu_model::Gemma4GpuModel,
+    sizes: &[usize],
+) {
+    let filler = "The quick brown fox jumps over the lazy dog. ";
+    println!("\n=== Gemma4 parallel prefill benchmark (Metal GPU) ===");
+    println!(
+        "  max_parallel_prefill_seq={}  PREFILL_MUL_MM={}",
+        model.max_parallel_prefill_seq(),
+        std::env::var("PREFILL_MUL_MM").unwrap_or_else(|_| "1".into())
+    );
+
+    for &target in sizes {
+        model.reset_legacy_state();
+        let mut text = String::from("<start_of_turn>user\n");
+        while tokenizer
+            .encode(text.as_str(), true)
+            .map(|e| e.get_ids().len())
+            .unwrap_or(0)
+            < target
+        {
+            text.push_str(filler);
+        }
+        text.push_str("<end_of_turn>\n<start_of_turn>model\n");
+        let token_ids: Vec<usize> = tokenizer
+            .encode(text.as_str(), true)
+            .expect("Failed to encode bench prefill prompt")
+            .get_ids()
+            .iter()
+            .map(|&t| t as usize)
+            .collect();
+        let actual = token_ids.len();
+
+        let mut kv_pool = model.create_kv_pool(1, model.kv_capacity);
+        let slot = kv_pool
+            .allocate()
+            .expect("Failed to allocate prefill benchmark KV slot");
+
+        let start = Instant::now();
+        model
+            .forward_prefill_chunked_with_kv_slot(&token_ids, &mut kv_pool, slot)
+            .expect("prefill benchmark failed");
+        let secs = start.elapsed().as_secs_f64();
+        let tps = if secs > 0.0 { actual as f64 / secs } else { 0.0 };
+
+        println!(
+            "  target={:<4} actual={:<4} prefill={:.1} tok/s  ({:.2} ms)",
+            target,
+            actual,
+            tps,
+            secs * 1000.0
+        );
+    }
 }
 
 fn generate_gemma4_gpu(
