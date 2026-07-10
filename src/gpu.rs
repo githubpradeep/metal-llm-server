@@ -5838,8 +5838,7 @@ impl MetalContext {
         };
 
         let pad_off = layout.pad_off;
-        let blk_off = layout.blk_off;
-        let mask_off = layout.mask_off;
+        let (mask_off, blk_off) = layout.mask_blk_off(attention_window);
 
         let need_mask_blk = match mask_cache.as_ref() {
             Some(cache) => !cache.matches(q_len, kv_seq, q_start, attention_window),
@@ -5859,7 +5858,7 @@ impl MetalContext {
                 let base = scratch.contents() as *mut u8;
                 std::ptr::copy_nonoverlapping(
                     mask_host.as_ptr() as *const u8,
-                    base.add(layout.mask_off as usize),
+                    base.add(mask_off as usize),
                     mask_len * 2,
                 );
             }
@@ -5887,7 +5886,7 @@ impl MetalContext {
 
         let has_kvpad = kv_seq % NCPSG != 0;
         if has_kvpad {
-            let pad_args = pad_args(num_kv_heads, kv_seq, row_bytes, q_len);
+            let pad_args = pad_args(num_kv_heads, kv_seq, capacity, row_bytes, q_len);
             encoder.set_compute_pipeline_state(&self.flash_attn_ext_prefill_pad_pipeline);
             encoder.set_bytes(
                 0,

@@ -70,7 +70,10 @@ void dequantize_q4_0(device const block_q4_0 * xb, short il, thread type4x4 & re
     reg = (type4x4) reg_f;
 }
 
-constant bool FC_flash_attn_ext_pad_has_mask = false;
+// Must be true: when has_kvpad, the main kernel redirects mask reads into the
+// pad buffer (llama.cpp/ds4). If pad skips the mask, the last KV chunk attends
+// with garbage scores.
+constant bool FC_flash_attn_ext_pad_has_mask = true;
 
 constant int32_t FC_flash_attn_ext_pad_ncpsg = 64;
 
@@ -206,9 +209,12 @@ constant bool FC_flash_attn_ext_has_mask = true;
 constant bool FC_flash_attn_ext_has_sinks = false;
 constant bool FC_flash_attn_ext_has_bias = false;
 constant bool FC_flash_attn_ext_has_scap = false;
+// Always true is safe: the pad branch only runs when ic+C > ne11, and the host
+// only fills the pad buffer when kv_seq % NCPSG != 0.
 constant bool FC_flash_attn_ext_has_kvpad = true;
 
-constant bool FC_flash_attn_ext_bc_mask = false;
+// Guard partial query tiles when q_len % NQPTG != 0 (ds4 sets this dynamically).
+constant bool FC_flash_attn_ext_bc_mask = true;
 
 //constant float FC_flash_attn_ext_scale         [[function_constant(FC_FLASH_ATTN_EXT + 10)]];
 //constant float FC_flash_attn_ext_max_bias      [[function_constant(FC_FLASH_ATTN_EXT + 11)]];

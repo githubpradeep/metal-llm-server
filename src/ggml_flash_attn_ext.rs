@@ -85,10 +85,10 @@ pub fn mask_bytes(q_len: u32, kv_seq: u32) -> u64 {
     q_len as u64 * kv_seq as u64 * 2
 }
 
-pub fn pad_bytes(row_bytes: u64, num_kv_heads: u32, q_len: u32, kv_seq: u32) -> u64 {
-    let kv_plane = row_bytes * num_kv_heads as u64;
-    let mask_plane = q_len as u64 * kv_seq as u64 * 2;
-    NCPSG as u64 * (kv_plane + kv_plane + mask_plane)
+/// Pad scratch: last partial KV chunk (C rows) + causal mask rows for those C cols.
+/// Layout matches llama.cpp/ds4: `C * (2 * row_bytes * n_kv_heads + q_len * sizeof(half))`.
+pub fn pad_bytes(row_bytes: u64, num_kv_heads: u32, q_len: u32, _kv_seq: u32) -> u64 {
+    NCPSG as u64 * (2 * row_bytes * num_kv_heads as u64 + q_len as u64 * 2)
 }
 
 pub fn blk_bytes(q_len: u32, kv_seq: u32) -> u64 {
@@ -174,24 +174,29 @@ pub fn flash_attn_ext_args(
 pub fn pad_args(
     num_kv_heads: u32,
     kv_seq: u32,
+    capacity: u32,
     row_bytes: u64,
     q_len: u32,
 ) -> FlashAttnExtPadArgs {
+    // KV cache is [kv_head][capacity][row]; head stride must use capacity, not kv_seq.
+    let kv_head_stride = capacity as u64 * row_bytes;
+    let mask_row_bytes = kv_seq as u64 * 2;
     FlashAttnExtPadArgs {
         ne11: kv_seq as i32,
         ne_12_2: num_kv_heads as i32,
         ne_12_3: 1,
         nb11: row_bytes,
-        nb12: row_bytes * kv_seq as u64,
+        nb12: kv_head_stride,
         nb13: 0,
         nb21: row_bytes,
-        nb22: row_bytes * kv_seq as u64,
+        nb22: kv_head_stride,
         nb23: 0,
         ne31: q_len as i32,
         ne32: 1,
         ne33: 1,
-        nb31: 2,
-        nb32: kv_seq as u64 * 2,
+        // Causal mask is [q_len][kv_seq] f16 row-major (same as fill_causal_mask).
+        nb31: mask_row_bytes,
+        nb32: 0,
         nb33: 0,
     }
 }
@@ -236,24 +241,40 @@ pub fn fill_causal_mask(
 }
 
 pub struct ScratchLayout {
-    pub mask_off: u64,
+    /// Shared pad region (GPU-ordered per layer; safe to reuse in one CB).
     pub pad_off: u64,
-    pub blk_off: u64,
+    full_mask_off: u64,
+    full_blk_off: u64,
+    swa_mask_off: u64,
+    swa_blk_off: u64,
     pub total: u64,
 }
 
-/// Cache mask+blk prepass across layers sharing the same causal window in one chunk.
-#[derive(Clone, Copy, Default)]
-pub struct PrefillExtMaskCache {
-    pub q_len: u32,
-    pub kv_seq: u32,
-    pub q_start: u32,
-    pub attention_window: u32,
-    pub ready: bool,
+impl ScratchLayout {
+    /// Separate CPU-written mask+blk planes for full vs sliding-window layers.
+    /// One CB encodes all layers; CPU fills must not overwrite a plane still
+    /// referenced by earlier dispatches in that CB.
+    pub fn mask_blk_off(&self, attention_window: u32) -> (u64, u64) {
+        if attention_window == 0 {
+            (self.full_mask_off, self.full_blk_off)
+        } else {
+            (self.swa_mask_off, self.swa_blk_off)
+        }
+    }
 }
 
-impl PrefillExtMaskCache {
-    pub fn matches(&self, q_len: u32, kv_seq: u32, q_start: u32, attention_window: u32) -> bool {
+/// Per-window mask+blk readiness inside one prefill chunk CB.
+#[derive(Clone, Copy, Default)]
+struct PrefillExtMaskSlot {
+    q_len: u32,
+    kv_seq: u32,
+    q_start: u32,
+    attention_window: u32,
+    ready: bool,
+}
+
+impl PrefillExtMaskSlot {
+    fn matches(&self, q_len: u32, kv_seq: u32, q_start: u32, attention_window: u32) -> bool {
         self.ready
             && self.q_len == q_len
             && self.kv_seq == kv_seq
@@ -261,12 +282,47 @@ impl PrefillExtMaskCache {
             && self.attention_window == attention_window
     }
 
-    pub fn mark(&mut self, q_len: u32, kv_seq: u32, q_start: u32, attention_window: u32) {
+    fn mark(&mut self, q_len: u32, kv_seq: u32, q_start: u32, attention_window: u32) {
         self.q_len = q_len;
         self.kv_seq = kv_seq;
         self.q_start = q_start;
         self.attention_window = attention_window;
         self.ready = true;
+    }
+}
+
+/// Cache mask+blk prepass across layers; full and SWA keep independent slots.
+#[derive(Clone, Copy, Default)]
+pub struct PrefillExtMaskCache {
+    full: PrefillExtMaskSlot,
+    swa: PrefillExtMaskSlot,
+}
+
+impl PrefillExtMaskCache {
+    fn slot(&self, attention_window: u32) -> &PrefillExtMaskSlot {
+        if attention_window == 0 {
+            &self.full
+        } else {
+            &self.swa
+        }
+    }
+
+    fn slot_mut(&mut self, attention_window: u32) -> &mut PrefillExtMaskSlot {
+        if attention_window == 0 {
+            &mut self.full
+        } else {
+            &mut self.swa
+        }
+    }
+
+    pub fn matches(&self, q_len: u32, kv_seq: u32, q_start: u32, attention_window: u32) -> bool {
+        self.slot(attention_window)
+            .matches(q_len, kv_seq, q_start, attention_window)
+    }
+
+    pub fn mark(&mut self, q_len: u32, kv_seq: u32, q_start: u32, attention_window: u32) {
+        self.slot_mut(attention_window)
+            .mark(q_len, kv_seq, q_start, attention_window);
     }
 }
 
@@ -279,10 +335,18 @@ pub fn scratch_layout(
     let mask = mask_bytes(max_q_len, kv_capacity);
     let pad = pad_bytes(row_bytes, num_kv_heads, max_q_len, kv_capacity);
     let blk = blk_bytes(max_q_len, kv_capacity);
+    // [full_mask][swa_mask][pad][full_blk][swa_blk]
+    let full_mask_off = 0;
+    let swa_mask_off = mask;
+    let pad_off = mask * 2;
+    let full_blk_off = pad_off + pad;
+    let swa_blk_off = full_blk_off + blk;
     ScratchLayout {
-        mask_off: 0,
-        pad_off: mask,
-        blk_off: mask + pad,
-        total: mask + pad + blk,
+        pad_off,
+        full_mask_off,
+        full_blk_off,
+        swa_mask_off,
+        swa_blk_off,
+        total: swa_blk_off + blk,
     }
 }
