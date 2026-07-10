@@ -160,14 +160,26 @@ fn configured_max_prefill_seq(kv_capacity: u32) -> usize {
         .min(kv_capacity as usize)
 }
 
-/// KV cache slot count (context window). Override with `LLAMA_CTX_SIZE`.
+/// KV cache slot capacity (context window). Override with `LLAMA_CTX_SIZE`.
+///
+/// Default stays 16k for memory; set `LLAMA_CTX_SIZE=200000` for long-context
+/// agent workloads. Values above the model's trained `max_position_embeddings`
+/// are allowed (up to 200k) but may degrade RoPE quality.
 fn configured_kv_capacity(max_position_embeddings: usize) -> u32 {
     const DEFAULT_KV_CAPACITY: usize = 16384;
+    const ABSOLUTE_MAX_KV_CAPACITY: usize = 200_000;
     let requested = std::env::var("LLAMA_CTX_SIZE")
         .ok()
         .and_then(|value| value.parse::<usize>().ok())
         .unwrap_or(DEFAULT_KV_CAPACITY);
-    requested.clamp(256, max_position_embeddings) as u32
+    let capped = requested.clamp(256, ABSOLUTE_MAX_KV_CAPACITY);
+    if capped > max_position_embeddings {
+        eprintln!(
+            "  Warning: LLAMA_CTX_SIZE={} > model max_position_embeddings={} (quality may drop past training length)",
+            capped, max_position_embeddings
+        );
+    }
+    capped as u32
 }
 
 /// Gemma 4 E4B GPU-resident model with persistent KV cache on Metal.

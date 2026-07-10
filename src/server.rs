@@ -2676,6 +2676,36 @@ fn fit_messages_to_context(
     Ok(fitted)
 }
 
+/// How many prompt tokens to allow when fitting messages.
+///
+/// Clients (e.g. agents) often send `max_tokens` ≈ full context. Reserving that
+/// entire amount for completion would leave a 1-token prompt budget. Cap the
+/// reserved completion share at half the window so long tool results still fit;
+/// completion is clamped to the remainder after the prompt is known.
+fn prompt_token_budget(max_context_len: usize, requested_max_tokens: usize) -> usize {
+    let max_reserve = (max_context_len / 2).max(1).min(max_context_len.saturating_sub(1));
+    let reserved = requested_max_tokens.min(max_reserve);
+    max_context_len.saturating_sub(reserved).max(1)
+}
+
+fn clamp_max_tokens_to_context(
+    prompt_tokens: usize,
+    requested_max_tokens: usize,
+    max_context_len: usize,
+) -> Result<usize, ApiError> {
+    if prompt_tokens >= max_context_len {
+        return Err(ApiError::bad_request(
+            "context_length_exceeded",
+            format!(
+                "prompt has {} tokens, which exceeds the model context limit of {}",
+                prompt_tokens, max_context_len
+            ),
+        ));
+    }
+    let remaining = max_context_len - prompt_tokens;
+    Ok(requested_max_tokens.min(remaining).max(1))
+}
+
 fn encode_prompt(
     state: &AppState,
     messages: &[Message],
@@ -2683,10 +2713,7 @@ fn encode_prompt(
     tool_choice: Option<&serde_json::Value>,
     max_tokens: usize,
 ) -> Result<Vec<usize>, ApiError> {
-    let max_prompt_tokens = state
-        .max_context_len
-        .saturating_sub(max_tokens)
-        .max(1);
+    let max_prompt_tokens = prompt_token_budget(state.max_context_len, max_tokens);
     let fitted = fit_messages_to_context(
         messages,
         tools,
@@ -2759,7 +2786,7 @@ async fn chat_completions_sync(
     state: Arc<AppState>,
     req: ChatCompletionRequest,
 ) -> Result<Json<ChatCompletionResponse>, ApiError> {
-    let generation_params = generation_params_from_request(&req, state.request_timeout())?;
+    let mut generation_params = generation_params_from_request(&req, state.request_timeout())?;
     let input_ids = encode_prompt(
         &state,
         &req.messages,
@@ -2768,6 +2795,11 @@ async fn chat_completions_sync(
         generation_params.max_tokens,
     )?;
     let prompt_tokens = input_ids.len();
+    generation_params.max_tokens = clamp_max_tokens_to_context(
+        prompt_tokens,
+        generation_params.max_tokens,
+        state.max_context_len,
+    )?;
     validate_context_len(
         prompt_tokens,
         generation_params.max_tokens,
@@ -2895,7 +2927,7 @@ async fn chat_completions_stream(
 
     let chat_id = format!("chatcmpl-{}", uuid::Uuid::new_v4());
     let created = chrono::Utc::now().timestamp();
-    let generation_params = generation_params_from_request(&req, state.request_timeout())?;
+    let mut generation_params = generation_params_from_request(&req, state.request_timeout())?;
     let input_ids = encode_prompt(
         &state,
         &req.messages,
@@ -2903,8 +2935,14 @@ async fn chat_completions_stream(
         req.tool_choice.as_ref(),
         generation_params.max_tokens,
     )?;
+    let prompt_tokens = input_ids.len();
+    generation_params.max_tokens = clamp_max_tokens_to_context(
+        prompt_tokens,
+        generation_params.max_tokens,
+        state.max_context_len,
+    )?;
     validate_context_len(
-        input_ids.len(),
+        prompt_tokens,
         generation_params.max_tokens,
         state.max_context_len,
     )?;
@@ -2912,7 +2950,6 @@ async fn chat_completions_stream(
     let model_name = response_model(&req).to_string();
     let request_stop = req.stop.map(StopSequences::into_vec);
     let include_usage = should_include_stream_usage(req.stream_options.as_ref());
-    let prompt_tokens = input_ids.len();
     let allowed_tool_names = req
         .tools
         .as_ref()
@@ -3378,7 +3415,7 @@ pub async fn run_server(model: Gemma4GpuModel, tokenizer: tokenizers::Tokenizer,
             .unwrap_or_else(|| "model_default".to_string()),
     );
     println!(
-        "   Context: {} tokens max (override with LLAMA_CTX_SIZE)",
+        "   Context: {} tokens max (override with LLAMA_CTX_SIZE, up to 200000)",
         max_context_len
     );
 
@@ -3505,6 +3542,17 @@ mod tests {
 
         req.max_tokens = None;
         assert_eq!(effective_max_tokens(&req), 1024);
+    }
+
+    #[test]
+    fn prompt_token_budget_does_not_collapse_when_max_tokens_equals_context() {
+        // Agent clients often set max_tokens ≈ context_len.
+        assert_eq!(prompt_token_budget(16384, 16384), 8192);
+        assert_eq!(prompt_token_budget(16384, 1), 16383);
+        assert_eq!(
+            clamp_max_tokens_to_context(5420, 16384, 16384).ok(),
+            Some(10964)
+        );
     }
 
     #[test]
