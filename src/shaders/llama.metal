@@ -3855,7 +3855,7 @@ kernel void attention_single_token_offset_q4_0(
     uint lane = tid % SIMD_SIZE;
     uint num_simds = tg_size / SIMD_SIZE;
 
-    threadgroup float shared_scores[TILE_KV * 4];
+    threadgroup float shared_scores[TILE_KV * 8]; // up to 256-thread TG (8 simdgroups)
     threadgroup float shared_exp[TILE_KV];
     threadgroup float shared_update[4];
 
@@ -3994,7 +3994,7 @@ kernel void attention_causal_q4_0(
     uint lane = tid % SIMD_SIZE;
     uint num_simds = tg_size / SIMD_SIZE;
 
-    threadgroup float shared_scores[TILE_KV * 4];
+    threadgroup float shared_scores[TILE_KV * 8]; // up to 256-thread TG (8 simdgroups)
     threadgroup float shared_exp[TILE_KV];
     threadgroup float shared_update[4];
 
@@ -4135,7 +4135,7 @@ kernel void attention_causal_strided_q4_0(
     uint lane = tid % SIMD_SIZE;
     uint num_simds = tg_size / SIMD_SIZE;
 
-    threadgroup float shared_scores[TILE_KV * 4];
+    threadgroup float shared_scores[TILE_KV * 8]; // up to 256-thread TG (8 simdgroups)
     threadgroup float shared_exp[TILE_KV];
     threadgroup float shared_update[4];
 

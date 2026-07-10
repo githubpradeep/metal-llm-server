@@ -1526,6 +1526,15 @@ impl Gemma4GpuModel {
             "  Sliding head_dim={}, Full head_dim={}, PLE dim={}, shared_kv_layers={}",
             config.head_dim, config.global_head_dim, ple_dim, config.num_kv_shared_layers
         );
+        println!(
+            "  RoPE: sliding θ={:.0} (all {} dims), full θ={:.0} p-RoPE factor={:.2} ({} of {} dims)",
+            config.sliding_rope_theta(),
+            config.head_dim,
+            config.full_rope_theta(),
+            config.full_partial_rotary_factor(),
+            (config.global_head_dim as f64 * config.full_partial_rotary_factor()) as usize,
+            config.global_head_dim,
+        );
 
         // --- Embeddings ---
         println!("  Loading embeddings (dequantizing K-quant tables)...");
@@ -5106,6 +5115,8 @@ impl Gemma4GpuModel {
                 &self.prefill_scratch.q_buf,
                 &self.prefill_scratch.k_buf,
                 &self.prefill_scratch.v_buf,
+                &self.prefill_scratch.q_normed_buf,
+                &self.prefill_scratch.k_normed_buf,
                 &layer.q_norm_weight,
                 &layer.k_norm_weight,
                 layer.q_out_dim as u32,
@@ -7972,17 +7983,22 @@ fn gemma4_config_from_gguf(g: &crate::gguf::Gguf) -> Gemma4TextConfig {
 
     let full_theta = g.get_f32("gemma4.rope.freq_base").unwrap_or(1_000_000.0) as f64;
     let sliding_theta = g.get_f32("gemma4.rope.freq_base_swa").unwrap_or(10_000.0) as f64;
-    // rope.dimension_count tells us how many of the head_dim channels are rotated.
-    let full_rope_dim =
-        g.get_u32("gemma4.rope.dimension_count").unwrap_or(global_head_dim as u32) as f64;
+    // Sliding layers: dimension_count_swa is the rotated width (usually == head_dim).
     let sliding_rope_dim =
         g.get_u32("gemma4.rope.dimension_count_swa").unwrap_or(head_dim as u32) as f64;
+    // Full / global layers use proportional RoPE (p-RoPE, p=0.25): only the first
+    // p*head_dim channels are rotated; the rest stay identity. GGUF stores
+    // gemma4.rope.dimension_count == global_head_dim (the RoPE *op* width) and
+    // rope_freqs.weight with 1.0 on the active angles and ~1e30 on the rest —
+    // that is NOT "rotate all dims". Hard-coding p=0.25 matches HF / llama.cpp /
+    // the rope_freqs mask (64 of 256 half-dims active on E2B).
+    let full_partial_rotary = 0.25f64;
 
     let rope_parameters = Some(RopeParameters {
         full_attention: Some(RopeConfig {
             rope_theta: full_theta,
-            rope_type: String::new(),
-            partial_rotary_factor: full_rope_dim / global_head_dim as f64,
+            rope_type: "proportional".to_string(),
+            partial_rotary_factor: full_partial_rotary,
             factor: 1.0,
         }),
         sliding_attention: Some(RopeConfig {

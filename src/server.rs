@@ -1427,11 +1427,18 @@ fn infer_read_path_from_user(messages: &[Message]) -> Option<String> {
 }
 
 fn min_decode_tokens_for_request(
-    _messages: &[Message],
-    _tools: Option<&[Tool]>,
-    _tool_choice: Option<&serde_json::Value>,
+    messages: &[Message],
+    tools: Option<&[Tool]>,
+    tool_choice: Option<&serde_json::Value>,
 ) -> usize {
-    0
+    // Prefill can spuriously peak on <eos>/<turn|>/\n. Require a couple of
+    // non-EOS tokens on answer turns — but keep this small so short replies
+    // (e.g. "Hello") are not forced into filler monologue.
+    if should_require_tool_call(messages, tools, tool_choice) {
+        0
+    } else {
+        2
+    }
 }
 
 fn user_message_implies_read(messages: &[Message]) -> bool {
@@ -1815,20 +1822,21 @@ const NATIVE_TOOL_CALL_SUFFIX: &str = "<tool_call|>";
 const NATIVE_TOOL_RESPONSE_PREFIX: &str = "<|tool_response>response:";
 const NATIVE_TOOL_RESPONSE_SUFFIX: &str = "<tool_response|>";
 const SYSTEM_FINGERPRINT: &str = "local-7f3a2c1b";
-/// Gemma4 jinja primes every model generation with an empty thought channel when
-/// thinking is off; the model then emits optional thought text and/or final content.
+/// Empty thought channel used by Gemma 4 12B/26B/31B when thinking is off.
+/// E2B/E4B must NOT use this — official template ends at `<|turn>model\n` only.
+#[allow(dead_code)]
 const EMPTY_THOUGHT_PREFIX: &str = "<|channel>thought\n<channel|>";
 
 fn generation_priming_suffix(
     _messages: &[Message],
-    tools: Option<&[Tool]>,
+    _tools: Option<&[Tool]>,
     _tool_choice: Option<&serde_json::Value>,
 ) -> &'static str {
-    if tools.is_some_and(|t| !t.is_empty()) {
-        EMPTY_THOUGHT_PREFIX
-    } else {
-        ""
-    }
+    // Gemma 4 E2B/E4B (our target): thinking-off generation prompt is just
+    // `<|turn>model\n` with no empty thought stub. Priming
+    // `<|channel>thought\n<channel|>` is for 12B/26B/31B only and makes E2B
+    // emit meta-narration ("The user wants…") instead of the answer.
+    ""
 }
 
 const BUILT_IN_OUTPUT_TRIM_SEQUENCES: &[&str] = &[
@@ -3547,11 +3555,11 @@ mod tests {
         assert!(prompt.contains("be helpful"));
         assert!(prompt.contains("<|tool>declaration:read"));
         assert!(prompt.contains("<|turn>user\nhi<turn|>"));
-        assert!(prompt.ends_with(EMPTY_THOUGHT_PREFIX));
+        assert!(prompt.ends_with("<|turn>model\n"));
     }
 
     #[test]
-    fn apply_chat_template_omits_thought_priming_for_plain_chat() {
+    fn apply_chat_template_ends_at_model_turn_for_plain_chat() {
         let messages = vec![Message {
             role: "user".to_string(),
             content: Some("Say hello".to_string()),
@@ -3559,8 +3567,9 @@ mod tests {
         }];
         let prompt = apply_chat_template(&messages, None, None);
         assert!(prompt.contains("<|turn>user\nSay hello<turn|>"));
+        // E2B/E4B thinking-off: no empty thought channel stub.
         assert!(prompt.ends_with("<|turn>model\n"));
-        assert!(!prompt.contains(CHANNEL_START));
+        assert!(!prompt.contains(EMPTY_THOUGHT_PREFIX));
     }
 
     #[test]
@@ -3603,7 +3612,8 @@ mod tests {
         assert!(prompt.contains("<|think|>"));
         assert!(prompt.contains("<|tool>declaration:bash"));
         assert!(prompt.contains("<|turn>user\nlist files<turn|>"));
-        assert!(prompt.ends_with("<|turn>model\n<|channel>thought\n<channel|>"));
+        assert!(prompt.ends_with("<|turn>model\n"));
+        assert!(!prompt.contains(EMPTY_THOUGHT_PREFIX));
     }
 
     #[test]
@@ -3753,7 +3763,7 @@ mod tests {
     }
 
     #[test]
-    fn generation_priming_suffix_uses_empty_thought_for_post_tool_answer() {
+    fn generation_priming_suffix_is_empty_for_e2b_post_tool_answer() {
         let messages = vec![
             Message {
                 role: "user".to_string(),
@@ -3791,7 +3801,7 @@ mod tests {
         }];
         assert_eq!(
             generation_priming_suffix(&messages, Some(&tools), None),
-            EMPTY_THOUGHT_PREFIX
+            ""
         );
     }
 
@@ -3956,7 +3966,10 @@ mod tests {
         let prompt = apply_chat_template(&messages, Some(&tools), None);
         assert!(!prompt.contains("declaration:read"));
         assert!(prompt.contains("# Title"));
-        assert!(prompt.ends_with(EMPTY_THOUGHT_PREFIX));
+        // Post-tool answer: remain in open model turn with no empty-thought stub.
+        assert!(prompt.contains("<|tool_response>response:read{"));
+        assert!(!prompt.contains("<|channel>thought\n<channel|>"));
+        assert!(!prompt.ends_with("<turn|>\n"));
     }
 
     #[test]
@@ -4285,7 +4298,9 @@ think<channel|><|tool_call>call:bash{command:<|"|>ls -F<|"|>}"#;
 
         let prompt = apply_chat_template(&messages, Some(&tools), None);
         assert!(prompt.contains("<|tool_response>response:read{value:"));
-        assert!(prompt.ends_with(EMPTY_THOUGHT_PREFIX));
+        // Stay in the open model turn; E2B/E4B do not prime an empty thought channel.
+        assert!(prompt.contains("<|tool_response>response:read{"));
+        assert!(!prompt.contains("<|channel>thought\n<channel|>"));
         assert!(!prompt.ends_with("<turn|>\n"));
     }
 

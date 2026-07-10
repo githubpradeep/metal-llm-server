@@ -624,28 +624,27 @@ fn prepare_decode_token(active: &mut ActiveRequest) -> DecodePreparation {
     let mut next_token =
         sampling::sample_with_params(&active.logits, &sampling_params, &active.generated_tokens);
 
-    while active.completion_tokens < active.request.params.min_decode_tokens
-        && active.request.params.eos_token_ids.contains(&next_token)
-    {
-        let mut masked_logits = active.logits.clone();
-        for eos in &active.request.params.eos_token_ids {
-            if *eos < masked_logits.len() {
-                masked_logits[*eos] = f32::NEG_INFINITY;
-            }
-        }
-        next_token = sampling::sample_with_params(
-            &masked_logits,
-            &sampling_params,
-            &active.generated_tokens,
-        );
-    }
+    // Control tokens that should not lead an answer turn.
+    // 1=<eos>, 100=<|channel>, 101=<channel|>, 105=<|turn>, 106=<turn|>, 107='\n'
+    const FIRST_TOKEN_BLOCKLIST: &[usize] = &[1, 100, 101, 105, 106, 107];
 
-    // After long prefills the model can spuriously sample <turn|> (106) before any text.
-    if active.completion_tokens == 0
-        && active.request.params.min_decode_tokens == 0
-        && active.request.params.eos_token_ids.contains(&next_token)
-    {
+    let mut guard = 0;
+    loop {
+        let block_eos = active.completion_tokens < active.request.params.min_decode_tokens
+            && active.request.params.eos_token_ids.contains(&next_token);
+        let block_first =
+            active.completion_tokens == 0 && FIRST_TOKEN_BLOCKLIST.contains(&next_token);
+        if (!block_eos && !block_first) || guard >= 64 {
+            break;
+        }
         let mut masked_logits = active.logits.clone();
+        if block_first {
+            for &blocked in FIRST_TOKEN_BLOCKLIST {
+                if blocked < masked_logits.len() {
+                    masked_logits[blocked] = f32::NEG_INFINITY;
+                }
+            }
+        }
         for eos in &active.request.params.eos_token_ids {
             if *eos < masked_logits.len() {
                 masked_logits[*eos] = f32::NEG_INFINITY;
@@ -656,6 +655,7 @@ fn prepare_decode_token(active: &mut ActiveRequest) -> DecodePreparation {
             &sampling_params,
             &active.generated_tokens,
         );
+        guard += 1;
     }
 
     if active.request.params.eos_token_ids.contains(&next_token) {

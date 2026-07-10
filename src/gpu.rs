@@ -878,7 +878,7 @@ impl MetalContext {
             println!("  FlashAttention-style tiled kernels enabled (FLASH_ATTN=legacy to disable)");
             if prefill_flash_attn_ext_enabled() {
                 println!(
-                    "  Q4 prefill attention: llama.cpp flash_attn_ext tiled (PREFILL_FLASH_ATTN=1, q_len≥20)"
+                    "  Q4 prefill attention: legacy causal (PREFILL_FLASH_ATTN=1 ignored; tiled flash disabled — long-ctx corruption)"
                 );
             }
             match attention_kernel_mode() {
@@ -3192,6 +3192,9 @@ impl MetalContext {
     }
 
     /// Post-projection: split (if stacked) + QK-norm + layout → HSD for rotary/flash_attn.
+    ///
+    /// `q_scratch` / `k_scratch` are required for the non-stacked SHD→HSD path:
+    /// that remap must be out-of-place (in-place races for seq_len > 1).
     pub fn encode_prefill_qkv_postproj_hsd(
         &self,
         encoder: &metal::ComputeCommandEncoderRef,
@@ -3199,6 +3202,8 @@ impl MetalContext {
         q_buf: &Buffer,
         k_buf: &Buffer,
         v_buf: &Buffer,
+        q_scratch: &Buffer,
+        k_scratch: &Buffer,
         q_norm_weight: &BufferView,
         k_norm_weight: &BufferView,
         m_q: u32,
@@ -3226,6 +3231,7 @@ impl MetalContext {
                 num_kv_heads,
                 seq_len,
             );
+            // Already HSD: in-place per-row RMSNorm is safe.
             self.encode_rmsnorm_hsd_batch_view(
                 encoder,
                 q_buf,
@@ -3250,40 +3256,48 @@ impl MetalContext {
                 encoder, v_buf, v_buf, head_dim, num_kv_heads, seq_len, eps,
             );
         } else if has_kv {
+            // SHD→HSD remaps (s,h)↔(h,s): never in-place for seq_len > 1.
+            let q_elems = seq_len * num_heads * head_dim;
+            let kv_elems = seq_len * num_kv_heads * head_dim;
             self.encode_rmsnorm_shd_to_hsd_view(
                 encoder,
                 q_buf,
                 q_norm_weight,
-                q_buf,
+                q_scratch,
                 head_dim,
                 num_heads,
                 seq_len,
                 eps,
             );
+            self.encode_copy(encoder, q_scratch, q_buf, q_elems);
             self.encode_rmsnorm_shd_to_hsd_view(
                 encoder,
                 k_buf,
                 k_norm_weight,
-                k_buf,
+                k_scratch,
                 head_dim,
                 num_kv_heads,
                 seq_len,
                 eps,
             );
+            self.encode_copy(encoder, k_scratch, k_buf, kv_elems);
             self.encode_rmsnorm_noweight_shd_to_hsd(
-                encoder, v_buf, v_buf, head_dim, num_kv_heads, seq_len, eps,
+                encoder, v_buf, k_scratch, head_dim, num_kv_heads, seq_len, eps,
             );
+            self.encode_copy(encoder, k_scratch, v_buf, kv_elems);
         } else {
+            let q_elems = seq_len * num_heads * head_dim;
             self.encode_rmsnorm_shd_to_hsd_view(
                 encoder,
                 q_buf,
                 q_norm_weight,
-                q_buf,
+                q_scratch,
                 head_dim,
                 num_heads,
                 seq_len,
                 eps,
             );
+            self.encode_copy(encoder, q_scratch, q_buf, q_elems);
         }
     }
 

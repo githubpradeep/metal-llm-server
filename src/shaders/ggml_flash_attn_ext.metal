@@ -1555,6 +1555,6 @@ kernel void flash_attn_ext_prefill_q4_0_h512(
     uint3 tgpig [[threadgroup_position_in_grid]],
     ushort tiisg [[thread_index_in_simdgroup]],
     ushort sgitg [[simdgroup_index_in_threadgroup]]) {
-    kernel_flash_attn_ext_impl_h512<FA_TYPES, block_q4_0, 2, dequantize_q4_0, block_q4_0, 2, dequantize_q4_0, 512, 512, 8, 64, 8>(
+    kernel_flash_attn_ext_impl_h512<FA_TYPES, block_q4_0, 2, dequantize_q4_0, block_q4_0, 2, dequantize_q4_0, 512, 512, 8, 64, 4>(
         args, q, k, v, mask, (device const char *)nullptr, pad, blk, dst, shmem_f16, tgpig, tiisg, sgitg);
 }

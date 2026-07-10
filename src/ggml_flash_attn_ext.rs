@@ -77,8 +77,14 @@ fn pad_to(x: u64, n: u64) -> u64 {
 }
 
 /// Use tiled flash_attn_ext when q_len ≥ 20 (matches llama.cpp vec/tiled switch).
+///
+/// Disabled for now: Q4_0 tiled prefill still corrupts multi-chunk / long
+/// contexts (7k→1-token stop) even for SWA h256. Full-attn h512 was already
+/// excluded (32KB TG limit). Prefer legacy `attention_causal_q4_0` until the
+/// tiled path matches ds4/llama.cpp on Apple GPUs.
 pub fn prefill_use_tiled_ext(q_len: u32, head_dim: u32) -> bool {
-    q_len >= 20 && head_dim % 32 == 0 && matches!(head_dim, 256 | 512)
+    let _ = (q_len, head_dim);
+    false
 }
 
 pub fn mask_bytes(q_len: u32, kv_seq: u32) -> u64 {
@@ -108,6 +114,16 @@ pub fn scratch_bytes(
         + blk_bytes(max_q_len, kv_capacity)
 }
 
+pub fn nsg_for_head_dim(head_dim: u32) -> u32 {
+    // Q4_0 needs extra TG dequant scratch. M1 maxThreadgroupMemoryLength=32KB:
+    // h512×NSG=8 → 36KB (overflow). Prefer NSG=2 for headroom if h512 is re-enabled.
+    if head_dim >= 512 {
+        2
+    } else {
+        4
+    }
+}
+
 pub fn smem_bytes(head_dim: u32, nsg: u32) -> u64 {
     let ne00 = head_dim as u64;
     let ne20 = head_dim as u64;
@@ -115,11 +131,12 @@ pub fn smem_bytes(head_dim: u32, nsg: u32) -> u64 {
     let ncpsg = NCPSG as u64;
     let is_q = 1u64;
     let inner = (nqptg * (ne00 + 2 * pad_to(ne20, 64) + 2 * (2 * ncpsg)) + is_q * (16 * 32 * nsg as u64)) * 2;
-    pad_to(inner, 16)
-}
-
-pub fn nsg_for_head_dim(head_dim: u32) -> u32 {
-    if head_dim >= 512 { 8 } else { 4 }
+    let bytes = pad_to(inner, 16);
+    debug_assert!(
+        bytes <= 32768,
+        "flash_attn_ext smem {bytes} exceeds Metal 32KB limit (head_dim={head_dim}, nsg={nsg})"
+    );
+    bytes
 }
 
 pub fn flash_attn_ext_args(
