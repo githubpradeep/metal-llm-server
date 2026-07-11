@@ -2881,6 +2881,10 @@ impl Gemma4GpuModel {
         hidden_size: u32,
     ) {
         let total_intermediate = seq_len * intermediate_size;
+        let use_f16 = crate::gpu::prefill_mlp_f16_enabled()
+            && layer.weight_format != WeightFormat::F16;
+        // residual_buf unused during MLP after fused residual path; holds f16 normed.
+        // up_buf unused on stacked path; holds f16 gelu for down proj.
         if layer.weight_format == WeightFormat::F16 {
             self.ctx.encode_projection_f16_batch_view(
                 encoder,
@@ -2908,35 +2912,79 @@ impl Gemma4GpuModel {
                 total_intermediate,
             );
         } else if Self::use_prefill_gate_up_stacked(layer) {
+            let x_buf = if use_f16 {
+                self.ctx.encode_cast_f32_to_f16(
+                    encoder,
+                    &self.prefill_scratch.normed_buf,
+                    &self.prefill_scratch.residual_buf,
+                    seq_len * hidden_size,
+                );
+                &self.prefill_scratch.residual_buf
+            } else {
+                &self.prefill_scratch.normed_buf
+            };
             self.ctx.encode_prefill_gate_up_kquant_stacked(
                 encoder,
                 &layer.gate_up_stacked,
-                &self.prefill_scratch.normed_buf,
+                x_buf,
                 &self.prefill_scratch.gate_buf,
                 &self.prefill_scratch.gelu_buf,
                 intermediate_size,
                 hidden_size,
                 seq_len,
+                use_f16,
             );
         } else {
-            self.ctx.encode_prefill_projection_q4_batch_view(
-                encoder,
-                &layer.gate_proj,
-                &self.prefill_scratch.normed_buf,
-                &self.prefill_scratch.gate_buf,
-                intermediate_size,
-                hidden_size,
-                seq_len,
-            );
-            self.ctx.encode_prefill_projection_q4_batch_view(
-                encoder,
-                &layer.up_proj,
-                &self.prefill_scratch.normed_buf,
-                &self.prefill_scratch.up_buf,
-                intermediate_size,
-                hidden_size,
-                seq_len,
-            );
+            let x_buf = if use_f16 {
+                self.ctx.encode_cast_f32_to_f16(
+                    encoder,
+                    &self.prefill_scratch.normed_buf,
+                    &self.prefill_scratch.residual_buf,
+                    seq_len * hidden_size,
+                );
+                &self.prefill_scratch.residual_buf
+            } else {
+                &self.prefill_scratch.normed_buf
+            };
+            if use_f16 {
+                self.ctx.encode_mul_mm_kquant_f16_at_view(
+                    encoder,
+                    &layer.gate_proj,
+                    x_buf,
+                    &self.prefill_scratch.gate_buf,
+                    intermediate_size,
+                    hidden_size,
+                    seq_len,
+                );
+                self.ctx.encode_mul_mm_kquant_f16_at_view(
+                    encoder,
+                    &layer.up_proj,
+                    x_buf,
+                    &self.prefill_scratch.up_buf,
+                    intermediate_size,
+                    hidden_size,
+                    seq_len,
+                );
+            } else {
+                self.ctx.encode_prefill_projection_q4_batch_view(
+                    encoder,
+                    &layer.gate_proj,
+                    x_buf,
+                    &self.prefill_scratch.gate_buf,
+                    intermediate_size,
+                    hidden_size,
+                    seq_len,
+                );
+                self.ctx.encode_prefill_projection_q4_batch_view(
+                    encoder,
+                    &layer.up_proj,
+                    x_buf,
+                    &self.prefill_scratch.up_buf,
+                    intermediate_size,
+                    hidden_size,
+                    seq_len,
+                );
+            }
             self.ctx.encode_gelu_mul(
                 encoder,
                 &self.prefill_scratch.gate_buf,
@@ -5452,6 +5500,11 @@ impl Gemma4GpuModel {
                 } else {
                     &self.prefill_scratch.attn_out_buf
                 };
+                let q_f16_scratch = if use_ext_attn {
+                    Some(&self.prefill_scratch.attn_out_buf)
+                } else {
+                    None
+                };
                 let (fa_scratch, fa_layout) = if use_ext_attn {
                     (
                         Some(&self.prefill_scratch.fa_ext_scratch),
@@ -5466,6 +5519,7 @@ impl Gemma4GpuModel {
                     k_cache,
                     v_cache,
                     attn_out,
+                    q_f16_scratch,
                     num_heads as u32,
                     num_kv_heads as u32,
                     num_kv_groups,
@@ -5866,12 +5920,7 @@ impl Gemma4GpuModel {
             }
         }
 
-        self.ctx.encode_copy(
-            encoder,
-            &self.prefill_scratch.hidden_buf,
-            &self.prefill_scratch.residual_buf,
-            total_hidden,
-        );
+        // Post-attn / post-MLP / PLE: fuse RMSNorm+add into hidden (no residual copies).
         self.ctx.encode_transpose_hsd(
             encoder,
             &self.prefill_scratch.attn_out_buf,
@@ -5889,29 +5938,16 @@ impl Gemma4GpuModel {
             q_out as u32,
             total_seq_len as u32,
         );
-        self.ctx.encode_rmsnorm_batch_view(
+        self.ctx.encode_rmsnorm_acc_batch_view(
             encoder,
+            &self.prefill_scratch.hidden_buf,
             &self.prefill_scratch.o_out_buf,
             &layer.post_attention_layernorm_weight,
-            &self.prefill_scratch.normed_buf,
             hidden_size as u32,
             eps,
             total_seq_len as u32,
         );
-        self.ctx.encode_vec_add_batch(
-            encoder,
-            &self.prefill_scratch.residual_buf,
-            &self.prefill_scratch.normed_buf,
-            &self.prefill_scratch.hidden_buf,
-            total_hidden,
-        );
 
-        self.ctx.encode_copy(
-            encoder,
-            &self.prefill_scratch.hidden_buf,
-            &self.prefill_scratch.residual_buf,
-            total_hidden,
-        );
         self.ctx.encode_rmsnorm_batch_view(
             encoder,
             &self.prefill_scratch.hidden_buf,
@@ -5949,29 +5985,16 @@ impl Gemma4GpuModel {
                 total_seq_len as u32,
             );
         }
-        self.ctx.encode_rmsnorm_batch_view(
+        self.ctx.encode_rmsnorm_acc_batch_view(
             encoder,
+            &self.prefill_scratch.hidden_buf,
             &self.prefill_scratch.down_buf,
             &layer.post_feedforward_layernorm_weight,
-            &self.prefill_scratch.normed_buf,
             hidden_size as u32,
             eps,
             total_seq_len as u32,
         );
-        self.ctx.encode_vec_add_batch(
-            encoder,
-            &self.prefill_scratch.residual_buf,
-            &self.prefill_scratch.normed_buf,
-            &self.prefill_scratch.hidden_buf,
-            total_hidden,
-        );
 
-        self.ctx.encode_copy(
-            encoder,
-            &self.prefill_scratch.hidden_buf,
-            &self.prefill_scratch.residual_buf,
-            total_hidden,
-        );
         self.ctx.encode_prefill_projection_auto_batch_view(
             encoder,
             &layer.per_layer_input_gate_weight,
@@ -6000,34 +6023,21 @@ impl Gemma4GpuModel {
             ple_dim as u32,
             total_seq_len as u32,
         );
-        self.ctx.encode_rmsnorm_batch_view(
+        self.ctx.encode_rmsnorm_acc_batch_view(
             encoder,
+            &self.prefill_scratch.hidden_buf,
             &self.prefill_scratch.o_out_buf,
             &layer.post_per_layer_input_norm_weight,
-            &self.prefill_scratch.normed_buf,
             hidden_size as u32,
             eps,
             total_seq_len as u32,
         );
-        self.ctx.encode_vec_add_batch(
-            encoder,
-            &self.prefill_scratch.residual_buf,
-            &self.prefill_scratch.normed_buf,
-            &self.prefill_scratch.hidden_buf,
-            total_hidden,
-        );
         self.ctx.encode_vec_scale(
             encoder,
             &self.prefill_scratch.hidden_buf,
-            &self.prefill_scratch.residual_buf,
-            total_hidden,
-            layer.layer_scalar,
-        );
-        self.ctx.encode_copy(
-            encoder,
-            &self.prefill_scratch.residual_buf,
             &self.prefill_scratch.hidden_buf,
             total_hidden,
+            layer.layer_scalar,
         );
 
         encoder.end_encoding();
@@ -6060,18 +6070,21 @@ impl Gemma4GpuModel {
             rope_encoder.end_encoding();
         }
         let t_after_rope = std::time::Instant::now();
-        let ple_encoder = cmd.new_compute_command_encoder();
-        self.encode_parallel_prefill_ple_context_on_encoder(ple_encoder, seq_len)?;
-        ple_encoder.end_encoding();
+        let ablate_early = crate::gpu::ProfileAblate::from_env();
+        if !ablate_early.skip_ple() {
+            let ple_encoder = cmd.new_compute_command_encoder();
+            self.encode_parallel_prefill_ple_context_on_encoder(ple_encoder, seq_len)?;
+            ple_encoder.end_encoding();
+        }
 
         let mut ext_mask_cache = crate::ggml_flash_attn_ext::PrefillExtMaskCache::default();
+        let ablate = crate::gpu::ProfileAblate::from_env();
+        ablate.log_once();
 
         // One compute encoder for all layers: fewer encoder create/end costs.
         // Dependent dispatches already share an encoder within each layer.
         let encoder = cmd.new_compute_command_encoder();
         for layer_idx in 0..self.layers.len() {
-            self.encode_parallel_prefill_attention_inputs(encoder, layer_idx, seq_len)?;
-
             let layer = self
                 .layers
                 .get(layer_idx)
@@ -6084,13 +6097,16 @@ impl Gemma4GpuModel {
             let head_dim = layer.head_dim;
             let q_out = layer.q_out_dim;
             let total_hidden = (seq_len * hidden_size) as u32;
-            let total_intermediate = (seq_len * intermediate_size) as u32;
+            let _total_intermediate = (seq_len * intermediate_size) as u32;
             let scale = 1.0f32;
             let attention_window = if layer.is_full_attention {
                 0
             } else {
                 self.config.sliding_window as u32
             };
+
+            if !ablate.skip_attn() {
+            self.encode_parallel_prefill_attention_inputs(encoder, layer_idx, seq_len)?;
 
             if layer.has_kv {
                 let k_cache = kv_pool
@@ -6231,6 +6247,11 @@ impl Gemma4GpuModel {
                     } else {
                         &self.prefill_scratch.attn_out_buf
                     };
+                    let q_f16_scratch = if use_ext_attn {
+                        Some(&self.prefill_scratch.attn_out_buf)
+                    } else {
+                        None
+                    };
                     let (fa_scratch, fa_layout) = if use_ext_attn {
                         (
                             Some(&self.prefill_scratch.fa_ext_scratch),
@@ -6245,6 +6266,7 @@ impl Gemma4GpuModel {
                         k_cache,
                         v_cache,
                         attn_out,
+                        q_f16_scratch,
                         num_heads as u32,
                         num_kv_heads as u32,
                         num_kv_groups,
@@ -6264,12 +6286,8 @@ impl Gemma4GpuModel {
                 }
             }
 
-            self.ctx.encode_copy(
-                encoder,
-                &self.prefill_scratch.hidden_buf,
-                &self.prefill_scratch.residual_buf,
-                total_hidden,
-            );
+            // Post-attn: hidden += RMSNorm(o_proj(attn)). Keep hidden as residual
+            // for pre-FFN (no copy into residual_buf).
             let use_ext_attn = crate::gpu::prefill_flash_attn_ext_enabled()
                 && crate::gpu::prefill_use_flash_attn_ext_tiled(seq_len as u32, head_dim as u32)
                 && matches!(self.kv_cache_type, KvCacheType::Q4_0);
@@ -6292,29 +6310,18 @@ impl Gemma4GpuModel {
                 q_out as u32,
                 seq_len as u32,
             );
-            self.ctx.encode_rmsnorm_batch_view(
+            self.ctx.encode_rmsnorm_acc_batch_view(
                 encoder,
+                &self.prefill_scratch.hidden_buf,
                 &self.prefill_scratch.o_out_buf,
                 &layer.post_attention_layernorm_weight,
-                &self.prefill_scratch.normed_buf,
                 hidden_size as u32,
                 eps,
                 seq_len as u32,
             );
-            self.ctx.encode_vec_add_batch(
-                encoder,
-                &self.prefill_scratch.residual_buf,
-                &self.prefill_scratch.normed_buf,
-                &self.prefill_scratch.hidden_buf,
-                total_hidden,
-            );
+            } // !skip_attn
 
-            self.ctx.encode_copy(
-                encoder,
-                &self.prefill_scratch.hidden_buf,
-                &self.prefill_scratch.residual_buf,
-                total_hidden,
-            );
+            if !ablate.skip_mlp() {
             self.ctx.encode_rmsnorm_batch_view(
                 encoder,
                 &self.prefill_scratch.hidden_buf,
@@ -6341,6 +6348,34 @@ impl Gemma4GpuModel {
                     intermediate_size as u32,
                     seq_len as u32,
                 );
+            } else if crate::gpu::prefill_mlp_f16_enabled()
+                && crate::gpu::prefill_mul_mm_enabled()
+                && crate::ggml_gemv::should_use_mul_mm(
+                    intermediate_size as u32,
+                    seq_len as u32,
+                )
+            {
+                // Stacked f16 path already wrote halfs into gelu_buf; skip cast.
+                let gelu_f16 = if Self::use_prefill_gate_up_stacked(layer) {
+                    &self.prefill_scratch.gelu_buf
+                } else {
+                    self.ctx.encode_cast_f32_to_f16(
+                        encoder,
+                        &self.prefill_scratch.gelu_buf,
+                        &self.prefill_scratch.up_buf,
+                        (seq_len * intermediate_size) as u32,
+                    );
+                    &self.prefill_scratch.up_buf
+                };
+                self.ctx.encode_mul_mm_kquant_f16_at_view(
+                    encoder,
+                    &layer.down_proj,
+                    gelu_f16,
+                    &self.prefill_scratch.down_buf,
+                    hidden_size as u32,
+                    intermediate_size as u32,
+                    seq_len as u32,
+                );
             } else {
                 self.ctx.encode_prefill_projection_q4_batch_view(
                     encoder,
@@ -6352,29 +6387,18 @@ impl Gemma4GpuModel {
                     seq_len as u32,
                 );
             }
-            self.ctx.encode_rmsnorm_batch_view(
+            self.ctx.encode_rmsnorm_acc_batch_view(
                 encoder,
+                &self.prefill_scratch.hidden_buf,
                 &self.prefill_scratch.down_buf,
                 &layer.post_feedforward_layernorm_weight,
-                &self.prefill_scratch.normed_buf,
                 hidden_size as u32,
                 eps,
                 seq_len as u32,
             );
-            self.ctx.encode_vec_add_batch(
-                encoder,
-                &self.prefill_scratch.residual_buf,
-                &self.prefill_scratch.normed_buf,
-                &self.prefill_scratch.hidden_buf,
-                total_hidden,
-            );
+            } // !skip_mlp
 
-            self.ctx.encode_copy(
-                encoder,
-                &self.prefill_scratch.hidden_buf,
-                &self.prefill_scratch.residual_buf,
-                total_hidden,
-            );
+            if !ablate.skip_ple() {
             self.ctx.encode_prefill_projection_auto_batch_view(
                 encoder,
                 &layer.per_layer_input_gate_weight,
@@ -6403,35 +6427,23 @@ impl Gemma4GpuModel {
                 ple_dim as u32,
                 seq_len as u32,
             );
-            self.ctx.encode_rmsnorm_batch_view(
+            self.ctx.encode_rmsnorm_acc_batch_view(
                 encoder,
+                &self.prefill_scratch.hidden_buf,
                 &self.prefill_scratch.o_out_buf,
                 &layer.post_per_layer_input_norm_weight,
-                &self.prefill_scratch.normed_buf,
                 hidden_size as u32,
                 eps,
                 seq_len as u32,
             );
-            self.ctx.encode_vec_add_batch(
-                encoder,
-                &self.prefill_scratch.residual_buf,
-                &self.prefill_scratch.normed_buf,
-                &self.prefill_scratch.hidden_buf,
-                total_hidden,
-            );
             self.ctx.encode_vec_scale(
                 encoder,
                 &self.prefill_scratch.hidden_buf,
-                &self.prefill_scratch.residual_buf,
+                &self.prefill_scratch.hidden_buf,
                 total_hidden,
                 layer.layer_scalar,
             );
-            self.ctx.encode_copy(
-                encoder,
-                &self.prefill_scratch.residual_buf,
-                &self.prefill_scratch.hidden_buf,
-                total_hidden,
-            );
+            } // !skip_ple
         }
         encoder.end_encoding();
 
@@ -7899,10 +7911,20 @@ impl Gemma4GpuModel {
         slot: KvSlot,
         compute_logits: bool,
     ) -> Result<Vec<f32>, String> {
+        let timing = crate::gpu::prefill_timing_enabled();
+        let t_prep = std::time::Instant::now();
         self.prepare_parallel_prefill_inputs(token_ids)?;
+        let prepare_ms = t_prep.elapsed().as_secs_f64() * 1e3;
         let start_pos = kv_pool.total_tokens(slot).map_err(|err| err.to_string())?;
         if !crate::gpu::prefill_gpu_rope_enabled() {
             self.prepare_parallel_prefill_rotary(start_pos, token_ids.len())?;
+        }
+        if timing {
+            eprintln!(
+                "[prefill timing] cpu_embed_ple_prepare={:.1}ms seq={}",
+                prepare_ms,
+                token_ids.len()
+            );
         }
 
         if self.can_use_parallel_prefill_chunk(start_pos, token_ids.len(), kv_pool) {

@@ -345,20 +345,20 @@ void kernel_flash_attn_ext_impl(
         v += ikv2*args.nb22 + ikv3*args.nb23;
     }
 
-    // load heads from Q to shared memory
-    FOR_UNROLL (short jj = 0; jj < NQ; ++jj) {
-        const short j = jj*NSG + sgitg;
+        // load heads from Q to shared memory (device f16 → half smem)
+        FOR_UNROLL (short jj = 0; jj < NQ; ++jj) {
+            const short j = jj*NSG + sgitg;
 
-        device const float4 * q4 = (device const float4 *) ((device const char *) q + j*args.nb01);
+            device const half4 * q4 = (device const half4 *) ((device const char *) q + j*args.nb01);
 
-        for (short i = tiisg; i < DK4; i += NW) {
-            if (iq1 + j < args.ne01) {
-                sq4[j*DK4 + i] = (q4_t) q4[i];
-            } else {
-                sq4[j*DK4 + i] = 0;
+            for (short i = tiisg; i < DK4; i += NW) {
+                if (iq1 + j < args.ne01) {
+                    sq4[j*DK4 + i] = (q4_t) q4[i];
+                } else {
+                    sq4[j*DK4 + i] = 0;
+                }
             }
         }
-    }
 
     // zero out
     FOR_UNROLL (short jj = 0; jj < NQ; ++jj) {
@@ -984,20 +984,20 @@ void kernel_flash_attn_ext_impl_h512(
         v += ikv2*args.nb22 + ikv3*args.nb23;
     }
 
-    // load heads from Q to shared memory
-    FOR_UNROLL (short jj = 0; jj < NQ; ++jj) {
-        const short j = jj*NSG + sgitg;
+        // load heads from Q to shared memory (device f16 → half smem)
+        FOR_UNROLL (short jj = 0; jj < NQ; ++jj) {
+            const short j = jj*NSG + sgitg;
 
-        device const float4 * q4 = (device const float4 *) ((device const char *) q + j*args.nb01);
+            device const half4 * q4 = (device const half4 *) ((device const char *) q + j*args.nb01);
 
-        for (short i = tiisg; i < DK4; i += NW) {
-            if (iq1 + j < args.ne01) {
-                sq4[j*DK4 + i] = (q4_t) q4[i];
-            } else {
-                sq4[j*DK4 + i] = 0;
+            for (short i = tiisg; i < DK4; i += NW) {
+                if (iq1 + j < args.ne01) {
+                    sq4[j*DK4 + i] = (q4_t) q4[i];
+                } else {
+                    sq4[j*DK4 + i] = 0;
+                }
             }
         }
-    }
 
     // zero out
     FOR_UNROLL (short jj = 0; jj < NQ; ++jj) {

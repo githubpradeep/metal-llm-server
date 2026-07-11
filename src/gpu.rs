@@ -463,6 +463,15 @@ pub fn prefill_gate_up_stacked_enabled() -> bool {
     )
 }
 
+/// Prefill MLP mul_mm with f16 RHS activations (cast before each matmul).
+/// Default on — set PREFILL_MLP_F16=0 to force f32 src1.
+pub fn prefill_mlp_f16_enabled() -> bool {
+    !matches!(
+        std::env::var("PREFILL_MLP_F16").as_deref(),
+        Ok("0") | Ok("false") | Ok("FALSE")
+    )
+}
+
 /// Prefill Q∥K∥V: one stacked mul_mm + split instead of three mul_mm dispatches (KV layers).
 /// Set PREFILL_QKV_STACKED=0 to use separate Q/K/V projections.
 pub fn prefill_qkv_stacked_enabled() -> bool {
@@ -530,6 +539,14 @@ pub struct MetalContext {
     mul_mm_q4k_pipeline: OnceLock<ComputePipelineState>,
     /// Lazy: prefill Q6_K matrix-matrix (llama.cpp `kernel_mul_mm_q6_K_f32`).
     mul_mm_q6k_pipeline: OnceLock<ComputePipelineState>,
+    /// Lazy: Q4_K mul_mm with f16 RHS.
+    mul_mm_q4k_f16_pipeline: OnceLock<ComputePipelineState>,
+    /// Lazy: Q6_K mul_mm with f16 RHS.
+    mul_mm_q6k_f16_pipeline: OnceLock<ComputePipelineState>,
+    /// Lazy: Q4_K mul_mm with f16 RHS + f16 dst.
+    mul_mm_q4k_f16_f16_pipeline: OnceLock<ComputePipelineState>,
+    /// Lazy: Q6_K mul_mm with f16 RHS + f16 dst.
+    mul_mm_q6k_f16_f16_pipeline: OnceLock<ComputePipelineState>,
     // Q3_0 pipelines
     pub matvec_ggml_q3_pipeline: ComputePipelineState,
     pub matvec_ggml_q3_dual_pipeline: ComputePipelineState,
@@ -550,6 +567,7 @@ pub struct MetalContext {
     pub rmsnorm_add_save_residual_pipeline: ComputePipelineState,
     pub rmsnorm_acc_pipeline: ComputePipelineState,
     pub rmsnorm_acc_out_pipeline: ComputePipelineState,
+    pub rmsnorm_acc_batch_pipeline: ComputePipelineState,
     pub rmsnorm_batch_pipeline: ComputePipelineState,
     pub rmsnorm_noweight_batch_pipeline: ComputePipelineState,
     pub silu_mul_pipeline: ComputePipelineState,
@@ -561,6 +579,7 @@ pub struct MetalContext {
     pub rope_fill_prefill_batch_pipeline: ComputePipelineState,
     pub rotary_batch_pipeline: ComputePipelineState,
     pub vec_add_pipeline: ComputePipelineState,
+    pub cast_f32_to_f16_pipeline: ComputePipelineState,
     pub vec_add_batch_pipeline: ComputePipelineState,
     pub buf_copy_pipeline: ComputePipelineState,
     pub kv_append_pipeline: ComputePipelineState,
@@ -572,6 +591,8 @@ pub struct MetalContext {
     pub transpose_hsd_pipeline: ComputePipelineState,
     pub gelu_mul_pipeline: ComputePipelineState,
     pub gelu_mul_stacked_batch_pipeline: ComputePipelineState,
+    pub gelu_mul_stacked_batch_f16_pipeline: ComputePipelineState,
+    pub gelu_mul_stacked_batch_f16_from_f32_pipeline: ComputePipelineState,
     pub qkv_split_stacked_batch_pipeline: ComputePipelineState,
     pub qkv_split_stacked_to_hsd_pipeline: ComputePipelineState,
     pub rmsnorm_hsd_batch_pipeline: ComputePipelineState,
@@ -756,6 +777,7 @@ impl MetalContext {
         let rmsnorm_add_save_residual_pipeline = get_fn("rmsnorm_add_save_residual");
         let rmsnorm_acc_pipeline = get_fn("rmsnorm_acc");
         let rmsnorm_acc_out_pipeline = get_fn("rmsnorm_acc_out");
+        let rmsnorm_acc_batch_pipeline = get_fn("rmsnorm_acc_batch");
         let rmsnorm_batch_pipeline = get_fn("rmsnorm_batch");
         let rmsnorm_noweight_batch_pipeline = get_fn("rmsnorm_noweight_batch");
         let silu_mul_pipeline = get_fn("silu_mul");
@@ -767,6 +789,7 @@ impl MetalContext {
         let rope_fill_prefill_batch_pipeline = get_fn("rope_fill_prefill_batch");
         let rotary_batch_pipeline = get_fn("apply_rotary_batch");
         let vec_add_pipeline = get_fn("vec_add");
+        let cast_f32_to_f16_pipeline = get_fn("cast_f32_to_f16");
         let vec_add_batch_pipeline = get_fn("vec_add_batch");
         let buf_copy_pipeline = get_fn("buf_copy");
         let kv_append_pipeline = get_fn("kv_cache_append");
@@ -778,6 +801,9 @@ impl MetalContext {
         let transpose_hsd_pipeline = get_fn("transpose_hsd_to_shd");
         let gelu_mul_pipeline = get_fn("gelu_mul");
         let gelu_mul_stacked_batch_pipeline = get_fn("gelu_mul_stacked_batch");
+        let gelu_mul_stacked_batch_f16_pipeline = get_fn("gelu_mul_stacked_batch_f16");
+        let gelu_mul_stacked_batch_f16_from_f32_pipeline =
+            get_fn("gelu_mul_stacked_batch_f16_from_f32");
         let qkv_split_stacked_batch_pipeline = get_fn("qkv_split_stacked_batch");
         let qkv_split_stacked_to_hsd_pipeline = get_fn("qkv_split_stacked_to_hsd");
         let rmsnorm_hsd_batch_pipeline = get_fn("rmsnorm_hsd_batch");
@@ -994,6 +1020,10 @@ impl MetalContext {
             matvec_ggml_q4k_rmsnorm_gelu_mul_pipeline,
             mul_mm_q4k_pipeline: OnceLock::new(),
             mul_mm_q6k_pipeline: OnceLock::new(),
+            mul_mm_q4k_f16_pipeline: OnceLock::new(),
+            mul_mm_q6k_f16_pipeline: OnceLock::new(),
+            mul_mm_q4k_f16_f16_pipeline: OnceLock::new(),
+            mul_mm_q6k_f16_f16_pipeline: OnceLock::new(),
             matvec_ggml_q3_pipeline,
             matvec_ggml_q3_dual_pipeline,
             matvec_ggml_q3_gelu_mul_pipeline,
@@ -1012,6 +1042,7 @@ impl MetalContext {
             rmsnorm_add_save_residual_pipeline,
             rmsnorm_acc_pipeline,
             rmsnorm_acc_out_pipeline,
+            rmsnorm_acc_batch_pipeline,
             rmsnorm_batch_pipeline,
             rmsnorm_noweight_batch_pipeline,
             silu_mul_pipeline,
@@ -1023,6 +1054,7 @@ impl MetalContext {
             rope_fill_prefill_batch_pipeline,
             rotary_batch_pipeline,
             vec_add_pipeline,
+            cast_f32_to_f16_pipeline,
             vec_add_batch_pipeline,
             buf_copy_pipeline,
             kv_append_pipeline,
@@ -1034,6 +1066,8 @@ impl MetalContext {
             transpose_hsd_pipeline,
             gelu_mul_pipeline,
             gelu_mul_stacked_batch_pipeline,
+            gelu_mul_stacked_batch_f16_pipeline,
+            gelu_mul_stacked_batch_f16_from_f32_pipeline,
             qkv_split_stacked_batch_pipeline,
             qkv_split_stacked_to_hsd_pipeline,
             rmsnorm_hsd_batch_pipeline,
@@ -1138,6 +1172,34 @@ impl MetalContext {
         self.mul_mm_q6k_pipeline.get_or_init(|| {
             println!("  Prefill mul_mm: compiling Q6_K simdgroup matmul pipeline");
             Self::compile_mul_mm_pipeline(&self.device, "mul_mm_q6_K_f32")
+        })
+    }
+
+    fn mul_mm_q4k_f16_pipeline(&self) -> &ComputePipelineState {
+        self.mul_mm_q4k_f16_pipeline.get_or_init(|| {
+            println!("  Prefill mul_mm: compiling Q4_K f16-RHS simdgroup matmul pipeline");
+            Self::compile_mul_mm_pipeline(&self.device, "mul_mm_q4_K_f16")
+        })
+    }
+
+    fn mul_mm_q6k_f16_pipeline(&self) -> &ComputePipelineState {
+        self.mul_mm_q6k_f16_pipeline.get_or_init(|| {
+            println!("  Prefill mul_mm: compiling Q6_K f16-RHS simdgroup matmul pipeline");
+            Self::compile_mul_mm_pipeline(&self.device, "mul_mm_q6_K_f16")
+        })
+    }
+
+    fn mul_mm_q4k_f16_f16_pipeline(&self) -> &ComputePipelineState {
+        self.mul_mm_q4k_f16_f16_pipeline.get_or_init(|| {
+            println!("  Prefill mul_mm: compiling Q4_K f16→f16 simdgroup matmul pipeline");
+            Self::compile_mul_mm_pipeline(&self.device, "mul_mm_q4_K_f16_f16")
+        })
+    }
+
+    fn mul_mm_q6k_f16_f16_pipeline(&self) -> &ComputePipelineState {
+        self.mul_mm_q6k_f16_f16_pipeline.get_or_init(|| {
+            println!("  Prefill mul_mm: compiling Q6_K f16→f16 simdgroup matmul pipeline");
+            Self::compile_mul_mm_pipeline(&self.device, "mul_mm_q6_K_f16_f16")
         })
     }
 
@@ -1767,6 +1829,98 @@ impl MetalContext {
         encoder.dispatch_thread_groups(
             metal::MTLSize::new(tg_x, tg_y, tg_z),
             metal::MTLSize::new(tw, nsg, 1),
+        );
+    }
+
+    /// Prefill mul_mm with f16 RHS (`mul_mm_q*_K_f16`). `x_buf` must hold halfs.
+    pub fn encode_mul_mm_kquant_f16_at_view(
+        &self,
+        encoder: &metal::ComputeCommandEncoderRef,
+        weight: &BufferView,
+        x_f16_buf: &Buffer,
+        y_buf: &Buffer,
+        m: u32,
+        k: u32,
+        seq_len: u32,
+    ) {
+        use crate::ggml_gemv::{
+            mul_mm_args_k_f16, mul_mm_dispatch, MUL_MM_SMEM, Q4_K_BLOCK_BYTES, Q6_K_BLOCK_BYTES,
+        };
+        let (pipeline, block_bytes) = match weight.format {
+            weight_fmt::Q4_K => (self.mul_mm_q4k_f16_pipeline(), Q4_K_BLOCK_BYTES),
+            weight_fmt::Q6_K => (self.mul_mm_q6k_f16_pipeline(), Q6_K_BLOCK_BYTES),
+            other => panic!("encode_mul_mm_kquant_f16_at_view: not K-quant ({})", other),
+        };
+        let args = mul_mm_args_k_f16(m, k, seq_len, block_bytes);
+        encoder.set_compute_pipeline_state(pipeline);
+        encoder.set_bytes(
+            0,
+            std::mem::size_of::<crate::ggml_gemv::GgmlMulMmArgs>() as u64,
+            &args as *const _ as *const _,
+        );
+        encoder.set_buffer(1, Some(&weight.buffer), weight.offset);
+        encoder.set_buffer(2, Some(x_f16_buf), 0);
+        encoder.set_buffer(3, Some(y_buf), 0);
+        encoder.set_threadgroup_memory_length(0, MUL_MM_SMEM);
+        let (tg_x, tg_y, tg_z, tw, nsg) = mul_mm_dispatch(m, seq_len);
+        encoder.dispatch_thread_groups(
+            metal::MTLSize::new(tg_x, tg_y, tg_z),
+            metal::MTLSize::new(tw, nsg, 1),
+        );
+    }
+
+    /// Prefill mul_mm with f16 RHS and f16 dst. `x_f16_buf` / `y_f16_buf` hold halfs.
+    pub fn encode_mul_mm_kquant_f16_f16_at_view(
+        &self,
+        encoder: &metal::ComputeCommandEncoderRef,
+        weight: &BufferView,
+        x_f16_buf: &Buffer,
+        y_f16_buf: &Buffer,
+        m: u32,
+        k: u32,
+        seq_len: u32,
+    ) {
+        use crate::ggml_gemv::{
+            mul_mm_args_k_f16, mul_mm_dispatch, MUL_MM_SMEM, Q4_K_BLOCK_BYTES, Q6_K_BLOCK_BYTES,
+        };
+        let (pipeline, block_bytes) = match weight.format {
+            weight_fmt::Q4_K => (self.mul_mm_q4k_f16_f16_pipeline(), Q4_K_BLOCK_BYTES),
+            weight_fmt::Q6_K => (self.mul_mm_q6k_f16_f16_pipeline(), Q6_K_BLOCK_BYTES),
+            other => panic!("encode_mul_mm_kquant_f16_f16_at_view: not K-quant ({})", other),
+        };
+        let args = mul_mm_args_k_f16(m, k, seq_len, block_bytes);
+        encoder.set_compute_pipeline_state(pipeline);
+        encoder.set_bytes(
+            0,
+            std::mem::size_of::<crate::ggml_gemv::GgmlMulMmArgs>() as u64,
+            &args as *const _ as *const _,
+        );
+        encoder.set_buffer(1, Some(&weight.buffer), weight.offset);
+        encoder.set_buffer(2, Some(x_f16_buf), 0);
+        encoder.set_buffer(3, Some(y_f16_buf), 0);
+        encoder.set_threadgroup_memory_length(0, MUL_MM_SMEM);
+        let (tg_x, tg_y, tg_z, tw, nsg) = mul_mm_dispatch(m, seq_len);
+        encoder.dispatch_thread_groups(
+            metal::MTLSize::new(tg_x, tg_y, tg_z),
+            metal::MTLSize::new(tw, nsg, 1),
+        );
+    }
+
+    pub fn encode_cast_f32_to_f16(
+        &self,
+        encoder: &metal::ComputeCommandEncoderRef,
+        src: &Buffer,
+        dst: &Buffer,
+        n: u32,
+    ) {
+        encoder.set_compute_pipeline_state(&self.cast_f32_to_f16_pipeline);
+        encoder.set_buffer(0, Some(src), 0);
+        encoder.set_buffer(1, Some(dst), 0);
+        encoder.set_bytes(2, 4, &n as *const u32 as *const _);
+        let tg = 256u64;
+        encoder.dispatch_thread_groups(
+            metal::MTLSize::new(((n as u64) + tg - 1) / tg, 1, 1),
+            metal::MTLSize::new(tg, 1, 1),
         );
     }
 
@@ -3020,6 +3174,8 @@ impl MetalContext {
     }
 
     /// Prefill stacked gate∥up K-quant: one mul_mm [seq, 2*m] + stacked GeLU → gelu_buf.
+    /// When `x_is_f16`, mul_mm writes f32 gate∥up then GeLU writes halfs into gelu_buf
+    /// (f16 dst mul_mm was slower on M1 Pro due to TG float→half store).
     pub fn encode_prefill_gate_up_kquant_stacked(
         &self,
         encoder: &metal::ComputeCommandEncoderRef,
@@ -3030,18 +3186,54 @@ impl MetalContext {
         m: u32,
         k: u32,
         seq_len: u32,
+        x_is_f16: bool,
     ) {
         let m2 = m * 2;
-        self.encode_prefill_kquant_projection(
-            encoder,
-            gate_up_stacked,
-            x_buf,
-            gate_up_act_buf,
-            m2,
-            k,
-            seq_len,
-        );
-        self.encode_gelu_mul_stacked_batch(encoder, gate_up_act_buf, gelu_buf, m, seq_len);
+        let use_mm = prefill_mul_mm_enabled()
+            && crate::ggml_gemv::should_use_mul_mm(k, seq_len)
+            && matches!(gate_up_stacked.format, weight_fmt::Q4_K | weight_fmt::Q6_K);
+        if use_mm && x_is_f16 {
+            self.encode_mul_mm_kquant_f16_at_view(
+                encoder,
+                gate_up_stacked,
+                x_buf,
+                gate_up_act_buf,
+                m2,
+                k,
+                seq_len,
+            );
+            self.encode_gelu_mul_stacked_batch_f16_from_f32(
+                encoder,
+                gate_up_act_buf,
+                gelu_buf,
+                m,
+                seq_len,
+            );
+        } else if use_mm {
+            self.encode_mul_mm_kquant_at_view(
+                encoder,
+                gate_up_stacked,
+                x_buf,
+                gate_up_act_buf,
+                m2,
+                k,
+                seq_len,
+            );
+            self.encode_gelu_mul_stacked_batch(encoder, gate_up_act_buf, gelu_buf, m, seq_len);
+        } else {
+            self.encode_matvec_qk_at_view(
+                encoder,
+                gate_up_stacked,
+                x_buf,
+                0,
+                gate_up_act_buf,
+                0,
+                m2,
+                k,
+                seq_len,
+            );
+            self.encode_gelu_mul_stacked_batch(encoder, gate_up_act_buf, gelu_buf, m, seq_len);
+        }
     }
 
     pub fn encode_gelu_mul_stacked_batch(
@@ -3055,6 +3247,40 @@ impl MetalContext {
         encoder.set_compute_pipeline_state(&self.gelu_mul_stacked_batch_pipeline);
         encoder.set_buffer(0, Some(gate_up_stacked), 0);
         encoder.set_buffer(1, Some(out_buf), 0);
+        encoder.set_bytes(2, 4, &m as *const u32 as *const _);
+        encoder.set_bytes(3, 4, &seq_len as *const u32 as *const _);
+        let total = (seq_len * m) as u64;
+        encoder.dispatch_threads(MTLSize::new(total, 1, 1), MTLSize::new(256, 1, 1));
+    }
+
+    pub fn encode_gelu_mul_stacked_batch_f16(
+        &self,
+        encoder: &metal::ComputeCommandEncoderRef,
+        gate_up_stacked_f16: &Buffer,
+        out_f16: &Buffer,
+        m: u32,
+        seq_len: u32,
+    ) {
+        encoder.set_compute_pipeline_state(&self.gelu_mul_stacked_batch_f16_pipeline);
+        encoder.set_buffer(0, Some(gate_up_stacked_f16), 0);
+        encoder.set_buffer(1, Some(out_f16), 0);
+        encoder.set_bytes(2, 4, &m as *const u32 as *const _);
+        encoder.set_bytes(3, 4, &seq_len as *const u32 as *const _);
+        let total = (seq_len * m) as u64;
+        encoder.dispatch_threads(MTLSize::new(total, 1, 1), MTLSize::new(256, 1, 1));
+    }
+
+    pub fn encode_gelu_mul_stacked_batch_f16_from_f32(
+        &self,
+        encoder: &metal::ComputeCommandEncoderRef,
+        gate_up_stacked: &Buffer,
+        out_f16: &Buffer,
+        m: u32,
+        seq_len: u32,
+    ) {
+        encoder.set_compute_pipeline_state(&self.gelu_mul_stacked_batch_f16_from_f32_pipeline);
+        encoder.set_buffer(0, Some(gate_up_stacked), 0);
+        encoder.set_buffer(1, Some(out_f16), 0);
         encoder.set_bytes(2, 4, &m as *const u32 as *const _);
         encoder.set_bytes(3, 4, &seq_len as *const u32 as *const _);
         let total = (seq_len * m) as u64;
@@ -3684,6 +3910,27 @@ impl MetalContext {
         encoder.set_bytes(4, 4, &eps as *const f32 as *const _);
         let tg_size = MTLSize::new(256.min(dim as u64), 1, 1);
         encoder.dispatch_thread_groups(MTLSize::new(1, 1, 1), tg_size);
+    }
+
+    /// Prefill: `acc[row] += RMSNorm(x[row]) * weight` for `seq_len` rows.
+    pub fn encode_rmsnorm_acc_batch_view(
+        &self,
+        encoder: &metal::ComputeCommandEncoderRef,
+        acc_buf: &Buffer,
+        x_buf: &Buffer,
+        weight: &BufferView,
+        dim: u32,
+        eps: f32,
+        seq_len: u32,
+    ) {
+        encoder.set_compute_pipeline_state(&self.rmsnorm_acc_batch_pipeline);
+        encoder.set_buffer(0, Some(acc_buf), 0);
+        encoder.set_buffer(1, Some(x_buf), 0);
+        encoder.set_buffer(2, Some(&weight.buffer), weight.offset);
+        encoder.set_bytes(3, 4, &dim as *const u32 as *const _);
+        encoder.set_bytes(4, 4, &eps as *const f32 as *const _);
+        let tg_size = MTLSize::new(256.min(dim as u64), 1, 1);
+        encoder.dispatch_thread_groups(MTLSize::new(seq_len as u64, 1, 1), tg_size);
     }
 
     /// Fused RMSNorm(x)*weight + acc -> out (batch decode residual path).
@@ -5770,6 +6017,7 @@ impl MetalContext {
         k_cache_buf: &Buffer,
         v_cache_buf: &Buffer,
         out_buf: &Buffer,
+        q_f16_scratch: Option<&Buffer>,
         num_heads: u32,
         num_kv_heads: u32,
         num_kv_groups: u32,
@@ -5790,13 +6038,16 @@ impl MetalContext {
         if prefill_flash_attn_ext_enabled()
             && prefill_use_flash_attn_ext_tiled(q_len, head_dim)
         {
-            if let (Some(scratch), Some(layout)) = (fa_ext_scratch, fa_ext_layout) {
+            if let (Some(scratch), Some(layout), Some(q_f16)) =
+                (fa_ext_scratch, fa_ext_layout, q_f16_scratch)
+            {
                 // Mask/blk scratch is capped (see MAX_TILED_PREFILL_KV); fall back
                 // when this layer's live KV exceeds the plane.
                 if kv_seq <= layout.mask_kv_capacity {
                     self.encode_prefill_flash_attn_ext_q4_0(
                         encoder,
                         q_buf,
+                        q_f16,
                         k_cache_buf,
                         v_cache_buf,
                         out_buf,
@@ -5843,7 +6094,8 @@ impl MetalContext {
     fn encode_prefill_flash_attn_ext_q4_0(
         &self,
         encoder: &metal::ComputeCommandEncoderRef,
-        q_buf: &Buffer,
+        q_f32_buf: &Buffer,
+        q_f16_buf: &Buffer,
         k_cache_buf: &Buffer,
         v_cache_buf: &Buffer,
         out_buf: &Buffer,
@@ -5869,6 +6121,18 @@ impl MetalContext {
 
         let pad_off = layout.pad_off;
         let (mask_off, blk_off) = layout.mask_blk_off(attention_window);
+
+        // Cast Q f32 → f16 once per layer (kernel loads half4).
+        let q_elems = q_len * num_heads * head_dim;
+        encoder.set_compute_pipeline_state(&self.cast_f32_to_f16_pipeline);
+        encoder.set_buffer(0, Some(q_f32_buf), 0);
+        encoder.set_buffer(1, Some(q_f16_buf), 0);
+        encoder.set_bytes(2, 4, &q_elems as *const u32 as *const _);
+        let tg = 256u64;
+        encoder.dispatch_thread_groups(
+            metal::MTLSize::new(((q_elems as u64) + tg - 1) / tg, 1, 1),
+            metal::MTLSize::new(tg, 1, 1),
+        );
 
         let need_mask_blk = match mask_cache.as_ref() {
             Some(cache) => !cache.matches(q_len, kv_seq, q_start, attention_window),
@@ -5955,7 +6219,7 @@ impl MetalContext {
             std::mem::size_of::<FlashAttnExtArgs>() as u64,
             &args as *const _ as *const _,
         );
-        encoder.set_buffer(1, Some(q_buf), 0);
+        encoder.set_buffer(1, Some(q_f16_buf), 0);
         encoder.set_buffer(2, Some(k_cache_buf), 0);
         encoder.set_buffer(3, Some(v_cache_buf), 0);
         encoder.set_buffer(4, Some(scratch), mask_off);

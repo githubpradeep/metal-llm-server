@@ -156,7 +156,8 @@ pub fn flash_attn_ext_args(
     scale: f32,
 ) -> FlashAttnExtArgs {
     let blocks = (head_dim / 32) as i32;
-    let head_stride = head_dim as u64 * 4;
+    // Prefill flash_attn_ext consumes f16 Q (cast before dispatch).
+    let head_stride = head_dim as u64 * 2;
     let kv_stride = capacity as u64 * row_bytes;
     FlashAttnExtArgs {
         ne01: q_len as i32,

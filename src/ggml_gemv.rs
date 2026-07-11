@@ -288,6 +288,14 @@ pub fn mul_mm_args_k(m: u32, k: u32, seq_len: u32, block_bytes: u64) -> GgmlMulM
     }
 }
 
+/// Same as `mul_mm_args_k` but src1 is f16 (nb10=2).
+pub fn mul_mm_args_k_f16(m: u32, k: u32, seq_len: u32, block_bytes: u64) -> GgmlMulMmArgs {
+    let mut args = mul_mm_args_k(m, k, seq_len, block_bytes);
+    args.nb10 = 2;
+    args.nb11 = (k as u64) * 2;
+    args
+}
+
 pub fn mul_mm_args_q4_k(m: u32, k: u32, seq_len: u32) -> GgmlMulMmArgs {
     mul_mm_args_k(m, k, seq_len, Q4_K_BLOCK_BYTES)
 }

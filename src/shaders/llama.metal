@@ -1629,6 +1629,41 @@ kernel void rmsnorm_acc(
     }
 }
 
+// Prefill: one threadgroup per token row. acc[row] += RMSNorm(x[row]) * weight.
+kernel void rmsnorm_acc_batch(
+    device float* acc [[buffer(0)]],
+    device const float* x [[buffer(1)]],
+    device const float* weight [[buffer(2)]],
+    constant uint& dim [[buffer(3)]],
+    constant float& eps [[buffer(4)]],
+    uint tid [[thread_index_in_threadgroup]],
+    uint tg_size [[threads_per_threadgroup]],
+    uint tgid [[threadgroup_position_in_grid]]
+) {
+    uint row_offset = tgid * dim;
+    threadgroup float shared_sum[256];
+
+    float partial_sum = 0.0f;
+    for (uint i = tid; i < dim; i += tg_size) {
+        float val = x[row_offset + i];
+        partial_sum += val * val;
+    }
+    shared_sum[tid] = partial_sum;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint stride = tg_size / 2; stride > 0; stride >>= 1) {
+        if (tid < stride) shared_sum[tid] += shared_sum[tid + stride];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    float inv_rms = rsqrt(shared_sum[0] / float(dim) + eps);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint i = tid; i < dim; i += tg_size) {
+        acc[row_offset + i] += x[row_offset + i] * inv_rms * weight[i];
+    }
+}
+
 // acc/out split variant for batch decode (residual_buf + normed -> hidden_buf).
 kernel void rmsnorm_acc_out(
     device const float* acc [[buffer(0)]],
@@ -1902,6 +1937,17 @@ kernel void vec_add(
 ) {
     if (gid >= n) return;
     c[gid] = a[gid] + b[gid];
+}
+
+/// Pack f32 → f16 for flash_attn_ext Q (halves device bandwidth into the kernel).
+kernel void cast_f32_to_f16(
+    device const float* src [[buffer(0)]],
+    device half* dst [[buffer(1)]],
+    constant uint& n [[buffer(2)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    if (gid >= n) return;
+    dst[gid] = half(src[gid]);
 }
 
 // ─── Embedding Gather (bf16 table → f32 output) ─────────────────────────────
@@ -2559,6 +2605,42 @@ kernel void gelu_mul_stacked_batch(
     float gate = gate_up[base + i];
     float up = gate_up[base + m + i];
     out[gid] = gelu_pytorch_tanh(gate) * up;
+}
+
+/// Prefill f16 path: float gate∥up → half GeLU*up (skip separate cast before down).
+kernel void gelu_mul_stacked_batch_f16_from_f32(
+    device const float* gate_up [[buffer(0)]],
+    device half* out [[buffer(1)]],
+    constant uint& m [[buffer(2)]],
+    constant uint& seq_len [[buffer(3)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    uint total = seq_len * m;
+    if (gid >= total) return;
+    uint t = gid / m;
+    uint i = gid % m;
+    uint base = t * (2u * m);
+    float gate = gate_up[base + i];
+    float up = gate_up[base + m + i];
+    out[gid] = half(gelu_pytorch_tanh(gate) * up);
+}
+
+/// Prefill f16 path: half gate∥up → half GeLU*up (no f32 round-trip).
+kernel void gelu_mul_stacked_batch_f16(
+    device const half* gate_up [[buffer(0)]],
+    device half* out [[buffer(1)]],
+    constant uint& m [[buffer(2)]],
+    constant uint& seq_len [[buffer(3)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    uint total = seq_len * m;
+    if (gid >= total) return;
+    uint t = gid / m;
+    uint i = gid % m;
+    uint base = t * (2u * m);
+    float gate = float(gate_up[base + i]);
+    float up = float(gate_up[base + m + i]);
+    out[gid] = half(gelu_pytorch_tanh(gate) * up);
 }
 
 // qkv_stacked: per token [q_0..q_{mq-1}, k_0..k_{mkv-1}, v_0..v_{mkv-1}] (SHD rows).
