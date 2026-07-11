@@ -156,8 +156,8 @@ pub fn flash_attn_ext_args(
     scale: f32,
 ) -> FlashAttnExtArgs {
     let blocks = (head_dim / 32) as i32;
-    // Prefill flash_attn_ext consumes f16 Q (cast before dispatch).
-    let head_stride = head_dim as u64 * 2;
+    // Prefill flash_attn_ext consumes f32 Q (cast to half inside the kernel, like llama.cpp).
+    let head_stride = head_dim as u64 * 4;
     let kv_stride = capacity as u64 * row_bytes;
     FlashAttnExtArgs {
         ne01: q_len as i32,

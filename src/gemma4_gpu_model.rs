@@ -216,7 +216,7 @@ pub struct Gemma4GpuModel {
     // Shared weights
     pub final_norm_weight: BufferView,
     pub per_layer_projection_norm_weight: BufferView,
-    pub per_layer_model_projection_weight: BufferView, // [num_layers * ple_dim, hidden_size] f16
+    pub per_layer_model_projection_weight: BufferView, // [num_layers * ple_dim, hidden_size] f16/Q4
 
     // Pre-allocated scratch buffers (reused every token)
     pub hidden_buf: Buffer,
@@ -1023,12 +1023,9 @@ impl Gemma4GpuModel {
             BufferView::from_buffer(ctx.buffer_from_slice(&per_layer_proj_norm_data));
         let per_layer_model_projection_weight = if !per_layer_model_proj_data.is_empty() {
             BufferView::from_buffer(
-                ctx.buffer_from_f32_as_q4(
-                    &per_layer_model_proj_data,
-                    num_layers * ple_dim,
-                    hidden_size,
-                ),
+                ctx.buffer_from_f32_as_f16(&per_layer_model_proj_data),
             )
+            .with_format(crate::gpu::weight_fmt::F16)
         } else {
             // Fallback: create empty buffer (shouldn't happen for E4B)
             println!(
@@ -1594,12 +1591,42 @@ impl Gemma4GpuModel {
             ctx.buffer_from_slice(&g.dequant_to_f32("per_layer_proj_norm.weight")),
         );
         let per_layer_model_proj_f32 = g.dequant_to_f32("per_layer_model_proj.weight");
-        let per_layer_model_projection_weight = BufferView::from_buffer(ctx.buffer_from_f32_as_q4(
-            &per_layer_model_proj_f32,
-            ple_total_dim,
-            hidden_size,
-        ));
+        // GGUF Q4_K_M stores this as BF16 (llama uses dense mul_mm). Keep f16 —
+        // requantizing to Q4_0 forced the slow projection_q4_batch path.
+        let per_layer_model_projection_weight = {
+            use crate::gguf::ggml_type;
+            use crate::gpu::weight_fmt;
+            match g.tensor_type("per_layer_model_proj.weight") {
+                ggml_type::Q4_K => BufferView::from_buffer(
+                    ctx.buffer_from_bytes(g.tensor_raw("per_layer_model_proj.weight")),
+                )
+                .with_format(weight_fmt::Q4_K),
+                ggml_type::Q6_K => BufferView::from_buffer(
+                    ctx.buffer_from_bytes(g.tensor_raw("per_layer_model_proj.weight")),
+                )
+                .with_format(weight_fmt::Q6_K),
+                ggml_type::BF16 | ggml_type::F16 | ggml_type::F32 => {
+                    BufferView::from_buffer(ctx.buffer_from_f32_as_f16(&per_layer_model_proj_f32))
+                        .with_format(weight_fmt::F16)
+                }
+                _ => BufferView::from_buffer(ctx.buffer_from_f32_as_q4(
+                    &per_layer_model_proj_f32,
+                    ple_total_dim,
+                    hidden_size,
+                )),
+            }
+        };
         drop(per_layer_model_proj_f32);
+        println!(
+            "  per_layer_model_proj: format={} ({:.1} MB)",
+            match per_layer_model_projection_weight.format {
+                crate::gpu::weight_fmt::F16 => "F16",
+                crate::gpu::weight_fmt::Q4_K => "Q4_K",
+                crate::gpu::weight_fmt::Q6_K => "Q6_K",
+                _ => "Q4_0",
+            },
+            per_layer_model_projection_weight.length as f64 / (1024.0 * 1024.0)
+        );
 
         // --- Layers ---
         let q6k_to_q4 = std::env::var("Q6K_TO_Q4").as_deref() == Ok("1");
@@ -2879,6 +2906,7 @@ impl Gemma4GpuModel {
         seq_len: u32,
         intermediate_size: u32,
         hidden_size: u32,
+        skip_gelu: bool,
     ) {
         let total_intermediate = seq_len * intermediate_size;
         let use_f16 = crate::gpu::prefill_mlp_f16_enabled()
@@ -2904,13 +2932,15 @@ impl Gemma4GpuModel {
                 hidden_size,
                 seq_len,
             );
-            self.ctx.encode_gelu_mul(
-                encoder,
-                &self.prefill_scratch.gate_buf,
-                &self.prefill_scratch.up_buf,
-                &self.prefill_scratch.gelu_buf,
-                total_intermediate,
-            );
+            if !skip_gelu {
+                self.ctx.encode_gelu_mul(
+                    encoder,
+                    &self.prefill_scratch.gate_buf,
+                    &self.prefill_scratch.up_buf,
+                    &self.prefill_scratch.gelu_buf,
+                    total_intermediate,
+                );
+            }
         } else if Self::use_prefill_gate_up_stacked(layer) {
             let x_buf = if use_f16 {
                 self.ctx.encode_cast_f32_to_f16(
@@ -2933,6 +2963,7 @@ impl Gemma4GpuModel {
                 hidden_size,
                 seq_len,
                 use_f16,
+                skip_gelu,
             );
         } else {
             let x_buf = if use_f16 {
@@ -2985,13 +3016,15 @@ impl Gemma4GpuModel {
                     seq_len,
                 );
             }
-            self.ctx.encode_gelu_mul(
-                encoder,
-                &self.prefill_scratch.gate_buf,
-                &self.prefill_scratch.up_buf,
-                &self.prefill_scratch.gelu_buf,
-                total_intermediate,
-            );
+            if !skip_gelu {
+                self.ctx.encode_gelu_mul(
+                    encoder,
+                    &self.prefill_scratch.gate_buf,
+                    &self.prefill_scratch.up_buf,
+                    &self.prefill_scratch.gelu_buf,
+                    total_intermediate,
+                );
+            }
         }
     }
 
@@ -3397,7 +3430,7 @@ impl Gemma4GpuModel {
         // * 4), so the previous 42 per-layer copy-out dispatches are gone.
         if !__ablate.skip_ple() {
             // Step 2a: context_proj = per_layer_model_projection @ embed
-            self.ctx.encode_matvec_q4_view(
+            self.ctx.encode_matvec_auto_view(
                 encoder,
                 &self.per_layer_model_projection_weight,
                 &self.hidden_buf,
@@ -5074,7 +5107,7 @@ impl Gemma4GpuModel {
         let ple_input_scale = 1.0f32 / 2.0f32.sqrt();
         let total_ple = (seq_len * ple_total_dim) as u32;
 
-        self.ctx.encode_prefill_projection_q4_batch_view(
+        self.ctx.encode_prefill_projection_auto_batch_view(
             encoder,
             &self.per_layer_model_projection_weight,
             &self.prefill_scratch.hidden_buf,
@@ -5605,6 +5638,7 @@ impl Gemma4GpuModel {
             seq_len as u32,
             intermediate_size as u32,
             hidden_size as u32,
+            false,
         );
         if layer.weight_format == WeightFormat::F16 {
             self.ctx.encode_projection_f16_batch_view(
@@ -5963,6 +5997,7 @@ impl Gemma4GpuModel {
             total_seq_len as u32,
             intermediate_size as u32,
             hidden_size as u32,
+            false,
         );
         if layer.weight_format == WeightFormat::F16 {
             self.ctx.encode_projection_f16_batch_view(
@@ -6322,6 +6357,7 @@ impl Gemma4GpuModel {
             } // !skip_attn
 
             if !ablate.skip_mlp() {
+            if !ablate.skip_mlp_gate() {
             self.ctx.encode_rmsnorm_batch_view(
                 encoder,
                 &self.prefill_scratch.hidden_buf,
@@ -6337,7 +6373,10 @@ impl Gemma4GpuModel {
                 seq_len as u32,
                 intermediate_size as u32,
                 hidden_size as u32,
+                ablate.skip_mlp_gelu(),
             );
+            } // !skip_mlp_gate
+            if !ablate.skip_mlp_down() {
         if layer.weight_format == WeightFormat::F16 {
             self.ctx.encode_projection_f16_batch_view(
                 encoder,
@@ -6396,6 +6435,7 @@ impl Gemma4GpuModel {
                 eps,
                 seq_len as u32,
             );
+            } // !skip_mlp_down
             } // !skip_mlp
 
             if !ablate.skip_ple() {
@@ -6550,7 +6590,7 @@ impl Gemma4GpuModel {
             let encoder = cmd.new_compute_command_encoder();
             for batch_idx in 0..batch_size {
                 let offsets = self.decode_batch_row_offsets(batch_idx);
-                self.ctx.encode_matvec_q4_at_view(
+                self.ctx.encode_matvec_auto_at_view(
                     encoder,
                     &self.per_layer_model_projection_weight,
                     &self.decode_batch_scratch.hidden_buf,

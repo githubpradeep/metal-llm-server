@@ -296,6 +296,27 @@ pub fn mul_mm_args_k_f16(m: u32, k: u32, seq_len: u32, block_bytes: u64) -> Ggml
     args
 }
 
+/// Dense f16 weight rows: `nb01 = K * sizeof(half)`.
+pub fn mul_mm_args_f16(m: u32, k: u32, seq_len: u32) -> GgmlMulMmArgs {
+    let nb01 = (k as u64) * 2;
+    GgmlMulMmArgs {
+        ne00: k as i32,
+        ne02: 1,
+        nb01,
+        nb02: nb01 * m as u64,
+        nb03: 0,
+        ne12: 1,
+        nb10: 4,
+        nb11: (k as u64) * 4,
+        nb12: 0,
+        nb13: 0,
+        ne0: m as i32,
+        ne1: seq_len as i32,
+        r2: 1,
+        r3: 1,
+    }
+}
+
 pub fn mul_mm_args_q4_k(m: u32, k: u32, seq_len: u32) -> GgmlMulMmArgs {
     mul_mm_args_k(m, k, seq_len, Q4_K_BLOCK_BYTES)
 }

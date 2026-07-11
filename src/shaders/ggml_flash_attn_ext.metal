@@ -209,12 +209,10 @@ constant bool FC_flash_attn_ext_has_mask = true;
 constant bool FC_flash_attn_ext_has_sinks = false;
 constant bool FC_flash_attn_ext_has_bias = false;
 constant bool FC_flash_attn_ext_has_scap = false;
-// Always true is safe: the pad branch only runs when ic+C > ne11, and the host
-// only fills the pad buffer when kv_seq % NCPSG != 0.
-constant bool FC_flash_attn_ext_has_kvpad = true;
-
-// Guard partial query tiles when q_len % NQPTG != 0 (ds4 sets this dynamically).
-constant bool FC_flash_attn_ext_bc_mask = true;
+// Specialized at pipeline create time (llama.cpp FC indices 4 / 10).
+// Fast path: has_kvpad=false when kv_seq%64==0; bc_mask=false when q_len%8==0.
+constant bool FC_flash_attn_ext_has_kvpad [[function_constant(0)]];
+constant bool FC_flash_attn_ext_bc_mask [[function_constant(1)]];
 
 //constant float FC_flash_attn_ext_scale         [[function_constant(FC_FLASH_ATTN_EXT + 10)]];
 //constant float FC_flash_attn_ext_max_bias      [[function_constant(FC_FLASH_ATTN_EXT + 11)]];
@@ -345,15 +343,15 @@ void kernel_flash_attn_ext_impl(
         v += ikv2*args.nb22 + ikv3*args.nb23;
     }
 
-        // load heads from Q to shared memory (device f16 → half smem)
+        // load heads from Q to shared memory (device f32 → half smem, match llama.cpp)
         FOR_UNROLL (short jj = 0; jj < NQ; ++jj) {
             const short j = jj*NSG + sgitg;
 
-            device const half4 * q4 = (device const half4 *) ((device const char *) q + j*args.nb01);
+            device const float4 * q4 = (device const float4 *) ((device const char *) q + j*args.nb01);
 
             for (short i = tiisg; i < DK4; i += NW) {
                 if (iq1 + j < args.ne01) {
-                    sq4[j*DK4 + i] = (q4_t) q4[i];
+                    sq4[j*DK4 + i] = half4(q4[i]);
                 } else {
                     sq4[j*DK4 + i] = 0;
                 }
@@ -984,15 +982,15 @@ void kernel_flash_attn_ext_impl_h512(
         v += ikv2*args.nb22 + ikv3*args.nb23;
     }
 
-        // load heads from Q to shared memory (device f16 → half smem)
+        // load heads from Q to shared memory (device f32 → half smem, match llama.cpp)
         FOR_UNROLL (short jj = 0; jj < NQ; ++jj) {
             const short j = jj*NSG + sgitg;
 
-            device const half4 * q4 = (device const half4 *) ((device const char *) q + j*args.nb01);
+            device const float4 * q4 = (device const float4 *) ((device const char *) q + j*args.nb01);
 
             for (short i = tiisg; i < DK4; i += NW) {
                 if (iq1 + j < args.ne01) {
-                    sq4[j*DK4 + i] = (q4_t) q4[i];
+                    sq4[j*DK4 + i] = half4(q4[i]);
                 } else {
                     sq4[j*DK4 + i] = 0;
                 }

@@ -37,6 +37,11 @@ fn main() {
         ctx.bench_matvec();
         return;
     }
+    if args.iter().any(|a| a == "--bench-mul-mm") {
+        let ctx = gpu::MetalContext::new();
+        ctx.bench_mul_mm();
+        return;
+    }
 
     let bench_decode = args.iter().any(|a| a == "--bench-decode");
     let bench_decode_tokens: usize = args
