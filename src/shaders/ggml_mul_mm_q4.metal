@@ -5,7 +5,7 @@
 //
 // Grid:     (ceil(N/32), ceil(M/64), 1)
 // Threads:  128 = 4 simdgroups × 32
-// Shared:   8192 bytes (sa half + sb float; partial-tile reuse)
+// Shared:   8192 bytes (sa half + sb half; llama f32 path also uses half B tile)
 //
 // block_q4_K / QK_K come from ggml_mul_mv_q4.metal (concatenated first).
 // Threshold: llama.cpp uses mul_mm when seq_len > 8 (ne11_mm_min).
@@ -74,7 +74,7 @@ kernel void mul_mm_q4_K_f32(
     constexpr short NL1 = NK / 8;   // 4
 
     threadgroup half * sa = (threadgroup half *)(shmem);
-    threadgroup float * sb = (threadgroup float *)(shmem + 4096);
+    threadgroup half * sb = (threadgroup half *)(shmem + 4096);
 
     const int r0 = tgpig.y * NR0;
     const int r1 = tgpig.x * NR1;
@@ -97,7 +97,7 @@ kernel void mul_mm_q4_K_f32(
         (device const float *)(src1 + args.nb11 * (r1 + lr1) + args.nb10 * iy);
 
     simdgroup_half8x8 ma[4];
-    simdgroup_float8x8 mb[2];
+    simdgroup_half8x8 mb[2];
     simdgroup_float8x8 mc[8];
 
     for (short i = 0; i < 8; i++) {
@@ -121,15 +121,14 @@ kernel void mul_mm_q4_K_f32(
             }
         }
 
-        // Bounds-checked input load (handles partial K / edge tiles).
-        for (short i = 0; i < 8; ++i) {
+        // Match llama.cpp q*_K_f32: cast f32 src1 -> half TG tile, half MMA.
+        {
             const short sx = (tiitg % NL1);
             const short sy = (tiitg / NL1) / 8;
-            const short lx = i;
             const short ly = (tiitg / NL1) % 8;
             const short ib = 4 * sx + sy;
-            *(sb + 64 * ib + 8 * ly + lx) =
-                (loop_k + iy + i < args.ne00) ? *(y + i) : 0.f;
+            *((threadgroup half2x4 *)(sb + 64 * ib + 8 * ly)) =
+                half2x4(*((device float2x4 *)y));
         }
 
         il = (il + 2 < nl) ? il + 2 : il % 2;
@@ -139,7 +138,7 @@ kernel void mul_mm_q4_K_f32(
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
         threadgroup const half * lsma = sa + 4 * 64 * (sgitg % 2);
-        threadgroup const float * lsmb = sb + 2 * 64 * (sgitg / 2);
+        threadgroup const half * lsmb = sb + 2 * 64 * (sgitg / 2);
 
         for (short ik = 0; ik < NK / 8; ik++) {
             simdgroup_barrier(mem_flags::mem_none);
@@ -242,7 +241,7 @@ kernel void mul_mm_q6_K_f32(
     constexpr short NL1 = NK / 8;
 
     threadgroup half * sa = (threadgroup half *)(shmem);
-    threadgroup float * sb = (threadgroup float *)(shmem + 4096);
+    threadgroup half * sb = (threadgroup half *)(shmem + 4096);
 
     const int r0 = tgpig.y * NR0;
     const int r1 = tgpig.x * NR1;
@@ -264,7 +263,7 @@ kernel void mul_mm_q6_K_f32(
         (device const float *)(src1 + args.nb11 * (r1 + lr1) + args.nb10 * iy);
 
     simdgroup_half8x8 ma[4];
-    simdgroup_float8x8 mb[2];
+    simdgroup_half8x8 mb[2];
     simdgroup_float8x8 mc[8];
 
     for (short i = 0; i < 8; i++) {
@@ -284,16 +283,14 @@ kernel void mul_mm_q6_K_f32(
                 const short ib = 8 * sx + sy;
                 *(sa + 64 * ib + 8 * ly + lx) = temp_a[i / 4][i % 4];
             }
-        }
-
-        for (short i = 0; i < 8; ++i) {
+        }        // Match llama.cpp q*_K_f32: cast f32 src1 -> half TG tile, half MMA.
+        {
             const short sx = (tiitg % NL1);
             const short sy = (tiitg / NL1) / 8;
-            const short lx = i;
             const short ly = (tiitg / NL1) % 8;
             const short ib = 4 * sx + sy;
-            *(sb + 64 * ib + 8 * ly + lx) =
-                (loop_k + iy + i < args.ne00) ? *(y + i) : 0.f;
+            *((threadgroup half2x4 *)(sb + 64 * ib + 8 * ly)) =
+                half2x4(*((device float2x4 *)y));
         }
 
         il = (il + 2 < nl) ? il + 2 : il % 2;
@@ -303,7 +300,7 @@ kernel void mul_mm_q6_K_f32(
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
         threadgroup const half * lsma = sa + 4 * 64 * (sgitg % 2);
-        threadgroup const float * lsmb = sb + 2 * 64 * (sgitg / 2);
+        threadgroup const half * lsmb = sb + 2 * 64 * (sgitg / 2);
 
         for (short ik = 0; ik < NK / 8; ik++) {
             simdgroup_barrier(mem_flags::mem_none);
