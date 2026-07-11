@@ -21,6 +21,8 @@ pub struct DecodeInput {
 pub struct PrefillInput {
     pub slot: KvSlot,
     pub token_ids: Vec<usize>,
+    /// When false, skip final norm + lm_head (intermediate prefill chunks).
+    pub want_logits: bool,
 }
 
 impl BatchEngine {
@@ -53,11 +55,15 @@ impl BatchEngine {
         &mut self,
         token_ids: &[usize],
         slot: KvSlot,
+        want_logits: bool,
     ) -> Result<TimedForward, String> {
         let started_at = Instant::now();
-        let logits =
-            self.model
-                .forward_prefill_chunk_with_kv_slot(token_ids, &mut self.kv_pool, slot)?;
+        let logits = self.model.forward_prefill_chunk_with_kv_slot(
+            token_ids,
+            &mut self.kv_pool,
+            slot,
+            want_logits,
+        )?;
         Ok(TimedForward {
             logits,
             latency: started_at.elapsed(),
@@ -70,7 +76,11 @@ impl BatchEngine {
         }
         if inputs.len() == 1 {
             let input = &inputs[0];
-            return vec![self.prefill_chunk(&input.token_ids, input.slot)];
+            return vec![self.prefill_chunk(
+                &input.token_ids,
+                input.slot,
+                input.want_logits,
+            )];
         }
 
         let started_at = Instant::now();

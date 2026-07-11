@@ -25,6 +25,7 @@ pub struct GenerationParams {
     pub repetition_penalty: f32,
     pub frequency_penalty: f32,
     pub eos_token_ids: Vec<usize>,
+    pub min_decode_tokens: usize,
     pub request_timeout: Duration,
 }
 
@@ -286,6 +287,7 @@ impl Scheduler {
             .map(|prepared| PrefillInput {
                 slot: prepared.input.slot,
                 token_ids: prepared.input.token_ids.clone(),
+                want_logits: prepared.input.want_logits,
             })
             .collect();
 
@@ -585,6 +587,7 @@ fn prepare_prefill_chunk(active: &ActiveRequest, chunk_size: usize) -> PrefillPr
     PrefillPreparation::Forward(PrefillInput {
         slot: active.slot,
         token_ids: active.request.input_ids[chunk_start..chunk_end].to_vec(),
+        want_logits: chunk_end >= active.request.input_ids.len(),
     })
 }
 
@@ -610,17 +613,50 @@ fn prepare_decode_token(active: &mut ActiveRequest) -> DecodePreparation {
         return DecodePreparation::Finish(active.finish("stop"));
     }
 
-    let next_token = sampling::sample_with_params(
-        &active.logits,
-        &SamplingParams {
-            temperature: active.request.params.temperature,
-            min_p: active.request.params.min_p,
-            top_k: active.request.params.top_k,
-            repetition_penalty: active.request.params.repetition_penalty,
-            frequency_penalty: active.request.params.frequency_penalty,
-        },
-        &active.generated_tokens,
-    );
+    let sampling_params = SamplingParams {
+        temperature: active.request.params.temperature,
+        min_p: active.request.params.min_p,
+        top_k: active.request.params.top_k,
+        repetition_penalty: active.request.params.repetition_penalty,
+        frequency_penalty: active.request.params.frequency_penalty,
+    };
+
+    let mut next_token =
+        sampling::sample_with_params(&active.logits, &sampling_params, &active.generated_tokens);
+
+    // Control tokens that should not lead an answer turn.
+    // 1=<eos>, 100=<|channel>, 101=<channel|>, 105=<|turn>, 106=<turn|>, 107='\n'
+    const FIRST_TOKEN_BLOCKLIST: &[usize] = &[1, 100, 101, 105, 106, 107];
+
+    let mut guard = 0;
+    loop {
+        let block_eos = active.completion_tokens < active.request.params.min_decode_tokens
+            && active.request.params.eos_token_ids.contains(&next_token);
+        let block_first =
+            active.completion_tokens == 0 && FIRST_TOKEN_BLOCKLIST.contains(&next_token);
+        if (!block_eos && !block_first) || guard >= 64 {
+            break;
+        }
+        let mut masked_logits = active.logits.clone();
+        if block_first {
+            for &blocked in FIRST_TOKEN_BLOCKLIST {
+                if blocked < masked_logits.len() {
+                    masked_logits[blocked] = f32::NEG_INFINITY;
+                }
+            }
+        }
+        for eos in &active.request.params.eos_token_ids {
+            if *eos < masked_logits.len() {
+                masked_logits[*eos] = f32::NEG_INFINITY;
+            }
+        }
+        next_token = sampling::sample_with_params(
+            &masked_logits,
+            &sampling_params,
+            &active.generated_tokens,
+        );
+        guard += 1;
+    }
 
     if active.request.params.eos_token_ids.contains(&next_token) {
         let _ = active.request.response_tx.blocking_send(StreamEvent::Done {

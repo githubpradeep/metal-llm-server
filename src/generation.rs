@@ -6,6 +6,7 @@ use tokenizers::Tokenizer;
 use crate::cache::StreamingKVCache;
 use crate::model::LlamaForCausalLM;
 use crate::sampling::min_p_sampling;
+use crate::token_printer;
 
 /// Generate text using streaming attention sinks.
 /// The attention window is bounded to (sink_size + window_size) tokens,
@@ -51,29 +52,23 @@ pub fn generate_streaming(
         .map(|v| logits[[0, seq_len - 1, v]])
         .collect();
 
-    // Decode loop
+    // Decode loop: sample + forward on main thread; decode/print on background thread
     let start_time = Instant::now();
     let mut tokens_generated = 0;
     let mut current_logits = last_logits;
+    let mut next_token = min_p_sampling(&current_logits, 0.1);
+    let printer = token_printer::TokenPrinter::spawn(tokenizer);
 
     for _ in 0..max_tokens {
-        // Sample next token
-        let next_token = min_p_sampling(&current_logits, 0.1);
-
-        // Decode and print
-        let tok_str = tokenizer
-            .decode(&[next_token as u32], false)
-            .unwrap_or_default();
-        result.push_str(&tok_str);
-        print!("{}", tok_str);
-        io::stdout().flush().unwrap();
+        printer.send(next_token as u32);
         tokens_generated += 1;
 
-        // Forward pass with bounded attention window
         let logits = model.forward(&[vec![next_token as i64]], &mut kv_cache);
         current_logits = (0..vocab_size).map(|v| logits[[0, 0, v]]).collect();
+        next_token = min_p_sampling(&current_logits, 0.1);
     }
 
+    result.push_str(&printer.finish());
     let elapsed = start_time.elapsed().as_secs_f64();
     let tps = if elapsed > 0.0 {
         tokens_generated as f64 / elapsed
