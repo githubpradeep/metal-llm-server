@@ -76,15 +76,20 @@ fn pad_to(x: u64, n: u64) -> u64 {
     ((x + n - 1) / n) * n
 }
 
+/// Max KV length for tiled-prefill mask/blk scratch.
+///
+/// Scratch is `[q_chunk × kv] f16` × 2 windows. With `LLAMA_CTX_SIZE=200k` and
+/// `max_q=4096` that would be multi-GB if sized to full capacity — thrashing
+/// even when tiled is unused. Cap here; layers with `kv_seq` above this fall
+/// back to legacy causal attention.
+pub const MAX_TILED_PREFILL_KV: u32 = 65536;
+
 /// Use tiled flash_attn_ext when q_len ≥ 20 (matches llama.cpp vec/tiled switch).
 ///
-/// Disabled for now: Q4_0 tiled prefill still corrupts multi-chunk / long
-/// contexts (7k→1-token stop) even for SWA h256. Full-attn h512 was already
-/// excluded (32KB TG limit). Prefer legacy `attention_causal_q4_0` until the
-/// tiled path matches ds4/llama.cpp on Apple GPUs.
+/// Enabled for h256 (SWA) and h512 (full) once pad/mask/NSG fixes landed.
+/// Host `nsg_for_head_dim` must match Metal entry NSG (both use 4).
 pub fn prefill_use_tiled_ext(q_len: u32, head_dim: u32) -> bool {
-    let _ = (q_len, head_dim);
-    false
+    q_len >= 20 && matches!(head_dim, 256 | 512)
 }
 
 pub fn mask_bytes(q_len: u32, kv_seq: u32) -> u64 {
@@ -98,9 +103,12 @@ pub fn pad_bytes(row_bytes: u64, num_kv_heads: u32, q_len: u32, _kv_seq: u32) ->
 }
 
 pub fn blk_bytes(q_len: u32, kv_seq: u32) -> u64 {
+    // One byte per (KV-tile × Q-tile); matches ds4/llama.cpp:
+    //   align_up(nblk0 * nblk1, 32)
+    // (Previously multiplied by q_len → ~GB of wasted scratch.)
     let nblk1 = (q_len + NQPTG - 1) / NQPTG;
     let nblk0 = (kv_seq + NCPSG - 1) / NCPSG;
-    pad_to(nblk0 as u64 * nblk1 as u64 * q_len as u64, 32)
+    pad_to(nblk0 as u64 * nblk1 as u64, 32)
 }
 
 pub fn scratch_bytes(
@@ -109,19 +117,17 @@ pub fn scratch_bytes(
     num_kv_heads: u32,
     row_bytes: u64,
 ) -> u64 {
-    mask_bytes(max_q_len, kv_capacity)
-        + pad_bytes(row_bytes, num_kv_heads, max_q_len, kv_capacity)
-        + blk_bytes(max_q_len, kv_capacity)
+    let mask_kv = kv_capacity.min(MAX_TILED_PREFILL_KV);
+    mask_bytes(max_q_len, mask_kv)
+        + pad_bytes(row_bytes, num_kv_heads, max_q_len, mask_kv)
+        + blk_bytes(max_q_len, mask_kv)
 }
 
 pub fn nsg_for_head_dim(head_dim: u32) -> u32 {
-    // Q4_0 needs extra TG dequant scratch. M1 maxThreadgroupMemoryLength=32KB:
-    // h512×NSG=8 → 36KB (overflow). Prefer NSG=2 for headroom if h512 is re-enabled.
-    if head_dim >= 512 {
-        2
-    } else {
-        4
-    }
+    // Must match Metal entry points (both h256 and h512 use NSG=4).
+    // h512×NSG=8 overflows 32KB (36KB); NSG=4 fits exactly at 32768.
+    let _ = head_dim;
+    4
 }
 
 pub fn smem_bytes(head_dim: u32, nsg: u32) -> u64 {
@@ -231,6 +237,28 @@ pub fn blk_args(q_len: u32, kv_seq: u32) -> FlashAttnExtBlkArgs {
     }
 }
 
+#[repr(C)]
+pub struct FlashAttnExtMaskFillArgs {
+    pub q_len: u32,
+    pub kv_seq: u32,
+    pub q_start: u32,
+    pub attention_window: u32,
+}
+
+pub fn mask_fill_args(
+    q_len: u32,
+    kv_seq: u32,
+    q_start: u32,
+    attention_window: u32,
+) -> FlashAttnExtMaskFillArgs {
+    FlashAttnExtMaskFillArgs {
+        q_len,
+        kv_seq,
+        q_start,
+        attention_window,
+    }
+}
+
 const F16_NEG_INF: u16 = 0xFC00;
 
 /// Fill causal f16 mask: shape [q_len, kv_seq], row-major (query × kv).
@@ -242,6 +270,8 @@ pub fn fill_causal_mask(
     attention_window: u32,
 ) {
     assert_eq!(out.len(), (q_len as usize) * (kv_seq as usize));
+    // Default deny, then punch allowed [attend_start, q_pos] holes.
+    out.fill(F16_NEG_INF);
     for qi in 0..q_len {
         let q_pos = q_start + qi;
         let attend_len = (q_pos + 1).min(kv_seq);
@@ -250,9 +280,9 @@ pub fn fill_causal_mask(
         } else {
             0
         };
-        for kj in 0..kv_seq {
-            let allowed = kj <= q_pos && kj >= attend_start;
-            out[qi as usize * kv_seq as usize + kj as usize] = if allowed { 0 } else { F16_NEG_INF };
+        let row = qi as usize * kv_seq as usize;
+        for kj in attend_start..attend_len {
+            out[row + kj as usize] = 0;
         }
     }
 }
@@ -264,6 +294,8 @@ pub struct ScratchLayout {
     full_blk_off: u64,
     swa_mask_off: u64,
     swa_blk_off: u64,
+    /// Max KV columns the mask/blk planes can hold (may be < model capacity).
+    pub mask_kv_capacity: u32,
     pub total: u64,
 }
 
@@ -349,9 +381,10 @@ pub fn scratch_layout(
     num_kv_heads: u32,
     row_bytes: u64,
 ) -> ScratchLayout {
-    let mask = mask_bytes(max_q_len, kv_capacity);
-    let pad = pad_bytes(row_bytes, num_kv_heads, max_q_len, kv_capacity);
-    let blk = blk_bytes(max_q_len, kv_capacity);
+    let mask_kv = kv_capacity.min(MAX_TILED_PREFILL_KV);
+    let mask = mask_bytes(max_q_len, mask_kv);
+    let pad = pad_bytes(row_bytes, num_kv_heads, max_q_len, mask_kv);
+    let blk = blk_bytes(max_q_len, mask_kv);
     // [full_mask][swa_mask][pad][full_blk][swa_blk]
     let full_mask_off = 0;
     let swa_mask_off = mask;
@@ -364,6 +397,7 @@ pub fn scratch_layout(
         full_blk_off,
         swa_mask_off,
         swa_blk_off,
+        mask_kv_capacity: mask_kv,
         total: swa_blk_off + blk,
     }
 }

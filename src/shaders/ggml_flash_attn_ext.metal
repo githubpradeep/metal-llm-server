@@ -1525,6 +1525,33 @@ kernel void flash_attn_ext_prefill_blk(
     kernel_flash_attn_ext_blk(args, mask, dst, tgpig, tiisg);
 }
 
+struct flash_attn_ext_mask_fill_args {
+    uint q_len;
+    uint kv_seq;
+    uint q_start;
+    uint attention_window;
+};
+
+/// GPU causal (+ optional SWA) f16 mask: shape [q_len, kv_seq], 0 = attend, -inf = mask.
+kernel void flash_attn_ext_prefill_mask_fill(
+    constant flash_attn_ext_mask_fill_args & args [[buffer(0)]],
+    device half * mask [[buffer(1)]],
+    uint2 gid [[thread_position_in_grid]]) {
+    const uint kj = gid.x;
+    const uint qi = gid.y;
+    if (qi >= args.q_len || kj >= args.kv_seq) {
+        return;
+    }
+    const uint q_pos = args.q_start + qi;
+    const uint attend_len = min(q_pos + 1, args.kv_seq);
+    uint attend_start = 0;
+    if (args.attention_window > 0 && attend_len > args.attention_window) {
+        attend_start = attend_len - args.attention_window;
+    }
+    const bool allowed = kj < attend_len && kj >= attend_start;
+    mask[qi * args.kv_seq + kj] = allowed ? half(0.0h) : half(-INFINITY);
+}
+
 kernel void flash_attn_ext_prefill_q4_0_h256(
     constant ggml_metal_kargs_flash_attn_ext & args [[buffer(0)]],
     device const char * q [[buffer(1)]],

@@ -431,6 +431,12 @@ impl PrefillScratch {
             row_bytes,
         );
         let fa_ext_elems = ((fa_ext_layout.total + 3) / 4) as usize;
+        println!(
+            "  fa_ext scratch: {:.1} MB (mask_kv≤{}, max_q={}, dual full/SWA planes)",
+            fa_ext_layout.total as f64 / (1024.0 * 1024.0),
+            fa_ext_layout.mask_kv_capacity,
+            max_seq_len
+        );
         Self {
             max_seq_len,
             hidden_buf: ctx.buffer_empty(max_seq_len * hidden_size),
@@ -6060,8 +6066,10 @@ impl Gemma4GpuModel {
 
         let mut ext_mask_cache = crate::ggml_flash_attn_ext::PrefillExtMaskCache::default();
 
+        // One compute encoder for all layers: fewer encoder create/end costs.
+        // Dependent dispatches already share an encoder within each layer.
+        let encoder = cmd.new_compute_command_encoder();
         for layer_idx in 0..self.layers.len() {
-            let encoder = cmd.new_compute_command_encoder();
             self.encode_parallel_prefill_attention_inputs(encoder, layer_idx, seq_len)?;
 
             let layer = self
@@ -6424,9 +6432,8 @@ impl Gemma4GpuModel {
                 &self.prefill_scratch.hidden_buf,
                 total_hidden,
             );
-
-            encoder.end_encoding();
         }
+        encoder.end_encoding();
 
         if compute_logits {
             // Final norm + lm_head (last chunk only — matches llama.cpp out_ids gating).
