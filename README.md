@@ -1,58 +1,40 @@
 # Gemma4 Metal Inference Server (Rust)
 
-Alpha-stage local LLM inference server for Gemma4 E4B on Apple Silicon. The goal
-is to keep the stack understandable while implementing production-oriented
-serving pieces: an OpenAI-compatible API, Metal GPU kernels, KV pooling,
-continuous batching, chunked prefill, and scheduler observability.
+Alpha-stage local LLM inference server for **Gemma4** on Apple Silicon. Metal GPU
+kernels, OpenAI-compatible API, KV pooling, continuous batching, and chunked
+prefill. Suitable for experimentation — not production-stable yet.
 
-This is suitable for experimentation and technical preview use. It is not yet a
-production-stable serving system.
+Binary name: `llama-sinks`.
 
-## Current Status
+## Models (GGUF preferred)
 
-Implemented:
+The primary path is a **community GGUF** (weights + embedded tokenizer). Point
+`--gpu` at a `.gguf` file:
 
-- Gemma4 E4B GPU inference on Metal.
-- Q4_0 model weights with selected f16 paths for quality-sensitive operations.
-- OpenAI-compatible `/v1/chat/completions`, `/v1/models`, `/health`, and
-  `/metrics` endpoints.
-- Non-streaming and SSE streaming chat completions.
-- KV cache pooling for concurrent requests.
-- Real decode batching across active requests.
-- Real multi-request batched prefill across KV slots.
-- Chunked prefill for long prompts.
-- Mixed prefill/decode scheduling with a per-tick prefill token budget.
-- Denser prefill scheduling so one long prompt does not monopolize a tick when
-  other prompts are prefilling.
-- Runtime knobs for queue depth, KV pool slots, request timeout, and prefill
-  token budget.
-- Rich Prometheus-style metrics for batch size and latency.
-- 4096-token server context cap for Gemma4 E4B in the current build.
-- Single-request parallel prefill chunk path optimized into one Metal command
-  buffer across the layer stack.
+| Model | Example GGUF | Notes |
+|-------|----------------|-------|
+| **Gemma4 E2B** | `gemma-4-E2B-it-Q4_K_M.gguf` | Smaller; good for prefill/decode tuning |
+| **Gemma4 E4B** | `gemma-4-E4B-it-Q4_K_M.gguf` | Larger; original target |
 
-Validated locally:
+`Q4_K_M` (mixed Q4_K / Q6_K) is the usual quant. On first load the engine builds a
+local Q4 weight cache next to the GGUF for faster restarts.
 
-- Full regression suite: health/models, structured errors, sync chat, chunked
-  prefill, streaming, 10-way concurrency, prefill correctness, mixed fairness,
-  stress, and idle metrics.
-- Sequential vs concurrent greedy correctness across varied prompt shapes and
-  reversed request order.
-- Stress tests for mixed prompt lengths, staggered arrivals, stream
-  cancellation, client timeout pressure, and scheduler idle recovery.
-- Long-context acceptance around 3500 prompt tokens and structured rejection
-  above the 4096-token context limit.
+HF safetensors directories (`config.json` + `tokenizer.json` + weights) still load,
+but GGUF is what we use day-to-day.
 
-Still pending:
+### Get a GGUF
 
-- Make KV capacity configurable and memory-aware instead of hardcoding 4096.
-- Move the single-command-buffer optimization into the multi-request batched
-  prefill path.
-- Use or remove the experimental tiled projection kernels after benchmarking.
-- Benchmark and tune the tiled FlashAttention-style attention kernels further.
-- Add deeper logits/top-k debug correctness checks.
-- Publish stable benchmark numbers with exact hardware, model, and runtime
-  configuration.
+From Hugging Face (example — pick a repo that hosts the file you want):
+
+```bash
+# Example layout
+mkdir -p ~/Downloads/models/e2b
+
+# Download with huggingface-cli / browser, then:
+ls ~/Downloads/models/e2b/gemma-4-E2B-it-Q4_K_M.gguf
+```
+
+Or convert / obtain any Gemma4 Instruct `Q4_K_M` GGUF compatible with llama.cpp.
 
 ## Build
 
@@ -63,235 +45,135 @@ export MACOSX_DEPLOYMENT_TARGET=15.0
 cargo build --release
 ```
 
-The model directory should contain:
-
-- `config.json`
-- `tokenizer.json`
-- `model.safetensors` or sharded safetensors with `model.safetensors.index.json`
-
-## Download Model From Hugging Face
-
-Install the Hugging Face CLI:
+## Run server (GGUF)
 
 ```bash
-python3 -m pip install -U huggingface_hub
+LLAMA_KV_CACHE_TYPE=q4_0 \
+LLAMA_CTX_SIZE=16384 \
+LLAMA_MAX_PREFILL_SEQ=4096 \
+./target/release/llama-sinks \
+  --gpu ~/Downloads/models/e2b/gemma-4-E2B-it-Q4_K_M.gguf \
+  --serve
 ```
 
-If the model is gated, log in first and make sure you have accepted the model
-license on Hugging Face:
+Listens on `http://0.0.0.0:8080` by default (`--port N` to change).
+
+### Important env vars
+
+| Variable | Default | Meaning |
+|----------|---------|---------|
+| `LLAMA_KV_CACHE_TYPE` | `f16` | KV quant: `q4_0` (recommended), `q8_0`, or omit for f16 |
+| `LLAMA_CTX_SIZE` | `16384` | KV capacity / context window (max `200000`) |
+| `LLAMA_MAX_PREFILL_SEQ` | engine default | Max tokens per prefill chunk (e.g. `4096`) |
+| `LLAMA_QUEUE_DEPTH` | server default | Admission queue depth |
+| `LLAMA_KV_POOL_SLOTS` | server default | Concurrent KV slots |
+| `LLAMA_REQUEST_TIMEOUT_SECS` | server default | Per-request timeout |
+| `LLAMA_PREFILL_TOKENS_PER_TICK` | server default | Prefill budget per scheduler tick |
+
+Prefill tuning (defaults are usually fine):
+
+| Variable | Default | Meaning |
+|----------|---------|---------|
+| `PREFILL_FLASH_ATTN` | on | Tiled `flash_attn_ext` for prefill (`0` = legacy) |
+| `PREFILL_MUL_MM` | on | K-quant matrix-matrix for long seq |
+| `PREFILL_MLP_F16` | on | f16 RHS activations for MLP mul_mm |
+| `PREFILL_GATE_UP_STACKED` | on | Stacked gate∥up mul_mm |
+| `PREFILL_QKV_STACKED` | on | Stacked Q∥K∥V mul_mm |
+| `PREFILL_TIMING` | off | Print CPU/GPU prefill phase timings |
+| `PROFILE_ABLATE` | off | Skip `attn` / `mlp` / `ple` for ablation |
+
+Decode: `ATTENTION_KERNEL=auto|ggml|specialized` (see server startup logs).
+
+## Benchmarks
+
+Prefill:
 
 ```bash
-hf auth login
+LLAMA_KV_CACHE_TYPE=q4_0 LLAMA_MAX_PREFILL_SEQ=4096 \
+./target/release/llama-sinks \
+  --gpu ~/Downloads/models/e2b/gemma-4-E2B-it-Q4_K_M.gguf \
+  --bench-prefill --bench-prefill-tokens 2048,4096
 ```
 
-Download the model to a local directory:
+Decode:
 
 ```bash
-mkdir -p ~/models
-
-hf download google/gemma-4-e4b-it \
-  --local-dir ~/models/gemma-4-e4b-it
+LLAMA_KV_CACHE_TYPE=q4_0 \
+./target/release/llama-sinks \
+  --gpu ~/Downloads/models/e2b/gemma-4-E2B-it-Q4_K_M.gguf \
+  --bench-decode --bench-decode-tokens 25,200
 ```
 
-Then point the server at that directory:
+Ballpark on Apple M1 Pro (E2B Q4_K_M, Q4_0 KV, cool machine): prefill ~450 tok/s
+@ 4k; decode ~45–50 tok/s at short context (falls with long context). Numbers
+move with thermal state — warm up or take the second run.
 
-```bash
-export MODEL_DIR=~/models/gemma-4-e4b-it
-```
-
-If you use a different Gemma4 E4B checkpoint or an already-downloaded local
-snapshot, set `MODEL_DIR` to the folder containing `config.json`,
-`tokenizer.json`, and the safetensors files.
-
-## Run Server
-
-```bash
-export MODEL_DIR=/path/to/gemma-model-dir
-
-MACOSX_DEPLOYMENT_TARGET=15.0 \
-LLAMA_QUEUE_DEPTH=64 \
-LLAMA_KV_POOL_SLOTS=32 \
-LLAMA_PREFILL_TOKENS_PER_TICK=128 \
-LLAMA_REQUEST_TIMEOUT_SECS=300 \
-cargo run --release -- --gpu --serve "$MODEL_DIR" --port 8080
-```
-
-Important runtime knobs:
-
-```bash
-LLAMA_QUEUE_DEPTH=64
-LLAMA_KV_POOL_SLOTS=32
-LLAMA_REQUEST_TIMEOUT_SECS=300
-LLAMA_PREFILL_TOKENS_PER_TICK=128
-```
-
-`LLAMA_PREFILL_TOKENS_PER_TICK` controls how much prompt prefill work the
-scheduler can submit per tick. Lower values improve decode interleaving under
-long prefill load; higher values may improve prompt throughput.
-
-## API Example
+## API example
 
 ```bash
 curl http://127.0.0.1:8080/v1/chat/completions \
   -H "Content-Type: application/json" \
   -d '{
-    "model": "gemma-4-e4b-q4",
+    "model": "gemma-4",
     "messages": [{"role": "user", "content": "Explain KV cache reuse in one sentence."}],
     "max_tokens": 64,
     "temperature": 0.0
   }'
 ```
 
-Streaming:
+Streaming: add `"stream": true` and use `curl -N`.
+
+Endpoints: `/v1/chat/completions`, `/v1/models`, `/health`, `/metrics`.
+
+## HF safetensors (optional)
 
 ```bash
-curl -N http://127.0.0.1:8080/v1/chat/completions \
-  -H "Content-Type: application/json" \
-  -d '{
-    "model": "gemma-4-e4b-q4",
-    "messages": [{"role": "user", "content": "Count from one to five."}],
-    "max_tokens": 32,
-    "stream": true
-  }'
+hf download google/gemma-4-e4b-it --local-dir ~/models/gemma-4-e4b-it
+
+./target/release/llama-sinks --gpu ~/models/gemma-4-e4b-it --serve
 ```
 
-## Test Commands
+Directory must contain `config.json`, `tokenizer.json`, and safetensors weights.
+Prefer GGUF for quantized Metal runs.
 
-Core Rust tests:
+## Tests
 
 ```bash
 cargo test
 ```
 
-Full server regression after starting the server:
+With the server up:
 
 ```bash
-python3 benchmarks/server_regression.py \
-  --port 8080 \
-  --requests 10 \
-  --max-tokens 32 \
-  --timeout 300 \
-  --prefill-correctness \
-  --mixed-fairness \
-  --stress
+python3 benchmarks/server_regression.py --port 8080 --requests 10 --max-tokens 32 --timeout 300
+python3 benchmarks/prefill_correctness.py --port 8080 --max-tokens 24 --timeout 300
 ```
-
-Standalone correctness:
-
-```bash
-python3 benchmarks/prefill_correctness.py \
-  --port 8080 \
-  --max-tokens 24 \
-  --timeout 300
-```
-
-Standalone stress:
-
-```bash
-python3 benchmarks/stress_scheduler.py \
-  --port 8080 \
-  --requests 24 \
-  --timeout 300
-```
-
-Long-context smoke:
-
-```bash
-python3 benchmarks/mixed_batching_fairness.py \
-  --port 8080 \
-  --stream-tokens 32 \
-  --prefill-words 900 \
-  --prefill-max-tokens 1 \
-  --timeout 300 \
-  --max-stream-gap 8.0
-```
-
-This has produced prompts around 3500 tokens locally. Prompts above 4096 tokens
-are expected to fail cleanly with `context_length_exceeded`.
-
-## Metrics
-
-The server exposes Prometheus-style metrics at `/metrics`.
-
-Useful batching and latency metrics:
-
-```bash
-curl -s http://127.0.0.1:8080/metrics \
-  | grep -E 'llama_(prefill|decode)_batch_items_(avg|max)|llama_.*latency_ms_(avg|max)'
-```
-
-Examples:
-
-- `llama_prefill_batch_items_avg`
-- `llama_prefill_batch_items_max`
-- `llama_decode_batch_items_avg`
-- `llama_decode_batch_items_max`
-- `llama_request_latency_ms_avg`
-- `llama_prefill_latency_ms_avg`
-- `llama_decode_latency_ms_avg`
-- `llama_decode_compute_latency_ms_avg`
 
 ## Architecture
 
-Key files:
-
 ```text
-src/main.rs                 CLI entry point and model detection
-src/server.rs               OpenAI-compatible HTTP server and runtime config
-src/scheduler.rs            Request admission, prefill/decode scheduling
-src/batch_engine.rs         KV pool bridge for batched model calls
-src/kv_pool.rs              Per-request KV cache slots
-src/gemma4_gpu_model.rs     Gemma4 model loading, prefill, decode, batching
-src/gpu.rs                  Metal pipeline setup and encoder helpers
-src/shaders/llama.metal     Metal compute kernels
-src/metrics.rs              Prometheus-style counters and gauges
-benchmarks/                 Regression, correctness, stress, fairness scripts
-docs/                       Architecture notes and blog posts
+src/main.rs                 CLI (GGUF vs HF dir, --serve, benches)
+src/server.rs               OpenAI-compatible HTTP + runtime config
+src/scheduler.rs            Prefill/decode scheduling
+src/gemma4_gpu_model.rs     Load (GGUF/HF), prefill, decode, batching
+src/gguf.rs                 GGUF parse + embedded tokenizer
+src/gpu.rs                  Metal pipelines / encoders
+src/shaders/                Metal kernels (mul_mm, flash_attn_ext, …)
+benchmarks/                 Regression / correctness / stress scripts
 ```
 
-## Performance Tuning
+## Known limits
 
-Decode throughput on an Apple M1 Pro with Gemma4 E4B Q4_0 is ~29 tok/s out of
- the box and ~31–32 tok/s with:
-
-```bash
-MLP_GATE_UP_GGML=1 cargo run --release -- --gpu "$MODEL_DIR"
-```
-
-`MLP_GATE_UP_GGML=1` replaces the packed interleaved MLP gate∥up+GeLU kernel
-with two separate ggml-style Q4 matvecs plus a GeLU multiply. It is opt-in
-because the extra dispatch can hurt on other shapes, but it helps this model.
-
-To reach llama.cpp-level single-request speeds (~40 tok/s on similar hardware)
-the remaining work is in the attention kernel: it currently dispatches one
-threadgroup per query head, so GQA groups read the same KV cache multiple times.
-A GQA-aware attention kernel (one threadgroup per KV head, computing all query
-heads in the group) plus further dispatch-reduction (e.g., a working mega-kernel
-or fusing O-projection/norm/residual) is the next step.
-
-For serving, use the existing decode batching: aggregate throughput scales with
-the number of concurrent requests because weights and KV are amortized across
-the batch.
-
-## Known Limits
-
-- Alpha software. Expect sharp edges.
-- Gemma4 E4B-focused; not a general model runtime.
-- Current server context cap is 4096 tokens.
-- Near-4096 prompts can be slow enough to require a larger
-  `LLAMA_REQUEST_TIMEOUT_SECS`.
-- Multi-request batched prefill is real, but the latest single-command-buffer
-  optimization is not yet applied to that path.
-- Tiled projection kernels are present but not currently used in the hot path.
-- Decode and causal attention use tiled FlashAttention-style kernels by default
-  (`FLASH_ATTN=legacy` to revert to the older per-token attention path).
+- Alpha software; expect sharp edges.
+- Gemma4-focused (E2B / E4B); not a general multi-arch runtime.
+- Context via `LLAMA_CTX_SIZE` (default 16k, up to 200k); quality may drop past
+  the model’s trained length.
+- Long prompts are chunked (`LLAMA_MAX_PREFILL_SEQ`); multi-chunk prefill is
+  slower per token than a single 4k bench chunk.
+- Decode throughput falls as KV grows; short-context benches overstate long-chat
+  tok/s.
 
 ## Positioning
 
-Recommended public framing:
-
 > Alpha: a local Metal Gemma inference server with production-oriented
 > continuous batching experiments.
-
-Avoid calling it production-ready until long-context performance, configurability,
-and broader soak testing are complete.
