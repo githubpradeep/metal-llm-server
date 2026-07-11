@@ -13,6 +13,15 @@
 #include <metal_stdlib>
 using namespace metal;
 
+// Match llama.cpp ggml-metal.metal — full unroll is required for Q4_K dequant/MMA
+// to reach ~3 TFLOPS on M1; without it Q4_K sits ~1.5 TFLOPS (Q6 is less sensitive).
+#define FOR_UNROLL(x) _Pragma("clang loop unroll(full)") for (x)
+
+// Function constants (llama FC_MUL_MM+0/+1). Hot path: both false when K%32==0
+// and M%64==0 && N%32==0 (E2B prefill @ 4096).
+constant bool FC_mul_mm_bc_inp [[function_constant(0)]];
+constant bool FC_mul_mm_bc_out [[function_constant(1)]];
+
 static inline uchar2 mul_mm_get_scale_min_k4(int j, int k, device const uchar * q) {
     return j < 4
         ? uchar2{uchar(q[j + 0 + k] & 63), uchar(q[j + 4 + k] & 63)}
@@ -21,8 +30,8 @@ static inline uchar2 mul_mm_get_scale_min_k4(int j, int k, device const uchar * 
               uchar((q[j + 4 + k] >> 4) | ((q[j - 0 + k] & 0xc0) >> 2))};
 }
 
-// Same dequant as llama.cpp dequantize_q4_K (half4x4 path).
-void mul_mm_dequantize_q4_K(device const block_q4_K * xb, short il, thread half4x4 & reg) {
+// Same dequant as llama.cpp dequantize_q4_K (half4x4 path). Must stay inlined.
+static inline void mul_mm_dequantize_q4_K(device const block_q4_K * xb, short il, thread half4x4 & reg) {
     device const uchar * q = xb->qs;
     short is = (il / 4) * 2;
     q = q + (il / 4) * 32 + 16 * (il & 1);
@@ -33,7 +42,7 @@ void mul_mm_dequantize_q4_K(device const block_q4_K * xb, short il, thread half4
     const float dl = d * sc[0];
     const float ml = min * sc[1];
     const ushort mask = il < 2 ? 0x0F : 0xF0;
-    for (int i = 0; i < 16; ++i) {
+    FOR_UNROLL(int i = 0; i < 16; ++i) {
         reg[i / 4][i % 4] = dl * (q[i] & mask) - ml;
     }
 }
@@ -122,13 +131,21 @@ kernel void mul_mm_q4_K_f32(
         }
 
         // Match llama.cpp q*_K_f32: cast f32 src1 -> half TG tile, half MMA.
-        {
+        if (!FC_mul_mm_bc_inp) {
             const short sx = (tiitg % NL1);
             const short sy = (tiitg / NL1) / 8;
             const short ly = (tiitg / NL1) % 8;
             const short ib = 4 * sx + sy;
             *((threadgroup half2x4 *)(sb + 64 * ib + 8 * ly)) =
                 half2x4(*((device float2x4 *)y));
+        } else {
+            const short sx = (tiitg % NL1);
+            const short sy = (tiitg / NL1) / 8;
+            const short ly = (tiitg / NL1) % 8;
+            const short ib = 4 * sx + sy;
+            for (short i = 0; i < 8; ++i) {
+                *(sb + 64 * ib + 8 * ly + i) = half(y[i]);
+            }
         }
 
         il = (il + 2 < nl) ? il + 2 : il % 2;
@@ -140,17 +157,17 @@ kernel void mul_mm_q4_K_f32(
         threadgroup const half * lsma = sa + 4 * 64 * (sgitg % 2);
         threadgroup const half * lsmb = sb + 2 * 64 * (sgitg / 2);
 
-        for (short ik = 0; ik < NK / 8; ik++) {
+        FOR_UNROLL(short ik = 0; ik < NK / 8; ik++) {
             simdgroup_barrier(mem_flags::mem_none);
-            for (short i = 0; i < 4; i++) {
+            FOR_UNROLL(short i = 0; i < 4; i++) {
                 simdgroup_load(ma[i], lsma + 64 * i, 8, 0, false);
             }
             simdgroup_barrier(mem_flags::mem_none);
-            for (short i = 0; i < 2; i++) {
+            FOR_UNROLL(short i = 0; i < 2; i++) {
                 simdgroup_load(mb[i], lsmb + 64 * i, 8, 0, false);
             }
             simdgroup_barrier(mem_flags::mem_none);
-            for (short i = 0; i < 8; i++) {
+            FOR_UNROLL(short i = 0; i < 8; i++) {
                 simdgroup_multiply_accumulate(mc[i], mb[i / 4], ma[i % 4], mc[i]);
             }
             lsma += 8 * 64;
@@ -158,7 +175,7 @@ kernel void mul_mm_q4_K_f32(
         }
     }
 
-    if (r0 + NR0 <= args.ne0 && r1 + NR1 <= args.ne1) {
+    if (!FC_mul_mm_bc_out || (r0 + NR0 <= args.ne0 && r1 + NR1 <= args.ne1)) {
         device float * C = (device float *)dst + (r0 + 32 * (sgitg & 1))
             + (r1 + 16 * (sgitg >> 1)) * args.ne0;
         for (short i = 0; i < 8; i++) {
@@ -191,7 +208,7 @@ kernel void mul_mm_q4_K_f32(
 
 // ─── Q6_K mul_mm (same tiling; llama.cpp kernel_mul_mm_q6_K_f32) ────────────
 
-void mul_mm_dequantize_q6_K(device const block_q6_K * xb, short il, thread half4x4 & reg) {
+static inline void mul_mm_dequantize_q6_K(device const block_q6_K * xb, short il, thread half4x4 & reg) {
     const half d_all = xb->d;
     device const uint16_t * ql = (device const uint16_t *)xb->ql;
     device const uint16_t * qh = (device const uint16_t *)xb->qh;
@@ -284,13 +301,21 @@ kernel void mul_mm_q6_K_f32(
                 *(sa + 64 * ib + 8 * ly + lx) = temp_a[i / 4][i % 4];
             }
         }        // Match llama.cpp q*_K_f32: cast f32 src1 -> half TG tile, half MMA.
-        {
+        if (!FC_mul_mm_bc_inp) {
             const short sx = (tiitg % NL1);
             const short sy = (tiitg / NL1) / 8;
             const short ly = (tiitg / NL1) % 8;
             const short ib = 4 * sx + sy;
             *((threadgroup half2x4 *)(sb + 64 * ib + 8 * ly)) =
                 half2x4(*((device float2x4 *)y));
+        } else {
+            const short sx = (tiitg % NL1);
+            const short sy = (tiitg / NL1) / 8;
+            const short ly = (tiitg / NL1) % 8;
+            const short ib = 4 * sx + sy;
+            for (short i = 0; i < 8; ++i) {
+                *(sb + 64 * ib + 8 * ly + i) = half(y[i]);
+            }
         }
 
         il = (il + 2 < nl) ? il + 2 : il % 2;
@@ -302,17 +327,17 @@ kernel void mul_mm_q6_K_f32(
         threadgroup const half * lsma = sa + 4 * 64 * (sgitg % 2);
         threadgroup const half * lsmb = sb + 2 * 64 * (sgitg / 2);
 
-        for (short ik = 0; ik < NK / 8; ik++) {
+        FOR_UNROLL(short ik = 0; ik < NK / 8; ik++) {
             simdgroup_barrier(mem_flags::mem_none);
-            for (short i = 0; i < 4; i++) {
+            FOR_UNROLL(short i = 0; i < 4; i++) {
                 simdgroup_load(ma[i], lsma + 64 * i, 8, 0, false);
             }
             simdgroup_barrier(mem_flags::mem_none);
-            for (short i = 0; i < 2; i++) {
+            FOR_UNROLL(short i = 0; i < 2; i++) {
                 simdgroup_load(mb[i], lsmb + 64 * i, 8, 0, false);
             }
             simdgroup_barrier(mem_flags::mem_none);
-            for (short i = 0; i < 8; i++) {
+            FOR_UNROLL(short i = 0; i < 8; i++) {
                 simdgroup_multiply_accumulate(mc[i], mb[i / 4], ma[i % 4], mc[i]);
             }
             lsma += 8 * 64;
@@ -320,7 +345,7 @@ kernel void mul_mm_q6_K_f32(
         }
     }
 
-    if (r0 + NR0 <= args.ne0 && r1 + NR1 <= args.ne1) {
+    if (!FC_mul_mm_bc_out || (r0 + NR0 <= args.ne0 && r1 + NR1 <= args.ne1)) {
         device float * C = (device float *)dst + (r0 + 32 * (sgitg & 1))
             + (r1 + 16 * (sgitg >> 1)) * args.ne0;
         for (short i = 0; i < 8; i++) {
@@ -418,12 +443,20 @@ kernel void mul_mm_q4_K_f16(
         }
 
                 // Keep B as half (llama.cpp q*_K_f16); K%32==0.
-        {
+        if (!FC_mul_mm_bc_inp) {
             const short sx = (tiitg % NL1);
             const short sy = (tiitg / NL1) / 8;
             const short ly = (tiitg / NL1) % 8;
             const short ib = 4 * sx + sy;
             *((threadgroup half2x4 *)(sb + 64 * ib + 8 * ly)) = *((device half2x4 *)y);
+        } else {
+            const short sx = (tiitg % NL1);
+            const short sy = (tiitg / NL1) / 8;
+            const short ly = (tiitg / NL1) % 8;
+            const short ib = 4 * sx + sy;
+            for (short i = 0; i < 8; ++i) {
+                *(sb + 64 * ib + 8 * ly + i) = y[i];
+            }
         }
 
         il = (il + 2 < nl) ? il + 2 : il % 2;
@@ -435,17 +468,17 @@ kernel void mul_mm_q4_K_f16(
         threadgroup const half * lsma = sa + 4 * 64 * (sgitg % 2);
         threadgroup const half * lsmb = sb + 2 * 64 * (sgitg / 2);
 
-        for (short ik = 0; ik < NK / 8; ik++) {
+        FOR_UNROLL(short ik = 0; ik < NK / 8; ik++) {
             simdgroup_barrier(mem_flags::mem_none);
-            for (short i = 0; i < 4; i++) {
+            FOR_UNROLL(short i = 0; i < 4; i++) {
                 simdgroup_load(ma[i], lsma + 64 * i, 8, 0, false);
             }
             simdgroup_barrier(mem_flags::mem_none);
-            for (short i = 0; i < 2; i++) {
+            FOR_UNROLL(short i = 0; i < 2; i++) {
                 simdgroup_load(mb[i], lsmb + 64 * i, 8, 0, false);
             }
             simdgroup_barrier(mem_flags::mem_none);
-            for (short i = 0; i < 8; i++) {
+            FOR_UNROLL(short i = 0; i < 8; i++) {
                 simdgroup_multiply_accumulate(mc[i], mb[i / 4], ma[i % 4], mc[i]);
             }
             lsma += 8 * 64;
@@ -453,17 +486,18 @@ kernel void mul_mm_q4_K_f16(
         }
     }
 
-    if (r0 + NR0 <= args.ne0 && r1 + NR1 <= args.ne1) {
+    // FC_mul_mm_bc_out=false DCE's the partial-tile store (llama.cpp).
+    if (!FC_mul_mm_bc_out || (r0 + NR0 <= args.ne0 && r1 + NR1 <= args.ne1)) {
         device float * C = (device float *)dst + (r0 + 32 * (sgitg & 1))
             + (r1 + 16 * (sgitg >> 1)) * args.ne0;
-        for (short i = 0; i < 8; i++) {
+        FOR_UNROLL(short i = 0; i < 8; i++) {
             simdgroup_store(mc[i], C + 8 * (i % 4) + 8 * args.ne0 * (i / 4), args.ne0, 0, false);
         }
     } else {
         threadgroup_barrier(mem_flags::mem_threadgroup);
         threadgroup float * temp_str =
             ((threadgroup float *)shmem) + 32 * (sgitg & 1) + (16 * (sgitg >> 1)) * NR0;
-        for (short i = 0; i < 8; i++) {
+        FOR_UNROLL(short i = 0; i < 8; i++) {
             simdgroup_store(mc[i], temp_str + 8 * (i % 4) + 8 * NR0 * (i / 4), NR0, 0, false);
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -545,12 +579,20 @@ kernel void mul_mm_q6_K_f16(
                 *(sa + 64 * ib + 8 * ly + lx) = temp_a[i / 4][i % 4];
             }
         }        // Keep B as half (llama.cpp q*_K_f16); K%32==0.
-        {
+        if (!FC_mul_mm_bc_inp) {
             const short sx = (tiitg % NL1);
             const short sy = (tiitg / NL1) / 8;
             const short ly = (tiitg / NL1) % 8;
             const short ib = 4 * sx + sy;
             *((threadgroup half2x4 *)(sb + 64 * ib + 8 * ly)) = *((device half2x4 *)y);
+        } else {
+            const short sx = (tiitg % NL1);
+            const short sy = (tiitg / NL1) / 8;
+            const short ly = (tiitg / NL1) % 8;
+            const short ib = 4 * sx + sy;
+            for (short i = 0; i < 8; ++i) {
+                *(sb + 64 * ib + 8 * ly + i) = y[i];
+            }
         }
 
         il = (il + 2 < nl) ? il + 2 : il % 2;
@@ -562,17 +604,17 @@ kernel void mul_mm_q6_K_f16(
         threadgroup const half * lsma = sa + 4 * 64 * (sgitg % 2);
         threadgroup const half * lsmb = sb + 2 * 64 * (sgitg / 2);
 
-        for (short ik = 0; ik < NK / 8; ik++) {
+        FOR_UNROLL(short ik = 0; ik < NK / 8; ik++) {
             simdgroup_barrier(mem_flags::mem_none);
-            for (short i = 0; i < 4; i++) {
+            FOR_UNROLL(short i = 0; i < 4; i++) {
                 simdgroup_load(ma[i], lsma + 64 * i, 8, 0, false);
             }
             simdgroup_barrier(mem_flags::mem_none);
-            for (short i = 0; i < 2; i++) {
+            FOR_UNROLL(short i = 0; i < 2; i++) {
                 simdgroup_load(mb[i], lsmb + 64 * i, 8, 0, false);
             }
             simdgroup_barrier(mem_flags::mem_none);
-            for (short i = 0; i < 8; i++) {
+            FOR_UNROLL(short i = 0; i < 8; i++) {
                 simdgroup_multiply_accumulate(mc[i], mb[i / 4], ma[i % 4], mc[i]);
             }
             lsma += 8 * 64;
@@ -580,7 +622,7 @@ kernel void mul_mm_q6_K_f16(
         }
     }
 
-    if (r0 + NR0 <= args.ne0 && r1 + NR1 <= args.ne1) {
+    if (!FC_mul_mm_bc_out || (r0 + NR0 <= args.ne0 && r1 + NR1 <= args.ne1)) {
         device float * C = (device float *)dst + (r0 + 32 * (sgitg & 1))
             + (r1 + 16 * (sgitg >> 1)) * args.ne0;
         for (short i = 0; i < 8; i++) {
@@ -697,17 +739,17 @@ kernel void mul_mm_q4_K_f16_f16(
         threadgroup const half * lsma = sa + 4 * 64 * (sgitg % 2);
         threadgroup const float * lsmb = sb + 2 * 64 * (sgitg / 2);
 
-        for (short ik = 0; ik < NK / 8; ik++) {
+        FOR_UNROLL(short ik = 0; ik < NK / 8; ik++) {
             simdgroup_barrier(mem_flags::mem_none);
-            for (short i = 0; i < 4; i++) {
+            FOR_UNROLL(short i = 0; i < 4; i++) {
                 simdgroup_load(ma[i], lsma + 64 * i, 8, 0, false);
             }
             simdgroup_barrier(mem_flags::mem_none);
-            for (short i = 0; i < 2; i++) {
+            FOR_UNROLL(short i = 0; i < 2; i++) {
                 simdgroup_load(mb[i], lsmb + 64 * i, 8, 0, false);
             }
             simdgroup_barrier(mem_flags::mem_none);
-            for (short i = 0; i < 8; i++) {
+            FOR_UNROLL(short i = 0; i < 8; i++) {
                 simdgroup_multiply_accumulate(mc[i], mb[i / 4], ma[i % 4], mc[i]);
             }
             lsma += 8 * 64;
@@ -820,17 +862,17 @@ kernel void mul_mm_q6_K_f16_f16(
         threadgroup const half * lsma = sa + 4 * 64 * (sgitg % 2);
         threadgroup const float * lsmb = sb + 2 * 64 * (sgitg / 2);
 
-        for (short ik = 0; ik < NK / 8; ik++) {
+        FOR_UNROLL(short ik = 0; ik < NK / 8; ik++) {
             simdgroup_barrier(mem_flags::mem_none);
-            for (short i = 0; i < 4; i++) {
+            FOR_UNROLL(short i = 0; i < 4; i++) {
                 simdgroup_load(ma[i], lsma + 64 * i, 8, 0, false);
             }
             simdgroup_barrier(mem_flags::mem_none);
-            for (short i = 0; i < 2; i++) {
+            FOR_UNROLL(short i = 0; i < 2; i++) {
                 simdgroup_load(mb[i], lsmb + 64 * i, 8, 0, false);
             }
             simdgroup_barrier(mem_flags::mem_none);
-            for (short i = 0; i < 8; i++) {
+            FOR_UNROLL(short i = 0; i < 8; i++) {
                 simdgroup_multiply_accumulate(mc[i], mb[i / 4], ma[i % 4], mc[i]);
             }
             lsma += 8 * 64;
@@ -946,17 +988,17 @@ kernel void mul_mm_f16_f32(
         threadgroup const half * lsma = sa + 4 * 64 * (sgitg % 2);
         threadgroup const half * lsmb = sb + 2 * 64 * (sgitg / 2);
 
-        for (short ik = 0; ik < NK / 8; ik++) {
+        FOR_UNROLL(short ik = 0; ik < NK / 8; ik++) {
             simdgroup_barrier(mem_flags::mem_none);
-            for (short i = 0; i < 4; i++) {
+            FOR_UNROLL(short i = 0; i < 4; i++) {
                 simdgroup_load(ma[i], lsma + 64 * i, 8, 0, false);
             }
             simdgroup_barrier(mem_flags::mem_none);
-            for (short i = 0; i < 2; i++) {
+            FOR_UNROLL(short i = 0; i < 2; i++) {
                 simdgroup_load(mb[i], lsmb + 64 * i, 8, 0, false);
             }
             simdgroup_barrier(mem_flags::mem_none);
-            for (short i = 0; i < 8; i++) {
+            FOR_UNROLL(short i = 0; i < 8; i++) {
                 simdgroup_multiply_accumulate(mc[i], mb[i / 4], ma[i % 4], mc[i]);
             }
             lsma += 8 * 64;
@@ -964,7 +1006,7 @@ kernel void mul_mm_f16_f32(
         }
     }
 
-    if (r0 + NR0 <= args.ne0 && r1 + NR1 <= args.ne1) {
+    if (!FC_mul_mm_bc_out || (r0 + NR0 <= args.ne0 && r1 + NR1 <= args.ne1)) {
         device float * C = (device float *)dst + (r0 + 32 * (sgitg & 1))
             + (r1 + 16 * (sgitg >> 1)) * args.ne0;
         for (short i = 0; i < 8; i++) {

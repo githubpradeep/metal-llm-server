@@ -1181,7 +1181,13 @@ impl MetalContext {
     }
 
     /// Compile prefill mul_mm in a separate Metal library (lazy — decode never pays this cost).
-    fn compile_mul_mm_pipeline(device: &Device, entry: &str) -> ComputePipelineState {
+    /// `bc_inp`/`bc_out` match llama.cpp FC_MUL_MM (false,false for E2B aligned tiles).
+    fn compile_mul_mm_pipeline(
+        device: &Device,
+        entry: &str,
+        bc_inp: bool,
+        bc_out: bool,
+    ) -> ComputePipelineState {
         let ggml_path =
             Path::new(env!("CARGO_MANIFEST_DIR")).join("src/shaders/ggml_mul_mv_q4.metal");
         let ggml_mm_path =
@@ -1196,60 +1202,82 @@ impl MetalContext {
         let library = device
             .new_library_with_source(&mul_mm_src, &options)
             .expect("Failed to compile ggml_mul_mm Metal shaders");
+        let constants = FunctionConstantValues::new();
+        constants.set_constant_value_at_index(
+            &bc_inp as *const bool as *const std::ffi::c_void,
+            MTLDataType::Bool,
+            0,
+        );
+        constants.set_constant_value_at_index(
+            &bc_out as *const bool as *const std::ffi::c_void,
+            MTLDataType::Bool,
+            1,
+        );
         let func = library
-            .get_function(entry, None)
-            .unwrap_or_else(|e| panic!("Failed to get mul_mm function '{}': {:?}", entry, e));
+            .get_function(entry, Some(constants))
+            .unwrap_or_else(|e| {
+                panic!(
+                    "Failed to get mul_mm function '{}' bc_inp={} bc_out={}: {:?}",
+                    entry, bc_inp, bc_out, e
+                )
+            });
         device
             .new_compute_pipeline_state_with_function(&func)
-            .unwrap_or_else(|e| panic!("Failed to create mul_mm pipeline for '{}': {:?}", entry, e))
+            .unwrap_or_else(|e| {
+                panic!(
+                    "Failed to create mul_mm pipeline for '{}' bc_inp={} bc_out={}: {:?}",
+                    entry, bc_inp, bc_out, e
+                )
+            })
     }
 
     fn mul_mm_q4k_pipeline(&self) -> &ComputePipelineState {
         self.mul_mm_q4k_pipeline.get_or_init(|| {
             println!("  Prefill mul_mm: compiling Q4_K simdgroup matmul pipeline");
-            Self::compile_mul_mm_pipeline(&self.device, "mul_mm_q4_K_f32")
+            // E2B shapes are tile-aligned; specialize bc_inp=0 bc_out=0 like llama.
+            Self::compile_mul_mm_pipeline(&self.device, "mul_mm_q4_K_f32", false, false)
         })
     }
 
     fn mul_mm_q6k_pipeline(&self) -> &ComputePipelineState {
         self.mul_mm_q6k_pipeline.get_or_init(|| {
             println!("  Prefill mul_mm: compiling Q6_K simdgroup matmul pipeline");
-            Self::compile_mul_mm_pipeline(&self.device, "mul_mm_q6_K_f32")
+            Self::compile_mul_mm_pipeline(&self.device, "mul_mm_q6_K_f32", false, false)
         })
     }
 
     fn mul_mm_q4k_f16_pipeline(&self) -> &ComputePipelineState {
         self.mul_mm_q4k_f16_pipeline.get_or_init(|| {
             println!("  Prefill mul_mm: compiling Q4_K f16-RHS simdgroup matmul pipeline");
-            Self::compile_mul_mm_pipeline(&self.device, "mul_mm_q4_K_f16")
+            Self::compile_mul_mm_pipeline(&self.device, "mul_mm_q4_K_f16", false, false)
         })
     }
 
     fn mul_mm_q6k_f16_pipeline(&self) -> &ComputePipelineState {
         self.mul_mm_q6k_f16_pipeline.get_or_init(|| {
             println!("  Prefill mul_mm: compiling Q6_K f16-RHS simdgroup matmul pipeline");
-            Self::compile_mul_mm_pipeline(&self.device, "mul_mm_q6_K_f16")
+            Self::compile_mul_mm_pipeline(&self.device, "mul_mm_q6_K_f16", false, false)
         })
     }
 
     fn mul_mm_q4k_f16_f16_pipeline(&self) -> &ComputePipelineState {
         self.mul_mm_q4k_f16_f16_pipeline.get_or_init(|| {
             println!("  Prefill mul_mm: compiling Q4_K f16→f16 simdgroup matmul pipeline");
-            Self::compile_mul_mm_pipeline(&self.device, "mul_mm_q4_K_f16_f16")
+            Self::compile_mul_mm_pipeline(&self.device, "mul_mm_q4_K_f16_f16", false, false)
         })
     }
 
     fn mul_mm_q6k_f16_f16_pipeline(&self) -> &ComputePipelineState {
         self.mul_mm_q6k_f16_f16_pipeline.get_or_init(|| {
             println!("  Prefill mul_mm: compiling Q6_K f16→f16 simdgroup matmul pipeline");
-            Self::compile_mul_mm_pipeline(&self.device, "mul_mm_q6_K_f16_f16")
+            Self::compile_mul_mm_pipeline(&self.device, "mul_mm_q6_K_f16_f16", false, false)
         })
     }
 
     fn mul_mm_f16_pipeline(&self) -> &ComputePipelineState {
         self.mul_mm_f16_pipeline.get_or_init(|| {
             println!("  Prefill mul_mm: compiling f16×f32 simdgroup matmul pipeline");
-            Self::compile_mul_mm_pipeline(&self.device, "mul_mm_f16_f32")
+            Self::compile_mul_mm_pipeline(&self.device, "mul_mm_f16_f32", false, false)
         })
     }
 

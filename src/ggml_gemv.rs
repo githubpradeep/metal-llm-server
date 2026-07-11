@@ -260,7 +260,9 @@ pub const MUL_MM_MIN_SEQ: u32 = 8;
 pub const MUL_MM_NR0: u32 = 64;
 pub const MUL_MM_NR1: u32 = 32;
 pub const MUL_MM_NSG: u32 = 4;
-pub const MUL_MM_SMEM: u64 = 8192;
+/// llama uses 6144 when bc_out=false (sa 4096 + sb 2048); 8192 when bc_out=true.
+pub const MUL_MM_SMEM: u64 = 6144;
+pub const MUL_MM_SMEM_BC_OUT: u64 = 8192;
 
 /// Prefer simdgroup matmul over matvec for prefill when seq is long enough
 /// and K is aligned (llama.cpp: ne00 >= 64 && ne11 > 8).
