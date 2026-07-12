@@ -48,12 +48,8 @@ cargo build --release
 ## Run server (GGUF)
 
 ```bash
-LLAMA_KV_CACHE_TYPE=q4_0 \
-LLAMA_CTX_SIZE=16384 \
-LLAMA_MAX_PREFILL_SEQ=4096 \
-./target/release/llama-sinks \
-  --gpu ~/Downloads/models/e2b/gemma-4-E2B-it-Q4_K_M.gguf \
-  --serve
+ATTENTION_KERNEL=auto LLAMA_KV_CACHE_TYPE=q4_0 LLAMA_CTX_SIZE=200000 LLAMA_MAX_PREFILL_SEQ=4096 \
+  ./target/release/llama-sinks --gpu ~/Downloads/models/e2b/gemma-4-E2B-it-Q4_K_M.gguf --serve
 ```
 
 Listens on `http://0.0.0.0:8080` by default (`--port N` to change).
@@ -65,6 +61,7 @@ Listens on `http://0.0.0.0:8080` by default (`--port N` to change).
 | `LLAMA_KV_CACHE_TYPE` | `f16` | KV quant: `q4_0` (recommended), `q8_0`, or omit for f16 |
 | `LLAMA_CTX_SIZE` | `16384` | KV capacity / context window (max `200000`) |
 | `LLAMA_MAX_PREFILL_SEQ` | engine default | Max tokens per prefill chunk (e.g. `4096`) |
+| `ATTENTION_KERNEL` | `specialized` | Decode attention: `auto` (hybrid), `ggml`, or `specialized` |
 | `LLAMA_QUEUE_DEPTH` | server default | Admission queue depth |
 | `LLAMA_KV_POOL_SLOTS` | server default | Concurrent KV slots |
 | `LLAMA_REQUEST_TIMEOUT_SECS` | server default | Per-request timeout |
@@ -81,8 +78,7 @@ Prefill tuning (defaults are usually fine):
 | `PREFILL_QKV_STACKED` | on | Stacked Q∥K∥V mul_mm |
 | `PREFILL_TIMING` | off | Print CPU/GPU prefill phase timings |
 | `PROFILE_ABLATE` | off | Skip `attn` / `mlp` / `ple` for ablation |
-
-Decode: `ATTENTION_KERNEL=auto|ggml|specialized` (see server startup logs).
+| `BENCH_PREFILL_EXACT` | off | Truncate bench prompts to exact target length |
 
 ## Benchmarks
 
@@ -104,9 +100,10 @@ LLAMA_KV_CACHE_TYPE=q4_0 \
   --bench-decode --bench-decode-tokens 25,200
 ```
 
-Ballpark on Apple M1 Pro (E2B Q4_K_M, Q4_0 KV, cool machine): prefill ~450 tok/s
-@ 4k; decode ~45–50 tok/s at short context (falls with long context). Numbers
-move with thermal state — warm up or take the second run.
+Ballpark on Apple M1 Pro (E2B Q4_K_M, Q4_0 KV, cool machine): prefill ~580–590
+tok/s @ 4k (matches llama.cpp FA); decode ~45–50 tok/s at short context (falls
+with long context). Numbers move with thermal state — warm up or take the second
+run.
 
 ## API example
 
