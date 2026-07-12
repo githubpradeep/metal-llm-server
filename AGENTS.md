@@ -305,10 +305,24 @@ llama-bench pp4096 FA=1: **593.9 tok/s**. After PLE f16 baseline ~533, flash Δ
 Cool exact-4096: **581–591 tok/s**, flash Δ ~1900 ms. Correctness: Hello /
 ZEBRA42 / short needle OK. Remaining gap to llama is noise/thermal.
 
-### E17. Hybrid threshold sweep (not started)
+### E24. Fused GQA shared-KV decode (2026-07-12) — correctness OK, slower
 
-Sweep auto switch threshold: 64, 128 (current), 256. Measure tok/s at 200 and
-400 tok generation; verify text quality at each threshold.
+Raised `GQA_MAX_GROUPS` 4→8 (E2B MQA), fixed per-group `shared_exp` race,
+added `attention_flash_decode_qknorm_rope_q4_0_gqa` and wired into
+`decode_fused` shared-KV path behind `ATTENTION_GQA_Q4=1`.
+
+Throughput (E2B Q4_0 KV): regression vs baseline — specialized@400
+**40.2→32.1** tok/s; auto wash/slight loss. Correctness: Hello / ZEBRA42 /
+essay OK. Root cause: groups=8 leaves 32 threads/Q-head; KV-tile savings on
+shared layers only do not offset lost parallelism vs 256-thr per-head fused.
+
+Keep opt-in off. Full-fused GQA on KV-owning layers still pending (E11).
+
+### E17. Hybrid threshold sweep (2026-07-12) — keep 128
+
+Added `ATTENTION_AUTO_THRESHOLD` (default 128). Swept 64/128/256 @ gen
+25/200/400: **128 wins everywhere**. thr=64 hurts short ctx; 256 slightly
+worse mid/long. See `benchmarks/auto_threshold_sweep.txt`.
 
 ### E18. ggml vs specialized at 400–512 tok (not started)
 

@@ -223,13 +223,23 @@ fn attention_kernel_mode() -> AttentionKernelMode {
     }
 }
 
-/// Auto mode hybrid (all layers): fused attention below 128 KV tokens, ggml MWG at/above.
+/// Auto hybrid switch: fused below this KV length, ggml MWG at/above.
+/// Override with `ATTENTION_AUTO_THRESHOLD` (default 128).
+pub fn attention_auto_threshold() -> u32 {
+    std::env::var("ATTENTION_AUTO_THRESHOLD")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or(128)
+}
+
+/// Auto mode hybrid (all layers): fused attention below threshold, ggml MWG at/above.
 pub fn attention_use_ggml_for_layer_kv(has_kv: bool, kv_seq: u32) -> bool {
     let _ = has_kv;
     match attention_kernel_mode() {
         AttentionKernelMode::Ggml => true,
         AttentionKernelMode::Specialized | AttentionKernelMode::Generic => false,
-        AttentionKernelMode::Auto => kv_seq >= 128,
+        AttentionKernelMode::Auto => kv_seq >= attention_auto_threshold(),
     }
 }
 
@@ -239,7 +249,7 @@ pub fn attention_use_ggml_for_layer(has_kv: bool) -> bool {
 
 /// KV-owning layers need a separate `encode_kv_append` when attention does not fuse
 /// the append (ggml MWG and decomposed flash paths). Hybrid `auto` crosses this at
-/// kv_seq ≥ 128 while `fused_kv_attention_enabled()` stays true for fused layers.
+/// `ATTENTION_AUTO_THRESHOLD` while `fused_kv_attention_enabled()` stays true for fused layers.
 pub fn needs_explicit_kv_append(has_kv: bool, effective_kv_seq: u32) -> bool {
     if !has_kv {
         return false;
@@ -638,6 +648,7 @@ pub struct MetalContext {
     pub attention_offset_q4_0_h128_pipeline: ComputePipelineState,
     pub attention_offset_q4_0_h512_pipeline: ComputePipelineState,
     pub attention_offset_q4_0_gqa_pipeline: ComputePipelineState,
+    pub attention_qknorm_rope_q4_0_gqa_pipeline: ComputePipelineState,
     pub attention_fused_q4_0_pipeline: ComputePipelineState,
     pub attention_fused_q4_0_h256_pipeline: ComputePipelineState,
     pub attention_fused_q4_0_h128_pipeline: ComputePipelineState,
@@ -899,6 +910,8 @@ impl MetalContext {
         let attention_offset_q4_0_h128_pipeline = get_fn("attention_flash_decode_q4_0_h128");
         let attention_offset_q4_0_h512_pipeline = get_fn("attention_flash_decode_q4_0_h512");
         let attention_offset_q4_0_gqa_pipeline = get_fn("attention_flash_decode_q4_0_gqa");
+        let attention_qknorm_rope_q4_0_gqa_pipeline =
+            get_fn("attention_flash_decode_qknorm_rope_q4_0_gqa");
         let attention_fused_q4_0_pipeline = get_fn("attention_flash_decode_fused_q4_0");
         let attention_fused_q4_0_h256_pipeline = get_fn("attention_flash_decode_fused_q4_0_h256");
         let attention_fused_q4_0_h128_pipeline = get_fn("attention_flash_decode_fused_q4_0_h128");
@@ -974,8 +987,9 @@ impl MetalContext {
                     println!("  Q4 decode attention: ggml flash_attn_ext_vec nwg=32 (ATTENTION_KERNEL=ggml)");
                 }
                 AttentionKernelMode::Auto => {
+                    let thr = attention_auto_threshold();
                     println!(
-                        "  Q4 decode attention: auto hybrid — fused <128 tok, ggml MWG ≥128 (ATTENTION_KERNEL=auto)"
+                        "  Q4 decode attention: auto hybrid — fused <{thr} tok, ggml MWG ≥{thr} (ATTENTION_KERNEL=auto, ATTENTION_AUTO_THRESHOLD)"
                     );
                 }
                 AttentionKernelMode::Specialized if attention_q4_hd_specialized() => {
@@ -998,7 +1012,7 @@ impl MetalContext {
                 Ok("1") | Ok("true") | Ok("TRUE")
             ) {
                 println!(
-                    "  GQA-aware tiled Q4_0 flash-decode attention (ATTENTION_GQA_Q4=1)"
+                    "  GQA/MQA tiled Q4_0 flash-decode (shared-KV fused qknorm+rope; ATTENTION_GQA_Q4=1)"
                 );
             }
             if packed_mlp_gate_up_enabled() {
@@ -1154,6 +1168,7 @@ impl MetalContext {
             attention_offset_q4_0_h128_pipeline,
             attention_offset_q4_0_h512_pipeline,
             attention_offset_q4_0_gqa_pipeline,
+            attention_qknorm_rope_q4_0_gqa_pipeline,
             attention_fused_q4_0_pipeline,
             attention_fused_q4_0_h256_pipeline,
             attention_fused_q4_0_h128_pipeline,
@@ -5440,6 +5455,55 @@ impl MetalContext {
         encoder.set_bytes(17, 4, &eps as *const f32 as *const _);
         let tg_size = attention_threadgroup_size(self.use_flash_attention);
         encoder.dispatch_thread_groups(MTLSize::new(num_heads as u64, 1, 1), tg_size);
+    }
+
+    /// GQA/MQA shared-KV flash decode with fused Q-RMSNorm + RoPE.
+    /// One threadgroup per KV head; opt-in via `ATTENTION_GQA_Q4=1`.
+    pub fn encode_attention_qknorm_rope_q4_0_gqa(
+        &self,
+        encoder: &metal::ComputeCommandEncoderRef,
+        q_raw_buf: &Buffer,
+        q_norm_weight: &BufferView,
+        cos_buf: &Buffer,
+        cos_offset: u64,
+        sin_buf: &Buffer,
+        sin_offset: u64,
+        k_cache_buf: &Buffer,
+        v_cache_buf: &Buffer,
+        out_buf: &Buffer,
+        num_heads: u32,
+        num_kv_heads: u32,
+        num_kv_groups: u32,
+        head_dim: u32,
+        kv_seq: u32,
+        capacity: u32,
+        scale: f32,
+        kv_start: u32,
+        groups_per_row: u32,
+        row_bytes: u32,
+        eps: f32,
+    ) {
+        encoder.set_compute_pipeline_state(&self.attention_qknorm_rope_q4_0_gqa_pipeline);
+        encoder.set_buffer(0, Some(q_raw_buf), 0);
+        encoder.set_buffer(1, Some(&q_norm_weight.buffer), q_norm_weight.offset);
+        encoder.set_buffer(2, Some(cos_buf), cos_offset);
+        encoder.set_buffer(3, Some(sin_buf), sin_offset);
+        encoder.set_buffer(4, Some(k_cache_buf), 0);
+        encoder.set_buffer(5, Some(v_cache_buf), 0);
+        encoder.set_buffer(6, Some(out_buf), 0);
+        encoder.set_bytes(7, 4, &num_heads as *const u32 as *const _);
+        encoder.set_bytes(8, 4, &num_kv_heads as *const u32 as *const _);
+        encoder.set_bytes(9, 4, &num_kv_groups as *const u32 as *const _);
+        encoder.set_bytes(10, 4, &head_dim as *const u32 as *const _);
+        encoder.set_bytes(11, 4, &kv_seq as *const u32 as *const _);
+        encoder.set_bytes(12, 4, &capacity as *const u32 as *const _);
+        encoder.set_bytes(13, 4, &scale as *const f32 as *const _);
+        encoder.set_bytes(14, 4, &kv_start as *const u32 as *const _);
+        encoder.set_bytes(15, 4, &groups_per_row as *const u32 as *const _);
+        encoder.set_bytes(16, 4, &row_bytes as *const u32 as *const _);
+        encoder.set_bytes(17, 4, &eps as *const f32 as *const _);
+        let tg_size = attention_threadgroup_size(self.use_flash_attention);
+        encoder.dispatch_thread_groups(MTLSize::new(num_kv_heads as u64, 1, 1), tg_size);
     }
 
     pub fn encode_attention_fused_qknorm_rope_q4_0(

@@ -338,29 +338,56 @@ impl Gemma4GpuModel {
             && matches!(head_dim, 128 | 256 | 512)
             && !gpu::attention_use_ggml_for_layer_kv(false, effective_kv_seq)
         {
-            self.ctx.encode_attention_qknorm_rope_q4_0(
-                encoder,
-                scratch.q,
-                &layer.q_norm_weight,
-                scratch.cos_packed,
-                rope_off,
-                scratch.sin_packed,
-                rope_off,
-                &self.k_cache[layer.kv_source_layer],
-                &self.v_cache[layer.kv_source_layer],
-                scratch.attn_out,
-                num_heads,
-                num_kv_heads,
-                num_kv_groups,
-                head_dim,
-                effective_kv_seq,
-                self.kv_capacity,
-                scale,
-                kv_start,
-                groups_per_row,
-                row_bytes,
-                eps,
-            );
+            // Shared-KV: fused qknorm+rope+GQA when enabled (avoids E11 split-path bug).
+            if gpu::attention_gqa_q4_0_enabled(num_kv_groups) {
+                self.ctx.encode_attention_qknorm_rope_q4_0_gqa(
+                    encoder,
+                    scratch.q,
+                    &layer.q_norm_weight,
+                    scratch.cos_packed,
+                    rope_off,
+                    scratch.sin_packed,
+                    rope_off,
+                    &self.k_cache[layer.kv_source_layer],
+                    &self.v_cache[layer.kv_source_layer],
+                    scratch.attn_out,
+                    num_heads,
+                    num_kv_heads,
+                    num_kv_groups,
+                    head_dim,
+                    effective_kv_seq,
+                    self.kv_capacity,
+                    scale,
+                    kv_start,
+                    groups_per_row,
+                    row_bytes,
+                    eps,
+                );
+            } else {
+                self.ctx.encode_attention_qknorm_rope_q4_0(
+                    encoder,
+                    scratch.q,
+                    &layer.q_norm_weight,
+                    scratch.cos_packed,
+                    rope_off,
+                    scratch.sin_packed,
+                    rope_off,
+                    &self.k_cache[layer.kv_source_layer],
+                    &self.v_cache[layer.kv_source_layer],
+                    scratch.attn_out,
+                    num_heads,
+                    num_kv_heads,
+                    num_kv_groups,
+                    head_dim,
+                    effective_kv_seq,
+                    self.kv_capacity,
+                    scale,
+                    kv_start,
+                    groups_per_row,
+                    row_bytes,
+                    eps,
+                );
+            }
             n += 1;
         } else {
             self.ctx.encode_rmsnorm_per_head_view(
