@@ -37,6 +37,11 @@ fn main() {
         ctx.bench_matvec();
         return;
     }
+    if args.iter().any(|a| a == "--bench-mul-mm") {
+        let ctx = gpu::MetalContext::new();
+        ctx.bench_mul_mm();
+        return;
+    }
 
     let bench_decode = args.iter().any(|a| a == "--bench-decode");
     let bench_decode_tokens: usize = args
@@ -523,13 +528,17 @@ fn bench_prefill_gemma4(
             text.push_str(filler);
         }
         text.push_str("<end_of_turn>\n<start_of_turn>model\n");
-        let token_ids: Vec<usize> = tokenizer
+        let mut token_ids: Vec<usize> = tokenizer
             .encode(text.as_str(), true)
             .expect("Failed to encode bench prefill prompt")
             .get_ids()
             .iter()
             .map(|&t| t as usize)
             .collect();
+        // Exact length for fair tile-alignment A/B (flash FC needs kv%64==0, q%8==0).
+        if std::env::var("BENCH_PREFILL_EXACT").is_ok() && token_ids.len() > target {
+            token_ids.truncate(target);
+        }
         let actual = token_ids.len();
 
         let mut kv_pool = model.create_kv_pool(1, model.kv_capacity);

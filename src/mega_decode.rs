@@ -482,13 +482,26 @@ impl MegaDecodeGraph {
         let context_proj_scale = 1.0 / (hidden as f32).sqrt();
 
         // PLE pre-pass
+        let ple_wf = match model.per_layer_model_projection_weight.format {
+            crate::gpu::weight_fmt::F16 => WeightFormat::F16,
+            crate::gpu::weight_fmt::Q4_0
+                if crate::gpu::weight_buf_is_q4(
+                    &model.per_layer_model_projection_weight,
+                    ple_total,
+                    hidden,
+                ) =>
+            {
+                WeightFormat::Q4_0
+            }
+            _ => WeightFormat::F16,
+        };
         builder.matvec(
             &model.per_layer_model_projection_weight,
             ple_total,
             hidden,
             buf::HIDDEN,
             buf::PLE_CTX,
-            WeightFormat::Q4_0,
+            ple_wf,
         );
         builder.vec_scale(ple_total, context_proj_scale, buf::PLE_CTX, buf::PLE_TMP);
         builder.rmsnorm_per_head(

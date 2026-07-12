@@ -87,7 +87,7 @@ pub const MAX_TILED_PREFILL_KV: u32 = 65536;
 /// Use tiled flash_attn_ext when q_len ≥ 20 (matches llama.cpp vec/tiled switch).
 ///
 /// Enabled for h256 (SWA) and h512 (full) once pad/mask/NSG fixes landed.
-/// Host `nsg_for_head_dim` must match Metal entry NSG (both use 4).
+/// Host `nsg_for_head_dim` must match Metal entry NSG (h256=8, h512=4).
 pub fn prefill_use_tiled_ext(q_len: u32, head_dim: u32) -> bool {
     q_len >= 20 && matches!(head_dim, 256 | 512)
 }
@@ -123,11 +123,15 @@ pub fn scratch_bytes(
         + blk_bytes(max_q_len, mask_kv)
 }
 
+/// Host NSG must match Metal entry points:
+/// - h256: NSG=8 (24 KB smem; matches llama.cpp for dk<512)
+/// - h512: NSG=4 (32 KB; NSG=8 would be 36 KB > Metal limit with Q4)
 pub fn nsg_for_head_dim(head_dim: u32) -> u32 {
-    // Must match Metal entry points (both h256 and h512 use NSG=4).
-    // h512×NSG=8 overflows 32KB (36KB); NSG=4 fits exactly at 32768.
-    let _ = head_dim;
-    4
+    if head_dim <= 256 {
+        8
+    } else {
+        4
+    }
 }
 
 pub fn smem_bytes(head_dim: u32, nsg: u32) -> u64 {
@@ -156,8 +160,8 @@ pub fn flash_attn_ext_args(
     scale: f32,
 ) -> FlashAttnExtArgs {
     let blocks = (head_dim / 32) as i32;
-    // Prefill flash_attn_ext consumes f16 Q (cast before dispatch).
-    let head_stride = head_dim as u64 * 2;
+    // Prefill flash_attn_ext consumes f32 Q (cast to half inside the kernel, like llama.cpp).
+    let head_stride = head_dim as u64 * 4;
     let kv_stride = capacity as u64 * row_bytes;
     FlashAttnExtArgs {
         ne01: q_len as i32,

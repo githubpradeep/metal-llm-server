@@ -1828,10 +1828,18 @@ const SYSTEM_FINGERPRINT: &str = "local-7f3a2c1b";
 const EMPTY_THOUGHT_PREFIX: &str = "<|channel>thought\n<channel|>";
 
 fn generation_priming_suffix(
-    _messages: &[Message],
-    _tools: Option<&[Tool]>,
-    _tool_choice: Option<&serde_json::Value>,
+    messages: &[Message],
+    tools: Option<&[Tool]>,
+    tool_choice: Option<&serde_json::Value>,
 ) -> &'static str {
+    // Only prime native tool-call markup when the client explicitly requires a
+    // tool (`tool_choice=required`). Priming on `auto` forces every turn —
+    // including "hello" — into a tool call.
+    if tool_choice_is_required(tool_choice)
+        && should_force_tool_call(messages, tools, tool_choice)
+    {
+        return NATIVE_TOOL_CALL_TRIGGER;
+    }
     // Gemma 4 E2B/E4B (our target): thinking-off generation prompt is just
     // `<|turn>model\n` with no empty thought stub. Priming
     // `<|channel>thought\n<channel|>` is for 12B/26B/31B only and makes E2B
@@ -2156,6 +2164,14 @@ fn parse_tool_calls(
         return finish_parse_tool_calls(calls, allowed_names.as_deref());
     }
 
+    // Bare continuation after a primed <|tool_call> (or model omitting the tag):
+    // call:bing_search{query:flight 6e5309 timings}
+    // call:bash{command:<|"|>ls -F<|"|>}<tool_call|>
+    parse_bare_gemma4_call_invocations(text, &mut calls);
+    if !calls.is_empty() {
+        return finish_parse_tool_calls(calls, allowed_names.as_deref());
+    }
+
     // Fenced ```tool_call blocks.
     let mut rest = text;
     while let Some(start) = rest.find("```tool_call") {
@@ -2220,6 +2236,82 @@ fn finish_parse_tool_calls(calls: Vec<ToolCall>, allowed_names: Option<&[String]
         Some(names) if !names.is_empty() => normalize_tool_calls(calls, names),
         _ => calls,
     }
+}
+
+/// Parse `call:name{...}` without a leading `<|tool_call>` tag.
+fn parse_bare_gemma4_call_invocations(text: &str, calls: &mut Vec<ToolCall>) {
+    let mut rest = text;
+    while let Some(idx) = rest.find("call:") {
+        // Avoid matching inside a longer word (e.g. "callback:").
+        if idx > 0 {
+            let prev = rest.as_bytes()[idx - 1];
+            if prev.is_ascii_alphanumeric() || prev == b'_' {
+                rest = &rest[idx + 5..];
+                continue;
+            }
+        }
+        let after = &rest[idx + 5..];
+        let Some(brace) = after.find('{') else {
+            rest = &rest[idx + 5..];
+            continue;
+        };
+        let name = after[..brace].trim();
+        if name.is_empty()
+            || !name
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+        {
+            rest = &rest[idx + 5..];
+            continue;
+        }
+        let dict_start = &after[brace..];
+        let dict = if let Some(end) = dict_start.find(NATIVE_TOOL_CALL_SUFFIX) {
+            &dict_start[..end]
+        } else if let Some(end) = find_matching_brace(dict_start) {
+            &dict_start[..=end]
+        } else {
+            dict_start.trim()
+        };
+        if let Some(args_val) = gemma4_dict_to_json_object(dict) {
+            push_unique_call(
+                calls,
+                ToolCall {
+                    id: format!("call_{}", uuid::Uuid::new_v4()),
+                    call_type: "function".to_string(),
+                    function: FunctionCall {
+                        name: name.to_string(),
+                        arguments: serde_json::to_string(&args_val).unwrap_or_default(),
+                    },
+                },
+            );
+        }
+        let advance = idx + 5 + brace + dict.len();
+        if advance == 0 || advance > rest.len() {
+            break;
+        }
+        rest = &rest[advance.min(rest.len())..];
+    }
+}
+
+fn find_matching_brace(s: &str) -> Option<usize> {
+    let bytes = s.as_bytes();
+    if bytes.first() != Some(&b'{') {
+        return None;
+    }
+    let mut depth = 0i32;
+    for (i, &b) in bytes.iter().enumerate() {
+        match b {
+            b'{' => depth += 1,
+            b'}' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(i);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
 }
 
 fn push_unique_call(calls: &mut Vec<ToolCall>, call: ToolCall) {
@@ -2895,7 +2987,10 @@ async fn chat_completions_sync(
     }
 
     let split_mode = ChannelSplitMode {
-        plain_text_as_reasoning: has_tools && awaits_tool_call(&req.messages),
+        // With tool_choice=auto the model may answer in plain text. Only treat
+        // untagged output as pre-tool reasoning when a tool is required.
+        plain_text_as_reasoning: tool_choice_is_required(req.tool_choice.as_ref())
+            && awaits_tool_call(&req.messages),
     };
     let message = assistant_message_out(text, tool_calls, split_mode);
 
@@ -3028,7 +3123,8 @@ async fn chat_completions_stream(
                 tool_choice_for_resolve.as_ref(),
             );
         let split_mode = ChannelSplitMode {
-            plain_text_as_reasoning: has_tools && awaits_tool_call(&messages_for_resolve),
+            plain_text_as_reasoning: tool_choice_is_required(tool_choice_for_resolve.as_ref())
+                && awaits_tool_call(&messages_for_resolve),
         };
         let role_chunk_data = stream_chunk_json(
             &chat_id,
@@ -3603,7 +3699,9 @@ mod tests {
         assert!(prompt.contains("be helpful"));
         assert!(prompt.contains("<|tool>declaration:read"));
         assert!(prompt.contains("<|turn>user\nhi<turn|>"));
+        // tool_choice=auto: do not prime <|tool_call> (that forces tools on "hi").
         assert!(prompt.ends_with("<|turn>model\n"));
+        assert!(!prompt.contains(EMPTY_THOUGHT_PREFIX));
     }
 
     #[test]
@@ -3660,6 +3758,7 @@ mod tests {
         assert!(prompt.contains("<|think|>"));
         assert!(prompt.contains("<|tool>declaration:bash"));
         assert!(prompt.contains("<|turn>user\nlist files<turn|>"));
+        // auto: no forced tool-call priming
         assert!(prompt.ends_with("<|turn>model\n"));
         assert!(!prompt.contains(EMPTY_THOUGHT_PREFIX));
     }
@@ -4162,6 +4261,19 @@ mod tests {
             compute_stream_deltas(text, 0, 0, false, ChannelSplitMode::default());
         assert!(new_reasoning.is_empty());
         assert_eq!(new_content, "Here is the summary.");
+    }
+
+    #[test]
+    fn parse_tool_calls_handles_bare_call_invocation() {
+        let allowed = vec!["bing_search".to_string()];
+        let text = "call:bing_search{query:flight 6e5309 timings}";
+        let calls = parse_tool_calls(text, Some(&allowed), true);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].function.name, "bing_search");
+        assert_eq!(
+            calls[0].function.arguments,
+            r#"{"query":"flight 6e5309 timings"}"#
+        );
     }
 
     #[test]
