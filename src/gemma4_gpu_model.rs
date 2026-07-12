@@ -1174,16 +1174,14 @@ impl Gemma4GpuModel {
                 post_feedforward_layernorm_weight: BufferView::from_buffer(ctx.buffer_from_slice(&post_ff_ln)),
                 post_per_layer_input_norm_weight: BufferView::from_buffer(ctx.buffer_from_slice(&post_ple_norm)),
 
-                per_layer_input_gate_weight: BufferView::from_buffer(ctx.buffer_from_f32_as_q4(
-                    &ple_gate_data,
-                    ple_dim,
-                    hidden_size,
-                )),
-                per_layer_projection_weight: BufferView::from_buffer(ctx.buffer_from_f32_as_q4(
-                    &ple_proj_data,
-                    hidden_size,
-                    ple_dim,
-                )),
+                per_layer_input_gate_weight: BufferView::from_buffer(
+                    ctx.buffer_from_f32_as_f16(&ple_gate_data),
+                )
+                .with_format(crate::gpu::weight_fmt::F16),
+                per_layer_projection_weight: BufferView::from_buffer(
+                    ctx.buffer_from_f32_as_f16(&ple_proj_data),
+                )
+                .with_format(crate::gpu::weight_fmt::F16),
                 layer_scalar,
 
                 q_norm_weight: BufferView::from_buffer(ctx.buffer_from_slice(&q_norm_data)),
@@ -1666,6 +1664,14 @@ impl Gemma4GpuModel {
                         ctx.buffer_from_bytes(g.tensor_raw(&name)),
                     )
                     .with_format(weight_fmt::Q6_K),
+                    // PLE inp_gate/proj are F32 on Q4_K_M; keep dense f16 for mul_mm_f16
+                    // (requant→Q4_0 forced the slow projection_q4_batch path — same class
+                    // of bug as per_layer_model_proj).
+                    ggml_type::BF16 | ggml_type::F16 | ggml_type::F32 => {
+                        let data = g.dequant_to_f32(&name);
+                        BufferView::from_buffer(ctx.buffer_from_f32_as_f16(&data))
+                            .with_format(weight_fmt::F16)
+                    }
                     _ => {
                         let data = g.dequant_to_f32(&name);
                         BufferView::from_buffer(ctx.buffer_from_f32_as_q4(&data, rows, cols))
@@ -2910,6 +2916,7 @@ impl Gemma4GpuModel {
     ) {
         let total_intermediate = seq_len * intermediate_size;
         let use_f16 = crate::gpu::prefill_mlp_f16_enabled()
+            && !crate::gpu::ProfileAblate::from_env().skip_cast()
             && layer.weight_format != WeightFormat::F16;
         // residual_buf unused during MLP after fused residual path; holds f16 normed.
         // up_buf unused on stacked path; holds f16 gelu for down proj.
@@ -6141,8 +6148,11 @@ impl Gemma4GpuModel {
             };
 
             if !ablate.skip_attn() {
+            if !ablate.skip_attn_qkv() {
             self.encode_parallel_prefill_attention_inputs(encoder, layer_idx, seq_len)?;
+            } // !skip_attn_qkv
 
+            if !ablate.skip_attn_flash() {
             if layer.has_kv {
                 let k_cache = kv_pool
                     .layer_k_cache(slot, layer_idx)
@@ -6320,9 +6330,11 @@ impl Gemma4GpuModel {
                     );
                 }
             }
+            } // !skip_attn_flash
 
             // Post-attn: hidden += RMSNorm(o_proj(attn)). Keep hidden as residual
             // for pre-FFN (no copy into residual_buf).
+            if !ablate.skip_attn_o() {
             let use_ext_attn = crate::gpu::prefill_flash_attn_ext_enabled()
                 && crate::gpu::prefill_use_flash_attn_ext_tiled(seq_len as u32, head_dim as u32)
                 && matches!(self.kv_cache_type, KvCacheType::Q4_0);
@@ -6354,6 +6366,7 @@ impl Gemma4GpuModel {
                 eps,
                 seq_len as u32,
             );
+            } // !skip_attn_o
             } // !skip_attn
 
             if !ablate.skip_mlp() {
@@ -6388,6 +6401,7 @@ impl Gemma4GpuModel {
                     seq_len as u32,
                 );
             } else if crate::gpu::prefill_mlp_f16_enabled()
+                && !ablate.skip_cast()
                 && crate::gpu::prefill_mul_mm_enabled()
                 && crate::ggml_gemv::should_use_mul_mm(
                     intermediate_size as u32,

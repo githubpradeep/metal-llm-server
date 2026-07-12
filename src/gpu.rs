@@ -472,6 +472,16 @@ pub fn prefill_mlp_f16_enabled() -> bool {
     )
 }
 
+/// Prefill stacked gate∥up: mul_mm writes f16 (then `gelu_mul_stacked_batch_f16`)
+/// instead of f32 + `gelu_mul_stacked_batch_f16_from_f32`. Opt-in — historically
+/// slower on M1 Pro (TG float→half store); re-check after mul_mm unroll/FC.
+pub fn prefill_mlp_gate_f16_dst_enabled() -> bool {
+    matches!(
+        std::env::var("PREFILL_MLP_GATE_F16_DST").as_deref(),
+        Ok("1") | Ok("true") | Ok("TRUE")
+    )
+}
+
 /// Prefill Q∥K∥V: one stacked mul_mm + split instead of three mul_mm dispatches (KV layers).
 /// Set PREFILL_QKV_STACKED=0 to use separate Q/K/V projections.
 pub fn prefill_qkv_stacked_enabled() -> bool {
@@ -3402,8 +3412,8 @@ impl MetalContext {
     }
 
     /// Prefill stacked gate∥up K-quant: one mul_mm [seq, 2*m] + stacked GeLU → gelu_buf.
-    /// When `x_is_f16`, mul_mm writes f32 gate∥up then GeLU writes halfs into gelu_buf
-    /// (f16 dst mul_mm was slower on M1 Pro due to TG float→half store).
+    /// When `x_is_f16`, default path: mul_mm → f32 gate∥up → GeLU→halfs.
+    /// `PREFILL_MLP_GATE_F16_DST=1`: mul_mm → f16 gate∥up → GeLU→halfs (less DRAM).
     /// `skip_gelu` is for PROFILE_ABLATE=mlp_gelu only.
     pub fn encode_prefill_gate_up_kquant_stacked(
         &self,
@@ -3422,7 +3432,26 @@ impl MetalContext {
         let use_mm = prefill_mul_mm_enabled()
             && crate::ggml_gemv::should_use_mul_mm(k, seq_len)
             && matches!(gate_up_stacked.format, weight_fmt::Q4_K | weight_fmt::Q6_K);
-        if use_mm && x_is_f16 {
+        if use_mm && x_is_f16 && prefill_mlp_gate_f16_dst_enabled() {
+            self.encode_mul_mm_kquant_f16_f16_at_view(
+                encoder,
+                gate_up_stacked,
+                x_buf,
+                gate_up_act_buf,
+                m2,
+                k,
+                seq_len,
+            );
+            if !skip_gelu {
+                self.encode_gelu_mul_stacked_batch_f16(
+                    encoder,
+                    gate_up_act_buf,
+                    gelu_buf,
+                    m,
+                    seq_len,
+                );
+            }
+        } else if use_mm && x_is_f16 {
             self.encode_mul_mm_kquant_f16_at_view(
                 encoder,
                 gate_up_stacked,
@@ -6783,11 +6812,18 @@ fn quantize_q4_0(data: &[f32], rows: usize, cols: usize) -> Vec<u8> {
     output
 }
 
-/// Skip sections for bottleneck ablation (`PROFILE_ABLATE=attn|mlp|mlp_gate|mlp_gelu|mlp_down|ple|head`).
+/// Skip sections for bottleneck ablation
+/// (`PROFILE_ABLATE=attn|attn_qkv|attn_flash|attn_o|mlp|mlp_gate|mlp_gelu|mlp_down|cast|ple|head|all`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProfileAblate {
     None,
     Attn,
+    /// Skip pre-attn RMSNorm + QKV (+ QK-norm/RoPE). Keep flash + o_proj.
+    AttnQkv,
+    /// Skip KV append + flash/causal attention.
+    AttnFlash,
+    /// Skip o_proj + post-attn RMSNorm-acc.
+    AttnO,
     Mlp,
     /// Skip pre-FF RMSNorm + gate∥up (+ GeLU). Keep down proj.
     MlpGate,
@@ -6795,20 +6831,29 @@ pub enum ProfileAblate {
     MlpGelu,
     /// Skip down proj + post-FF RMSNorm-acc.
     MlpDown,
+    /// Force f32 mul_mm path (skip f16 activation casts).
+    Cast,
     Ple,
     Head,
+    /// Skip attn+mlp+ple+head — leftover is embed/rope/CB/commit floor.
+    All,
 }
 
 impl ProfileAblate {
     pub fn from_env() -> Self {
         match std::env::var("PROFILE_ABLATE").as_deref() {
             Ok("attn") | Ok("ATTN") | Ok("attention") => ProfileAblate::Attn,
+            Ok("attn_qkv") | Ok("ATTN_QKV") | Ok("qkv") => ProfileAblate::AttnQkv,
+            Ok("attn_flash") | Ok("ATTN_FLASH") | Ok("flash") => ProfileAblate::AttnFlash,
+            Ok("attn_o") | Ok("ATTN_O") | Ok("o_proj") => ProfileAblate::AttnO,
             Ok("mlp") | Ok("MLP") => ProfileAblate::Mlp,
             Ok("mlp_gate") | Ok("MLP_GATE") | Ok("gate") => ProfileAblate::MlpGate,
             Ok("mlp_gelu") | Ok("MLP_GELU") | Ok("gelu") => ProfileAblate::MlpGelu,
             Ok("mlp_down") | Ok("MLP_DOWN") | Ok("down") => ProfileAblate::MlpDown,
+            Ok("cast") | Ok("CAST") | Ok("f16_cast") => ProfileAblate::Cast,
             Ok("ple") | Ok("PLE") => ProfileAblate::Ple,
             Ok("head") | Ok("HEAD") | Ok("lm_head") => ProfileAblate::Head,
+            Ok("all") | Ok("ALL") | Ok("layers") => ProfileAblate::All,
             _ => ProfileAblate::None,
         }
     }
@@ -6818,15 +6863,39 @@ impl ProfileAblate {
     }
 
     pub fn skip_attn(&self) -> bool {
-        matches!(self, ProfileAblate::Attn)
+        matches!(self, ProfileAblate::Attn | ProfileAblate::All)
+    }
+
+    pub fn skip_attn_qkv(&self) -> bool {
+        matches!(
+            self,
+            ProfileAblate::Attn | ProfileAblate::AttnQkv | ProfileAblate::All
+        )
+    }
+
+    pub fn skip_attn_flash(&self) -> bool {
+        matches!(
+            self,
+            ProfileAblate::Attn | ProfileAblate::AttnFlash | ProfileAblate::All
+        )
+    }
+
+    pub fn skip_attn_o(&self) -> bool {
+        matches!(
+            self,
+            ProfileAblate::Attn | ProfileAblate::AttnO | ProfileAblate::All
+        )
     }
 
     pub fn skip_mlp(&self) -> bool {
-        matches!(self, ProfileAblate::Mlp)
+        matches!(self, ProfileAblate::Mlp | ProfileAblate::All)
     }
 
     pub fn skip_mlp_gate(&self) -> bool {
-        matches!(self, ProfileAblate::Mlp | ProfileAblate::MlpGate)
+        matches!(
+            self,
+            ProfileAblate::Mlp | ProfileAblate::MlpGate | ProfileAblate::All
+        )
     }
 
     pub fn skip_mlp_gelu(&self) -> bool {
@@ -6834,15 +6903,23 @@ impl ProfileAblate {
     }
 
     pub fn skip_mlp_down(&self) -> bool {
-        matches!(self, ProfileAblate::Mlp | ProfileAblate::MlpDown)
+        matches!(
+            self,
+            ProfileAblate::Mlp | ProfileAblate::MlpDown | ProfileAblate::All
+        )
+    }
+
+    /// Skip f16 activation casts (use f32 mul_mm).
+    pub fn skip_cast(&self) -> bool {
+        matches!(self, ProfileAblate::Cast)
     }
 
     pub fn skip_ple(&self) -> bool {
-        matches!(self, ProfileAblate::Ple)
+        matches!(self, ProfileAblate::Ple | ProfileAblate::All)
     }
 
     pub fn skip_head(&self) -> bool {
-        matches!(self, ProfileAblate::Head)
+        matches!(self, ProfileAblate::Head | ProfileAblate::All)
     }
 
     pub fn log_once(&self) {
