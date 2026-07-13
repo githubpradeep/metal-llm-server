@@ -1615,19 +1615,19 @@ impl Gemma4GpuModel {
             use crate::gpu::weight_fmt;
             match g.tensor_type("token_embd.weight") {
                 ggml_type::Q4_0 => BufferView::from_buffer(
-                    ctx.buffer_from_bytes(g.tensor_raw("token_embd.weight")),
+                    ctx.buffer_from_slice_no_copy(g.tensor_raw("token_embd.weight")),
                 )
                 .with_format(weight_fmt::Q4_0),
                 ggml_type::Q4_K => BufferView::from_buffer(
-                    ctx.buffer_from_bytes(g.tensor_raw("token_embd.weight")),
+                    ctx.buffer_from_slice_no_copy(g.tensor_raw("token_embd.weight")),
                 )
                 .with_format(weight_fmt::Q4_K),
                 ggml_type::Q6_K => BufferView::from_buffer(
-                    ctx.buffer_from_bytes(g.tensor_raw("token_embd.weight")),
+                    ctx.buffer_from_slice_no_copy(g.tensor_raw("token_embd.weight")),
                 )
                 .with_format(weight_fmt::Q6_K),
                 ggml_type::F16 | ggml_type::BF16 => BufferView::from_buffer(
-                    ctx.buffer_from_bytes(g.tensor_raw("token_embd.weight")),
+                    ctx.buffer_from_slice_no_copy(g.tensor_raw("token_embd.weight")),
                 )
                 .with_format(weight_fmt::F16),
                 _ => BufferView::from_buffer(ctx.buffer_from_f32_as_q4(
@@ -1670,17 +1670,21 @@ impl Gemma4GpuModel {
             use crate::gpu::weight_fmt;
             match g.tensor_type("per_layer_model_proj.weight") {
                 ggml_type::Q4_K => BufferView::from_buffer(
-                    ctx.buffer_from_bytes(g.tensor_raw("per_layer_model_proj.weight")),
+                    ctx.buffer_from_slice_no_copy(g.tensor_raw("per_layer_model_proj.weight")),
                 )
                 .with_format(weight_fmt::Q4_K),
                 ggml_type::Q6_K => BufferView::from_buffer(
-                    ctx.buffer_from_bytes(g.tensor_raw("per_layer_model_proj.weight")),
+                    ctx.buffer_from_slice_no_copy(g.tensor_raw("per_layer_model_proj.weight")),
                 )
                 .with_format(weight_fmt::Q6_K),
-                ggml_type::BF16 | ggml_type::F16 | ggml_type::F32 => {
-                    BufferView::from_buffer(ctx.buffer_from_f32_as_f16(&per_layer_model_proj_f32))
-                        .with_format(weight_fmt::F16)
-                }
+                ggml_type::BF16 | ggml_type::F16 => BufferView::from_buffer(
+                    ctx.buffer_from_slice_no_copy(g.tensor_raw("per_layer_model_proj.weight")),
+                )
+                .with_format(weight_fmt::F16),
+                ggml_type::F32 => BufferView::from_buffer(
+                    ctx.buffer_from_f32_as_f16(&per_layer_model_proj_f32),
+                )
+                .with_format(weight_fmt::F16),
                 _ => BufferView::from_buffer(ctx.buffer_from_f32_as_q4(
                     &per_layer_model_proj_f32,
                     ple_total_dim,
@@ -1727,7 +1731,7 @@ impl Gemma4GpuModel {
                 use crate::gpu::weight_fmt;
                 match g.tensor_type(&name) {
                     ggml_type::Q4_K => BufferView::from_buffer(
-                        ctx.buffer_from_bytes(g.tensor_raw(&name)),
+                        ctx.buffer_from_slice_no_copy(g.tensor_raw(&name)),
                     )
                     .with_format(weight_fmt::Q4_K),
                     ggml_type::Q6_K if q6k_to_q4 => {
@@ -1735,13 +1739,18 @@ impl Gemma4GpuModel {
                         BufferView::from_buffer(ctx.buffer_from_f32_as_q4(&data, rows, cols))
                     }
                     ggml_type::Q6_K => BufferView::from_buffer(
-                        ctx.buffer_from_bytes(g.tensor_raw(&name)),
+                        ctx.buffer_from_slice_no_copy(g.tensor_raw(&name)),
                     )
                     .with_format(weight_fmt::Q6_K),
                     // PLE inp_gate/proj are F32 on Q4_K_M; keep dense f16 for mul_mm_f16
                     // (requant→Q4_0 forced the slow projection_q4_batch path — same class
-                    // of bug as per_layer_model_proj).
-                    ggml_type::BF16 | ggml_type::F16 | ggml_type::F32 => {
+                    // of bug as per_layer_model_proj). Native F16/BF16 upload the raw
+                    // blocks zero-copy; F32 is dequantized to f16 (one tensor, small).
+                    ggml_type::BF16 | ggml_type::F16 => BufferView::from_buffer(
+                        ctx.buffer_from_slice_no_copy(g.tensor_raw(&name)),
+                    )
+                    .with_format(weight_fmt::F16),
+                    ggml_type::F32 => {
                         let data = g.dequant_to_f32(&name);
                         BufferView::from_buffer(ctx.buffer_from_f32_as_f16(&data))
                             .with_format(weight_fmt::F16)
