@@ -464,7 +464,9 @@ impl PrefillScratch {
     }
 }
 
-/// CPU-resident embedding tables. Cache load mmap's the file (instant); first safetensors load owns bytes.
+/// CPU-resident embedding tables. Cache load mmap's the file (instant); first
+/// safetensors load owns bytes; direct GGUF load decodes rows on demand from the
+/// native GGUF blocks (no up-front dequant/requant of the multi-GB tables).
 struct EmbedTables {
     mmap: Option<Mmap>,
     embed_offset: usize,
@@ -475,6 +477,10 @@ struct EmbedTables {
     vocab_size: usize,
     owned_embed: Option<Vec<u8>>,
     owned_ple: Option<Vec<u8>>,
+    // Native GGUF backing (direct GGUF load): decode rows on demand.
+    gguf: Option<std::sync::Arc<crate::gguf::Gguf>>,
+    embed_native: Option<(u32, usize, usize)>, // (ggml_type, row_stride, cols=hidden)
+    ple_native: Option<(u32, usize, usize)>,    // (ggml_type, row_stride, cols=ple_total)
 }
 
 impl EmbedTables {
@@ -497,6 +503,9 @@ impl EmbedTables {
             vocab_size,
             owned_embed: None,
             owned_ple: None,
+            gguf: None,
+            embed_native: None,
+            ple_native: None,
         }
     }
 
@@ -513,6 +522,50 @@ impl EmbedTables {
             vocab_size,
             owned_embed,
             owned_ple,
+            gguf: None,
+            embed_native: None,
+            ple_native: None,
+        }
+    }
+
+    /// Direct GGUF load: keep the GGUF mmap alive and decode embedding/PLE rows
+    /// on demand from the native tensor blocks. Avoids the multi-GB CPU
+    /// dequant→bf16→Q4_0 conversion entirely. `embed_cols == hidden_size`,
+    /// `ple_total == num_layers * ple_dim`, and the contiguous dim (ne0) of each
+    /// tensor is the row length.
+    fn from_gguf(
+        gguf: std::sync::Arc<crate::gguf::Gguf>,
+        vocab_size: usize,
+        embed_cols: usize,
+        ple_total: usize,
+    ) -> Self {
+        let (embed_type, embed_row_stride, embed_actual) = {
+            let e = gguf
+                .tensor("token_embd.weight")
+                .expect("token_embd.weight missing");
+            (e.ggml_type, e.byte_len() / vocab_size, e.num_elements() / vocab_size)
+        };
+        assert_eq!(embed_actual, embed_cols, "token_embd row length mismatch");
+        let (ple_type, ple_row_stride, ple_actual) = {
+            let p = gguf
+                .tensor("per_layer_token_embd.weight")
+                .expect("per_layer_token_embd.weight missing");
+            (p.ggml_type, p.byte_len() / vocab_size, p.num_elements() / vocab_size)
+        };
+        assert_eq!(ple_actual, ple_total, "per_layer_token_embd row length mismatch");
+        Self {
+            mmap: None,
+            embed_offset: 0,
+            embed_byte_len: 0,
+            ple_offset: 0,
+            ple_byte_len: 0,
+            ple_cols: ple_total,
+            vocab_size,
+            owned_embed: None,
+            owned_ple: None,
+            gguf: Some(gguf),
+            embed_native: Some((embed_type, embed_row_stride, embed_cols)),
+            ple_native: Some((ple_type, ple_row_stride, ple_total)),
         }
     }
 
@@ -627,31 +680,43 @@ impl EmbedTables {
 
     fn decode_embed_into(&self, token_id: usize, hidden_size: usize, out: &mut [f32]) {
         let scale = (hidden_size as f32).sqrt();
-        let bf16_row_bytes = hidden_size * 2;
-        if self.embed_byte_len as u64 > self.vocab_size as u64 * bf16_row_bytes as u64 / 2 {
-            // bf16 format
-            let byte_start = token_id * bf16_row_bytes;
-            let bytes = &self.embed_bytes()[byte_start..byte_start + bf16_row_bytes];
-            for (i, chunk) in bytes.chunks_exact(2).enumerate() {
-                out[i] = crate::gpu::bf16_to_f32(u16::from_le_bytes([chunk[0], chunk[1]])) * scale;
+        if let Some((gt, stride, cols)) = self.embed_native {
+            let bytes = self
+                .gguf
+                .as_ref()
+                .unwrap()
+                .tensor_row_bytes("token_embd.weight", token_id, stride);
+            crate::gguf::dequant_row_to_f32(gt, bytes, cols, out);
+            for v in out.iter_mut() {
+                *v *= scale;
             }
         } else {
-            // Q4_0 format
-            let blocks = hidden_size / 32;
-            let q4_row_bytes = blocks * 18;
-            let row_start = token_id * q4_row_bytes;
-            let bytes = &self.embed_bytes()[row_start..row_start + q4_row_bytes];
-            for g in 0..blocks {
-                let off = g * 18;
-                let raw_d = u16::from_le_bytes([bytes[off], bytes[off + 1]]);
-                let d = crate::gpu::f16_to_f32(raw_d);
-                let out_off = g * 32;
-                for i in 0..16 {
-                    let packed = bytes[off + 2 + i];
-                    let q0 = packed & 0x0F;
-                    let q1 = packed >> 4;
-                    out[out_off + i] = d * ((q0 as i32 - 8) as f32) * scale;
-                    out[out_off + i + 16] = d * ((q1 as i32 - 8) as f32) * scale;
+            let bf16_row_bytes = hidden_size * 2;
+            if self.embed_byte_len as u64 > self.vocab_size as u64 * bf16_row_bytes as u64 / 2 {
+                // bf16 format
+                let byte_start = token_id * bf16_row_bytes;
+                let bytes = &self.embed_bytes()[byte_start..byte_start + bf16_row_bytes];
+                for (i, chunk) in bytes.chunks_exact(2).enumerate() {
+                    out[i] = crate::gpu::bf16_to_f32(u16::from_le_bytes([chunk[0], chunk[1]])) * scale;
+                }
+            } else {
+                // Q4_0 format
+                let blocks = hidden_size / 32;
+                let q4_row_bytes = blocks * 18;
+                let row_start = token_id * q4_row_bytes;
+                let bytes = &self.embed_bytes()[row_start..row_start + q4_row_bytes];
+                for g in 0..blocks {
+                    let off = g * 18;
+                    let raw_d = u16::from_le_bytes([bytes[off], bytes[off + 1]]);
+                    let d = crate::gpu::f16_to_f32(raw_d);
+                    let out_off = g * 32;
+                    for i in 0..16 {
+                        let packed = bytes[off + 2 + i];
+                        let q0 = packed & 0x0F;
+                        let q1 = packed >> 4;
+                        out[out_off + i] = d * ((q0 as i32 - 8) as f32) * scale;
+                        out[out_off + i + 16] = d * ((q1 as i32 - 8) as f32) * scale;
+                    }
                 }
             }
         }
@@ -665,7 +730,17 @@ impl EmbedTables {
         out: &mut [f32],
     ) {
         let scale = (ple_dim as f32).sqrt();
-        if self.ple_byte_len as u64 > self.vocab_size as u64 * ple_total_dim as u64 {
+        if let Some((gt, stride, cols)) = self.ple_native {
+            let bytes = self
+                .gguf
+                .as_ref()
+                .unwrap()
+                .tensor_row_bytes("per_layer_token_embd.weight", token_id, stride);
+            crate::gguf::dequant_row_to_f32(gt, bytes, cols, out);
+            for v in out.iter_mut() {
+                *v *= scale;
+            }
+        } else if self.ple_byte_len as u64 > self.vocab_size as u64 * ple_total_dim as u64 {
             // Old format: bf16 (detected by large byte length)
             let cols = self.ple_cols;
             let byte_start = token_id * cols * 2;
@@ -1486,13 +1561,11 @@ impl Gemma4GpuModel {
     pub fn load_from_gguf(gguf_path: &str) -> Self {
         let load_start = Instant::now();
 
+        // Open GGUF for fast metadata parsing (header only) and load weights
+        // directly into GPU buffers (no intermediate qcache file). The Gguf is
+        // kept alive (Arc) so EmbedTables can decode lookup rows on demand.
         let gguf_path = std::path::Path::new(gguf_path);
-        let gguf_dir = gguf_path.parent().unwrap_or(std::path::Path::new("."));
-        let cache_path = gguf_dir.join("model.q4cache");
-        let embed_cache_path = gguf_dir.join("model.embed.cache");
-
-        // Open GGUF for fast metadata parsing (header only).
-        let g = crate::gguf::Gguf::open(gguf_path);
+        let g = std::sync::Arc::new(crate::gguf::Gguf::open(gguf_path));
         let arch = g.get_str("general.architecture").unwrap_or("");
         assert_eq!(
             arch, "gemma4",
@@ -1501,24 +1574,6 @@ impl Gemma4GpuModel {
         );
 
         let config = gemma4_config_from_gguf(&g);
-
-        // Check for existing Q4 cache (instant load).
-        if embed_cache_path.exists() {
-            match Self::read_weights_magic(&cache_path) {
-                Some(m) if m == *b"GQ4H" => {
-                    println!("  Found Q4 cache, loading from cache (instant)...");
-                    return Self::load_gguf_from_cache(config, &embed_cache_path, &cache_path, load_start);
-                }
-                Some(m) if m == *b"GQ4G" => {
-                    // GQ4G from an earlier GGUF load lacks per-tensor format tags.
-                    // Delete and re-generate as GQ4H.
-                    println!("  Stale GGUF Q4 cache (GQ4G without format tags). Re-generating...");
-                    let _ = std::fs::remove_file(&embed_cache_path);
-                    let _ = std::fs::remove_file(&cache_path);
-                }
-                _ => {}
-            }
-        }
 
         let ctx = MetalContext::new();
 
@@ -1549,37 +1604,56 @@ impl Gemma4GpuModel {
             config.global_head_dim,
         );
 
-        // --- Embeddings ---
-        println!("  Loading embeddings (dequantizing K-quant tables)...");
-        let embed_f32 = g.dequant_to_f32("token_embd.weight");
-        assert_eq!(
-            embed_f32.len(),
-            vocab_size * hidden_size,
-            "token_embd size mismatch"
-        );
+        // --- Embeddings (native GGUF: decode rows on demand, no CPU conversion) ---
+        println!("  Loading embeddings directly from GGUF blocks (no conversion)...");
         // lm_head is tied to the input embeddings (no separate output.weight tensor).
-        let lm_head_buf =
-            BufferView::from_buffer(ctx.buffer_from_f32_as_q4(&embed_f32, vocab_size, hidden_size));
+        // Upload the native GGUF token_embd blocks directly (Q4_K/Q6_K/F16/...) so the
+        // tied logits matrix needs no CPU dequant/requant; logits paths dispatch by
+        // format. Falls back to Q4_0 requant only for unusual embedding types.
+        let lm_head_buf = {
+            use crate::gguf::ggml_type;
+            use crate::gpu::weight_fmt;
+            match g.tensor_type("token_embd.weight") {
+                ggml_type::Q4_0 => BufferView::from_buffer(
+                    ctx.buffer_from_bytes(g.tensor_raw("token_embd.weight")),
+                )
+                .with_format(weight_fmt::Q4_0),
+                ggml_type::Q4_K => BufferView::from_buffer(
+                    ctx.buffer_from_bytes(g.tensor_raw("token_embd.weight")),
+                )
+                .with_format(weight_fmt::Q4_K),
+                ggml_type::Q6_K => BufferView::from_buffer(
+                    ctx.buffer_from_bytes(g.tensor_raw("token_embd.weight")),
+                )
+                .with_format(weight_fmt::Q6_K),
+                ggml_type::F16 | ggml_type::BF16 => BufferView::from_buffer(
+                    ctx.buffer_from_bytes(g.tensor_raw("token_embd.weight")),
+                )
+                .with_format(weight_fmt::F16),
+                _ => BufferView::from_buffer(ctx.buffer_from_f32_as_q4(
+                    &g.dequant_to_f32("token_embd.weight"),
+                    vocab_size,
+                    hidden_size,
+                )),
+            }
+        };
         println!(
-            "    lm_head (tied, Q4_0 on GPU): {:.1} MB",
+            "    lm_head (tied, native {} on GPU): {:.1} MB",
+            match lm_head_buf.format {
+                crate::gpu::weight_fmt::Q4_K => "Q4_K",
+                crate::gpu::weight_fmt::Q6_K => "Q6_K",
+                crate::gpu::weight_fmt::F16 => "F16",
+                _ => "Q4_0",
+            },
             lm_head_buf.length as f64 / 1024.0 / 1024.0
         );
-        // bf16 image for the CPU embedding lookup table (re-quantized to Q4_0 inside).
-        let embed_bf16 = f32_to_bf16_bytes(&embed_f32);
-        drop(embed_f32);
-        // PLE embedding table is multi-GB; stream straight to bf16 bytes.
-        let ple_bf16 = g.dequant_to_bf16_bytes("per_layer_token_embd.weight");
-        assert_eq!(
-            ple_bf16.len(),
-            vocab_size * ple_total_dim * 2,
-            "per_layer_token_embd size mismatch"
-        );
-        let embed_tables = EmbedTables::from_owned(
-            embed_bf16,
-            ple_bf16,
+        // Embedding + PLE lookup tables are decoded directly from native GGUF blocks
+        // (Q4_K / F16 / ...) on demand, eliminating the multi-GB CPU conversion.
+        let embed_tables = EmbedTables::from_gguf(
+            std::sync::Arc::clone(&g),
             vocab_size,
-            ple_total_dim,
             hidden_size,
+            ple_total_dim,
         );
 
         // --- Shared norms / projections ---
@@ -1759,152 +1833,15 @@ impl Gemma4GpuModel {
             layers,
         );
 
-        // Save cache for future loads
-        println!("  Saving Q4 cache for fast future loads...");
-        model.save_gguf_cache(&cache_path);
+        println!(
+            "  Loaded GGUF directly into GPU in {:.2}s (no qcache).",
+            load_start.elapsed().as_secs_f64()
+        );
 
         model
     }
 
-    /// Fast path: load GGUF model from previously-saved Q4 cache files.
-    fn load_gguf_from_cache(
-        config: Gemma4TextConfig,
-        embed_cache_path: &Path,
-        weights_cache_path: &Path,
-        load_start: Instant,
-    ) -> Self {
-        let ctx = MetalContext::new();
-        let device = &ctx.device;
 
-        // --- Embed tables: mmap from embed cache ---
-        let embed_file = fs::File::open(embed_cache_path).expect("Failed to open embed cache");
-        let embed_mmap =
-            unsafe { Mmap::map(&embed_file).expect("Failed to mmap embed cache") };
-        assert_eq!(&embed_mmap[0..4], b"GQ4E", "Invalid embed cache magic");
-        let mut eoff = 4;
-        let embed_len = Self::read_u64_at(&embed_mmap, &mut eoff);
-        let embed_offset = eoff;
-        eoff += embed_len as usize;
-        println!(
-            "    embed_tokens: {:.1} MB (mmap)",
-            embed_len as f64 / 1024.0 / 1024.0
-        );
-        let ple_len = Self::read_u64_at(&embed_mmap, &mut eoff);
-        let ple_offset = eoff;
-        println!(
-            "    embed_tokens_per_layer: {:.1} MB (mmap)",
-            ple_len as f64 / 1024.0 / 1024.0
-        );
-        let ple_cols = config.num_hidden_layers * config.hidden_size_per_layer_input;
-        let embed_tables = EmbedTables::from_mmap(
-            embed_mmap,
-            embed_offset,
-            embed_len as usize,
-            ple_offset,
-            ple_len as usize,
-            ple_cols,
-            config.vocab_size,
-        );
-
-        // --- Weights: read directly into a single GPU buffer (aligned layout) ---
-        let mut weights_file =
-            fs::File::open(weights_cache_path).expect("Failed to open weights cache");
-        let file_len = weights_file
-            .metadata()
-            .expect("weights metadata")
-            .len();
-        let weights_bytes = file_len.saturating_sub(4) as u64;
-
-        use std::io::Read;
-        let mut magic = [0u8; 4];
-        weights_file
-            .read_exact(&mut magic)
-            .expect("read weights cache magic");
-        let has_tensor_formats = magic == *b"GQ4H";
-        assert!(
-            magic == *b"GQ4G" || magic == *b"GQ4H",
-            "Invalid weights cache magic ({:?}), expected GQ4G or GQ4H",
-            magic
-        );
-        let copy_start = Instant::now();
-        let weights_buf =
-            MetalContext::buffer_read_from_file(&device, &mut weights_file, 4, weights_bytes);
-        println!(
-            "  Copying weights to GPU: {:.1} MB ({:.2}s)...",
-            weights_bytes as f64 / 1024.0 / 1024.0,
-            copy_start.elapsed().as_secs_f64()
-        );
-        let section = unsafe {
-            std::slice::from_raw_parts(weights_buf.contents() as *const u8, weights_bytes as usize)
-        };
-        let mut section_offset = 0;
-        let (mut lm_head_buf, mut per_layer_model_projection_weight,
-             mut final_norm_weight, mut per_layer_projection_norm_weight,
-             mut layers) =
-            Self::load_weight_sections(
-                section,
-                &mut section_offset,
-                &device,
-                config.num_hidden_layers,
-                config.hidden_size,
-                true,
-                Some(&weights_buf),
-                0,
-            );
-
-        // Restore per-tensor format tags from the format table
-        // (appended after all layer data by save_gguf_cache).
-        if has_tensor_formats {
-            let num_tensors = 4 + 16 * config.num_hidden_layers;
-            let fmt_bytes = &section[section_offset..section_offset + num_tensors];
-            let mut fi = 0;
-
-            let mut global_views = [
-                &mut lm_head_buf,
-                &mut per_layer_model_projection_weight,
-                &mut final_norm_weight,
-                &mut per_layer_projection_norm_weight,
-            ];
-            for v in &mut *global_views.as_mut_slice() {
-                v.format = fmt_bytes[fi];
-                fi += 1;
-            }
-
-            for layer in &mut layers {
-                for v in [
-                    &mut layer.q_proj, &mut layer.k_proj, &mut layer.v_proj,
-                    &mut layer.o_proj, &mut layer.gate_proj, &mut layer.up_proj,
-                    &mut layer.down_proj,
-                    &mut layer.input_layernorm_weight,
-                    &mut layer.post_attention_layernorm_weight,
-                    &mut layer.pre_feedforward_layernorm_weight,
-                    &mut layer.post_feedforward_layernorm_weight,
-                    &mut layer.post_per_layer_input_norm_weight,
-                    &mut layer.per_layer_input_gate_weight,
-                    &mut layer.per_layer_projection_weight,
-                    &mut layer.q_norm_weight, &mut layer.k_norm_weight,
-                ] {
-                    v.format = fmt_bytes[fi];
-                    fi += 1;
-                }
-            }
-            debug_assert_eq!(fi, num_tensors);
-        }
-
-        Self::finish_cache_load(
-            ctx,
-            config,
-            embed_tables,
-            None,
-            lm_head_buf,
-            per_layer_model_projection_weight,
-            final_norm_weight,
-            per_layer_projection_norm_weight,
-            layers,
-            load_start,
-            "GGUF Q4 cache",
-        )
-    }
 
     pub(crate) fn decode_rope_byte_offset(&self, layer_idx: usize) -> u64 {
         (layer_idx * self.rope_max_head_dim * std::mem::size_of::<f32>()) as u64
@@ -1920,95 +1857,7 @@ impl Gemma4GpuModel {
         self.save_weights_cache(path);
     }
 
-    /// Save GGUF cache with per-tensor format tags (magic `GQ4H`).
-    /// The format byte for each tensor is appended after all layer data
-    /// so that the existing `load_weight_sections` can read the tensor
-    /// payloads unchanged; the format table is then read separately.
-    fn save_gguf_cache(&self, path: &Path) {
-        let embed_path = path
-            .parent()
-            .expect("cache path has no parent")
-            .join("model.embed.cache");
-        self.save_embed_cache(&embed_path);
 
-        use std::io::{Seek, Write};
-        let mut file = fs::File::create(path).expect("Failed to create weights cache");
-        file.write_all(b"GQ4H").unwrap();
-
-        let save_view = |f: &mut fs::File, view: &BufferView| {
-            f.write_all(&view.length.to_le_bytes()).unwrap();
-            let pos = f.stream_position().expect("stream position") as usize;
-            let pad_before = weight_section_pad(pos - WEIGHT_CACHE_MAGIC_LEN);
-            if pad_before > 0 {
-                f.write_all(&vec![0u8; pad_before]).unwrap();
-            }
-            f.write_all(view.as_bytes()).unwrap();
-            let pos = f.stream_position().expect("stream position") as usize;
-            let pad_after = weight_section_pad(pos - WEIGHT_CACHE_MAGIC_LEN);
-            if pad_after > 0 {
-                f.write_all(&vec![0u8; pad_after]).unwrap();
-            }
-        };
-
-        let collect_formats = |views: &[&BufferView]| -> Vec<u8> {
-            views.iter().map(|v| v.format).collect()
-        };
-
-        // Global tensors (4)
-        let mut formats = Vec::new();
-        let global_views = [
-            &self.lm_head_buf,
-            &self.per_layer_model_projection_weight,
-            &self.final_norm_weight,
-            &self.per_layer_projection_norm_weight,
-        ];
-        for &v in &global_views {
-            save_view(&mut file, v);
-        }
-        formats.extend(collect_formats(&global_views));
-
-        // Per-layer weights
-        let num_layers = self.layers.len() as u32;
-        file.write_all(&num_layers.to_le_bytes()).unwrap();
-        pad_weights_file_to_section_align(&mut file);
-        for layer in &self.layers {
-            let layer_views = [
-                &layer.q_proj, &layer.k_proj, &layer.v_proj,
-                &layer.o_proj, &layer.gate_proj, &layer.up_proj,
-                &layer.down_proj,
-                &layer.input_layernorm_weight,
-                &layer.post_attention_layernorm_weight,
-                &layer.pre_feedforward_layernorm_weight,
-                &layer.post_feedforward_layernorm_weight,
-                &layer.post_per_layer_input_norm_weight,
-                &layer.per_layer_input_gate_weight,
-                &layer.per_layer_projection_weight,
-                &layer.q_norm_weight, &layer.k_norm_weight,
-            ];
-            for &v in &layer_views {
-                save_view(&mut file, v);
-            }
-            formats.extend(collect_formats(&layer_views));
-
-            file.write_all(&layer.layer_scalar.to_le_bytes()).unwrap();
-            file.write_all(&(layer.is_full_attention as u8).to_le_bytes()).unwrap();
-            file.write_all(&(layer.has_kv as u8).to_le_bytes()).unwrap();
-            file.write_all(&[layer.weight_format.to_u8()]).unwrap();
-            file.write_all(&(layer.kv_source_layer as u32).to_le_bytes()).unwrap();
-            file.write_all(&(layer.head_dim as u32).to_le_bytes()).unwrap();
-            file.write_all(&(layer.q_out_dim as u32).to_le_bytes()).unwrap();
-            file.write_all(&(layer.kv_out_dim as u32).to_le_bytes()).unwrap();
-            pad_weights_file_to_section_align(&mut file);
-        }
-
-        // Append format table (all format bytes, in tensor order)
-        file.write_all(&formats).unwrap();
-
-        println!(
-            "  Weights cache saved: {:.1} MB",
-            file.metadata().map(|m| m.len()).unwrap_or(0) as f64 / 1024.0 / 1024.0
-        );
-    }
 
     fn save_embed_cache(&self, path: &Path) {
         use std::io::{Seek, Write};
@@ -4586,8 +4435,9 @@ impl Gemma4GpuModel {
             hidden_size as u32,
             eps,
         );
-        // Logits via tied embeddings (Q4 lm_head): logits = lm_head @ normed
-        self.ctx.encode_matvec_q4_view(
+        // Logits via tied embeddings (native lm_head): logits = lm_head @ normed.
+        // Format-aware dispatch handles Q4_0 / Q4_K / Q6_K / F16 lm_head.
+        self.ctx.encode_matvec_auto_view(
             encoder,
             &self.lm_head_buf,
             &self.normed_buf,
@@ -6514,7 +6364,7 @@ impl Gemma4GpuModel {
                 seq_len as u32,
             );
             let last_offsets = self.prefill_row_offsets(seq_len - 1);
-            self.ctx.encode_matvec_q4_at_view(
+            self.ctx.encode_matvec_auto_at_view(
                 encoder,
                 &self.lm_head_buf,
                 &self.prefill_scratch.normed_buf,
@@ -7592,7 +7442,7 @@ impl Gemma4GpuModel {
             for batch_idx in 0..batch_size {
                 let offsets = self.decode_batch_row_offsets(batch_idx);
                 let logits_offset = Self::f32_byte_offset(batch_idx * vocab_size);
-                self.ctx.encode_matvec_q4_at_view(
+                self.ctx.encode_matvec_auto_at_view(
                     encoder,
                     &self.lm_head_buf,
                     &self.decode_batch_scratch.normed_buf,
@@ -7882,7 +7732,7 @@ impl Gemma4GpuModel {
                 self.prefill_row_offsets(segment.row_start + segment.token_count - 1);
             let cmd = self.ctx.queue.new_command_buffer();
             let encoder = cmd.new_compute_command_encoder();
-            self.ctx.encode_matvec_q4_at_view(
+            self.ctx.encode_matvec_auto_at_view(
                 encoder,
                 &self.lm_head_buf,
                 &self.prefill_scratch.normed_buf,

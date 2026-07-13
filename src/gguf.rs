@@ -108,7 +108,7 @@ impl TensorInfo {
             self.dims[1..].iter().product::<u64>() as usize
         }
     }
-    fn byte_len(&self) -> usize {
+    pub fn byte_len(&self) -> usize {
         let (epb, bpb) = block_spec(self.ggml_type);
         let n = self.num_elements();
         assert!(n % epb == 0, "tensor {} elems {} not divisible by block {}", self.name, n, epb);
@@ -275,6 +275,14 @@ impl Gguf {
         self.tensor_bytes(info)
     }
 
+    /// Raw byte slice for a single row (`row` of `n_rows`) of a tensor, for
+    /// decoding one lookup-table row on demand (no full-tensor dequant).
+    pub fn tensor_row_bytes(&self, name: &str, row: usize, row_stride: usize) -> &[u8] {
+        let info = self.tensor(name).unwrap_or_else(|| panic!("tensor not found: {}", name));
+        let start = self.data_offset + info.offset as usize + row * row_stride;
+        &self.mmap[start..start + row_stride]
+    }
+
     /// ggml type id of a tensor (see `ggml_type`).
     pub fn tensor_type(&self, name: &str) -> u32 {
         self.tensor(name)
@@ -421,6 +429,19 @@ pub fn dequant_type_to_f32(ggml_type: u32, bytes: &[u8], total_elems: usize) -> 
     let mut out = Vec::with_capacity(total_elems);
     dequant_blocks(ggml_type, bytes, total_elems, |chunk| out.extend_from_slice(chunk));
     out
+}
+
+/// Dequantize a single row (`elems` values) of a tensor stored in `ggml_type`
+/// block layout into `out` (length `elems`). Used to decode one embedding/PLE
+/// lookup-table row directly from native GGUF blocks (no full-tensor conversion).
+pub fn dequant_row_to_f32(ggml_type: u32, row_bytes: &[u8], elems: usize, out: &mut [f32]) {
+    assert!(out.len() >= elems, "dequant_row_to_f32: out too small");
+    let mut n = 0;
+    dequant_blocks(ggml_type, row_bytes, elems, |chunk| {
+        out[n..n + chunk.len()].copy_from_slice(chunk);
+        n += chunk.len();
+    });
+    assert_eq!(n, elems, "dequant_row_to_f32: row did not fill elems");
 }
 
 /// ggml token type ids (tokenizer.ggml.token_type).
