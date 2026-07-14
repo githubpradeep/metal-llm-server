@@ -38,6 +38,7 @@ mod op {
     pub const RMS_NORM_ADD_SAVE: u32 = 3;
     pub const MATVEC_Q4: u32 = 4;
     pub const MATVEC_F16: u32 = 5;
+    pub const MATVEC_QK: u32 = 15; // K-quant (Q4_K/Q6_K) matvec for native lm_head
     pub const ROTARY_Q: u32 = 6;
     pub const ROTARY_K: u32 = 7;
     pub const KV_APPEND_Q4: u32 = 8;
@@ -235,6 +236,58 @@ impl<'a> GraphBuilder<'a> {
             } else {
                 self.weights.index_q4(self.device, weight) // reuse Q4 table for Q3 views
             };
+            self.push(MegaOpDesc {
+                op_type: op::MATVEC_Q4,
+                arg0: m,
+                arg1: k,
+                num_tgs: MEGA_GRID_TGS,
+                in_buf,
+                out_buf,
+                weight_buf_idx: w,
+                ..MegaOpDesc::default()
+            });
+        } else {
+            let w = self.weights.index_f16(self.device, weight);
+            self.push(MegaOpDesc {
+                op_type: op::MATVEC_F16,
+                arg0: m,
+                arg1: k,
+                num_tgs: MEGA_GRID_TGS,
+                in_buf,
+                out_buf,
+                weight_buf_idx: w,
+                ..MegaOpDesc::default()
+            });
+        }
+    }
+
+    /// lm_head matvec: dispatch by the weight's actual format (native Q4_K/Q6_K
+    /// tied embedding needs the K-quant kernel; Q4_0 needs the Q4 kernel; else f16).
+    /// Kept separate from `matvec` so per-layer weight routing is untouched.
+    fn matvec_lm_head(
+        &mut self,
+        weight: &BufferView,
+        m: u32,
+        k: u32,
+        in_buf: u32,
+        out_buf: u32,
+    ) {
+        use crate::gpu::weight_fmt;
+        let is_kquant = matches!(weight.format, weight_fmt::Q4_K | weight_fmt::Q6_K);
+        if is_kquant {
+            let w = self.weights.index_q4(self.device, weight);
+            self.push(MegaOpDesc {
+                op_type: op::MATVEC_QK,
+                arg0: m,
+                arg1: k,
+                num_tgs: MEGA_GRID_TGS,
+                in_buf,
+                out_buf,
+                weight_buf_idx: w,
+                ..MegaOpDesc::default()
+            });
+        } else if weight_buf_is_q4(weight, m, k) {
+            let w = self.weights.index_q4(self.device, weight);
             self.push(MegaOpDesc {
                 op_type: op::MATVEC_Q4,
                 arg0: m,
@@ -615,13 +668,12 @@ impl MegaDecodeGraph {
             buf::HIDDEN,
             buf::NORMED,
         );
-        builder.matvec(
+        builder.matvec_lm_head(
             &model.lm_head_buf,
             cfg.vocab_size as u32,
             hidden,
             buf::NORMED,
             buf::LOGITS,
-            WeightFormat::Q4_0,
         );
 
         let k_addrs: Vec<u64> = model.k_cache.iter().map(|b| b.gpu_address()).collect();
@@ -795,6 +847,20 @@ impl MegaDecodeGraph {
                         buffers.buf(op.out_buf),
                         op.arg0,
                         op.arg1,
+                    );
+                }
+                op::MATVEC_QK => {
+                    let w = &self.weights.q4_views[op.weight_buf_idx as usize];
+                    ctx.encode_matvec_qk_at_view(
+                        encoder,
+                        w,
+                        buffers.buf(op.in_buf),
+                        0,
+                        buffers.buf(op.out_buf),
+                        0,
+                        op.arg0,
+                        op.arg1,
+                        1,
                     );
                 }
                 op::ROTARY_Q => {

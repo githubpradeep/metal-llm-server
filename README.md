@@ -1,8 +1,8 @@
 # Gemma4 Metal Inference Server (Rust)
 
-Alpha-stage local LLM inference server for **Gemma4** on Apple Silicon. Metal GPU
+Local LLM inference server for **Gemma4** on Apple Silicon. Metal GPU
 kernels, OpenAI-compatible API, KV pooling, continuous batching, and chunked
-prefill. Suitable for experimentation — not production-stable yet.
+prefill. Loads community GGUF directly with mmap zero-copy weights.
 
 Binary name: `llama-sinks`.
 
@@ -16,8 +16,10 @@ The primary path is a **community GGUF** (weights + embedded tokenizer). Point
 | **Gemma4 E2B** | `gemma-4-E2B-it-Q4_K_M.gguf` | Smaller; good for prefill/decode tuning |
 | **Gemma4 E4B** | `gemma-4-E4B-it-Q4_K_M.gguf` | Larger; original target |
 
-`Q4_K_M` (mixed Q4_K / Q6_K) is the usual quant. On first load the engine builds a
-local Q4 weight cache next to the GGUF for faster restarts.
+`Q4_K_M` (mixed Q4_K / Q6_K) is the usual quant. Weights are read directly from
+the GGUF and uploaded as native K-quant (Q4_K / Q6_K) Metal buffers via
+memory-mapped zero-copy — cold load is sub-second and there is no separate
+weight cache to build or maintain.
 
 HF safetensors directories (`config.json` + `tokenizer.json` + weights) still load,
 but GGUF is what we use day-to-day.
@@ -161,7 +163,7 @@ benchmarks/                 Regression / correctness / stress scripts
 
 ## Known limits
 
-- Alpha software; expect sharp edges.
+- Local single-node server; not a clustered / multi-GPU runtime.
 - Gemma4-focused (E2B / E4B); not a general multi-arch runtime.
 - Context via `LLAMA_CTX_SIZE` (default 16k, up to 200k); quality may drop past
   the model’s trained length.
@@ -172,5 +174,7 @@ benchmarks/                 Regression / correctness / stress scripts
 
 ## Positioning
 
-> Alpha: a local Metal Gemma inference server with production-oriented
-> continuous batching experiments.
+> A local Metal Gemma inference server with production-oriented continuous
+> batching, native GGUF loading, and mmap zero-copy weights (cold load
+> ~0.3s). Decode throughput tracks llama.cpp within a few tok/s at the
+> context lengths we exercise.

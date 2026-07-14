@@ -1365,6 +1365,25 @@ impl MetalContext {
         )
     }
 
+    /// Zero-copy Metal buffer that references `data` in place (no CPU→GPU copy).
+    /// Safe on Apple Silicon (unified memory): the GPU reads the same physical
+    /// pages, faulting them in from the mmap on demand, so weights stay in the
+    /// GGUF mmap instead of being duplicated into private GPU buffers. `data`
+    /// must outlive the returned buffer. Falls back to a copy when the pointer
+    /// is not 16-byte aligned (required by `new_buffer_with_bytes_no_copy`).
+    pub fn buffer_from_slice_no_copy(&self, data: &[u8]) -> Buffer {
+        if !data.is_empty() && (data.as_ptr() as usize) % 16 == 0 {
+            self.device.new_buffer_with_bytes_no_copy(
+                data.as_ptr() as *const _,
+                data.len() as u64,
+                MTLResourceOptions::StorageModeShared,
+                None,
+            )
+        } else {
+            self.buffer_from_bytes(data)
+        }
+    }
+
     pub fn buffer_from_slice(&self, data: &[f32]) -> Buffer {
         let byte_len = (data.len() * std::mem::size_of::<f32>()) as u64;
         self.device.new_buffer_with_data(
