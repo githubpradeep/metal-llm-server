@@ -67,7 +67,7 @@ fn encode_proj_norm_residual(
 }
 
 const DEFAULT_MAX_PREFILL_SEQ: usize = 1024;
-const DEFAULT_MAX_DECODE_BATCH: usize = 4;
+const DEFAULT_MAX_DECODE_BATCH: usize = 8;
 
 /// Cumulative per-phase GPU time (ms) and token count for PROFILE_PHASES.
 #[derive(Clone, Copy)]
@@ -237,6 +237,12 @@ pub struct Gemma4GpuModel {
     pub prefill_scratch: PrefillScratch,
     pub decode_batch_scratch: DecodeBatchScratch,
 
+    // MTP verify buffers
+    pub mtp_verify_logits_buf: Buffer,
+    pub mtp_verify_argmax_buf: Buffer,
+    pub mtp_verify_hidden_buf: Buffer,
+    pub mtp_verify_scratch: MtpVerifyScratch,
+
     // PLE scratch buffers
     pub ple_embed_buf: Buffer, // [ple_dim] = 256 (unused now, kept for compat)
     pub ple_gated_buf: Buffer, // [ple_dim]
@@ -404,6 +410,41 @@ impl DecodeBatchScratch {
             q_normed_buf: ctx.buffer_empty(max_batch_size * max_q_out),
             k_normed_buf: ctx.buffer_empty(max_batch_size * max_kv_out),
             ggml_fa_tmp_buf: ctx.buffer_empty(ggml_fa_tmp_elems),
+        }
+    }
+}
+
+/// Scratch buffers for MTP verify batch (parallel decode of draft tokens).
+const MAX_MTP_VERIFY_SEQ: usize = 8;
+
+pub(crate) struct MtpVerifyScratch {
+    max_seq_len: usize,
+    hidden_buf: Buffer,
+    ple_token_id_buf: Buffer,
+    cos_bufs: Vec<Buffer>,
+    sin_bufs: Vec<Buffer>,
+}
+
+impl MtpVerifyScratch {
+    fn new(
+        ctx: &MetalContext,
+        max_seq_len: usize,
+        hidden_size: usize,
+        ple_total_dim: usize,
+        head_dims: &[usize],
+    ) -> Self {
+        Self {
+            max_seq_len,
+            hidden_buf: ctx.buffer_empty(max_seq_len * hidden_size),
+            ple_token_id_buf: ctx.buffer_empty(max_seq_len * ple_total_dim),
+            cos_bufs: head_dims
+                .iter()
+                .map(|&hd| ctx.buffer_empty(max_seq_len * hd))
+                .collect(),
+            sin_bufs: head_dims
+                .iter()
+                .map(|&hd| ctx.buffer_empty(max_seq_len * hd))
+                .collect(),
         }
     }
 }
@@ -680,6 +721,14 @@ impl EmbedTables {
 
     fn decode_embed_into(&self, token_id: usize, hidden_size: usize, out: &mut [f32]) {
         let scale = (hidden_size as f32).sqrt();
+        self.decode_embed_into_impl(token_id, hidden_size, out, scale);
+    }
+
+    fn decode_embed_into_no_scale(&self, token_id: usize, hidden_size: usize, out: &mut [f32]) {
+        self.decode_embed_into_impl(token_id, hidden_size, out, 1.0);
+    }
+
+    fn decode_embed_into_impl(&self, token_id: usize, hidden_size: usize, out: &mut [f32], scale: f32) {
         if let Some((gt, stride, cols)) = self.embed_native {
             let bytes = self
                 .gguf
@@ -1465,6 +1514,21 @@ impl Gemma4GpuModel {
             per_layer_ple_bufs.push(ctx.buffer_empty(ple_dim));
         }
 
+        // MTP verify scratch buffers
+        let mtp_verify_logits_buf =
+            ctx.buffer_empty(MAX_MTP_VERIFY_SEQ * vocab_size);
+        let mtp_verify_argmax_buf = ctx.buffer_empty_u32(MAX_MTP_VERIFY_SEQ);
+        let mtp_verify_hidden_buf =
+            ctx.buffer_empty(MAX_MTP_VERIFY_SEQ * hidden_size);
+        let mtp_head_dims: Vec<usize> = (0..num_layers).map(|i| config.layer_head_dim(i)).collect();
+        let mtp_verify_scratch = MtpVerifyScratch::new(
+            &ctx,
+            MAX_MTP_VERIFY_SEQ,
+            hidden_size,
+            num_layers * ple_dim,
+            &mtp_head_dims,
+        );
+
         println!("  Decode RoPE: GPU fill (rope_fill_decode kernel)");
         {
             let kq = layers.iter().filter(|l| l.weight_format.is_kquant()).count();
@@ -1516,6 +1580,10 @@ impl Gemma4GpuModel {
             inv_rms_buf,
             prefill_scratch,
             decode_batch_scratch,
+            mtp_verify_logits_buf,
+            mtp_verify_argmax_buf,
+            mtp_verify_hidden_buf,
+            mtp_verify_scratch,
             ple_embed_buf,
             ple_gated_buf,
             ple_normed_buf,
@@ -2534,6 +2602,21 @@ impl Gemma4GpuModel {
             load_start.elapsed().as_secs_f64()
         );
 
+        // MTP verify scratch buffers
+        let mtp_verify_logits_buf =
+            ctx.buffer_empty(MAX_MTP_VERIFY_SEQ * vocab_size);
+        let mtp_verify_argmax_buf = ctx.buffer_empty_u32(MAX_MTP_VERIFY_SEQ);
+        let mtp_verify_hidden_buf =
+            ctx.buffer_empty(MAX_MTP_VERIFY_SEQ * hidden_size);
+        let mtp_head_dims: Vec<usize> = (0..num_layers).map(|i| config.layer_head_dim(i)).collect();
+        let mtp_verify_scratch = MtpVerifyScratch::new(
+            &ctx,
+            MAX_MTP_VERIFY_SEQ,
+            hidden_size,
+            num_layers * ple_dim,
+            &mtp_head_dims,
+        );
+
         let model = Gemma4GpuModel {
             ctx,
             config,
@@ -2560,6 +2643,10 @@ impl Gemma4GpuModel {
             inv_rms_buf,
             prefill_scratch,
             decode_batch_scratch,
+            mtp_verify_logits_buf,
+            mtp_verify_argmax_buf,
+            mtp_verify_hidden_buf,
+            mtp_verify_scratch,
             ple_embed_buf,
             ple_gated_buf,
             ple_normed_buf,
@@ -2773,9 +2860,13 @@ impl Gemma4GpuModel {
         skip_gelu: bool,
     ) {
         let total_intermediate = seq_len * intermediate_size;
+        // f16 activations only feed the mul_mm path; the small-seq matvec
+        // fallback reads x as f32, so casting there corrupts the MLP.
         let use_f16 = crate::gpu::prefill_mlp_f16_enabled()
             && !crate::gpu::ProfileAblate::from_env().skip_cast()
-            && layer.weight_format != WeightFormat::F16;
+            && layer.weight_format != WeightFormat::F16
+            && crate::gpu::prefill_mul_mm_enabled()
+            && crate::ggml_gemv::should_use_mul_mm(hidden_size, seq_len);
         // residual_buf unused during MLP after fused residual path; holds f16 normed.
         // up_buf unused on stacked path; holds f16 gelu for down proj.
         if layer.weight_format == WeightFormat::F16 {
@@ -4608,8 +4699,864 @@ impl Gemma4GpuModel {
         self.total_tokens = 0;
     }
 
+    /// Raw (unscaled) input embedding row, matching a plain `nn.Embedding` lookup.
+    /// The MTP drafter concatenates this with the target hidden state and feeds it to
+    /// `pre_projection`, bypassing the text model's sqrt(hidden) scaling.
+    pub fn token_embedding_raw(&self, token_id: usize) -> Result<Vec<f32>, String> {
+        let hidden_size = self.config.hidden_size;
+        let mut emb = vec![0.0f32; hidden_size];
+        self.embed_tables.decode_embed_into_no_scale(token_id, hidden_size, &mut emb);
+        Ok(emb)
+    }
+
+    /// Map an MTP assistant layer index to the target model's KV cache layer
+    /// that has the same attention type (sliding vs full).
+    pub fn mtp_kv_source_layer(&self, is_full_attention: bool) -> Option<usize> {
+        let non_shared_layers = self
+            .config
+            .num_hidden_layers
+            .saturating_sub(self.config.num_kv_shared_layers);
+        (0..non_shared_layers)
+            .rev()
+            .find(|&layer_idx| self.config.is_full_attention(layer_idx) == is_full_attention)
+    }
+
+    /// Append one token to KV without lm_head readback (decode + final norm only).
+    /// Uses the existing `forward_advance` which is KV-only.
+    pub fn forward_append_token(&mut self, token_id: usize) {
+        // forward_advance already does KV-only with no lm_head
+        self.forward_advance(token_id);
+    }
+
+    /// Run lm_head on the current `normed_buf` (post-final-norm). Used after
+    /// `forward_append_token` when logits were already consumed from verify.
+    pub fn forward_logits_from_normed_buf(&self) -> Vec<f32> {
+        let vocab_size = self.config.vocab_size;
+        let hidden_size = self.config.hidden_size;
+        let cmd = self.ctx.queue.new_command_buffer();
+        let encoder = cmd.new_compute_command_encoder();
+        self.ctx.encode_matvec_auto_view(
+            encoder,
+            &self.lm_head_buf,
+            &self.normed_buf,
+            &self.logits_buf,
+            vocab_size as u32,
+            hidden_size as u32,
+        );
+        encoder.end_encoding();
+        cmd.commit();
+        cmd.wait_until_completed();
+
+        let mut logits = MetalContext::read_buffer(&self.logits_buf, vocab_size);
+        let cap = self.config.final_logit_softcapping;
+        for l in logits.iter_mut() {
+            let x = (*l / cap).clamp(-10.0, 10.0);
+            *l = cap * x.tanh();
+        }
+        logits
+    }
+
+    /// Post-final-norm hidden (LM-head input / h_nextn).
+    pub fn last_hidden_activation(&self) -> Vec<f32> {
+        MetalContext::read_buffer(&self.normed_buf, self.config.hidden_size)
+    }
+
+    /// Post-final-norm hidden from an MTP verify row.
+    pub fn prefill_hidden_activation_at(&self, row: usize) -> Vec<f32> {
+        let hidden_size = self.config.hidden_size;
+        let end = (row + 1) * hidden_size;
+        let all = MetalContext::read_buffer(&self.mtp_verify_hidden_buf, end);
+        all[row * hidden_size..end].to_vec()
+    }
+
+    /// Roll back trailing KV entries after a partial MTP accept.
+    pub fn truncate_kv(&mut self, tail_count: u32) {
+        self.kv_seq_len = self.kv_seq_len.saturating_sub(tail_count);
+        self.total_tokens = self
+            .total_tokens
+            .saturating_sub(tail_count as usize);
+    }
+
+    /// Alias this model's `k_cache`/`v_cache` handles to a pool slot's buffers.
+    /// Metal buffers are refcounted, so writes via the pool update what the
+    /// MTP assistant reads through `target.k_cache`.
+    pub fn alias_kv_from_pool(&mut self, kv_pool: &KvCachePool, slot: KvSlot) -> Result<(), String> {
+        let (k, v) = kv_pool.slot_buffers(slot).map_err(|e| e.to_string())?;
+        self.k_cache = k.to_vec();
+        self.v_cache = v.to_vec();
+        self.kv_seq_len = kv_pool.seq_len(slot).map_err(|e| e.to_string())?;
+        self.total_tokens = kv_pool.total_tokens(slot).map_err(|e| e.to_string())?;
+        self.kv_capacity = kv_pool.capacity();
+        Ok(())
+    }
+
+    fn sync_kv_meta_from_pool(&mut self, kv_pool: &KvCachePool, slot: KvSlot) -> Result<(), String> {
+        self.kv_seq_len = kv_pool.seq_len(slot).map_err(|e| e.to_string())?;
+        self.total_tokens = kv_pool.total_tokens(slot).map_err(|e| e.to_string())?;
+        Ok(())
+    }
+
+    /// Truncate trailing KV on a live pool slot (MTP partial accept).
+    pub fn truncate_kv_pool(
+        &mut self,
+        kv_pool: &mut KvCachePool,
+        slot: KvSlot,
+        tail_count: u32,
+    ) -> Result<(), String> {
+        kv_pool
+            .with_slot_mut(slot, |slot_state| {
+                slot_state.seq_len = slot_state.seq_len.saturating_sub(tail_count);
+                slot_state.total_tokens =
+                    slot_state.total_tokens.saturating_sub(tail_count as usize);
+            })
+            .map_err(|e| e.to_string())?;
+        self.sync_kv_meta_from_pool(kv_pool, slot)
+    }
+
+    /// Parallel prefill into a pool slot; syncs model meta + last-row normed_buf.
+    pub fn forward_prefill_pool(
+        &mut self,
+        token_ids: &[usize],
+        kv_pool: &mut KvCachePool,
+        slot: KvSlot,
+    ) -> Result<Vec<f32>, String> {
+        let logits = self.forward_prefill_chunked_with_kv_slot(token_ids, kv_pool, slot)?;
+        self.sync_kv_meta_from_pool(kv_pool, slot)?;
+        // Keep decode-facing last-row hidden for MTP h_nextn.
+        let hidden_size = self.config.hidden_size;
+        let seq_len = token_ids.len();
+        let normed = MetalContext::read_buffer(
+            &self.prefill_scratch.normed_buf,
+            seq_len * hidden_size,
+        );
+        let last = (seq_len - 1) * hidden_size;
+        MetalContext::write_buffer(&self.normed_buf, &normed[last..]);
+        Ok(logits)
+    }
+
+    /// Append tokens via parallel prefill kernels on a pool slot.
+    pub fn forward_continue_pool(
+        &mut self,
+        token_ids: &[usize],
+        kv_pool: &mut KvCachePool,
+        slot: KvSlot,
+    ) -> Result<Vec<f32>, String> {
+        if token_ids.is_empty() {
+            return Err("continue token_ids must not be empty".to_string());
+        }
+        // Force the parallel writer even for seq_len==1 (decode fallback would
+        // mix KV layouts and break later batched verify).
+        self.prepare_parallel_prefill_inputs(token_ids)?;
+        let start_pos = kv_pool.total_tokens(slot).map_err(|e| e.to_string())?;
+        if !crate::gpu::prefill_gpu_rope_enabled() {
+            self.prepare_parallel_prefill_rotary(start_pos, token_ids.len())?;
+        }
+        let logits = self.forward_prefill_chunk_parallel_with_kv_slot(
+            token_ids,
+            kv_pool,
+            slot,
+            start_pos,
+            true,
+            false,
+        )?;
+        self.sync_kv_meta_from_pool(kv_pool, slot)?;
+        let hidden_size = self.config.hidden_size;
+        let seq_len = token_ids.len();
+        let normed = MetalContext::read_buffer(
+            &self.prefill_scratch.normed_buf,
+            seq_len * hidden_size,
+        );
+        let last = (seq_len - 1) * hidden_size;
+        MetalContext::write_buffer(&self.normed_buf, &normed[last..]);
+        Ok(logits)
+    }
+
+    /// Batched MTP verify on a pool slot. Parallel prefill-at-offset disagrees
+    /// with decode-written KV; use decode-faithful sequential verify on the
+    /// aliased pool buffers instead (see `forward_verify_batch`).
+    pub fn forward_verify_pool(
+        &mut self,
+        token_ids: &[usize],
+        kv_pool: &mut KvCachePool,
+        slot: KvSlot,
+    ) -> Result<Vec<usize>, String> {
+        let _ = (kv_pool, slot);
+        self.forward_verify_batch(token_ids)
+    }
+
+    /// Batched MTP verify: run draft tokens in a single command buffer.
+    /// All tokens share the same KV slot, each at position base_pos + i.
+    /// Returns argmax token for each row + populates mtp_verify_hidden_buf.
+    pub fn forward_verify_batch(
+        &mut self,
+        token_ids: &[usize],
+    ) -> Result<Vec<usize>, String> {
+        if token_ids.is_empty() {
+            return Err("verify batch token_ids must not be empty".to_string());
+        }
+        if token_ids.len() > MAX_MTP_VERIFY_SEQ {
+            return Err(format!(
+                "verify batch size {} exceeds MAX_MTP_VERIFY_SEQ={}",
+                token_ids.len(),
+                MAX_MTP_VERIFY_SEQ
+            ));
+        }
+
+        let batch_size = token_ids.len();
+
+        // Optional crosscheck: compare parallel vs fused-sequential on rewound KV.
+        if std::env::var("MTP_VERIFY_CROSSCHECK").is_ok() && batch_size > 1 {
+            return self.forward_verify_crosscheck(token_ids);
+        }
+
+        // Default: parallel prefill verify (batched ext matvec + causal attn).
+        // Opt-in fused sequential (`MTP_VERIFY_SEQUENTIAL=1`) or decode-batch
+        // (`MTP_VERIFY_DECODE_BATCH=1`). Per-row decode attention:
+        // `MTP_VERIFY_DECODE_FA=1`.
+        let want_sequential = std::env::var("MTP_VERIFY_SEQUENTIAL")
+            .map(|v| v == "1")
+            .unwrap_or(false);
+        if want_sequential {
+            if !self.fused_decode_eligible() {
+                return self.forward_verify_chunk(token_ids);
+            }
+            return self.forward_verify_sequential(token_ids);
+        }
+
+        let want_parallel = batch_size > 1
+            && batch_size <= self.prefill_scratch.max_seq_len
+            && self.total_tokens + batch_size <= self.kv_capacity as usize
+            && !std::env::var("MTP_VERIFY_DECODE_BATCH")
+                .map(|v| v == "1")
+                .unwrap_or(false);
+        if want_parallel {
+            return self.forward_verify_parallel(token_ids);
+        }
+
+        let want_decode_batch = std::env::var("MTP_VERIFY_DECODE_BATCH")
+            .map(|v| v == "1")
+            .unwrap_or(false);
+        if want_decode_batch
+            && batch_size > 1
+            && batch_size <= self.max_decode_batch_size()
+        {
+            return self.forward_verify_decode_batch(token_ids);
+        }
+
+        if !self.fused_decode_eligible() {
+            return self.forward_verify_chunk(token_ids);
+        }
+        self.forward_verify_sequential(token_ids)
+    }
+
+    fn mtp_bisect_stop_layer() -> Option<usize> {
+        std::env::var("MTP_STOP_LAYER").ok().and_then(|v| v.parse().ok())
+    }
+
+    /// Compare parallel prefill verify against fused sequential on identical KV.
+    fn forward_verify_crosscheck(&mut self, token_ids: &[usize]) -> Result<Vec<usize>, String> {
+        let batch_size = token_ids.len();
+        let ref_seq = self.kv_seq_len;
+        let ref_total = self.total_tokens;
+
+        if std::env::var("MTP_LAYER_BISECT").is_ok() {
+            self.mtp_layer_bisect(token_ids[0], ref_seq, ref_total)?;
+            std::process::exit(0);
+        }
+
+        let reference = self.forward_verify_sequential(token_ids)?;
+        self.kv_seq_len = ref_seq;
+        self.total_tokens = ref_total;
+
+        // Single-row probe: does the parallel path agree on row 0 alone?
+        let single = self.forward_verify_parallel(&token_ids[..1])?;
+        self.kv_seq_len = ref_seq;
+        self.total_tokens = ref_total;
+        eprintln!(
+            "MTP VERIFY CROSSCHECK single-row: parallel={} sequential={} {}",
+            single[0],
+            reference[0],
+            if single[0] == reference[0] { "match" } else { "MISMATCH" }
+        );
+
+        let parallel = self.forward_verify_parallel(token_ids)?;
+        self.kv_seq_len = ref_seq;
+        self.total_tokens = ref_total;
+
+        for (row, (&got, &want)) in parallel.iter().zip(reference.iter()).enumerate() {
+            if got != want {
+                eprintln!(
+                    "MTP VERIFY CROSSCHECK row {}: parallel={} sequential={} MISMATCH",
+                    row, got, want
+                );
+            }
+        }
+        if parallel == reference {
+            eprintln!("MTP VERIFY CROSSCHECK: all {} rows match", batch_size);
+        }
+
+        // Apply reference result to KV (sequential path).
+        let _ = self.forward_verify_sequential(token_ids)?;
+        Ok(reference)
+    }
+
+    /// Bisect the first layer where the parallel prefill path diverges from the
+    /// fused sequential decode path on one token over identical KV state.
+    fn mtp_layer_bisect(
+        &mut self,
+        token: usize,
+        ref_seq: u32,
+        ref_total: usize,
+    ) -> Result<(), String> {
+        let hidden_size = self.config.hidden_size;
+        let num_layers = self.layers.len();
+        eprintln!("MTP LAYER BISECT: token={} base_seq={} total={}", token, ref_seq, ref_total);
+        let mut compare = |model: &mut Self, label: &str| -> Result<(), String> {
+            model.kv_seq_len = ref_seq;
+            model.total_tokens = ref_total;
+            let _ = model.forward_verify_sequential(&[token])?;
+            let seq_hidden = MetalContext::read_buffer(&model.hidden_buf, hidden_size);
+
+            model.kv_seq_len = ref_seq;
+            model.total_tokens = ref_total;
+            let _ = model.forward_verify_parallel(&[token])?;
+            let par_hidden = MetalContext::read_buffer(
+                &model.prefill_scratch.hidden_buf,
+                hidden_size,
+            );
+
+            let mut dot = 0.0f64;
+            let mut n1 = 0.0f64;
+            let mut n2 = 0.0f64;
+            let mut max_abs = 0.0f32;
+            for i in 0..hidden_size {
+                let a = seq_hidden[i];
+                let b = par_hidden[i];
+                dot += (a as f64) * (b as f64);
+                n1 += (a as f64) * (a as f64);
+                n2 += (b as f64) * (b as f64);
+                max_abs = max_abs.max((a - b).abs());
+            }
+            let cos = if n1 > 0.0 && n2 > 0.0 {
+                dot / (n1.sqrt() * n2.sqrt())
+            } else {
+                0.0
+            };
+            eprintln!(
+                "  {}: cos={:.6} max_abs_diff={:.5} |seq|={:.3} |par|={:.3}",
+                label,
+                cos,
+                max_abs,
+                n1.sqrt(),
+                n2.sqrt()
+            );
+            Ok(())
+        };
+
+        for stop in 0..=num_layers.min(3) {
+            std::env::set_var("MTP_STOP_LAYER", stop.to_string());
+            compare(self, &format!("stop_layer={:2} full", stop))?;
+        }
+
+        // Component ablation within layer 0 only.
+        std::env::set_var("MTP_STOP_LAYER", "1");
+        for ablate in ["attn", "mlp", "ple"] {
+            std::env::set_var("PROFILE_ABLATE", ablate);
+            compare(self, &format!("layer0 skip_{}", ablate))?;
+        }
+        std::env::remove_var("PROFILE_ABLATE");
+        std::env::remove_var("MTP_STOP_LAYER");
+        Ok(())
+    }
+
+    fn forward_verify_parallel(&mut self, token_ids: &[usize]) -> Result<Vec<usize>, String> {
+        let batch_size = token_ids.len();
+        let start_pos = self.total_tokens;
+        let base_seq = self.kv_seq_len;
+        let base_total = self.total_tokens;
+
+        let (mut kv_pool, slot) = KvCachePool::from_existing(
+            &self.k_cache,
+            &self.v_cache,
+            base_seq,
+            base_total,
+            self.kv_capacity,
+            self.kv_cache_type,
+        );
+
+        self.prepare_parallel_prefill_inputs(token_ids)?;
+        if !crate::gpu::prefill_gpu_rope_enabled() {
+            self.prepare_parallel_prefill_rotary(start_pos, batch_size)?;
+        }
+
+        self.forward_prefill_chunk_parallel_with_kv_slot(
+            token_ids,
+            &mut kv_pool,
+            slot,
+            start_pos,
+            false,
+            true,
+        )?;
+
+        self.kv_seq_len = kv_pool.seq_len(slot).map_err(|e| e.to_string())?;
+        self.total_tokens = kv_pool.total_tokens(slot).map_err(|e| e.to_string())?;
+
+        let hidden_size = self.config.hidden_size;
+        let hidden =
+            MetalContext::read_buffer(&self.mtp_verify_hidden_buf, batch_size * hidden_size);
+        let last = (batch_size - 1) * hidden_size;
+        MetalContext::write_buffer(&self.normed_buf, &hidden[last..]);
+
+        Ok(self.read_mtp_verify_argmax_tokens(batch_size))
+    }
+
+    /// Parallel prefill into this model's own KV (same kernels as verify).
+    /// MTP must stay on this path so verify does not mix decode-written KV.
+    pub fn forward_prefill_parallel_self(&mut self, token_ids: &[usize]) -> Result<Vec<f32>, String> {
+        if token_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        // Use a fresh pool slot then swap buffers into the model so we exercise
+        // the same allocation/path as the working prefill bench. from_existing
+        // over model-owned caches has disagreed with that path in practice.
+        let mut kv_pool = self.create_kv_pool(1, self.kv_capacity);
+        let slot = kv_pool
+            .allocate()
+            .ok_or_else(|| "failed to allocate MTP KV slot".to_string())?;
+
+        // Move model caches into the pool slot (pool starts with its own empty
+        // buffers; swap so we keep a single set of Metal buffers for drafting).
+        kv_pool
+            .with_slot_mut(slot, |slot_state| {
+                std::mem::swap(&mut self.k_cache, &mut slot_state.k_cache);
+                std::mem::swap(&mut self.v_cache, &mut slot_state.v_cache);
+                slot_state.seq_len = 0;
+                slot_state.total_tokens = 0;
+            })
+            .map_err(|e| e.to_string())?;
+
+        let logits = self.forward_prefill_chunked_with_kv_slot(token_ids, &mut kv_pool, slot)?;
+
+        kv_pool
+            .with_slot_mut(slot, |slot_state| {
+                std::mem::swap(&mut self.k_cache, &mut slot_state.k_cache);
+                std::mem::swap(&mut self.v_cache, &mut slot_state.v_cache);
+                self.kv_seq_len = slot_state.seq_len;
+                self.total_tokens = slot_state.total_tokens;
+            })
+            .map_err(|e| e.to_string())?;
+
+        // Last-row normed → decode-facing buffer for MTP h_nextn.
+        let hidden_size = self.config.hidden_size;
+        let normed = MetalContext::read_buffer(&self.prefill_scratch.normed_buf, hidden_size);
+        MetalContext::write_buffer(&self.normed_buf, &normed);
+
+        Ok(logits)
+    }
+
+    /// Extend KV with one or more tokens via the parallel prefill kernels.
+    pub fn forward_continue_parallel(&mut self, token_ids: &[usize]) -> Result<Vec<f32>, String> {
+        self.forward_continue_parallel_chunk(token_ids, true)
+    }
+
+    fn forward_continue_parallel_chunk(
+        &mut self,
+        token_ids: &[usize],
+        compute_logits: bool,
+    ) -> Result<Vec<f32>, String> {
+        if token_ids.is_empty() {
+            return Err("continue token_ids must not be empty".to_string());
+        }
+        if token_ids.len() > self.prefill_scratch.max_seq_len {
+            return Err(format!(
+                "continue chunk has {} tokens, max is {}",
+                token_ids.len(),
+                self.prefill_scratch.max_seq_len
+            ));
+        }
+        if self.total_tokens + token_ids.len() > self.kv_capacity as usize {
+            return Err("KV capacity exceeded during parallel continue".to_string());
+        }
+
+        let mut kv_pool = self.create_kv_pool(1, self.kv_capacity);
+        let slot = kv_pool
+            .allocate()
+            .ok_or_else(|| "failed to allocate MTP KV slot".to_string())?;
+        kv_pool
+            .with_slot_mut(slot, |slot_state| {
+                std::mem::swap(&mut self.k_cache, &mut slot_state.k_cache);
+                std::mem::swap(&mut self.v_cache, &mut slot_state.v_cache);
+                slot_state.seq_len = self.kv_seq_len;
+                slot_state.total_tokens = self.total_tokens;
+            })
+            .map_err(|e| e.to_string())?;
+
+        let logits =
+            self.forward_prefill_chunk_with_kv_slot(token_ids, &mut kv_pool, slot, compute_logits)?;
+
+        kv_pool
+            .with_slot_mut(slot, |slot_state| {
+                std::mem::swap(&mut self.k_cache, &mut slot_state.k_cache);
+                std::mem::swap(&mut self.v_cache, &mut slot_state.v_cache);
+                self.kv_seq_len = slot_state.seq_len;
+                self.total_tokens = slot_state.total_tokens;
+            })
+            .map_err(|e| e.to_string())?;
+
+        if compute_logits {
+            let hidden_size = self.config.hidden_size;
+            let seq_len = token_ids.len();
+            let normed = MetalContext::read_buffer(
+                &self.prefill_scratch.normed_buf,
+                seq_len * hidden_size,
+            );
+            let last = (seq_len - 1) * hidden_size;
+            MetalContext::write_buffer(&self.normed_buf, &normed[last..]);
+        }
+
+        Ok(logits)
+    }
+
+    /// Decode-faithful same-sequence MTP verify.
+    ///
+    /// Reuses the multi-request decode batch executor with consecutive
+    /// synthetic views of one aliased KV slot. The executor processes one
+    /// layer across all rows, appending row `i` at `base_seq + i` and limiting
+    /// that row's attention to the same position.
+    fn forward_verify_decode_batch(
+        &mut self,
+        token_ids: &[usize],
+    ) -> Result<Vec<usize>, String> {
+        let batch_size = token_ids.len();
+        if batch_size == 0 || batch_size > self.max_decode_batch_size() {
+            return Err(format!(
+                "MTP decode verify batch size {} exceeds supported range 1..={}",
+                batch_size,
+                self.max_decode_batch_size()
+            ));
+        }
+        if self.total_tokens + batch_size > self.kv_capacity as usize {
+            return Err("KV capacity exceeded during MTP decode verify".to_string());
+        }
+
+        let base_seq = self.kv_seq_len;
+        let base_total = self.total_tokens;
+        let capacity = self.kv_capacity;
+        let (mut kv_pool, slot) = KvCachePool::from_existing(
+            &self.k_cache,
+            &self.v_cache,
+            base_seq,
+            base_total,
+            capacity,
+            self.kv_cache_type,
+        );
+
+        self.prepare_decode_batch_inputs(token_ids)?;
+        let slot_views: Vec<KvSlotView> = (0..batch_size)
+            .map(|i| KvSlotView {
+                slot,
+                slot_index: 0,
+                seq_len: base_seq + i as u32,
+                total_tokens: base_total + i,
+            })
+            .collect();
+        self.prepare_decode_batch_rotary(&slot_views)?;
+        self.prepare_decode_batch_attention_metadata(&slot_views)?;
+
+        let inputs: Vec<(KvSlot, usize)> =
+            token_ids.iter().copied().map(|token| (slot, token)).collect();
+        let outputs = self.forward_decode_batch_encoded_with_kv_slots(
+            &inputs,
+            &slot_views,
+            &mut kv_pool,
+            true,
+        )?;
+
+        // Preserve decode-facing h_prev from the accepted verify row.
+        let hidden_size = self.config.hidden_size;
+        let hidden =
+            MetalContext::read_buffer(&self.mtp_verify_hidden_buf, batch_size * hidden_size);
+        let last = (batch_size - 1) * hidden_size;
+        MetalContext::write_buffer(&self.normed_buf, &hidden[last..]);
+
+        self.kv_seq_len = base_seq + batch_size as u32;
+        self.total_tokens = base_total + batch_size;
+
+        debug_assert!(outputs.is_empty());
+        Ok(self.read_mtp_verify_argmax_tokens(batch_size))
+    }
+
+    fn forward_verify_sequential(
+        &mut self,
+        token_ids: &[usize],
+    ) -> Result<Vec<usize>, String> {
+        let batch_size = token_ids.len();
+        let hidden_size = self.config.hidden_size;
+        let ple_dim = self.config.hidden_size_per_layer_input;
+        let ple_total_dim = self.config.num_hidden_layers * ple_dim;
+        let vocab_size = self.config.vocab_size;
+        let base_seq = self.kv_seq_len;
+        let eps = self.config.rms_norm_eps as f32;
+        let num_layers = self.config.num_hidden_layers as u32;
+        let context_proj_scale = 1.0f32 / (hidden_size as f32).sqrt();
+        let ple_input_scale = std::f32::consts::FRAC_1_SQRT_2;
+
+        // Prepare embeddings and PLE for all tokens (CPU)
+        let mut batch_hidden = vec![0.0f32; batch_size * hidden_size];
+        let mut batch_ple = vec![0.0f32; batch_size * ple_total_dim];
+        for i in 0..batch_size {
+            let emb = &mut batch_hidden[i * hidden_size..(i + 1) * hidden_size];
+            self.embed_tables.decode_embed_into(token_ids[i], hidden_size, emb);
+            let ple = &mut batch_ple[i * ple_total_dim..(i + 1) * ple_total_dim];
+            self.embed_tables.decode_ple_into(token_ids[i], ple_total_dim, ple_dim, ple);
+        }
+
+        MetalContext::write_buffer(&self.decode_batch_scratch.hidden_buf, &batch_hidden);
+        MetalContext::write_buffer(&self.decode_batch_scratch.ple_token_id_buf, &batch_ple);
+
+        let cmd = self.ctx.queue.new_command_buffer();
+        let encoder = cmd.new_compute_command_encoder();
+
+        // Per-token processing within a single encoder
+        for i in 0..batch_size {
+            let kv_seq = base_seq + i as u32;
+            let pos = (self.total_tokens + i) as f32;
+
+            // Copy token embedding row i → hidden_buf
+            self.ctx.encode_copy_at(
+                encoder,
+                &self.decode_batch_scratch.hidden_buf,
+                (i * hidden_size * 4) as u64,
+                &self.hidden_buf,
+                0,
+                hidden_size as u32,
+            );
+
+            // PLE context projection
+            self.ctx.encode_matvec_auto_view(
+                encoder,
+                &self.per_layer_model_projection_weight,
+                &self.hidden_buf,
+                &self.ple_context_proj_buf,
+                num_layers * ple_dim as u32,
+                hidden_size as u32,
+            );
+
+            // PLE scale
+            self.ctx.encode_vec_scale(
+                encoder,
+                &self.ple_context_proj_buf,
+                &self.ple_combined_buf,
+                num_layers * ple_dim as u32,
+                context_proj_scale,
+            );
+
+            // PLE norm per layer
+            let ple_off = (i * ple_total_dim * 4) as u64;
+            self.ctx.encode_rmsnorm_per_head_view(
+                encoder,
+                &self.ple_combined_buf,
+                &self.per_layer_projection_norm_weight,
+                &self.ple_context_proj_buf,
+                num_layers as u32,
+                ple_dim as u32,
+                eps,
+            );
+
+            // PLE add token identity
+            self.ctx.encode_copy_at(
+                encoder,
+                &self.decode_batch_scratch.ple_token_id_buf,
+                ple_off,
+                &self.ple_token_id_buf,
+                0,
+                ple_total_dim as u32,
+            );
+            self.ctx.encode_vec_add(
+                encoder,
+                &self.ple_context_proj_buf,
+                &self.ple_token_id_buf,
+                &self.ple_combined_buf,
+                num_layers * ple_dim as u32,
+            );
+
+            // PLE final scale
+            self.ctx.encode_vec_scale(
+                encoder,
+                &self.ple_combined_buf,
+                &self.ple_context_proj_buf,
+                num_layers * ple_dim as u32,
+                ple_input_scale,
+            );
+
+            // RoPE fill for this token's position
+            self.ctx.encode_rope_fill_decode(
+                encoder,
+                &self.decode_rope_cos_packed,
+                &self.decode_rope_sin_packed,
+                &self.rope_layer_params_buf,
+                self.layers.len() as u32,
+                self.rope_max_head_dim as u32,
+                pos,
+            );
+
+            // Fused decode layers
+            let scratch = crate::decode_fused::FusedDecodeScratch {
+                hidden: &self.hidden_buf,
+                normed: &self.normed_buf,
+                inv_rms: &self.inv_rms_buf,
+                q: &self.q_buf,
+                k: &self.k_buf,
+                v: &self.v_buf,
+                q_normed: &self.q_normed_buf,
+                k_normed: &self.k_normed_buf,
+                attn_out: &self.attn_out_buf,
+                o_out: &self.o_out_buf,
+                gate: &self.gate_buf,
+                up: &self.up_buf,
+                gelu: &self.gelu_buf,
+                down: &self.down_buf,
+                ple_ctx: &self.ple_context_proj_buf,
+                ple_normed: &self.ple_normed_buf,
+                ple_projected: &self.ple_projected_buf,
+                cos_packed: &self.decode_rope_cos_packed,
+                sin_packed: &self.decode_rope_sin_packed,
+            };
+            let stop_layer = Self::mtp_bisect_stop_layer().unwrap_or(self.layers.len());
+            let ablate = crate::gpu::ProfileAblate::from_env();
+            for layer_idx in 0..self.layers.len().min(stop_layer) {
+                self.encode_fused_decode_layer(
+                    encoder,
+                    layer_idx,
+                    kv_seq,
+                    &scratch,
+                    ablate.skip_attn(),
+                    ablate.skip_mlp(),
+                    ablate.skip_ple(),
+                );
+            }
+
+            // Final norm (hidden_buf → normed_buf)
+            self.ctx.encode_rmsnorm_view(
+                encoder,
+                &self.hidden_buf,
+                &self.final_norm_weight,
+                &self.normed_buf,
+                hidden_size as u32,
+                eps,
+            );
+
+            // LM head: logits → temp logits_buf, then copy to batch output
+            self.ctx.encode_matvec_auto_view(
+                encoder,
+                &self.lm_head_buf,
+                &self.normed_buf,
+                &self.logits_buf,
+                vocab_size as u32,
+                hidden_size as u32,
+            );
+            self.ctx.encode_copy_at(
+                encoder,
+                &self.logits_buf,
+                0,
+                &self.mtp_verify_logits_buf,
+                (i * vocab_size * 4) as u64,
+                vocab_size as u32,
+            );
+
+            // Copy normed → mtp_verify_hidden_buf row i (for h_nextn)
+            self.ctx.encode_copy_at(
+                encoder,
+                &self.normed_buf,
+                0,
+                &self.mtp_verify_hidden_buf,
+                (i * hidden_size * 4) as u64,
+                hidden_size as u32,
+            );
+        }
+
+        encoder.end_encoding();
+
+        // GPU softcap + argmax over all verify rows (avoids full-vocab readback).
+        let cap = self.config.final_logit_softcapping;
+        let argmax_encoder = cmd.new_compute_command_encoder();
+        self.ctx.encode_softcap_argmax_rows_f32(
+            argmax_encoder,
+            &self.mtp_verify_logits_buf,
+            &self.mtp_verify_argmax_buf,
+            batch_size as u32,
+            vocab_size as u32,
+            cap,
+        );
+        argmax_encoder.end_encoding();
+
+        cmd.commit();
+        cmd.wait_until_completed();
+
+        let raw_tokens = MetalContext::read_u32_buffer(&self.mtp_verify_argmax_buf, batch_size);
+        let tokens: Vec<usize> = raw_tokens.into_iter().map(|t| t as usize).collect();
+
+        // Update global state: KV length and total_tokens advance by batch
+        self.kv_seq_len = base_seq + batch_size as u32;
+        self.total_tokens += batch_size;
+
+        Ok(tokens)
+    }
+
+    fn read_mtp_verify_argmax_tokens(&self, batch_size: usize) -> Vec<usize> {
+        MetalContext::read_u32_buffer(&self.mtp_verify_argmax_buf, batch_size)
+            .into_iter()
+            .map(|t| t as usize)
+            .collect()
+    }
+
+    /// Batched MTP verify: run draft tokens and return argmax token after each row.
+    /// Uses sequential single-token passes (simplest, matches fallback path).
+    /// After each verify step, copies the post-norm hidden state to
+    /// mtp_verify_hidden_buf so prefill_hidden_activation_at() returns valid data.
+    pub fn forward_verify_chunk(
+        &mut self,
+        token_ids: &[usize],
+    ) -> Result<Vec<usize>, String> {
+        if token_ids.is_empty() {
+            return Err("verify chunk token_ids must not be empty".to_string());
+        }
+        let hidden_size = self.config.hidden_size;
+        let mut tokens = Vec::with_capacity(token_ids.len());
+        for (i, &token_id) in token_ids.iter().enumerate() {
+            let logits = self.forward_single_token(token_id);
+            tokens.push(Self::argmax_cpu(&logits));
+            // Copy normed_buf → mtp_verify_hidden_buf row i for later h_nextn readback
+            let blit = self.ctx.queue.new_command_buffer();
+            let blit_enc = blit.new_blit_command_encoder();
+            blit_enc.copy_from_buffer(
+                &self.normed_buf,
+                0,
+                &self.mtp_verify_hidden_buf,
+                (i * hidden_size * 4) as u64,
+                (hidden_size * 4) as u64,
+            );
+            blit_enc.end_encoding();
+            blit.commit();
+            blit.wait_until_completed();
+        }
+        Ok(tokens)
+    }
+
+    fn argmax_cpu(values: &[f32]) -> usize {
+        let mut best_idx = 0usize;
+        let mut best_val = f32::NEG_INFINITY;
+        for (idx, &value) in values.iter().enumerate() {
+            if value > best_val {
+                best_val = value;
+                best_idx = idx;
+            }
+        }
+        best_idx
+    }
+
     pub fn create_kv_pool(&self, num_slots: usize, max_seq_len: u32) -> KvCachePool {
-        let max_seq_len = max_seq_len.min(self.config.max_position_embeddings as u32);
+        let max_seq_len = max_seq_len.min(self.kv_capacity as u32);
         KvCachePool::new(&self.ctx, &self.config, num_slots, max_seq_len, self.kv_cache_type)
     }
 
@@ -5954,6 +6901,7 @@ impl Gemma4GpuModel {
         slot: KvSlot,
         start_pos: usize,
         compute_logits: bool,
+        capture_mtp_rows: bool,
     ) -> Result<Vec<f32>, String> {
         let seq_len = token_ids.len();
         let hidden_size = self.config.hidden_size;
@@ -5984,8 +6932,9 @@ impl Gemma4GpuModel {
 
         // One compute encoder for all layers: fewer encoder create/end costs.
         // Dependent dispatches already share an encoder within each layer.
+        let stop_layer = Self::mtp_bisect_stop_layer().unwrap_or(self.layers.len());
         let encoder = cmd.new_compute_command_encoder();
-        for layer_idx in 0..self.layers.len() {
+        for layer_idx in 0..self.layers.len().min(stop_layer) {
             let layer = self
                 .layers
                 .get(layer_idx)
@@ -6005,10 +6954,22 @@ impl Gemma4GpuModel {
             } else {
                 self.config.sliding_window as u32
             };
+            // MTP verify batches only: keep batched matmuls but use decode offset
+            // attention (same kernels as forward_verify_sequential / decode batch).
+            // Opt-in per-row decode attention via `MTP_VERIFY_DECODE_FA=1` when
+            // batched causal prefill attention disagrees with decode.
+            let use_decode_fa = capture_mtp_rows
+                && std::env::var("MTP_VERIFY_DECODE_FA")
+                    .map(|v| v == "1")
+                    .unwrap_or(false)
+                && matches!(self.kv_cache_type, KvCacheType::Q4_0)
+                && start_pos > 0
+                && seq_len <= MAX_MTP_VERIFY_SEQ
+                && num_kv_heads == 1;
 
             if !ablate.skip_attn() {
             if !ablate.skip_attn_qkv() {
-            self.encode_parallel_prefill_attention_inputs(encoder, layer_idx, seq_len)?;
+                self.encode_parallel_prefill_attention_inputs(encoder, layer_idx, seq_len)?;
             } // !skip_attn_qkv
 
             if !ablate.skip_attn_flash() {
@@ -6141,6 +7102,60 @@ impl Gemma4GpuModel {
                 KvCacheType::Q4_0 => {
                     let groups_per_row = (head_dim / 32) as u32;
                     let row_bytes = groups_per_row * 18;
+                    if use_decode_fa {
+                        // Prefill QKV postproj leaves Q in HSD [head][seq][dim] with
+                        // QK-norm + RoPE applied; decode attention kernels expect a
+                        // token-major [heads*dim] row. Transpose Q back to SHD, then
+                        // run the decode offset kernel per row. KV was batch-appended
+                        // above (K/V are HSD too, but num_kv_heads==1 makes the
+                        // layouts identical); each row reads the cache only up to its
+                        // own position, so appending all rows up front stays causal.
+                        let sliding_window = self.config.sliding_window as u32;
+                        self.ctx.encode_transpose_hsd(
+                            encoder,
+                            &self.prefill_scratch.q_buf,
+                            &self.prefill_scratch.q_normed_buf,
+                            seq_len as u32,
+                            num_heads as u32,
+                            head_dim as u32,
+                        );
+                        for qi in 0..seq_len {
+                            let append_pos = start_pos as u32 + qi as u32;
+                            let attn_kv_seq = append_pos + 1;
+                            let effective_kv_seq = if layer.is_full_attention {
+                                attn_kv_seq
+                            } else {
+                                attn_kv_seq.min(sliding_window)
+                            };
+                            let kv_start = if !layer.is_full_attention
+                                && attn_kv_seq > sliding_window
+                            {
+                                attn_kv_seq - sliding_window
+                            } else {
+                                0
+                            };
+                            let q_offset = (qi * q_out * 4) as u64;
+                            self.ctx.encode_attention_with_offset_q4_0_at(
+                                encoder,
+                                &self.prefill_scratch.q_normed_buf,
+                                q_offset,
+                                k_cache,
+                                v_cache,
+                                &self.prefill_scratch.attn_out_buf,
+                                q_offset,
+                                num_heads as u32,
+                                num_kv_heads as u32,
+                                num_kv_groups,
+                                head_dim as u32,
+                                effective_kv_seq,
+                                kv_pool.capacity(),
+                                scale,
+                                kv_start,
+                                groups_per_row,
+                                row_bytes,
+                            );
+                        }
+                    } else {
                     let use_ext_attn = crate::gpu::prefill_flash_attn_ext_enabled()
                         && crate::gpu::prefill_use_flash_attn_ext_tiled(
                             seq_len as u32,
@@ -6187,6 +7202,7 @@ impl Gemma4GpuModel {
                         fa_layout,
                         Some(&mut ext_mask_cache),
                     );
+                    }
                 }
             }
             } // !skip_attn_flash
@@ -6197,7 +7213,7 @@ impl Gemma4GpuModel {
             let use_ext_attn = crate::gpu::prefill_flash_attn_ext_enabled()
                 && crate::gpu::prefill_use_flash_attn_ext_tiled(seq_len as u32, head_dim as u32)
                 && matches!(self.kv_cache_type, KvCacheType::Q4_0);
-            if !use_ext_attn {
+            if !use_ext_attn && !use_decode_fa {
                 self.ctx.encode_transpose_hsd(
                     encoder,
                     &self.prefill_scratch.attn_out_buf,
@@ -6210,7 +7226,11 @@ impl Gemma4GpuModel {
             self.ctx.encode_prefill_projection_auto_batch_view(
                 encoder,
                 &layer.o_proj,
-                &self.prefill_scratch.q_normed_buf,
+                if use_decode_fa {
+                    &self.prefill_scratch.attn_out_buf
+                } else {
+                    &self.prefill_scratch.q_normed_buf
+                },
                 &self.prefill_scratch.o_out_buf,
                 hidden_size as u32,
                 q_out as u32,
@@ -6360,8 +7380,9 @@ impl Gemma4GpuModel {
         }
         encoder.end_encoding();
 
-        if compute_logits {
-            // Final norm + lm_head (last chunk only — matches llama.cpp out_ids gating).
+        if compute_logits || capture_mtp_rows {
+            // Final norm + lm_head. Normal prefill only needs the last row;
+            // MTP verify needs every row's logits + post-norm hidden.
             let encoder = cmd.new_compute_command_encoder();
             self.ctx.encode_rmsnorm_batch_view(
                 encoder,
@@ -6372,17 +7393,50 @@ impl Gemma4GpuModel {
                 eps,
                 seq_len as u32,
             );
-            let last_offsets = self.prefill_row_offsets(seq_len - 1);
-            self.ctx.encode_matvec_auto_at_view(
-                encoder,
-                &self.lm_head_buf,
-                &self.prefill_scratch.normed_buf,
-                last_offsets.hidden,
-                &self.prefill_scratch.logits_buf,
-                0,
-                vocab_size as u32,
-                hidden_size as u32,
-            );
+            if capture_mtp_rows {
+                // One batched lm_head projection for all rows: the ~440 MB
+                // vocab matrix is read once instead of seq_len times.
+                self.ctx.encode_prefill_projection_auto_batch_view(
+                    encoder,
+                    &self.lm_head_buf,
+                    &self.prefill_scratch.normed_buf,
+                    &self.mtp_verify_logits_buf,
+                    vocab_size as u32,
+                    hidden_size as u32,
+                    seq_len as u32,
+                );
+                for row in 0..seq_len {
+                    let offsets = self.prefill_row_offsets(row);
+                    self.ctx.encode_copy_at(
+                        encoder,
+                        &self.prefill_scratch.normed_buf,
+                        offsets.hidden,
+                        &self.mtp_verify_hidden_buf,
+                        (row * hidden_size * 4) as u64,
+                        hidden_size as u32,
+                    );
+                }
+                self.ctx.encode_softcap_argmax_rows_f32(
+                    encoder,
+                    &self.mtp_verify_logits_buf,
+                    &self.mtp_verify_argmax_buf,
+                    seq_len as u32,
+                    vocab_size as u32,
+                    self.config.final_logit_softcapping,
+                );
+            } else {
+                let last_offsets = self.prefill_row_offsets(seq_len - 1);
+                self.ctx.encode_matvec_auto_at_view(
+                    encoder,
+                    &self.lm_head_buf,
+                    &self.prefill_scratch.normed_buf,
+                    last_offsets.hidden,
+                    &self.prefill_scratch.logits_buf,
+                    0,
+                    vocab_size as u32,
+                    hidden_size as u32,
+                );
+            }
             encoder.end_encoding();
         }
 
@@ -6438,6 +7492,7 @@ impl Gemma4GpuModel {
         inputs: &[(KvSlot, usize)],
         slot_views: &[KvSlotView],
         kv_pool: &mut KvCachePool,
+        capture_mtp: bool,
     ) -> Result<Vec<Vec<f32>>, String> {
         let batch_size = inputs.len();
         if batch_size == 0 {
@@ -6461,58 +7516,45 @@ impl Gemma4GpuModel {
 
         {
             let encoder = cmd.new_compute_command_encoder();
-            for batch_idx in 0..batch_size {
-                let offsets = self.decode_batch_row_offsets(batch_idx);
-                self.ctx.encode_matvec_auto_at_view(
-                    encoder,
-                    &self.per_layer_model_projection_weight,
-                    &self.decode_batch_scratch.hidden_buf,
-                    offsets.hidden,
-                    &self.decode_batch_scratch.ple_context_proj_buf,
-                    offsets.ple_row,
-                    ple_total_dim as u32,
-                    hidden_size as u32,
-                );
-                self.ctx.encode_vec_scale_at(
-                    encoder,
-                    &self.decode_batch_scratch.ple_context_proj_buf,
-                    offsets.ple_row,
-                    &self.decode_batch_scratch.ple_combined_buf,
-                    offsets.ple_row,
-                    ple_total_dim as u32,
-                    context_proj_scale,
-                );
-                self.ctx.encode_rmsnorm_per_head_at_view(
-                    encoder,
-                    &self.decode_batch_scratch.ple_combined_buf,
-                    offsets.ple_row,
-                    &self.per_layer_projection_norm_weight,
-                    &self.decode_batch_scratch.ple_context_proj_buf,
-                    offsets.ple_row,
-                    num_layers as u32,
-                    ple_dim as u32,
-                    eps,
-                );
-                self.ctx.encode_vec_add_at(
-                    encoder,
-                    &self.decode_batch_scratch.ple_context_proj_buf,
-                    offsets.ple_row,
-                    &self.decode_batch_scratch.ple_token_id_buf,
-                    offsets.ple_row,
-                    &self.decode_batch_scratch.ple_combined_buf,
-                    offsets.ple_row,
-                    ple_total_dim as u32,
-                );
-                self.ctx.encode_vec_scale_at(
-                    encoder,
-                    &self.decode_batch_scratch.ple_combined_buf,
-                    offsets.ple_row,
-                    &self.decode_batch_scratch.ple_context_proj_buf,
-                    offsets.ple_row,
-                    ple_total_dim as u32,
-                    ple_input_scale,
-                );
-            }
+            self.ctx.encode_prefill_projection_auto_batch_view(
+                encoder,
+                &self.per_layer_model_projection_weight,
+                &self.decode_batch_scratch.hidden_buf,
+                &self.decode_batch_scratch.ple_context_proj_buf,
+                ple_total_dim as u32,
+                hidden_size as u32,
+                batch_size as u32,
+            );
+            self.ctx.encode_vec_scale(
+                encoder,
+                &self.decode_batch_scratch.ple_context_proj_buf,
+                &self.decode_batch_scratch.ple_combined_buf,
+                (batch_size * ple_total_dim) as u32,
+                context_proj_scale,
+            );
+            self.ctx.encode_rmsnorm_batch_view(
+                encoder,
+                &self.decode_batch_scratch.ple_combined_buf,
+                &self.per_layer_projection_norm_weight,
+                &self.decode_batch_scratch.ple_context_proj_buf,
+                ple_dim as u32,
+                eps,
+                (batch_size * num_layers) as u32,
+            );
+            self.ctx.encode_vec_add_batch(
+                encoder,
+                &self.decode_batch_scratch.ple_context_proj_buf,
+                &self.decode_batch_scratch.ple_token_id_buf,
+                &self.decode_batch_scratch.ple_combined_buf,
+                (batch_size * ple_total_dim) as u32,
+            );
+            self.ctx.encode_vec_scale(
+                encoder,
+                &self.decode_batch_scratch.ple_combined_buf,
+                &self.decode_batch_scratch.ple_context_proj_buf,
+                (batch_size * ple_total_dim) as u32,
+                ple_input_scale,
+            );
             encoder.end_encoding();
         }
 
@@ -7462,26 +8504,46 @@ impl Gemma4GpuModel {
                     hidden_size as u32,
                 );
             }
+            if capture_mtp {
+                self.ctx.encode_copy_at(
+                    encoder,
+                    &self.decode_batch_scratch.normed_buf,
+                    0,
+                    &self.mtp_verify_hidden_buf,
+                    0,
+                    (batch_size * hidden_size) as u32,
+                );
+                self.ctx.encode_softcap_argmax_rows_f32(
+                    encoder,
+                    &self.decode_batch_scratch.logits_buf,
+                    &self.mtp_verify_argmax_buf,
+                    batch_size as u32,
+                    vocab_size as u32,
+                    self.config.final_logit_softcapping,
+                );
+            }
             encoder.end_encoding();
         }
 
         cmd.commit();
         cmd.wait_until_completed();
 
-        let mut logits_batch = MetalContext::read_buffer(
-            &self.decode_batch_scratch.logits_buf,
-            batch_size * vocab_size,
-        );
-        let cap = self.config.final_logit_softcapping;
         let mut outputs = Vec::with_capacity(batch_size);
-        for batch_idx in 0..batch_size {
-            let start = batch_idx * vocab_size;
-            let end = start + vocab_size;
-            for logit in &mut logits_batch[start..end] {
-                let x = (*logit / cap).clamp(-10.0, 10.0);
-                *logit = cap * x.tanh();
+        if !capture_mtp {
+            let mut logits_batch = MetalContext::read_buffer(
+                &self.decode_batch_scratch.logits_buf,
+                batch_size * vocab_size,
+            );
+            let cap = self.config.final_logit_softcapping;
+            for batch_idx in 0..batch_size {
+                let start = batch_idx * vocab_size;
+                let end = start + vocab_size;
+                for logit in &mut logits_batch[start..end] {
+                    let x = (*logit / cap).clamp(-10.0, 10.0);
+                    *logit = cap * x.tanh();
+                }
+                outputs.push(logits_batch[start..end].to_vec());
             }
-            outputs.push(logits_batch[start..end].to_vec());
         }
 
         for slot_view in slot_views {
@@ -7609,6 +8671,7 @@ impl Gemma4GpuModel {
                 inputs,
                 &slot_views,
                 kv_pool,
+                false,
             ) {
                 Ok(outputs) => outputs.into_iter().map(Ok).collect(),
                 Err(message) => inputs.iter().map(|_| Err(message.clone())).collect(),
@@ -7847,6 +8910,7 @@ impl Gemma4GpuModel {
                 slot,
                 start_pos,
                 compute_logits,
+                false,
             );
         }
 

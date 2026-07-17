@@ -1217,6 +1217,169 @@ kernel void matvec_ggml_q6_K(
     mul_vec_q6_K_f32_impl<KQ_NR0>(args, W, x, y, tgpig, tiisg, sgitg);
 }
 
+// ─── K-quant small-batch ext matvec (llama.cpp kernel_mul_mv_ext_q4x4_f32) ───
+//
+// Processes r1ptg src1 rows per threadgroup so each quantized weight row is
+// dequantized once and dotted against all rows — the batch-2..8 regime of MTP
+// verify, where per-row matvec re-reads weights batch× times.
+
+static inline uchar2 get_scale_min_k4_just2(int j, int k, device const uchar * q) {
+    return j < 4 ? uchar2{uchar(q[j+0+k] & 63), uchar(q[j+4+k] & 63)}
+                 : uchar2{uchar((q[j+4+k] & 0xF) | ((q[j-4+k] & 0xc0) >> 2)),
+                          uchar((q[j+4+k] >>  4) | ((q[j-0+k] & 0xc0) >> 2))};
+}
+
+static inline void dequantize_q4_K_f4x4(device const block_q4_K * xb, short il, thread float4x4 & reg) {
+    device const uchar * q = xb->qs;
+
+    short is = (il/4) * 2;
+    q = q + (il/4) * 32 + 16 * (il&1);
+    il = il & 3;
+    const uchar2 sc = get_scale_min_k4_just2(is, il/2, xb->scales);
+    const float d   = il < 2 ? (float)xb->d : (float)xb->d / 16.f;
+    const float min = xb->dmin;
+    const float dl = d * sc[0];
+    const float ml = min * sc[1];
+
+    const ushort mask = il < 2 ? 0x0F : 0xF0;
+    for (int i = 0; i < 16; ++i) {
+        reg[i/4][i%4] = dl * (q[i] & mask) - ml;
+    }
+}
+
+static inline void dequantize_q6_K_f4x4(device const block_q6_K * xb, short il, thread float4x4 & reg) {
+    const half d_all = xb->d;
+    device const uint16_t * ql = (device const uint16_t *)xb->ql;
+    device const uint16_t * qh = (device const uint16_t *)xb->qh;
+    device const int8_t * scales = (device const int8_t *)xb->scales;
+
+    ql = ql + 32*(il/8) + 16*((il/2)&1) + 8*(il&1);
+    qh = qh + 16*(il/8) + 8*(il&1);
+    float sc = scales[(il%2) + 2 * ((il/2))];
+    il = (il/2) & 3;
+
+    const uint32_t kmask1 = il>1 ? (il>2 ? 0xC0C0C0C0 : 0x30303030) : (il>0 ? 0x0C0C0C0C : 0x03030303);
+    const uint32_t kmask2 = il>1 ? 0xF0F0F0F0                       : 0x0F0F0F0F;
+    const float ml = d_all * sc * 32.f;
+    const float dl0 = d_all * sc;
+    const float dl1 = dl0 / 256.f;
+    const float dl2 = dl0 / (256.f * 256.f);
+    const float dl3 = dl0 / (256.f * 256.f * 256.f);
+    const uint8_t shr_h = il>2 ? 2 : 0;
+    const uint8_t shl_h = il>1 ? 0 : (il>0 ? 2 : 4);
+    const uint8_t shr_l = il>1 ? 4 : 0;
+    for (int i = 0; i < 4; ++i) {
+        const uint32_t  low = (ql[2*i] | (uint32_t)(ql[2*i+1] << 16)) & kmask2;
+        const uint32_t high = (qh[2*i] | (uint32_t)(qh[2*i+1] << 16)) & kmask1;
+        const uint32_t q = ((high << shl_h) >> shr_h) | (low >> shr_l);
+        reg[i][0] = dl0 *  ((half)(q & 0xFF))       - ml;
+        reg[i][1] = dl1 * ((float)(q & 0xFF00))     - ml;
+        reg[i][2] = dl2 * ((float)(q & 0xFF0000))   - ml;
+        reg[i][3] = dl3 * ((float)(q & 0xFF000000)) - ml;
+    }
+}
+
+template<short nxpsg, short r1ptg, typename block_t,
+         void (*deq_t4x4)(device const block_t *, short, thread float4x4 &)>
+void mul_mv_ext_q4x4_f32_impl(
+        constant ggml_mul_mv_ext_args& args,
+        device const char * src0,
+        device const char * src1,
+        device char * dst,
+        uint3 tgpig,
+        ushort tiisg,
+        ushort sgitg) {
+    const short chpb = QK_K / 16;   // float4x4 chunks per super-block
+    const short nypsg = 32 / nxpsg;
+    const short tx = tiisg % nxpsg;
+    const short ty = tiisg / nxpsg;
+
+    const int i01 = tgpig.x * (nypsg * args.nsg) + nypsg * sgitg + ty;
+    const int i11 = tgpig.y * r1ptg;
+    const int i1m = tgpig.z;
+
+    const int i12 = i1m % args.ne12;
+    const int i13 = i1m / args.ne12;
+
+    const uint64_t offset0 = i01 * args.nb01 + (i12 / args.r2) * args.nb02 + (i13 / args.r3) * args.nb03;
+    const uint64_t offset1 = i11 * args.nb11 + i12 * args.nb12 + i13 * args.nb13;
+
+    device const block_t * xq = (i01 < args.ne01)
+        ? (device const block_t *)(src0 + offset0) + tx / chpb
+        : (device const block_t *)src0;
+
+    device const float4x4 * y4x4[r1ptg];
+    for (int ir1 = 0; ir1 < r1ptg; ++ir1) {
+        y4x4[ir1] = (i11 + ir1 < args.ne11)
+            ? (device const float4x4 *)(src1 + offset1 + ir1 * args.nb11) + tx
+            : (device const float4x4 *)src1;
+    }
+
+    float sumf[r1ptg];
+    for (int ir1 = 0; ir1 < r1ptg; ++ir1) sumf[ir1] = 0.0f;
+
+    short cch = tx % chpb;
+    for (int ich = tx; 16 * ich < args.ne00; ich += nxpsg) {
+        float4x4 lx;
+        deq_t4x4(xq, cch, lx);
+        cch += nxpsg;
+        if (cch >= chpb) {
+            xq += cch / chpb;
+            cch %= chpb;
+        }
+#pragma unroll
+        for (short ir1 = 0; ir1 < r1ptg; ++ir1) {
+            sumf[ir1] += dot(lx[0], y4x4[ir1][0][0]) +
+                         dot(lx[1], y4x4[ir1][0][1]) +
+                         dot(lx[2], y4x4[ir1][0][2]) +
+                         dot(lx[3], y4x4[ir1][0][3]);
+        }
+#pragma unroll
+        for (short ir1 = 0; ir1 < r1ptg; ++ir1) {
+            y4x4[ir1] += nxpsg;
+        }
+    }
+
+    for (short ir1 = 0; ir1 < r1ptg; ++ir1) {
+        if (nxpsg >= 32) sumf[ir1] += simd_shuffle_down(sumf[ir1], 16);
+        if (nxpsg >= 16) sumf[ir1] += simd_shuffle_down(sumf[ir1], 8);
+        if (nxpsg >= 8)  sumf[ir1] += simd_shuffle_down(sumf[ir1], 4);
+        if (nxpsg >= 4)  sumf[ir1] += simd_shuffle_down(sumf[ir1], 2);
+        if (nxpsg >= 2)  sumf[ir1] += simd_shuffle_down(sumf[ir1], 1);
+    }
+
+    if (tx == 0) {
+        for (short ir1 = 0; ir1 < r1ptg && i11 + ir1 < args.ne11; ++ir1) {
+            device float * dst_f32 = (device float *)dst
+                + (uint64_t)i1m * args.ne0 * args.ne1 + (uint64_t)(i11 + ir1) * args.ne0;
+            if (i01 < args.ne01) {
+                dst_f32[i01] = sumf[ir1];
+            }
+        }
+    }
+}
+
+#define MV_EXT_KQ_KERNEL(name, block_t, deq, nx, r1)                          \
+kernel void name(                                                             \
+    device const char * W [[buffer(0)]],                                      \
+    device const char * x [[buffer(1)]],                                      \
+    device char * y [[buffer(2)]],                                            \
+    constant ggml_mul_mv_ext_args& args [[buffer(3)]],                        \
+    uint3 tgpig [[threadgroup_position_in_grid]],                             \
+    ushort tiisg [[thread_index_in_simdgroup]],                               \
+    ushort sgitg [[simdgroup_index_in_threadgroup]]) {                        \
+    mul_mv_ext_q4x4_f32_impl<nx, r1, block_t, deq>(args, W, x, y, tgpig, tiisg, sgitg); \
+}
+
+MV_EXT_KQ_KERNEL(matvec_ggml_ext_q4K_nx8_r2, block_q4_K, dequantize_q4_K_f4x4, 8, 2)
+MV_EXT_KQ_KERNEL(matvec_ggml_ext_q4K_nx8_r3, block_q4_K, dequantize_q4_K_f4x4, 8, 3)
+MV_EXT_KQ_KERNEL(matvec_ggml_ext_q4K_nx8_r4, block_q4_K, dequantize_q4_K_f4x4, 8, 4)
+MV_EXT_KQ_KERNEL(matvec_ggml_ext_q4K_nx8_r5, block_q4_K, dequantize_q4_K_f4x4, 8, 5)
+MV_EXT_KQ_KERNEL(matvec_ggml_ext_q6K_nx8_r2, block_q6_K, dequantize_q6_K_f4x4, 8, 2)
+MV_EXT_KQ_KERNEL(matvec_ggml_ext_q6K_nx8_r3, block_q6_K, dequantize_q6_K_f4x4, 8, 3)
+MV_EXT_KQ_KERNEL(matvec_ggml_ext_q6K_nx8_r4, block_q6_K, dequantize_q6_K_f4x4, 8, 4)
+MV_EXT_KQ_KERNEL(matvec_ggml_ext_q6K_nx8_r5, block_q6_K, dequantize_q6_K_f4x4, 8, 5)
+
 // Fused gate+up+GeLU for Q4_K weights. Shared activation loads, dual weight streams.
 template<short nr0>
 void mul_vec_q4_K_gelu_f32_impl(
