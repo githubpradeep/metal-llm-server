@@ -17,6 +17,10 @@ pub struct Gemma4MtpAssistant {
 impl Gemma4MtpAssistant {
     pub fn new(ctx: &MetalContext, model_path: &str, target: &Gemma4GpuModel) -> Self {
         let mut head = MtpDraftHead::load_from_gguf(ctx, model_path);
+        // Prefer the target's softcap so draft p_min / greedy path matches verify.
+        if target.config.final_logit_softcapping > 0.0 {
+            head.final_logit_softcapping = target.config.final_logit_softcapping;
+        }
         let swa_source = target.mtp_kv_source_layer(false);
         let full_source = target.mtp_kv_source_layer(true);
         let mut remapped = false;

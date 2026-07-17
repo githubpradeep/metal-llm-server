@@ -482,6 +482,17 @@ pub fn prefill_mlp_gate_f16_dst_enabled() -> bool {
     )
 }
 
+/// Fused gate∥up+GeLU via K-quant ext matvec for small-batch prefill / MTP verify
+/// (seq 2–8). Shares activation loads between gate and up and writes GeLU output
+/// directly — skips the 2·M·batch intermediate and a separate gelu_mul. Default on.
+/// Set PREFILL_GATE_UP_EXT_GELU=0 to use stacked ext + gelu_mul_stacked.
+pub fn prefill_gate_up_ext_gelu_enabled() -> bool {
+    !matches!(
+        std::env::var("PREFILL_GATE_UP_EXT_GELU").as_deref(),
+        Ok("0") | Ok("false") | Ok("FALSE")
+    )
+}
+
 /// Prefill Q∥K∥V: one stacked mul_mm + split instead of three mul_mm dispatches (KV layers).
 /// Set PREFILL_QKV_STACKED=0 to use separate Q/K/V projections.
 pub fn prefill_qkv_stacked_enabled() -> bool {
@@ -570,6 +581,8 @@ pub struct MetalContext {
     /// K-quant small-batch ext matvec, indexed by r1ptg-2 (r1 in 2..=5).
     pub matvec_ggml_ext_q4k_pipelines: [ComputePipelineState; 4],
     pub matvec_ggml_ext_q6k_pipelines: [ComputePipelineState; 4],
+    /// Fused gate∥up+GeLU ext matvec (Q4_K), indexed by r1ptg-2.
+    pub matvec_ggml_ext_q4k_gelu_pipelines: [ComputePipelineState; 4],
     /// Decode Q4 matvec variant selected via the MATVEC_KERNEL env var.
     pub decode_matvec_kernel: DecodeMatvecKernel,
     pub projection_f16_batch_pipeline: ComputePipelineState,
@@ -812,6 +825,12 @@ impl MetalContext {
             get_fn("matvec_ggml_ext_q6K_nx8_r4"),
             get_fn("matvec_ggml_ext_q6K_nx8_r5"),
         ];
+        let matvec_ggml_ext_q4k_gelu_pipelines = [
+            get_fn("matvec_ggml_ext_q4K_gelu_nx8_r2"),
+            get_fn("matvec_ggml_ext_q4K_gelu_nx8_r3"),
+            get_fn("matvec_ggml_ext_q4K_gelu_nx8_r4"),
+            get_fn("matvec_ggml_ext_q4K_gelu_nx8_r5"),
+        ];
         let decode_matvec_kernel = DecodeMatvecKernel::from_env();
         match decode_matvec_kernel {
             DecodeMatvecKernel::Auto => {
@@ -1041,6 +1060,9 @@ impl MetalContext {
             if fused_rmsnorm_mlp_kquant_enabled() {
                 println!("  Fused pre-FF RMSNorm + Q4_K gate∥up+GeLU on K-quant (FUSED_RMSNORM_MLP_KQUANT=0 to disable)");
             }
+            if prefill_gate_up_ext_gelu_enabled() {
+                println!("  Prefill/MTP fused gate∥up+GeLU ext matvec seq 2–8 (PREFILL_GATE_UP_EXT_GELU=0 to disable)");
+            }
             if fused_rmsnorm_mlp_enabled() {
                 println!("  Fused pre-FF RMSNorm + gate∥up+GeLU (FUSED_RMSNORM_MLP=0 to disable)");
             }
@@ -1108,6 +1130,7 @@ impl MetalContext {
             matvec_ggml_ext_q4_nx16_pipeline,
             matvec_ggml_ext_q4k_pipelines,
             matvec_ggml_ext_q6k_pipelines,
+            matvec_ggml_ext_q4k_gelu_pipelines,
             decode_matvec_kernel,
             projection_f16_batch_pipeline,
             projection_q4_batch_pipeline,
@@ -2555,6 +2578,46 @@ impl MetalContext {
         encoder.set_buffer(2, Some(y_buf), y_offset);
         encoder.set_bytes(
             3,
+            std::mem::size_of::<crate::ggml_gemv::GgmlMulMvExtArgs>() as u64,
+            &args as *const _ as *const _,
+        );
+        let (tg_x, tg_y, tg_z, tw, nsg) = mul_mv_ext_k_dispatch(m, batch, r1ptg);
+        encoder.dispatch_thread_groups(
+            metal::MTLSize::new(tg_x, tg_y, tg_z),
+            metal::MTLSize::new(tw, nsg, 1),
+        );
+    }
+
+    /// Fused gate∥up+GeLU K-quant ext matvec for batch 2–8.
+    /// Dequantizes each gate/up weight row once, shares activation tile loads,
+    /// and writes `GeLU(gate·x)*(up·x)` directly (no intermediate activations).
+    pub fn encode_matvec_kq_ext_gelu_mul_at_view(
+        &self,
+        encoder: &metal::ComputeCommandEncoderRef,
+        gate: &BufferView,
+        up: &BufferView,
+        x_buf: &Buffer,
+        gelu_out: &Buffer,
+        m: u32,
+        k: u32,
+        batch: u32,
+    ) {
+        debug_assert_eq!(gate.format, weight_fmt::Q4_K);
+        debug_assert_eq!(up.format, weight_fmt::Q4_K);
+        use crate::ggml_gemv::{
+            mul_mv_ext_args_k, mul_mv_ext_k_dispatch, mv_ext_kq_r1ptg, Q4_K_BLOCK_BYTES,
+        };
+        let r1ptg = mv_ext_kq_r1ptg(batch);
+        let args = mul_mv_ext_args_k(m, k, batch, Q4_K_BLOCK_BYTES);
+        encoder.set_compute_pipeline_state(
+            &self.matvec_ggml_ext_q4k_gelu_pipelines[(r1ptg - 2) as usize],
+        );
+        encoder.set_buffer(0, Some(&gate.buffer), gate.offset);
+        encoder.set_buffer(1, Some(&up.buffer), up.offset);
+        encoder.set_buffer(2, Some(x_buf), 0);
+        encoder.set_buffer(3, Some(gelu_out), 0);
+        encoder.set_bytes(
+            4,
             std::mem::size_of::<crate::ggml_gemv::GgmlMulMvExtArgs>() as u64,
             &args as *const _ as *const _,
         );

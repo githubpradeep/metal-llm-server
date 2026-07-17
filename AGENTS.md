@@ -414,12 +414,34 @@ Sweep (adaptive, auto, 442-tok essay): p_min 0.3 → 44.0% accept / 40.6 tok/s;
 noise (±2) — the extra draft passes still roughly cancel the accept gain.
 p_min remains opt-in.
 
+### M7. Fused gate∥up+GeLU ext matvec for verify seq 2–8 (default on)
+
+**What**: Ported the decode-style fused Q4_K gate∥up+GeLU pattern onto the
+K-quant `mul_mv_ext` path (`matvec_ggml_ext_q4K_gelu_nx8_r{2..5}`). Each TG
+dequants gate row i + up row i, shares activation tiles across the batch, and
+writes `GeLU(gate·x)*(up·x)` directly — skips the 2·M·batch intermediate and
+the separate `gelu_mul_stacked` dispatch. Wired in `encode_prefill_mlp_gate_up`
+when `PREFILL_GATE_UP_EXT_GELU=1` (default), both weights Q4_K, seq ∈ [2,8].
+
+**Result** (adaptive MTP, auto, 442-tok essay, 2 runs each):
+- fused ON:  42.4 / 43.3 tok/s (accept 42.5%, identical draft path)
+- fused OFF: 42.1 / 41.9 tok/s
+- Essay coherent; accept rate unchanged (same greedy tokens).
+
+**Conclusion**: Correct and ~0.5–1.5 tok/s — within run noise / tiny. Expected:
+weight bandwidth for gate+up is unchanged (still read both matrices once); only
+activation scratch + one gelu dispatch are saved. Does **not** close the
+"batch-3 MLP ≈ 1.6× batch-1" gap — that cost is the three weight streams
+(gate/up/down) plus occupancy, not the gelu glue. Keep default-on as a clean
+path; next verify MLP lever needs a different angle (down-proj / occupancy /
+phase timing).
+
 ### Remaining gap to >45 tok/s
 
 Verify seq=3 is ~36 ms vs ~22 ms single decode (1.6x for 3 rows). Ablation:
 MLP ≈ 12 ms of it (batched ext matvec already; gate∥up + down at batch 3 cost
 ~1.6x batch-1 despite weight reuse — bandwidth model says should be ~1.1x).
 Acceptance is the structural limit: at 42% accept and 1.85 tok/forward, even
-free batching caps at ~1.85× per-forward cost. Next levers: draft head quality
-(accept ~42% → 60%+), or shave verify MLP (fused gate∥up ext kernel for
-batch 2–8, analogous to `matvec_ggml_q4_K_gelu_mul`).
+free batching caps at ~1.85× per-forward cost. M7 fused gelu was a wash for
+e2e. Next levers: draft head quality (accept ~42% → 60%+), or deeper verify
+phase timing to find where the 1.6× MLP tax actually lives.

@@ -1380,6 +1380,138 @@ MV_EXT_KQ_KERNEL(matvec_ggml_ext_q6K_nx8_r3, block_q6_K, dequantize_q6_K_f4x4, 8
 MV_EXT_KQ_KERNEL(matvec_ggml_ext_q6K_nx8_r4, block_q6_K, dequantize_q6_K_f4x4, 8, 4)
 MV_EXT_KQ_KERNEL(matvec_ggml_ext_q6K_nx8_r5, block_q6_K, dequantize_q6_K_f4x4, 8, 5)
 
+// ─── Fused gate∥up+GeLU ext matvec for small-batch MLP (MTP verify seq 2–8) ──
+//
+// Same weight-row reuse as mul_mv_ext_q4x4_f32, but each threadgroup processes
+// gate row i and up row i together: activation tiles are loaded once, both
+// weight rows are dequantized, and the output is GeLU(gate·x)*(up·x). Skips
+// writing the 2·M·batch intermediate activations and the separate gelu_mul
+// dispatch — the bandwidth win for MTP verify MLP.
+
+template<short nxpsg, short r1ptg>
+void mul_mv_ext_q4K_gelu_f32_impl(
+        constant ggml_mul_mv_ext_args& args,
+        device const char * src0_gate,
+        device const char * src0_up,
+        device const char * src1,
+        device char * dst,
+        uint3 tgpig,
+        ushort tiisg,
+        ushort sgitg) {
+    const short chpb = QK_K / 16;
+    const short nypsg = 32 / nxpsg;
+    const short tx = tiisg % nxpsg;
+    const short ty = tiisg / nxpsg;
+
+    const int i01 = tgpig.x * (nypsg * args.nsg) + nypsg * sgitg + ty;
+    const int i11 = tgpig.y * r1ptg;
+    const int i1m = tgpig.z;
+
+    const int i12 = i1m % args.ne12;
+    const int i13 = i1m / args.ne12;
+
+    const uint64_t offset0 = i01 * args.nb01 + (i12 / args.r2) * args.nb02 + (i13 / args.r3) * args.nb03;
+    const uint64_t offset1 = i11 * args.nb11 + i12 * args.nb12 + i13 * args.nb13;
+
+    device const block_q4_K * xqg = (i01 < args.ne01)
+        ? (device const block_q4_K *)(src0_gate + offset0) + tx / chpb
+        : (device const block_q4_K *)src0_gate;
+    device const block_q4_K * xqu = (i01 < args.ne01)
+        ? (device const block_q4_K *)(src0_up + offset0) + tx / chpb
+        : (device const block_q4_K *)src0_up;
+
+    device const float4x4 * y4x4[r1ptg];
+    for (int ir1 = 0; ir1 < r1ptg; ++ir1) {
+        y4x4[ir1] = (i11 + ir1 < args.ne11)
+            ? (device const float4x4 *)(src1 + offset1 + ir1 * args.nb11) + tx
+            : (device const float4x4 *)src1;
+    }
+
+    float sumf_g[r1ptg];
+    float sumf_u[r1ptg];
+    for (int ir1 = 0; ir1 < r1ptg; ++ir1) {
+        sumf_g[ir1] = 0.0f;
+        sumf_u[ir1] = 0.0f;
+    }
+
+    short cch = tx % chpb;
+    for (int ich = tx; 16 * ich < args.ne00; ich += nxpsg) {
+        float4x4 lg;
+        float4x4 lu;
+        dequantize_q4_K_f4x4(xqg, cch, lg);
+        dequantize_q4_K_f4x4(xqu, cch, lu);
+        cch += nxpsg;
+        if (cch >= chpb) {
+            const short step = cch / chpb;
+            xqg += step;
+            xqu += step;
+            cch %= chpb;
+        }
+#pragma unroll
+        for (short ir1 = 0; ir1 < r1ptg; ++ir1) {
+            const float4x4 y = y4x4[ir1][0];
+            sumf_g[ir1] += dot(lg[0], y[0]) + dot(lg[1], y[1]) +
+                           dot(lg[2], y[2]) + dot(lg[3], y[3]);
+            sumf_u[ir1] += dot(lu[0], y[0]) + dot(lu[1], y[1]) +
+                           dot(lu[2], y[2]) + dot(lu[3], y[3]);
+        }
+#pragma unroll
+        for (short ir1 = 0; ir1 < r1ptg; ++ir1) {
+            y4x4[ir1] += nxpsg;
+        }
+    }
+
+    for (short ir1 = 0; ir1 < r1ptg; ++ir1) {
+        if (nxpsg >= 32) {
+            sumf_g[ir1] += simd_shuffle_down(sumf_g[ir1], 16);
+            sumf_u[ir1] += simd_shuffle_down(sumf_u[ir1], 16);
+        }
+        if (nxpsg >= 16) {
+            sumf_g[ir1] += simd_shuffle_down(sumf_g[ir1], 8);
+            sumf_u[ir1] += simd_shuffle_down(sumf_u[ir1], 8);
+        }
+        if (nxpsg >= 8) {
+            sumf_g[ir1] += simd_shuffle_down(sumf_g[ir1], 4);
+            sumf_u[ir1] += simd_shuffle_down(sumf_u[ir1], 4);
+        }
+        if (nxpsg >= 4) {
+            sumf_g[ir1] += simd_shuffle_down(sumf_g[ir1], 2);
+            sumf_u[ir1] += simd_shuffle_down(sumf_u[ir1], 2);
+        }
+        if (nxpsg >= 2) {
+            sumf_g[ir1] += simd_shuffle_down(sumf_g[ir1], 1);
+            sumf_u[ir1] += simd_shuffle_down(sumf_u[ir1], 1);
+        }
+    }
+
+    if (tx == 0 && i01 < args.ne01) {
+        for (short ir1 = 0; ir1 < r1ptg && i11 + ir1 < args.ne11; ++ir1) {
+            device float * dst_f32 = (device float *)dst
+                + (uint64_t)i1m * args.ne0 * args.ne1 + (uint64_t)(i11 + ir1) * args.ne0;
+            dst_f32[i01] = gelu_pytorch_tanh_q4(sumf_g[ir1]) * sumf_u[ir1];
+        }
+    }
+}
+
+#define MV_EXT_KQ_GELU_KERNEL(name, nx, r1)                                   \
+kernel void name(                                                             \
+    device const char * W_gate [[buffer(0)]],                                 \
+    device const char * W_up   [[buffer(1)]],                                 \
+    device const char * x      [[buffer(2)]],                                 \
+    device char * y            [[buffer(3)]],                                 \
+    constant ggml_mul_mv_ext_args& args [[buffer(4)]],                        \
+    uint3 tgpig [[threadgroup_position_in_grid]],                             \
+    ushort tiisg [[thread_index_in_simdgroup]],                               \
+    ushort sgitg [[simdgroup_index_in_threadgroup]]) {                        \
+    mul_mv_ext_q4K_gelu_f32_impl<nx, r1>(                                     \
+        args, W_gate, W_up, x, y, tgpig, tiisg, sgitg);                       \
+}
+
+MV_EXT_KQ_GELU_KERNEL(matvec_ggml_ext_q4K_gelu_nx8_r2, 8, 2)
+MV_EXT_KQ_GELU_KERNEL(matvec_ggml_ext_q4K_gelu_nx8_r3, 8, 3)
+MV_EXT_KQ_GELU_KERNEL(matvec_ggml_ext_q4K_gelu_nx8_r4, 8, 4)
+MV_EXT_KQ_GELU_KERNEL(matvec_ggml_ext_q4K_gelu_nx8_r5, 8, 5)
+
 // Fused gate+up+GeLU for Q4_K weights. Shared activation loads, dual weight streams.
 template<short nr0>
 void mul_vec_q4_K_gelu_f32_impl(

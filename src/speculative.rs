@@ -57,6 +57,11 @@ pub struct MtpDraftHead {
     pub swa_n_rot: usize,
     /// Attention sliding window (drafter's own, in tokens).
     pub sliding_window: u32,
+    /// Final logit softcapping (Gemma). Draft argmax/p_min use the same cap as
+    /// the target verifier; assistant GGUF typically omits this key.
+    pub final_logit_softcapping: f32,
+    /// RMSNorm epsilon from assistant GGUF (fallback 1e-6).
+    pub rms_eps: f32,
     /// Output LM head / token embedding of the head [hidden_head, vocab] (F16).
     pub tok_embd: BufferView,
     /// [hidden_head] F32.
@@ -112,6 +117,31 @@ impl MtpDraftHead {
         let sliding_window = g
             .get_u32("gemma4-assistant.attention.sliding_window")
             .unwrap_or(512);
+        let final_logit_softcapping = g
+            .get_f32("gemma4-assistant.final_logit_softcapping")
+            .unwrap_or(30.0);
+        let rms_eps = g
+            .get_f32("gemma4-assistant.attention.layer_norm_rms_epsilon")
+            .unwrap_or(1e-6);
+
+        // true => sliding attention, false => full (llama.cpp is_swa_impl).
+        let swa_pattern: Vec<bool> = g
+            .get_arr_bool("gemma4-assistant.attention.sliding_window_pattern")
+            .map(|p| p.to_vec())
+            .unwrap_or_else(|| {
+                eprintln!(
+                    "  [MTP] WARNING: no sliding_window_pattern in assistant GGUF; \
+                     falling back to period-4 T,T,T,F"
+                );
+                (0..n_layers).map(|i| (i % 4) != 3).collect()
+            });
+        if swa_pattern.len() != n_layers {
+            panic!(
+                "assistant sliding_window_pattern length {} != n_layers {}",
+                swa_pattern.len(),
+                n_layers
+            );
+        }
 
         let tok_embd = f16("token_embd.weight");
         let output_norm = f32b("output_norm.weight");
@@ -155,10 +185,11 @@ impl MtpDraftHead {
                 .dims[0] as usize;
             max_ffn_inter = max_ffn_inter.max(ffn_inter);
 
-            // Gemma4 SWA pattern is T,T,T,F (period 4): only layers with
-            // i % 4 == 3 are full-attention (and carry rope_freqs).
-            let is_full = (i % 4) == 3;
-            if is_full { has_full = true; }
+            // GGUF pattern: true = SWA, false = full (matches llama.cpp is_swa).
+            let is_full = !swa_pattern[i];
+            if is_full {
+                has_full = true;
+            }
             let mapped_base_layer = if is_full { 34 } else { 33 };
 
             let out_scale_buf = f32b(&tn(i, "layer_output_scale.weight"));
@@ -196,6 +227,11 @@ impl MtpDraftHead {
             eprintln!("  [MTP] WARNING: no rope_freqs.weight found in assistant GGUF! p-RoPE will be disabled for full-attention layers.");
         }
 
+        eprintln!(
+            "  [MTP] SWA pattern (true=sliding): {:?}, rms_eps={}, logit_softcap={}",
+            swa_pattern, rms_eps, final_logit_softcapping
+        );
+
         MtpDraftHead {
             hidden_backbone,
             hidden_head,
@@ -206,6 +242,8 @@ impl MtpDraftHead {
             swa_rope_theta,
             swa_n_rot,
             sliding_window,
+            final_logit_softcapping,
+            rms_eps,
             tok_embd,
             output_norm,
             pre_proj,
@@ -336,8 +374,9 @@ impl MtpDraftHead {
         kv_cache_type: KvCacheType,
     ) -> (u32, Vec<f32>) {
         let sliding_window = self.sliding_window;
-        let eps = 1e-6f32;
+        let eps = self.rms_eps;
         let hh = self.hidden_head;
+        let softcap = self.final_logit_softcapping;
 
         // xh = concat(token_embedding [hidden_backbone], embd_nextn [hidden_backbone])
         let mut xh = Vec::with_capacity(self.hidden_backbone * 2);
@@ -562,18 +601,32 @@ impl MtpDraftHead {
         // result = rmsnorm(cur, output_norm)
         ctx.encode_rmsnorm_view(encoder, &scratch.h, &self.output_norm, &scratch.fnorm, hh as u32, eps);
 
-        // logits = output · result   (greedy draft token)
+        // logits = output · result; softcap + greedy (matches target verify).
+        // Softcap is monotonic so greedy identity is unchanged vs raw argmax,
+        // but p_min confidence (top-k softmax over logits) needs the softcapped
+        // distribution to match the verifier.
         ctx.encode_matvec_f16_view(encoder, &self.tok_embd, &scratch.fnorm, &scratch.logits, self.vocab as u32, hh as u32);
 
         // h_next = post_proj · result   (seed for next draft step)
         ctx.encode_matvec_f16_view(encoder, &self.post_proj, &scratch.fnorm, &scratch.hnext, self.hidden_backbone as u32, hh as u32);
 
-        ctx.encode_argmax_f32(
-            encoder,
-            &scratch.logits,
-            &scratch.argmax_token,
-            self.vocab as u32,
-        );
+        if softcap > 0.0 {
+            ctx.encode_softcap_argmax_rows_f32(
+                encoder,
+                &scratch.logits,
+                &scratch.argmax_token,
+                1,
+                self.vocab as u32,
+                softcap,
+            );
+        } else {
+            ctx.encode_argmax_f32(
+                encoder,
+                &scratch.logits,
+                &scratch.argmax_token,
+                self.vocab as u32,
+            );
+        }
 
         encoder.end_encoding();
         command_buffer.commit();

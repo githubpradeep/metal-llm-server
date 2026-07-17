@@ -2909,18 +2909,41 @@ impl Gemma4GpuModel {
             } else {
                 &self.prefill_scratch.normed_buf
             };
-            self.ctx.encode_prefill_gate_up_kquant_stacked(
-                encoder,
-                &layer.gate_up_stacked,
-                x_buf,
-                &self.prefill_scratch.gate_buf,
-                &self.prefill_scratch.gelu_buf,
-                intermediate_size,
-                hidden_size,
-                seq_len,
-                use_f16,
-                skip_gelu,
-            );
+            // MTP verify / small-batch: fused gate∥up+GeLU ext matvec shares
+            // activation loads and writes gelu directly (skips 2·M·batch scratch).
+            let use_ext_gelu = crate::gpu::prefill_gate_up_ext_gelu_enabled()
+                && !use_f16
+                && !skip_gelu
+                && seq_len >= 2
+                && seq_len <= 8
+                && layer.gate_proj.format == crate::gpu::weight_fmt::Q4_K
+                && layer.up_proj.format == crate::gpu::weight_fmt::Q4_K
+                && !crate::ggml_gemv::should_use_mul_mm(hidden_size, seq_len);
+            if use_ext_gelu {
+                self.ctx.encode_matvec_kq_ext_gelu_mul_at_view(
+                    encoder,
+                    &layer.gate_proj,
+                    &layer.up_proj,
+                    x_buf,
+                    &self.prefill_scratch.gelu_buf,
+                    intermediate_size,
+                    hidden_size,
+                    seq_len,
+                );
+            } else {
+                self.ctx.encode_prefill_gate_up_kquant_stacked(
+                    encoder,
+                    &layer.gate_up_stacked,
+                    x_buf,
+                    &self.prefill_scratch.gate_buf,
+                    &self.prefill_scratch.gelu_buf,
+                    intermediate_size,
+                    hidden_size,
+                    seq_len,
+                    use_f16,
+                    skip_gelu,
+                );
+            }
         } else {
             let x_buf = if use_f16 {
                 self.ctx.encode_cast_f32_to_f16(
