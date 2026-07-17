@@ -197,7 +197,7 @@ impl Gemma4MtpAssistant {
 
             if p_min > 0.0 {
                 let logits = MetalContext::read_buffer(&self.scratch.logits, self.head.vocab);
-                let prob = draft_token_softmax_prob(&logits, draft_token);
+                let prob = draft_token_confidence(&logits, draft_token, draft_top_k());
                 drafts.push(draft_token);
                 if prob < p_min {
                     break;
@@ -211,12 +211,51 @@ impl Gemma4MtpAssistant {
     }
 }
 
-fn draft_token_softmax_prob(logits: &[f32], token: usize) -> f32 {
-    let max_logit = logits.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
-    let mut sum = 0.0f32;
-    for &l in logits {
-        sum += (l - max_logit).exp();
+/// Candidate-set size for the draft confidence softmax. llama.cpp's draft-mtp
+/// sampler is top_k=10: the greedy token's probability is normalized over the
+/// top 10 candidates only, not the full vocab. 0 = full-vocab softmax.
+fn draft_top_k() -> usize {
+    static TOP_K: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *TOP_K.get_or_init(|| {
+        std::env::var("LLAMA_MTP_DRAFT_TOP_K")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(10)
+    })
+}
+
+/// Softmax probability of `token` normalized over the `top_k` largest logits
+/// (llama.cpp top-k sampler semantics). `top_k == 0` normalizes over the full
+/// vocab. `token` is the argmax, so it is always inside the candidate set.
+fn draft_token_confidence(logits: &[f32], token: usize, top_k: usize) -> f32 {
+    if top_k == 0 || top_k >= logits.len() {
+        let max_logit = logits.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+        let mut sum = 0.0f32;
+        for &l in logits {
+            sum += (l - max_logit).exp();
+        }
+        if sum <= 0.0 {
+            return 0.0;
+        }
+        return (logits[token] - max_logit).exp() / sum;
     }
+
+    // Single pass keeping the top_k largest logits (k is small, ~10).
+    let mut top: Vec<f32> = Vec::with_capacity(top_k + 1);
+    for &l in logits {
+        if top.len() < top_k {
+            top.push(l);
+            if top.len() == top_k {
+                top.sort_by(|a, b| b.partial_cmp(a).unwrap());
+            }
+        } else if l > top[top_k - 1] {
+            let pos = top.partition_point(|&t| t >= l);
+            top.insert(pos, l);
+            top.pop();
+        }
+    }
+    let max_logit = top[0];
+    let sum: f32 = top.iter().map(|&l| (l - max_logit).exp()).sum();
     if sum <= 0.0 {
         return 0.0;
     }

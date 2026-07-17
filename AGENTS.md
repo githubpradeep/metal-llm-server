@@ -389,6 +389,31 @@ Draft-steps sweep (2/3/4/6/7): flat 42–43.8; `p_min` 0.3/0.5 raises accept to
 44–48% but lowers tok/s (draft passes cost more than they save). Verify cap
 `MAX_MTP_VERIFY_SEQ=8` → max draft steps 7.
 
+### M5. h_nextn pre-final-norm "fix" — WRONG for Gemma4 (reverted)
+
+The generic `llama-graph.h` comment says `t_h_nextn` is "hidden state before
+final output norm", but **gemma4.cpp sets it AFTER `output_norm`** (post-final-
+norm, the LM-head input) — matching transformers/vLLM/SGLang for this arch.
+Tried switching all MTP h_nextn capture sites from `normed_buf` to
+`hidden_buf`: accept rate collapsed 42.5% → 21.8%, tok/s 41 → 30. Reverted.
+Our existing post-norm capture was already correct. Kept: last-row fix in
+`forward_prefill_parallel_self` (was reading row 0 instead of the last row for
+multi-token prefill).
+
+### M6. Draft confidence normalized over top-k=10 (llama.cpp parity)
+
+llama.cpp's draft-mtp sampler is `top_k=10`: `cur_p->data[0].p` (the p_min
+gate) is the greedy token's softmax over the **top 10 candidates**, not the
+full vocab. Ours was full-vocab softmax — systematically lower p, so p_min cut
+drafts too early. Now `draft_token_confidence` normalizes over top-k
+(`LLAMA_MTP_DRAFT_TOP_K`, default 10; 0 = full vocab).
+
+Sweep (adaptive, auto, 442-tok essay): p_min 0.3 → 44.0% accept / 40.6 tok/s;
+0.5 → 46.5% / 39.6–43.7; 0.75 → 50.5% / 43.4. Baseline greedy no-p_min:
+42.5% / 41.1–43.5. Accept rises with p_min but tok/s stays within run-to-run
+noise (±2) — the extra draft passes still roughly cancel the accept gain.
+p_min remains opt-in.
+
 ### Remaining gap to >45 tok/s
 
 Verify seq=3 is ~36 ms vs ~22 ms single decode (1.6x for 3 rows). Ablation:
