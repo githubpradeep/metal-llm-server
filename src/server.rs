@@ -1730,7 +1730,6 @@ pub struct AppState {
     pub tokenizer: tokenizers::Tokenizer,
     pub max_context_len: usize,
     pub runtime_config: ServerRuntimeConfig,
-    pub mtp_enabled: bool,
 }
 
 impl AppState {
@@ -2809,40 +2808,6 @@ fn encode_prompt(
     max_tokens: usize,
 ) -> Result<Vec<usize>, ApiError> {
     let max_prompt_tokens = prompt_token_budget(state.max_context_len, max_tokens);
-
-    // When MTP is enabled, the draft head was trained against the model's raw
-    // prompt encoding (the CLI MTP path does `tokenizer.encode(prompt, true)`
-    // with no chat template). Feeding the custom chat template instead halves
-    // the accept rate. So for MTP we encode the raw user text — matching the
-    // CLI exactly. Opt out with MTP_RAW_PROMPT=0.
-    let force_raw = std::env::var("MTP_RAW_PROMPT")
-        .map(|v| v != "0")
-        .unwrap_or(true);
-    if state.mtp_enabled && force_raw {
-        // Match the CLI MTP path's native Gemma4 chat template
-        // (`<start_of_turn>user\n…<end_of_turn>\n<start_of_turn>model\n`),
-        // which is what the F16 draft head was trained/validated against.
-        let user_text: String = messages
-            .iter()
-            .filter(|m| m.role == "user")
-            .filter_map(|m| m.content.clone())
-            .collect::<Vec<_>>()
-            .join("\n");
-        let raw = format!(
-            "<start_of_turn>user\n{user_text}<end_of_turn>\n<start_of_turn>model\n"
-        );
-        let encoding = state
-            .tokenizer
-            .encode(raw.as_str(), true)
-            .map_err(|err| {
-                ApiError::bad_request(
-                    "tokenizer_error",
-                    format!("failed to tokenize prompt: {}", err),
-                )
-            })?;
-        return Ok(encoding.get_ids().iter().map(|&t| t as usize).collect());
-    }
-
     let fitted = fit_messages_to_context(
         messages,
         tools,
@@ -3551,7 +3516,6 @@ pub async fn run_server_with_mtp(
         tokenizer,
         max_context_len,
         runtime_config: runtime_config.clone(),
-        mtp_enabled,
     });
 
     let app = create_router(state);
