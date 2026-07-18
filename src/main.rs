@@ -18,6 +18,7 @@ mod speculative;
 mod kv_pool;
 mod metrics;
 mod model;
+mod mtp_serve;
 mod quantize;
 mod sampling;
 mod scheduler;
@@ -318,8 +319,24 @@ fn main() {
                     .and_then(|p| p.parse().ok())
                     .unwrap_or(8080);
 
+                // Optional MTP speculative decoding: `--serve --mtp <draft_path>`.
+                let serve_mtp_path = args.iter()
+                    .position(|a| a == "--mtp")
+                    .and_then(|i| args.get(i + 1))
+                    .cloned();
+
+                let mtp_assistant = serve_mtp_path.map(|draft_path| {
+                    println!("Loading MTP draft head from: {}", draft_path);
+                    gemma4_mtp::Gemma4MtpAssistant::new(&gpu_model.ctx, &draft_path, &gpu_model)
+                });
+
                 let rt = tokio::runtime::Runtime::new().unwrap();
-                rt.block_on(server::run_server(gpu_model, tokenizer, port));
+                rt.block_on(server::run_server_with_mtp(
+                    gpu_model,
+                    tokenizer,
+                    port,
+                    mtp_assistant,
+                ));
                 return;
             }
 
@@ -337,7 +354,9 @@ fn main() {
                 let gen_start = Instant::now();
                 let mut assistant = gemma4_mtp::Gemma4MtpAssistant::new(&gpu_model.ctx, &draft_path, &gpu_model);
                 generate_gemma4_gpu_mtp(
-                    "<start_of_turn>user\n Write a short essay about the benefits of exercise. Include an introduction, 3 key points, and a conclusion.<end_of_turn>\n<start_of_turn>model\n",
+                    //"<start_of_turn>user\n Write a short essay about the benefits of exercise. Include an introduction, 3 key points, and a conclusion.<end_of_turn>\n<start_of_turn>model\n",
+                    "<start_of_turn>user\n def bubble_sort<end_of_turn>\n<start_of_turn>model\n",
+
                     &tokenizer,
                     &mut gpu_model,
                     &mut assistant,

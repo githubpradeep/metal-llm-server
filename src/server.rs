@@ -16,7 +16,9 @@ use std::time::{Duration, Instant};
 use tokio_stream::wrappers::ReceiverStream;
 
 use crate::gemma4_gpu_model::Gemma4GpuModel;
+use crate::gemma4_mtp::Gemma4MtpAssistant;
 use crate::metrics::Metrics;
+use crate::mtp_serve;
 use crate::scheduler::{
     self, GenerationParams, InferenceRequest, StreamEvent, CANCEL_CLIENT, CANCEL_NONE, CANCEL_STOP,
 };
@@ -3471,19 +3473,43 @@ pub fn create_router(state: Arc<AppState>) -> Router {
 }
 
 pub async fn run_server(model: Gemma4GpuModel, tokenizer: tokenizers::Tokenizer, port: u16) {
+    run_server_with_mtp(model, tokenizer, port, None).await
+}
+
+/// Serve mode with optional MTP (speculative draft/verify) decoding.
+///
+/// When `mtp_assistant` is `Some`, the server uses the serial MTP scheduler:
+/// requests are prefilled and decoded one at a time via draft/verify (the batched
+/// multi-slot scheduler is bypassed, since MTP is inherently single-sequence).
+pub async fn run_server_with_mtp(
+    model: Gemma4GpuModel,
+    tokenizer: tokenizers::Tokenizer,
+    port: u16,
+    mtp_assistant: Option<Gemma4MtpAssistant>,
+) {
     let max_context_len = model.kv_capacity as usize;
     let runtime_config = ServerRuntimeConfig::from_env();
     let metrics = Arc::new(Metrics::new());
-    let scheduler_config = scheduler::SchedulerConfig {
-        max_prefill_tokens_per_tick: runtime_config.max_prefill_tokens_per_tick,
+    let mtp_enabled = mtp_assistant.is_some();
+    let request_tx = if let Some(assistant) = mtp_assistant {
+        mtp_serve::spawn_mtp_scheduler(
+            model,
+            assistant,
+            runtime_config.queue_depth,
+            metrics.clone(),
+        )
+    } else {
+        let scheduler_config = scheduler::SchedulerConfig {
+            max_prefill_tokens_per_tick: runtime_config.max_prefill_tokens_per_tick,
+        };
+        scheduler::spawn_scheduler_with_config(
+            model,
+            runtime_config.queue_depth,
+            runtime_config.kv_pool_slots,
+            metrics.clone(),
+            scheduler_config,
+        )
     };
-    let request_tx = scheduler::spawn_scheduler_with_config(
-        model,
-        runtime_config.queue_depth,
-        runtime_config.kv_pool_slots,
-        metrics.clone(),
-        scheduler_config,
-    );
     let state = Arc::new(AppState {
         request_tx,
         metrics,
@@ -3514,6 +3540,9 @@ pub async fn run_server(model: Gemma4GpuModel, tokenizer: tokenizers::Tokenizer,
         "   Context: {} tokens max (override with LLAMA_CTX_SIZE, up to 200000)",
         max_context_len
     );
+    if mtp_enabled {
+        println!("   MTP: enabled (serial draft/verify decode; requests served FIFO)");
+    }
 
     let listener = tokio::net::TcpListener::bind(&addr).await.unwrap();
     axum::serve(listener, app).await.unwrap();
