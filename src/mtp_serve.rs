@@ -67,14 +67,14 @@ impl MtpScheduler {
             let _ = request.response_tx.blocking_send(StreamEvent::Done {
                 finish_reason: "timeout".to_string(),
             });
-            self.record_finish(&request, "timeout", 0, Duration::ZERO, Duration::ZERO, &[]);
+            self.record_finish(&request, "timeout", 0, Duration::ZERO, Duration::ZERO, &[], 0);
             return;
         }
         if let Some(reason) = cancellation_finish_reason(&request) {
             let _ = request.response_tx.blocking_send(StreamEvent::Done {
                 finish_reason: reason.to_string(),
             });
-            self.record_finish(&request, reason, 0, Duration::ZERO, Duration::ZERO, &[]);
+            self.record_finish(&request, reason, 0, Duration::ZERO, Duration::ZERO, &[], 0);
             return;
         }
 
@@ -82,43 +82,54 @@ impl MtpScheduler {
             let _ = request.response_tx.blocking_send(StreamEvent::Error {
                 message: "empty prompt".to_string(),
             });
-            self.record_finish(&request, "error", 0, Duration::ZERO, Duration::ZERO, &[]);
+            self.record_finish(&request, "error", 0, Duration::ZERO, Duration::ZERO, &[], 0);
             return;
         }
 
-        // ── Prefill into a fresh single-slot pool, then alias into model global
-        //    state so the draft/verify loop operates on this request's KV.
+        // ── Prefill. By default we mirror the CLI's decode-faithful path
+        //    (`forward_prefill` on the model's global KV) because the MTP draft
+        //    head was trained against that exact KV state — the pool/alias path
+        //    (MTP_PREFILL_PARALLEL=1) shifts KV bookkeeping and halves accept
+        //    rate. MTP decode is serialized on the global model anyway.
         self.metrics.record_prefill_start();
         let prefill_started = Instant::now();
-        let mut kv_pool = self.model.create_kv_pool(1, self.model.kv_capacity);
-        let slot = match kv_pool.allocate() {
-            Some(slot) => slot,
-            None => {
-                let _ = request.response_tx.blocking_send(StreamEvent::Error {
-                    message: "KV cache pool is full".to_string(),
-                });
-                self.record_finish(&request, "error_kv_pool_full", 0, Duration::ZERO, Duration::ZERO, &[]);
-                return;
-            }
-        };
+        let use_parallel_prefill = std::env::var("MTP_PREFILL_PARALLEL")
+            .map(|v| v == "1")
+            .unwrap_or(false);
 
-        let prefill = self
-            .model
-            .forward_prefill_pool(&request.input_ids, &mut kv_pool, slot)
-            .and_then(|logits| {
-                self.model
-                    .alias_kv_from_pool(&kv_pool, slot)
-                    .map(|()| logits)
-            });
-        let logits = match prefill {
-            Ok(logits) => logits,
-            Err(message) => {
-                let _ = request
-                    .response_tx
-                    .blocking_send(StreamEvent::Error { message: message.clone() });
-                self.record_finish(&request, "error", 0, prefill_started.elapsed(), Duration::ZERO, &[]);
-                return;
+        let logits = if use_parallel_prefill {
+            let mut kv_pool = self.model.create_kv_pool(1, self.model.kv_capacity);
+            let slot = match kv_pool.allocate() {
+                Some(slot) => slot,
+                None => {
+                    let _ = request.response_tx.blocking_send(StreamEvent::Error {
+                        message: "KV cache pool is full".to_string(),
+                    });
+                    self.record_finish(&request, "error_kv_pool_full", 0, Duration::ZERO, Duration::ZERO, &[], 0);
+                    return;
+                }
+            };
+            match self
+                .model
+                .forward_prefill_pool(&request.input_ids, &mut kv_pool, slot)
+                .and_then(|logits| {
+                    self.model
+                        .alias_kv_from_pool(&kv_pool, slot)
+                        .map(|()| logits)
+                })
+            {
+                Ok(logits) => logits,
+                Err(message) => {
+                    let _ = request
+                        .response_tx
+                        .blocking_send(StreamEvent::Error { message: message.clone() });
+                    self.record_finish(&request, "error", 0, prefill_started.elapsed(), Duration::ZERO, &[], 0);
+                    return;
+                }
             }
+        } else {
+            self.model.reset_legacy_state();
+            self.model.forward_prefill(&request.input_ids)
         };
         let prefill_latency = prefill_started.elapsed();
         self.metrics
@@ -140,6 +151,7 @@ impl MtpScheduler {
         let mut completion_tokens = 0usize;
         let mut generated: Vec<usize> = Vec::new();
         let mut accept_history: Vec<usize> = Vec::new();
+        let mut drafted_total: usize = 0;
 
         // First token comes straight from the prefill logits (greedy — MTP is a
         // greedy speculative scheme; sampling params other than greedy are not
@@ -180,6 +192,7 @@ impl MtpScheduler {
                 prefill_latency,
                 decode_started.elapsed(),
                 &[],
+                0,
             );
             return;
         } else {
@@ -198,6 +211,7 @@ impl MtpScheduler {
                     prefill_latency,
                     decode_started.elapsed(),
                     &accept_history,
+                drafted_total,
                 );
                 return;
             }
@@ -207,7 +221,7 @@ impl MtpScheduler {
 
         loop {
             if completion_tokens >= params.max_tokens {
-                self.finish_stop(request, completion_tokens, prefill_latency, decode_started, &accept_history);
+                self.finish_stop(request, completion_tokens, prefill_latency, decode_started, &accept_history, drafted_total);
                 return;
             }
             if let Some(reason) = cancellation_finish_reason(request) {
@@ -221,6 +235,7 @@ impl MtpScheduler {
                     prefill_latency,
                     decode_started.elapsed(),
                     &accept_history,
+                drafted_total,
                 );
                 return;
             }
@@ -235,6 +250,7 @@ impl MtpScheduler {
                     prefill_latency,
                     decode_started.elapsed(),
                     &accept_history,
+                drafted_total,
                 );
                 return;
             }
@@ -265,6 +281,7 @@ impl MtpScheduler {
                         prefill_latency,
                         decode_started.elapsed(),
                         &accept_history,
+                        drafted_total,
                     );
                     return;
                 }
@@ -277,9 +294,11 @@ impl MtpScheduler {
                 mtp_hidden = self.model.last_hidden_activation();
                 let next = sampling::argmax(&next_logits);
                 accept_history.push(0);
+                drafted_total += 1;
                 id_last = next;
                 vec![next]
             } else {
+                drafted_total += drafted.len();
                 let mut verify_batch = Vec::with_capacity(drafted.len() + 1);
                 verify_batch.push(id_last);
                 verify_batch.extend_from_slice(&drafted);
@@ -297,10 +316,26 @@ impl MtpScheduler {
                             prefill_latency,
                             decode_started.elapsed(),
                             &accept_history,
+                            drafted_total,
                         );
                         return;
                     }
                 };
+
+                if std::env::var("LLAMA_MTP_DEBUG").is_ok() && accept_history.len() < 5 {
+                    eprintln!(
+                        "[mtp-debug] cycle {}: id_last={} kv_seq={} drafted={:?}",
+                        accept_history.len(),
+                        id_last,
+                        self.model.kv_seq_len,
+                        drafted
+                    );
+                    eprintln!(
+                        "[mtp-debug]   verify_preds={:?} matches={:?}",
+                        verify_tokens,
+                        drafted.iter().enumerate().map(|(i, d)| verify_tokens[i] == *d).collect::<Vec<_>>()
+                    );
+                }
 
                 let mut ids: Vec<usize> = Vec::with_capacity(drafted.len() + 1);
                 let mut n_accepted = 0usize;
@@ -343,6 +378,7 @@ impl MtpScheduler {
                             prefill_latency,
                             decode_started.elapsed(),
                             &accept_history,
+                            drafted_total,
                         );
                         return;
                     }
@@ -408,6 +444,7 @@ impl MtpScheduler {
         prefill_latency: Duration,
         decode_started: Instant,
         accept_history: &[usize],
+        drafted_total: usize,
     ) {
         let _ = request.response_tx.blocking_send(StreamEvent::Done {
             finish_reason: "stop".to_string(),
@@ -419,6 +456,7 @@ impl MtpScheduler {
             prefill_latency,
             decode_started.elapsed(),
             accept_history,
+            drafted_total,
         );
     }
 
@@ -430,6 +468,7 @@ impl MtpScheduler {
         prefill_latency: Duration,
         decode_latency: Duration,
         accept_history: &[usize],
+        drafted_total: usize,
     ) {
         let latency = request.created_at.elapsed();
         self.metrics.record_finish(
@@ -446,10 +485,10 @@ impl MtpScheduler {
         } else {
             0.0
         };
-        let total_drafted: usize = accept_history.iter().sum();
         let draft_cycles = accept_history.len();
-        let accept_rate = if draft_cycles > 0 {
-            total_drafted as f64 / (draft_cycles * parse_mtp_draft_steps().max(1)) as f64
+        let total_accepted: usize = accept_history.iter().sum();
+        let accept_rate = if drafted_total > 0 {
+            total_accepted as f64 / drafted_total as f64
         } else {
             0.0
         };
