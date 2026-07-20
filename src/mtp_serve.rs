@@ -67,14 +67,28 @@ impl MtpScheduler {
             let _ = request.response_tx.blocking_send(StreamEvent::Done {
                 finish_reason: "timeout".to_string(),
             });
-            self.record_finish(&request, "timeout", 0, Duration::ZERO, Duration::ZERO, &[]);
+            self.record_finish(
+                &request,
+                "timeout",
+                0,
+                Duration::ZERO,
+                Duration::ZERO,
+                &MtpDecodeStats::default(),
+            );
             return;
         }
         if let Some(reason) = cancellation_finish_reason(&request) {
             let _ = request.response_tx.blocking_send(StreamEvent::Done {
                 finish_reason: reason.to_string(),
             });
-            self.record_finish(&request, reason, 0, Duration::ZERO, Duration::ZERO, &[]);
+            self.record_finish(
+                &request,
+                reason,
+                0,
+                Duration::ZERO,
+                Duration::ZERO,
+                &MtpDecodeStats::default(),
+            );
             return;
         }
 
@@ -82,7 +96,14 @@ impl MtpScheduler {
             let _ = request.response_tx.blocking_send(StreamEvent::Error {
                 message: "empty prompt".to_string(),
             });
-            self.record_finish(&request, "error", 0, Duration::ZERO, Duration::ZERO, &[]);
+            self.record_finish(
+                &request,
+                "error",
+                0,
+                Duration::ZERO,
+                Duration::ZERO,
+                &MtpDecodeStats::default(),
+            );
             return;
         }
 
@@ -97,7 +118,14 @@ impl MtpScheduler {
                 let _ = request.response_tx.blocking_send(StreamEvent::Error {
                     message: "KV cache pool is full".to_string(),
                 });
-                self.record_finish(&request, "error_kv_pool_full", 0, Duration::ZERO, Duration::ZERO, &[]);
+                self.record_finish(
+                    &request,
+                    "error_kv_pool_full",
+                    0,
+                    Duration::ZERO,
+                    Duration::ZERO,
+                    &MtpDecodeStats::default(),
+                );
                 return;
             }
         };
@@ -116,7 +144,14 @@ impl MtpScheduler {
                 let _ = request
                     .response_tx
                     .blocking_send(StreamEvent::Error { message: message.clone() });
-                self.record_finish(&request, "error", 0, prefill_started.elapsed(), Duration::ZERO, &[]);
+                self.record_finish(
+                    &request,
+                    "error",
+                    0,
+                    prefill_started.elapsed(),
+                    Duration::ZERO,
+                    &MtpDecodeStats::default(),
+                );
                 return;
             }
         };
@@ -139,7 +174,7 @@ impl MtpScheduler {
         let mut decode_compute = Duration::ZERO;
         let mut completion_tokens = 0usize;
         let mut generated: Vec<usize> = Vec::new();
-        let mut accept_history: Vec<usize> = Vec::new();
+        let mut stats = MtpDecodeStats::default();
 
         // First token comes straight from the prefill logits (greedy — MTP is a
         // greedy speculative scheme; sampling params other than greedy are not
@@ -179,7 +214,7 @@ impl MtpScheduler {
                 0,
                 prefill_latency,
                 decode_started.elapsed(),
-                &[],
+                &stats,
             );
             return;
         } else {
@@ -197,7 +232,7 @@ impl MtpScheduler {
                     completion_tokens,
                     prefill_latency,
                     decode_started.elapsed(),
-                    &accept_history,
+                    &stats,
                 );
                 return;
             }
@@ -207,7 +242,13 @@ impl MtpScheduler {
 
         loop {
             if completion_tokens >= params.max_tokens {
-                self.finish_stop(request, completion_tokens, prefill_latency, decode_started, &accept_history);
+                self.finish_stop(
+                    request,
+                    completion_tokens,
+                    prefill_latency,
+                    decode_started,
+                    &stats,
+                );
                 return;
             }
             if let Some(reason) = cancellation_finish_reason(request) {
@@ -220,7 +261,7 @@ impl MtpScheduler {
                     completion_tokens,
                     prefill_latency,
                     decode_started.elapsed(),
-                    &accept_history,
+                    &stats,
                 );
                 return;
             }
@@ -234,13 +275,13 @@ impl MtpScheduler {
                     completion_tokens,
                     prefill_latency,
                     decode_started.elapsed(),
-                    &accept_history,
+                    &stats,
                 );
                 return;
             }
 
             let tail_steps = effective_draft_tail_steps(
-                &accept_history,
+                &stats.accepted_per_cycle,
                 self.draft_steps,
                 self.adaptive,
                 self.model.kv_seq_len as usize,
@@ -264,7 +305,7 @@ impl MtpScheduler {
                         completion_tokens,
                         prefill_latency,
                         decode_started.elapsed(),
-                        &accept_history,
+                        &stats,
                     );
                     return;
                 }
@@ -276,7 +317,7 @@ impl MtpScheduler {
                 let next_logits = self.model.forward_single_token(id_last);
                 mtp_hidden = self.model.last_hidden_activation();
                 let next = sampling::argmax(&next_logits);
-                accept_history.push(0);
+                stats.record_cycle(/*drafted*/ 0, /*accepted*/ 0);
                 id_last = next;
                 vec![next]
             } else {
@@ -296,7 +337,7 @@ impl MtpScheduler {
                             completion_tokens,
                             prefill_latency,
                             decode_started.elapsed(),
-                            &accept_history,
+                            &stats,
                         );
                         return;
                     }
@@ -315,7 +356,7 @@ impl MtpScheduler {
                 if n_accepted == drafted.len() {
                     ids.push(verify_tokens[drafted.len()]);
                 }
-                accept_history.push(n_accepted);
+                stats.record_cycle(drafted.len(), n_accepted);
 
                 // Roll back KV for rejected drafts.
                 let rewind = (drafted.len() - n_accepted) as u32;
@@ -342,7 +383,7 @@ impl MtpScheduler {
                             completion_tokens,
                             prefill_latency,
                             decode_started.elapsed(),
-                            &accept_history,
+                            &stats,
                         );
                         return;
                     }
@@ -407,7 +448,7 @@ impl MtpScheduler {
         completion_tokens: usize,
         prefill_latency: Duration,
         decode_started: Instant,
-        accept_history: &[usize],
+        stats: &MtpDecodeStats,
     ) {
         let _ = request.response_tx.blocking_send(StreamEvent::Done {
             finish_reason: "stop".to_string(),
@@ -418,7 +459,7 @@ impl MtpScheduler {
             completion_tokens,
             prefill_latency,
             decode_started.elapsed(),
-            accept_history,
+            stats,
         );
     }
 
@@ -429,7 +470,7 @@ impl MtpScheduler {
         completion_tokens: usize,
         prefill_latency: Duration,
         decode_latency: Duration,
-        accept_history: &[usize],
+        stats: &MtpDecodeStats,
     ) {
         let latency = request.created_at.elapsed();
         self.metrics.record_finish(
@@ -446,10 +487,15 @@ impl MtpScheduler {
         } else {
             0.0
         };
-        let total_drafted: usize = accept_history.iter().sum();
-        let draft_cycles = accept_history.len();
-        let accept_rate = if draft_cycles > 0 {
-            total_drafted as f64 / (draft_cycles * parse_mtp_draft_steps().max(1)) as f64
+        // CLI parity: accepted/drafted (not vs configured draft_steps).
+        let accept_rate = if stats.drafted_total > 0 {
+            stats.accepted_total as f64 / stats.drafted_total as f64
+        } else {
+            0.0
+        };
+        // Emitted tokens per main-model verify/fallback forward (≳2.0 for ~2×).
+        let tokens_per_forward = if stats.main_forwards > 0 {
+            completion_tokens as f64 / stats.main_forwards as f64
         } else {
             0.0
         };
@@ -465,12 +511,35 @@ impl MtpScheduler {
                 "prefill_latency_ms": prefill_latency.as_millis(),
                 "decode_latency_ms": decode_latency.as_millis(),
                 "decode_tokens_per_s": format!("{:.2}", decode_tok_s),
-                "draft_cycles": draft_cycles,
-                "accept_rate": format!("{:.2}", accept_rate),
+                "draft_cycles": stats.main_forwards,
+                "drafted_total": stats.drafted_total,
+                "accepted_total": stats.accepted_total,
+                "accept_rate": format!("{:.3}", accept_rate),
+                "tokens_per_forward": format!("{:.2}", tokens_per_forward),
                 "finish_reason": reason,
                 "mode": "mtp",
             })
         );
+    }
+}
+
+/// Per-request MTP decode counters (CLI-parity accept / tok-per-forward).
+#[derive(Default)]
+struct MtpDecodeStats {
+    /// Accepted draft tokens each cycle (excludes bonus greedy token).
+    accepted_per_cycle: Vec<usize>,
+    drafted_total: usize,
+    accepted_total: usize,
+    /// Verify batches + single-token fallbacks (main-model forwards).
+    main_forwards: usize,
+}
+
+impl MtpDecodeStats {
+    fn record_cycle(&mut self, drafted: usize, accepted: usize) {
+        self.main_forwards += 1;
+        self.drafted_total += drafted;
+        self.accepted_total += accepted;
+        self.accepted_per_cycle.push(accepted);
     }
 }
 

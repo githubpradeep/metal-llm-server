@@ -4836,6 +4836,23 @@ impl Gemma4GpuModel {
         self.sync_kv_meta_from_pool(kv_pool, slot)
     }
 
+    /// After a parallel prefill chunk (or the last chunk of a multi-chunk
+    /// prefill), copy the final row of `prefill_scratch.normed_buf` into the
+    /// decode-facing `normed_buf` for MTP `h_nextn`.
+    ///
+    /// Scratch is only `max_parallel_prefill_seq` rows — never the full prompt.
+    /// Reading `token_ids.len()` rows here SIGSEGVs once the prompt exceeds one
+    /// chunk (MTP serve path; non-MTP never touches this).
+    fn capture_prefill_last_normed_row(&self, last_chunk_len: usize) {
+        debug_assert!(last_chunk_len > 0);
+        let hidden_size = self.config.hidden_size;
+        let rows = last_chunk_len.min(self.prefill_scratch.max_seq_len).max(1);
+        let normed =
+            MetalContext::read_buffer(&self.prefill_scratch.normed_buf, rows * hidden_size);
+        let last = (rows - 1) * hidden_size;
+        MetalContext::write_buffer(&self.normed_buf, &normed[last..last + hidden_size]);
+    }
+
     /// Parallel prefill into a pool slot; syncs model meta + last-row normed_buf.
     pub fn forward_prefill_pool(
         &mut self,
@@ -4845,15 +4862,15 @@ impl Gemma4GpuModel {
     ) -> Result<Vec<f32>, String> {
         let logits = self.forward_prefill_chunked_with_kv_slot(token_ids, kv_pool, slot)?;
         self.sync_kv_meta_from_pool(kv_pool, slot)?;
-        // Keep decode-facing last-row hidden for MTP h_nextn.
-        let hidden_size = self.config.hidden_size;
-        let seq_len = token_ids.len();
-        let normed = MetalContext::read_buffer(
-            &self.prefill_scratch.normed_buf,
-            seq_len * hidden_size,
-        );
-        let last = (seq_len - 1) * hidden_size;
-        MetalContext::write_buffer(&self.normed_buf, &normed[last..]);
+        // Only the last chunk remains in prefill_scratch (sized max_seq≤1024).
+        let chunk_size = self.max_parallel_prefill_seq().max(1);
+        let rem = token_ids.len() % chunk_size;
+        let last_chunk_len = if rem == 0 {
+            chunk_size.min(token_ids.len())
+        } else {
+            rem
+        };
+        self.capture_prefill_last_normed_row(last_chunk_len);
         Ok(logits)
     }
 
@@ -4883,14 +4900,7 @@ impl Gemma4GpuModel {
             false,
         )?;
         self.sync_kv_meta_from_pool(kv_pool, slot)?;
-        let hidden_size = self.config.hidden_size;
-        let seq_len = token_ids.len();
-        let normed = MetalContext::read_buffer(
-            &self.prefill_scratch.normed_buf,
-            seq_len * hidden_size,
-        );
-        let last = (seq_len - 1) * hidden_size;
-        MetalContext::write_buffer(&self.normed_buf, &normed[last..]);
+        self.capture_prefill_last_normed_row(token_ids.len());
         Ok(logits)
     }
 
@@ -5170,9 +5180,14 @@ impl Gemma4GpuModel {
             .map_err(|e| e.to_string())?;
 
         // Last-row normed → decode-facing buffer for MTP h_nextn.
-        let hidden_size = self.config.hidden_size;
-        let normed = MetalContext::read_buffer(&self.prefill_scratch.normed_buf, hidden_size);
-        MetalContext::write_buffer(&self.normed_buf, &normed);
+        let chunk_size = self.max_parallel_prefill_seq().max(1);
+        let rem = token_ids.len() % chunk_size;
+        let last_chunk_len = if rem == 0 {
+            chunk_size.min(token_ids.len())
+        } else {
+            rem
+        };
+        self.capture_prefill_last_normed_row(last_chunk_len);
 
         Ok(logits)
     }
@@ -5227,14 +5242,7 @@ impl Gemma4GpuModel {
             .map_err(|e| e.to_string())?;
 
         if compute_logits {
-            let hidden_size = self.config.hidden_size;
-            let seq_len = token_ids.len();
-            let normed = MetalContext::read_buffer(
-                &self.prefill_scratch.normed_buf,
-                seq_len * hidden_size,
-            );
-            let last = (seq_len - 1) * hidden_size;
-            MetalContext::write_buffer(&self.normed_buf, &normed[last..]);
+            self.capture_prefill_last_normed_row(token_ids.len());
         }
 
         Ok(logits)
