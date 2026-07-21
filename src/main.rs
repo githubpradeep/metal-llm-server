@@ -45,6 +45,11 @@ fn main() {
         ctx.bench_mul_mm();
         return;
     }
+    if args.iter().any(|a| a == "--bench-mv-ext") {
+        let ctx = gpu::MetalContext::new();
+        ctx.bench_mv_ext();
+        return;
+    }
 
     let bench_decode = args.iter().any(|a| a == "--bench-decode");
     let bench_decode_tokens: usize = args

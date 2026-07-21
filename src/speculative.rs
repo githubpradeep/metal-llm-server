@@ -36,6 +36,14 @@ pub struct MtpDraftLayer {
     pub n_rot: usize,
     /// Base KV layer this head layer attends to: 33 (SWA) or 34 (full).
     pub mapped_base_layer: usize,
+    /// Number of KV heads in the *base* model's cache at `mapped_base_layer`.
+    /// The draft's query heads attend GQA-style into this cache, so the
+    /// attention kernel must be told the base cache's KV-head count (and the
+    /// resulting group fan-out) — hardcoding 1 collapses every draft query head
+    /// onto KV head 0 and reads the wrong per-head region for any base model
+    /// with GQA (kv_heads > 1). Defaults to 1; set by the assistant loader from
+    /// the target config once the base layer mapping is known.
+    pub base_kv_heads: usize,
     pub head_dim: usize,
     pub n_head: usize,
     pub ffn_inter: usize,
@@ -217,6 +225,7 @@ impl MtpDraftHead {
                     swa_n_rot.min(head_dim)
                 },
                 mapped_base_layer,
+                base_kv_heads: 1,
                 head_dim,
                 n_head,
                 ffn_inter,
@@ -492,12 +501,15 @@ impl MtpDraftHead {
                         layer.mapped_base_layer, &kdata[..5.min(klen)], k_ok, &vdata[..5.min(vlen)], v_ok);
                 }
 
-                // Draft Q attends GQA-style into the target's single KV head.
-                // Use the same specialized decode kernels as the main model —
-                // ggml MWG with nh=4/n_kv=1 was giving ~25% accept on Q4_0 while
-                // F16 (this path) accepted ~99%.
-                let n_kv = 1u32;
-                let n_groups = nh / n_kv;
+                // Draft Q attends GQA-style into the target's KV cache. The
+                // base model stores `base_kv_heads` KV heads per token at this
+                // layer (GQA), so the kernel must use that count and the matching
+                // group fan-out (draft query heads / base KV heads). Hardcoding
+                // n_kv=1 only works when the base model has a single KV head
+                // (older E-series); for GQA bases (e.g. 12B: 16 Q / 8 KV) it
+                // collapses every query head onto KV head 0 and reads garbage.
+                let n_kv = (layer.base_kv_heads as u32).max(1).min(nh);
+                let n_groups = (nh / n_kv).max(1);
                 match kv_cache_type {
                     KvCacheType::F16 => {
                         ctx.encode_attention_with_offset_f16(

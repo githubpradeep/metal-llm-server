@@ -43,6 +43,20 @@ impl Gemma4MtpAssistant {
         if remapped {
             eprintln!("  [MTP] Fixed KV cache layer mapping (was reading from shared layers with no KV data)");
         }
+        // The draft attention reads the base model's KV cache GQA-style, so each
+        // draft layer must know how many KV heads the base cache holds at its
+        // mapped layer. Without this the kernel assumes a single KV head and
+        // reads the wrong per-head region for any GQA base (kv_heads > 1),
+        // producing garbage drafts (near-zero accept on e.g. 12B: 16 Q / 8 KV).
+        for l in head.layers.iter_mut() {
+            l.base_kv_heads = target.config.layer_num_kv_heads(l.mapped_base_layer).max(1);
+        }
+        if let Some(first) = head.layers.first() {
+            eprintln!(
+                "  [MTP] Base KV heads for draft attention: {} (base num_heads={})",
+                first.base_kv_heads, target.config.num_attention_heads,
+            );
+        }
         let scratch = head.alloc_scratch(ctx);
         println!(
             "  Gemma4 MTP assistant: {} layers, hidden_head={}, backbone_hidden={}, vocab={}",

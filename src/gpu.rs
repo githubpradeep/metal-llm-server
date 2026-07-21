@@ -1655,6 +1655,95 @@ impl MetalContext {
         );
     }
 
+    /// Small-batch K-quant matvec microbench (MTP verify path, batch 1..8).
+    /// Compares the ext matvec (`matvec_ggml_ext_q*K_nx*_r*`) against the
+    /// mul_mv kernel (`matvec_ggml_q*_K`) across batch sizes on real 12B MLP
+    /// shapes. Bytes counted = weights only (read once per op), so a kernel that
+    /// batches perfectly holds GB/s ~flat as batch grows; a kernel that loses
+    /// weight reuse (or occupancy) shows GB/s falling with batch.
+    pub fn bench_mv_ext(&self) {
+        use crate::ggml_gemv::{Q4_K_BLOCK_BYTES, Q6_K_BLOCK_BYTES};
+        use std::time::Instant;
+        let reps = 40;
+        let packed = 20;
+        // (m_out, k_in, fmt, label) — real gemma-4-12b MLP projection shapes.
+        let shapes: &[(u32, u32, u8, &str)] = &[
+            (15360, 3840, weight_fmt::Q4_K, "gate/up Q4_K 15360x3840"),
+            (3840, 15360, weight_fmt::Q6_K, "down    Q6_K 3840x15360"),
+            (3840, 15360, weight_fmt::Q4_K, "down    Q4_K 3840x15360"),
+            (4096, 3840, weight_fmt::Q4_K, "qkv     Q4_K 4096x3840"),
+            (3840, 4096, weight_fmt::Q4_K, "o_proj  Q4_K 3840x4096"),
+        ];
+        let batches: &[u32] = &[1, 2, 3, 4, 5, 6, 8];
+
+        println!("\n=== K-quant small-batch matvec microbench (packed {}/cmdbuf) ===", packed);
+        println!("GB/s = weight_bytes / ms (weights read once). Flat vs batch = good.");
+        println!("'ext' = matvec_ggml_ext (verify path), 'mv' = matvec_ggml_q*_K.\n");
+        print!("{:<26} {:>7}", "shape", "kern");
+        for b in batches {
+            print!("  b{:<5}", b);
+        }
+        println!();
+
+        for &(m, k, fmt, label) in shapes {
+            let block_bytes = match fmt {
+                weight_fmt::Q4_K => Q4_K_BLOCK_BYTES,
+                weight_fmt::Q6_K => Q6_K_BLOCK_BYTES,
+                _ => unreachable!(),
+            };
+            let wbytes = (m as u64) * (k as u64 / 256) * block_bytes;
+            let w = BufferView::from_buffer(
+                self.device
+                    .new_buffer(wbytes, MTLResourceOptions::StorageModeShared),
+            )
+            .with_format(fmt);
+            let x = self.buffer_empty((8 * k) as usize);
+            let y = self.buffer_empty((8 * m) as usize);
+            let mb = wbytes as f64 / 1e6;
+
+            // Two kernels: ext (batch>=2 only) and mul_mv (any batch).
+            for kern in ["ext", "mv"].iter() {
+                print!("{:<26} {:>7}", if *kern == "ext" { label } else { "" }, kern);
+                for &b in batches {
+                    if *kern == "ext" && !(2..=8).contains(&b) {
+                        print!("  {:>6}", "-");
+                        continue;
+                    }
+                    let run = |enc: &metal::ComputeCommandEncoderRef| {
+                        if *kern == "ext" {
+                            self.encode_matvec_kq_ext_at_view(enc, &w, &x, 0, &y, 0, m, k, b);
+                        } else {
+                            self.encode_matvec_qk_at_view(enc, &w, &x, 0, &y, 0, m, k, b);
+                        }
+                    };
+                    for _ in 0..3 {
+                        let cmd = self.queue.new_command_buffer();
+                        let enc = cmd.new_compute_command_encoder();
+                        run(enc);
+                        enc.end_encoding();
+                        cmd.commit();
+                        cmd.wait_until_completed();
+                    }
+                    let t = Instant::now();
+                    for _ in 0..reps {
+                        let cmd = self.queue.new_command_buffer();
+                        let enc = cmd.new_compute_command_encoder();
+                        for _ in 0..packed {
+                            run(enc);
+                        }
+                        enc.end_encoding();
+                        cmd.commit();
+                        cmd.wait_until_completed();
+                    }
+                    let per_op_ms = t.elapsed().as_secs_f64() * 1e3 / reps as f64 / packed as f64;
+                    print!("  {:>6.0}", mb / per_op_ms);
+                }
+                println!();
+            }
+        }
+        println!();
+    }
+
     /// Prefill Q4_K/Q6_K `mul_mm` microbench for Gemma4 E2B MLP shapes (seq=4096).
     /// Reports ms/op + TFLOP/s for f32-RHS and f16-RHS (production path).
     pub fn bench_mul_mm(&self) {

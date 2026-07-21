@@ -239,6 +239,22 @@ pub fn mul_mv_ext_dispatch(m: u32, batch: u32, nxpsg: i16) -> (u64, u64, u64, u6
 pub const MV_EXT_KQ_NXPSG: u32 = 8;
 pub const MV_EXT_KQ_NSG: u32 = 2;
 
+/// Simdgroups per threadgroup for the K-quant ext matvec. llama.cpp uses 2, but
+/// on M1 Pro the small-batch (MTP verify) matvec is latency-bound: more
+/// simdgroups per TG hide Q4_K/Q6_K dequant load latency. Tunable via
+/// `MV_EXT_NSG` for sweeps; the kernel indexes rows by `args.nsg`, so the
+/// dispatch and args must agree.
+pub fn mv_ext_kq_nsg() -> u32 {
+    static NSG: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *NSG.get_or_init(|| {
+        std::env::var("MV_EXT_NSG")
+            .ok()
+            .and_then(|v| v.parse::<u32>().ok())
+            .filter(|&n| n >= 1 && n <= 8 && 32 % MV_EXT_KQ_NXPSG == 0)
+            .unwrap_or(MV_EXT_KQ_NSG)
+    })
+}
+
 /// llama.cpp r1ptg selection by ne11 (src1 rows per threadgroup).
 pub fn mv_ext_kq_r1ptg(batch: u32) -> u32 {
     match batch {
@@ -271,18 +287,19 @@ pub fn mul_mv_ext_args_k(m: u32, k: u32, batch: u32, block_bytes: u64) -> GgmlMu
         ne1: batch as i32,
         r2: 1,
         r3: 1,
-        nsg: MV_EXT_KQ_NSG as i16,
+        nsg: mv_ext_kq_nsg() as i16,
         nxpsg: MV_EXT_KQ_NXPSG as i16,
     }
 }
 
 /// Threadgroups for the K-quant ext matvec.
 pub fn mul_mv_ext_k_dispatch(m: u32, batch: u32, r1ptg: u32) -> (u64, u64, u64, u64, u64) {
+    let nsg = mv_ext_kq_nsg();
     let nypsg = 32 / MV_EXT_KQ_NXPSG;
-    let r0ptg = nypsg * MV_EXT_KQ_NSG;
+    let r0ptg = nypsg * nsg;
     let tg_x = ((m + r0ptg - 1) / r0ptg) as u64;
     let tg_y = ((batch + r1ptg - 1) / r1ptg) as u64;
-    (tg_x, tg_y, 1, 32, MV_EXT_KQ_NSG as u64)
+    (tg_x, tg_y, 1, 32, nsg as u64)
 }
 
 // ─── Q4_K matrix-matrix (prefill) ───────────────────────────────────────────
