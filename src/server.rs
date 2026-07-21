@@ -1707,6 +1707,14 @@ impl ApiError {
             code: "internal_error".to_string(),
         }
     }
+
+    fn not_implemented(message: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::NOT_IMPLEMENTED,
+            message: message.into(),
+            code: "not_implemented".to_string(),
+        }
+    }
 }
 
 impl IntoResponse for ApiError {
@@ -1730,6 +1738,9 @@ pub struct AppState {
     pub tokenizer: tokenizers::Tokenizer,
     pub max_context_len: usize,
     pub runtime_config: ServerRuntimeConfig,
+    /// "Accept Brain" MTP telemetry broadcast (one JSON event per verify
+    /// cycle). `None` when MTP is disabled.
+    pub mtp_events: Option<mtp_serve::MtpEventsTx>,
 }
 
 impl AppState {
@@ -3462,6 +3473,46 @@ fn sse_stream(
 
 // ─── Router ──────────────────────────────────────────────────────────────────
 
+/// "Accept Brain" live MTP telemetry — one SSE event per verify cycle
+/// (`{"event":"mtp_cycle", "drafted":[...], "accept_mask":[...], ...}`).
+/// Returns 501 if the server wasn't started with `--mtp`.
+async fn mtp_events_stream(
+    State(state): State<Arc<AppState>>,
+) -> Result<Sse<impl Stream<Item = Result<Event, std::convert::Infallible>>>, ApiError> {
+    let Some(tx) = &state.mtp_events else {
+        return Err(ApiError::not_implemented(
+            "MTP is not enabled on this server (start with --mtp to enable Accept Brain telemetry)",
+        ));
+    };
+    let mut rx = tx.subscribe();
+    let (out_tx, out_rx) = tokio::sync::mpsc::channel(256);
+    tokio::spawn(async move {
+        loop {
+            match rx.recv().await {
+                Ok(payload) => {
+                    if out_tx.send(Ok(Event::default().data(payload))).await.is_err() {
+                        break;
+                    }
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+            }
+        }
+    });
+    Ok(sse_stream(out_rx))
+}
+
+/// Self-contained "Accept Brain" visualization page: connects to
+/// `/mtp/events` via `EventSource` and lights up a grid of draft tokens as
+/// they're accepted (green) or rejected (red) in real time.
+async fn brain_page() -> axum::response::Response {
+    (
+        [(header::CONTENT_TYPE, "text/html; charset=utf-8")],
+        include_str!("../ui/brain.html"),
+    )
+        .into_response()
+}
+
 pub fn create_router(state: Arc<AppState>) -> Router {
     Router::new()
         .route("/health", get(health))
@@ -3469,6 +3520,8 @@ pub fn create_router(state: Arc<AppState>) -> Router {
         .route("/v1/models", get(list_models))
         .route("/models", get(list_models))
         .route("/v1/chat/completions", post(chat_completions))
+        .route("/mtp/events", get(mtp_events_stream))
+        .route("/brain", get(brain_page))
         .with_state(state)
 }
 
@@ -3491,12 +3544,18 @@ pub async fn run_server_with_mtp(
     let runtime_config = ServerRuntimeConfig::from_env();
     let metrics = Arc::new(Metrics::new());
     let mtp_enabled = mtp_assistant.is_some();
+    let mtp_events = if mtp_enabled {
+        Some(tokio::sync::broadcast::Sender::<String>::new(256))
+    } else {
+        None
+    };
     let request_tx = if let Some(assistant) = mtp_assistant {
         mtp_serve::spawn_mtp_scheduler(
             model,
             assistant,
             runtime_config.queue_depth,
             metrics.clone(),
+            mtp_events.clone(),
         )
     } else {
         let scheduler_config = scheduler::SchedulerConfig {
@@ -3516,6 +3575,7 @@ pub async fn run_server_with_mtp(
         tokenizer,
         max_context_len,
         runtime_config: runtime_config.clone(),
+        mtp_events,
     });
 
     let app = create_router(state);
@@ -3542,6 +3602,7 @@ pub async fn run_server_with_mtp(
     );
     if mtp_enabled {
         println!("   MTP: enabled (serial draft/verify decode; requests served FIFO)");
+        println!("   Accept Brain UI: http://{}/brain  (live SSE: /mtp/events)", addr);
     }
 
     let listener = tokio::net::TcpListener::bind(&addr).await.unwrap();

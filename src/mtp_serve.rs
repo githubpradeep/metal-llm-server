@@ -30,6 +30,10 @@ const MAX_DRAFT_STEPS: usize = 7;
 /// 1=<eos>, 100/101=channel markers, 105/106=turn markers, 107='\n'.
 const FIRST_TOKEN_BLOCKLIST: &[usize] = &[1, 100, 101, 105, 106, 107];
 
+/// Broadcast sender for "Accept Brain" telemetry (one JSON event per MTP
+/// verify cycle). `None` when no one is listening (e.g. CLI-only usage).
+pub type MtpEventsTx = tokio::sync::broadcast::Sender<String>;
+
 pub struct MtpScheduler {
     model: Gemma4GpuModel,
     assistant: Gemma4MtpAssistant,
@@ -37,6 +41,7 @@ pub struct MtpScheduler {
     draft_steps: usize,
     adaptive: bool,
     p_min: f32,
+    events_tx: Option<MtpEventsTx>,
 }
 
 impl MtpScheduler {
@@ -44,6 +49,7 @@ impl MtpScheduler {
         model: Gemma4GpuModel,
         assistant: Gemma4MtpAssistant,
         metrics: Arc<Metrics>,
+        events_tx: Option<MtpEventsTx>,
     ) -> Self {
         Self {
             model,
@@ -52,6 +58,15 @@ impl MtpScheduler {
             draft_steps: parse_mtp_draft_steps(),
             adaptive: parse_mtp_adaptive(),
             p_min: parse_mtp_p_min(),
+            events_tx,
+        }
+    }
+
+    /// Broadcast one "Accept Brain" telemetry event. Best-effort — dropped
+    /// silently if no SSE client is subscribed.
+    fn emit_event(&self, payload: serde_json::Value) {
+        if let Some(tx) = &self.events_tx {
+            let _ = tx.send(payload.to_string());
         }
     }
 
@@ -308,14 +323,14 @@ impl MtpScheduler {
             };
 
             // Produce the accepted-token list for this cycle.
-            let accepted_ids: Vec<usize> = if drafted.is_empty() {
+            let (accepted_ids, accept_mask): (Vec<usize>, Vec<bool>) = if drafted.is_empty() {
                 // Rare fallback: plain single-token decode on global KV.
                 let next_logits = self.model.forward_single_token(id_last);
                 mtp_hidden = self.model.last_hidden_activation();
                 let next = sampling::argmax(&next_logits);
                 stats.record_cycle(/*drafted*/ 0, /*accepted*/ 0);
                 id_last = next;
-                vec![next]
+                (vec![next], Vec::new())
             } else {
                 let mut verify_batch = Vec::with_capacity(drafted.len() + 1);
                 verify_batch.push(id_last);
@@ -340,6 +355,7 @@ impl MtpScheduler {
                 };
 
                 let mut ids: Vec<usize> = Vec::with_capacity(drafted.len() + 1);
+                let mut mask = vec![false; drafted.len()];
                 let mut n_accepted = 0usize;
                 for i in 0..drafted.len() {
                     let pred = verify_tokens[i];
@@ -347,6 +363,7 @@ impl MtpScheduler {
                     if pred != drafted[i] {
                         break;
                     }
+                    mask[i] = true;
                     n_accepted += 1;
                 }
                 if n_accepted == drafted.len() {
@@ -363,11 +380,44 @@ impl MtpScheduler {
                 let i_h = n_accepted.min(verify_batch.len() - 1);
                 mtp_hidden = self.model.prefill_hidden_activation_at(i_h);
                 id_last = *ids.last().unwrap();
-                ids
+                (ids, mask)
             };
 
             decode_compute += step_started.elapsed();
             self.metrics.record_decode_compute(step_started.elapsed());
+
+            {
+                let n_drafted = drafted.len();
+                let n_accepted = accept_mask.iter().filter(|&&a| a).count();
+                let running_tok_s = {
+                    let secs = decode_started.elapsed().as_secs_f64();
+                    if secs > 0.0 { completion_tokens as f64 / secs } else { 0.0 }
+                };
+                let running_accept_pct = if stats.drafted_total > 0 {
+                    stats.accepted_total as f64 * 100.0 / stats.drafted_total as f64
+                } else {
+                    0.0
+                };
+                let tok_per_forward = if stats.main_forwards > 0 {
+                    completion_tokens as f64 / stats.main_forwards as f64
+                } else {
+                    0.0
+                };
+                self.emit_event(serde_json::json!({
+                    "event": "mtp_cycle",
+                    "request_id": request.id,
+                    "cycle": stats.main_forwards,
+                    "drafted": drafted,
+                    "accept_mask": accept_mask,
+                    "n_drafted": n_drafted,
+                    "n_accepted": n_accepted,
+                    "tokens_generated": completion_tokens,
+                    "tok_per_s": running_tok_s,
+                    "tok_per_forward": tok_per_forward,
+                    "accept_pct_running": running_accept_pct,
+                    "main_forwards": stats.main_forwards,
+                }));
+            }
 
             for tok in accepted_ids {
                 match self.emit_token(request, tok, &mut completion_tokens, &mut generated) {
@@ -550,10 +600,11 @@ pub fn spawn_mtp_scheduler(
     assistant: Gemma4MtpAssistant,
     queue_depth: usize,
     metrics: Arc<Metrics>,
+    events_tx: Option<MtpEventsTx>,
 ) -> SyncSender<InferenceRequest> {
     let (request_tx, request_rx) = std::sync::mpsc::sync_channel(queue_depth);
     std::thread::spawn(move || {
-        MtpScheduler::new(model, assistant, metrics).run(request_rx);
+        MtpScheduler::new(model, assistant, metrics, events_tx).run(request_rx);
     });
     request_tx
 }

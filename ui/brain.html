@@ -1,0 +1,199 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<title>MTP Accept Brain</title>
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<style>
+  :root {
+    --bg: #0a0b10;
+    --panel: #12141c;
+    --accent: #7dd3fc;
+    --green: #22c55e;
+    --red: #ef4444;
+    --dim: #2a2d3a;
+    --text: #e5e7eb;
+    --muted: #8b8fa3;
+  }
+  * { box-sizing: border-box; }
+  html, body {
+    margin: 0; padding: 0; height: 100%;
+    background: radial-gradient(circle at 50% -10%, #14213a 0%, var(--bg) 55%);
+    color: var(--text);
+    font-family: -apple-system, BlinkMacSystemFont, "SF Mono", Menlo, monospace;
+  }
+  header {
+    padding: 18px 28px 6px;
+    display: flex; align-items: baseline; gap: 14px;
+  }
+  header h1 {
+    font-size: 20px; margin: 0; font-weight: 650; letter-spacing: 0.2px;
+    background: linear-gradient(90deg, #7dd3fc, #a78bfa);
+    -webkit-background-clip: text; background-clip: text; color: transparent;
+  }
+  header .status {
+    font-size: 12px; color: var(--muted);
+  }
+  header .dot {
+    display: inline-block; width: 8px; height: 8px; border-radius: 50%;
+    background: var(--red); margin-right: 6px; vertical-align: middle;
+  }
+  header .dot.live { background: var(--green); box-shadow: 0 0 8px var(--green); }
+
+  .metrics {
+    display: grid; grid-template-columns: repeat(5, 1fr); gap: 10px;
+    padding: 8px 28px 18px;
+  }
+  .metric {
+    background: var(--panel); border: 1px solid #1f2230; border-radius: 10px;
+    padding: 10px 14px;
+  }
+  .metric .label { font-size: 11px; color: var(--muted); text-transform: uppercase; letter-spacing: 0.06em; }
+  .metric .value { font-size: 24px; font-weight: 650; margin-top: 2px; }
+  .metric .value.green { color: var(--green); }
+  .metric .value.accent { color: var(--accent); }
+
+  main {
+    padding: 6px 28px 28px;
+  }
+  #grid {
+    display: flex; flex-wrap: wrap; gap: 4px;
+    background: var(--panel); border: 1px solid #1f2230; border-radius: 12px;
+    padding: 16px; min-height: 160px; align-content: flex-start;
+  }
+  .cell {
+    width: 22px; height: 22px; border-radius: 5px;
+    background: var(--dim);
+    display: flex; align-items: center; justify-content: center;
+    font-size: 10px; color: rgba(255,255,255,0.75);
+    opacity: 0; transform: scale(0.5);
+    animation: pop 220ms ease-out forwards;
+  }
+  .cell.accept { background: var(--green); box-shadow: 0 0 10px rgba(34,197,94,0.55); }
+  .cell.reject { background: var(--red); box-shadow: 0 0 10px rgba(239,68,68,0.55); }
+  .cell.bonus  { background: var(--accent); box-shadow: 0 0 10px rgba(125,211,252,0.55); }
+  @keyframes pop {
+    to { opacity: 1; transform: scale(1); }
+  }
+  .cycle-sep {
+    width: 1px; background: #2a2d3a; margin: 0 3px; align-self: stretch;
+  }
+
+  footer {
+    padding: 0 28px 24px; color: var(--muted); font-size: 12px; line-height: 1.6;
+  }
+  footer code { color: var(--accent); }
+  .legend { display: flex; gap: 18px; margin-bottom: 10px; }
+  .legend span { display: inline-flex; align-items: center; gap: 6px; }
+  .legend .sw { width: 10px; height: 10px; border-radius: 3px; display: inline-block; }
+</style>
+</head>
+<body>
+  <header>
+    <h1>MTP Accept Brain</h1>
+    <span class="status"><span id="dot" class="dot"></span><span id="statusText">connecting…</span></span>
+  </header>
+
+  <div class="metrics">
+    <div class="metric"><div class="label">Accept %</div><div class="value green" id="mAccept">–</div></div>
+    <div class="metric"><div class="label">Tok / s</div><div class="value accent" id="mTps">–</div></div>
+    <div class="metric"><div class="label">Tok / forward</div><div class="value" id="mTpf">–</div></div>
+    <div class="metric"><div class="label">Tokens generated</div><div class="value" id="mTokens">–</div></div>
+    <div class="metric"><div class="label">Verify cycles</div><div class="value" id="mCycles">–</div></div>
+  </div>
+
+  <main>
+    <div id="grid"></div>
+  </main>
+
+  <footer>
+    <div class="legend">
+      <span><span class="sw" style="background:var(--green)"></span> accepted draft</span>
+      <span><span class="sw" style="background:var(--red)"></span> rejected draft (chain stops)</span>
+      <span><span class="sw" style="background:var(--accent)"></span> bonus token (verifier's own pick)</span>
+    </div>
+    Live feed from <code>/mtp/events</code> (SSE). Each block is one drafted token from one MTP verify cycle;
+    green blocks are the tokens the small draft head predicted <em>correctly</em> and the big model kept.
+    Start the server with <code>--mtp &lt;draft.gguf&gt; --serve</code> and send a chat request to see it flash.
+  </footer>
+
+  <script>
+    const grid = document.getElementById("grid");
+    const dot = document.getElementById("dot");
+    const statusText = document.getElementById("statusText");
+    const MAX_CELLS = 400;
+
+    function setStatus(live, text) {
+      dot.classList.toggle("live", live);
+      statusText.textContent = text;
+    }
+
+    function addSeparator() {
+      const sep = document.createElement("div");
+      sep.className = "cycle-sep";
+      grid.appendChild(sep);
+    }
+
+    function addCell(kind, label) {
+      const cell = document.createElement("div");
+      cell.className = "cell " + kind;
+      cell.textContent = label || "";
+      grid.appendChild(cell);
+      while (grid.children.length > MAX_CELLS) {
+        grid.removeChild(grid.firstChild);
+      }
+      grid.scrollTop = grid.scrollHeight;
+    }
+
+    function renderCycle(ev) {
+      const mask = ev.accept_mask || [];
+      const nDrafted = ev.n_drafted ?? mask.length;
+      if (nDrafted === 0) {
+        addCell("bonus", "·");
+      } else {
+        for (let i = 0; i < mask.length; i++) {
+          addCell(mask[i] ? "accept" : "reject", "");
+        }
+        if (mask.length > 0 && mask.every(Boolean)) {
+          addCell("bonus", "+1");
+        }
+      }
+      addSeparator();
+    }
+
+    function fmt(n, digits) {
+      return typeof n === "number" ? n.toFixed(digits) : "–";
+    }
+
+    function renderMetrics(ev) {
+      document.getElementById("mAccept").textContent = fmt(ev.accept_pct_running, 1) + "%";
+      document.getElementById("mTps").textContent = fmt(ev.tok_per_s, 1);
+      document.getElementById("mTpf").textContent = fmt(ev.tok_per_forward, 2);
+      document.getElementById("mTokens").textContent = ev.tokens_generated ?? "–";
+      document.getElementById("mCycles").textContent = ev.main_forwards ?? "–";
+    }
+
+    function connect() {
+      const es = new EventSource("/mtp/events");
+      es.onopen = () => setStatus(true, "live");
+      es.onerror = () => {
+        setStatus(false, "reconnecting…");
+      };
+      es.onmessage = (msg) => {
+        if (!msg.data || msg.data === "keep-alive") return;
+        let ev;
+        try {
+          ev = JSON.parse(msg.data);
+        } catch (e) {
+          return;
+        }
+        if (ev.event !== "mtp_cycle") return;
+        renderCycle(ev);
+        renderMetrics(ev);
+      };
+    }
+
+    connect();
+  </script>
+</body>
+</html>

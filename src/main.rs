@@ -15,6 +15,7 @@ mod gemma4_gpu_model;
 mod gemma4_mtp;
 mod decode_fused;
 mod speculative;
+mod kv_persist;
 mod kv_pool;
 mod metrics;
 mod model;
@@ -356,18 +357,8 @@ fn main() {
                 println!("GEMMA4 E2B GENERATION (Metal GPU, MTP)");
                 println!("{}", "=".repeat(60));
 
-                let gen_start = Instant::now();
                 let mut assistant = gemma4_mtp::Gemma4MtpAssistant::new(&gpu_model.ctx, &draft_path, &gpu_model);
-                generate_gemma4_gpu_mtp(
-                    //"<start_of_turn>user\n Write a short essay about the benefits of exercise. Include an introduction, 3 key points, and a conclusion.<end_of_turn>\n<start_of_turn>model\n",
-                    "<start_of_turn>user\n def bubble_sort<end_of_turn>\n<start_of_turn>model\n",
-
-                    &tokenizer,
-                    &mut gpu_model,
-                    &mut assistant,
-                    1000,
-                );
-                println!("\nTotal time: {:.2}s", gen_start.elapsed().as_secs_f64());
+                run_mtp_chat_cli(&tokenizer, &mut gpu_model, &mut assistant, &model_dir);
             } else {
                 println!("{}", "=".repeat(60));
                 println!("GEMMA4 E4B GENERATION (Metal GPU, Q4_0)");
@@ -737,6 +728,245 @@ fn print_gemma_token(
     print!("{}", tok_str);
     io::stdout().flush().unwrap();
     true
+}
+
+/// Interactive multi-turn MTP chat for the CLI, with "warm reopen" session
+/// persistence: `LLAMA_SESSION=<name>` + `LLAMA_KV_SAVE=1` save the KV cache
+/// and token history to disk after every completed turn, and reload them
+/// (with zero re-prefill of the restored prefix) the next time the process
+/// starts with the same session name against the same model.
+fn run_mtp_chat_cli(
+    tokenizer: &tokenizers::Tokenizer,
+    model: &mut gemma4_gpu_model::Gemma4GpuModel,
+    assistant: &mut gemma4_mtp::Gemma4MtpAssistant,
+    model_path: &str,
+) {
+    use std::io::BufRead;
+
+    let session_id = std::env::var("LLAMA_SESSION").ok();
+    let kv_save = std::env::var("LLAMA_KV_SAVE").map(|v| v == "1").unwrap_or(false);
+    let sessions_dir = kv_persist::default_sessions_dir();
+    let eos_tokens: &[usize] = &[1, 106];
+    let max_tokens_per_turn = std::env::var("LLAMA_MAX_TOKENS_PER_TURN")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(512);
+
+    let mut token_history: Vec<u32> = Vec::new();
+
+    println!(
+        "  [session] id={} save={} dir={}",
+        session_id.as_deref().unwrap_or("(none)"),
+        kv_save,
+        sessions_dir.display()
+    );
+
+    if let Some(id) = &session_id {
+        let t0 = Instant::now();
+        match kv_persist::load_session(&sessions_dir, id, model_path, model) {
+            Ok(loaded) => {
+                token_history = loaded.token_history;
+                println!(
+                    "  [session] restored {} tokens, 0 prefill ({:.1} ms)",
+                    token_history.len(),
+                    t0.elapsed().as_secs_f64() * 1000.0
+                );
+            }
+            Err(e) => {
+                if e.kind() == io::ErrorKind::NotFound {
+                    println!("  [session] no saved session '{}' yet — starting fresh", id);
+                } else {
+                    eprintln!("  [session] REFUSING to load '{}': {}", id, e);
+                    eprintln!("  [session] starting fresh instead");
+                }
+            }
+        }
+    }
+
+    println!("Type a message and press Enter (\"/exit\" to quit).\n");
+
+    let stdin = io::stdin();
+    loop {
+        print!("You: ");
+        io::stdout().flush().unwrap();
+        let mut line = String::new();
+        let n = stdin.lock().read_line(&mut line).unwrap_or(0);
+        if n == 0 {
+            break; // EOF (e.g. piped input ended)
+        }
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        if line == "/exit" || line == "/quit" {
+            break;
+        }
+
+        let turn_text = format!(
+            "<start_of_turn>user\n{}<end_of_turn>\n<start_of_turn>model\n",
+            line
+        );
+        let add_bos = token_history.is_empty();
+        let encoding = tokenizer
+            .encode(turn_text.as_str(), add_bos)
+            .expect("Failed to encode user turn");
+        let new_ids: Vec<usize> = encoding.get_ids().iter().map(|&t| t as usize).collect();
+        token_history.extend(new_ids.iter().map(|&t| t as u32));
+
+        print!("Model: ");
+        io::stdout().flush().unwrap();
+
+        let turn_start = Instant::now();
+        let logits = model.forward_prefill(&new_ids);
+        let mut id_last = sampling::argmax(&logits);
+        let mut mtp_hidden = model.last_hidden_activation();
+        token_history.push(id_last as u32);
+
+        let mut turn_tokens = 1usize;
+        let mut turn_drafted = 0usize;
+        let mut turn_accepted = 0usize;
+        let mut turn_forwards = 0usize;
+        let mut accept_history: Vec<usize> = Vec::new();
+        let draft_steps = parse_mtp_draft_steps();
+        let mtp_adaptive = parse_mtp_adaptive();
+        let mtp_p_min = parse_mtp_p_min();
+        let brain = std::env::var("LLAMA_BRAIN_CLI").map(|v| v != "0").unwrap_or(true);
+
+        if !print_gemma_token(id_last, tokenizer, eos_tokens) {
+            // First token was eos — nothing else to do this turn.
+        } else {
+            'turn: while turn_tokens < max_tokens_per_turn {
+                let tail_steps =
+                    effective_draft_tail_steps(&accept_history, draft_steps, mtp_adaptive);
+                let n_draft = tail_steps + 1;
+
+                let drafted = assistant
+                    .draft_chain(id_last, &mtp_hidden, n_draft, model, mtp_p_min)
+                    .expect("MTP draft failed");
+
+                if drafted.is_empty() {
+                    let next_logits = model.forward_single_token(id_last);
+                    turn_forwards += 1;
+                    mtp_hidden = model.last_hidden_activation();
+                    id_last = sampling::argmax(&next_logits);
+                    token_history.push(id_last as u32);
+                    accept_history.push(0);
+                    if brain {
+                        print_brain_cycle(0, &[], 0);
+                    }
+                    if !print_gemma_token(id_last, tokenizer, eos_tokens) {
+                        break 'turn;
+                    }
+                    turn_tokens += 1;
+                    continue;
+                }
+
+                let mut verify_batch = Vec::with_capacity(drafted.len() + 1);
+                verify_batch.push(id_last);
+                verify_batch.extend_from_slice(&drafted);
+
+                let verify_tokens = model
+                    .forward_verify_batch(&verify_batch)
+                    .expect("MTP verify failed");
+                turn_forwards += 1;
+
+                let mut accept_mask = vec![false; drafted.len()];
+                let mut ids: Vec<usize> = Vec::with_capacity(drafted.len() + 1);
+                let mut n_accepted = 0usize;
+                for i in 0..drafted.len() {
+                    let pred = verify_tokens[i];
+                    ids.push(pred);
+                    if pred != drafted[i] {
+                        break;
+                    }
+                    accept_mask[i] = true;
+                    n_accepted += 1;
+                }
+                if n_accepted == drafted.len() {
+                    ids.push(verify_tokens[drafted.len()]);
+                }
+
+                turn_drafted += drafted.len();
+                turn_accepted += n_accepted;
+                accept_history.push(n_accepted);
+                if brain {
+                    print_brain_cycle(n_accepted, &accept_mask, drafted.len());
+                }
+
+                let rewind = (drafted.len() - n_accepted) as u32;
+                if rewind > 0 {
+                    model.truncate_kv(rewind);
+                }
+
+                let i_h = n_accepted.min(verify_batch.len() - 1);
+                mtp_hidden = model.prefill_hidden_activation_at(i_h);
+
+                for &tok in &ids {
+                    if turn_tokens >= max_tokens_per_turn {
+                        break 'turn;
+                    }
+                    token_history.push(tok as u32);
+                    if !print_gemma_token(tok, tokenizer, eos_tokens) {
+                        break 'turn;
+                    }
+                    turn_tokens += 1;
+                }
+                id_last = *ids.last().unwrap();
+            }
+        }
+
+        let elapsed = turn_start.elapsed().as_secs_f64();
+        let tps = if elapsed > 0.0 { turn_tokens as f64 / elapsed } else { 0.0 };
+        let tpf = if turn_forwards > 0 {
+            turn_tokens as f64 / turn_forwards as f64
+        } else {
+            0.0
+        };
+        let accept_rate = if turn_drafted > 0 {
+            turn_accepted as f64 * 100.0 / turn_drafted as f64
+        } else {
+            0.0
+        };
+        println!(
+            "\n  [turn] {} tok in {:.2}s = {:.1} tok/s | accept {:.1}% | {:.2} tok/forward | ctx={} tok",
+            turn_tokens, elapsed, tps, accept_rate, tpf, model.num_items()
+        );
+
+        if kv_save {
+            if let Some(id) = &session_id {
+                let t0 = Instant::now();
+                match kv_persist::save_session(&sessions_dir, id, model_path, model, &token_history) {
+                    Ok((path, bytes)) => println!(
+                        "  [session] saved {} tokens, {:.1} MB KV -> {} ({:.1} ms)",
+                        token_history.len(),
+                        bytes as f64 / (1024.0 * 1024.0),
+                        path.display(),
+                        t0.elapsed().as_secs_f64() * 1000.0
+                    ),
+                    Err(e) => eprintln!("  [session] save failed: {}", e),
+                }
+            }
+        }
+        println!();
+    }
+}
+
+/// One line of "Accept Brain" terminal visualization per MTP verify cycle:
+/// a green block per accepted draft token, a red block per first rejection.
+fn print_brain_cycle(n_accepted: usize, accept_mask: &[bool], n_drafted: usize) {
+    let mut blocks = String::new();
+    for i in 0..n_drafted {
+        if accept_mask.get(i).copied().unwrap_or(false) {
+            blocks.push_str("\x1b[32m█\x1b[0m"); // green = accepted
+        } else {
+            blocks.push_str("\x1b[31m█\x1b[0m"); // red = first rejection
+            break;
+        }
+    }
+    if n_drafted == 0 {
+        blocks.push_str("\x1b[90m·\x1b[0m"); // fallback single-token step
+    }
+    eprint!(" [brain {}/{}]{} ", n_accepted, n_drafted, blocks);
 }
 
 fn generate_gemma4_gpu_mtp(
