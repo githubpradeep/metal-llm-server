@@ -587,13 +587,15 @@ impl EmbedTables {
             (e.ggml_type, e.byte_len() / vocab_size, e.num_elements() / vocab_size)
         };
         assert_eq!(embed_actual, embed_cols, "token_embd row length mismatch");
-        let (ple_type, ple_row_stride, ple_actual) = {
+        let ple_native = if ple_total > 0 {
             let p = gguf
                 .tensor("per_layer_token_embd.weight")
                 .expect("per_layer_token_embd.weight missing");
-            (p.ggml_type, p.byte_len() / vocab_size, p.num_elements() / vocab_size)
+            assert_eq!(p.num_elements() / vocab_size, ple_total, "per_layer_token_embd row length mismatch");
+            Some((p.ggml_type, p.byte_len() / vocab_size, ple_total))
+        } else {
+            None
         };
-        assert_eq!(ple_actual, ple_total, "per_layer_token_embd row length mismatch");
         Self {
             mmap: None,
             embed_offset: 0,
@@ -606,7 +608,7 @@ impl EmbedTables {
             owned_ple: None,
             gguf: Some(gguf),
             embed_native: Some((embed_type, embed_row_stride, embed_cols)),
-            ple_native: Some((ple_type, ple_row_stride, ple_total)),
+            ple_native,
         }
     }
 
@@ -710,8 +712,10 @@ impl EmbedTables {
     fn ple_bytes(&self) -> &[u8] {
         if let Some(mmap) = &self.mmap {
             &mmap[self.ple_offset..self.ple_offset + self.ple_byte_len]
+        } else if let Some(owned) = &self.owned_ple {
+            owned.as_slice()
         } else {
-            self.owned_ple.as_ref().unwrap()
+            &[]
         }
     }
 
@@ -778,6 +782,7 @@ impl EmbedTables {
         ple_dim: usize,
         out: &mut [f32],
     ) {
+        if ple_dim == 0 || ple_total_dim == 0 { return; }
         let scale = (ple_dim as f32).sqrt();
         if let Some((gt, stride, cols)) = self.ple_native {
             let bytes = self
@@ -1353,13 +1358,14 @@ impl Gemma4GpuModel {
     ) -> Self {
         let hidden_size = config.hidden_size;
         let num_heads = config.num_attention_heads;
-        let num_kv_heads = config.num_key_value_heads;
+        let num_kv_heads_max = *config.num_key_value_heads_per_layer.iter().max().unwrap_or(&config.num_key_value_heads);
         let vocab_size = config.vocab_size;
         let num_layers = config.num_hidden_layers;
         let ple_dim = config.hidden_size_per_layer_input;
         let max_head_dim = config.global_head_dim;
         let max_q_out = num_heads * max_head_dim;
-        let max_kv_out = num_kv_heads * max_head_dim;
+        let max_kv_out = (0..num_layers).map(|i| config.layer_num_kv_heads(i) * config.layer_head_dim(i)).max().unwrap_or(num_kv_heads_max * max_head_dim);
+        // Per-layer max intermediate for scratch buffers
 
         // Compute kv_source_layer for shared layers
         // For each shared layer, find the last non-shared layer of the same type
@@ -1389,12 +1395,16 @@ impl Gemma4GpuModel {
             .max()
             .unwrap_or_else(|| config.max_intermediate_size());
 
-        println!(
-            "  KV sharing: layers 0-{} have own KV, layers {}-{} share",
-            first_kv_shared - 1,
-            first_kv_shared,
-            num_layers - 1
-        );
+        if first_kv_shared < num_layers {
+            println!(
+                "  KV sharing: layers 0-{} have own KV, layers {}-{} share",
+                first_kv_shared - 1,
+                first_kv_shared,
+                num_layers - 1
+            );
+        } else {
+            println!("  KV sharing: all {} layers have own KV (no sharing)", num_layers);
+        }
 
         // Pre-allocate scratch buffers
         let hidden_buf = ctx.buffer_empty(hidden_size);
@@ -1412,14 +1422,16 @@ impl Gemma4GpuModel {
         let logits_buf = ctx.buffer_empty(vocab_size);
         let sample_out_buf = ctx.buffer_empty_u32(1);
         let inv_rms_buf = ctx.buffer_empty(1);
-        // PLE scratch
-        let ple_embed_buf = ctx.buffer_empty(ple_dim);
-        let ple_gated_buf = ctx.buffer_empty(ple_dim);
-        let ple_normed_buf = ctx.buffer_empty(ple_dim);
-        let ple_projected_buf = ctx.buffer_empty(hidden_size);
-        let ple_context_proj_buf = ctx.buffer_empty(num_layers * ple_dim);
-        let ple_token_id_buf = ctx.buffer_empty(num_layers * ple_dim);
-        let ple_combined_buf = ctx.buffer_empty(num_layers * ple_dim);
+        // PLE scratch (allocate at least 1 byte to avoid zero-size Metal buffers)
+        let ple_alloc = ple_dim.max(1);
+        let ple_embed_buf = ctx.buffer_empty(ple_alloc);
+        let ple_gated_buf = ctx.buffer_empty(ple_alloc);
+        let ple_normed_buf = ctx.buffer_empty(ple_alloc);
+        let ple_projected_buf = ctx.buffer_empty(hidden_size.max(1));
+        let ple_ctx_proj_alloc = (num_layers * ple_dim).max(1);
+        let ple_context_proj_buf = ctx.buffer_empty(ple_ctx_proj_alloc);
+        let ple_token_id_buf = ctx.buffer_empty(ple_ctx_proj_alloc);
+        let ple_combined_buf = ctx.buffer_empty(ple_ctx_proj_alloc);
 
         // QK norm scratch (max head_dim per head)
         let q_normed_buf = ctx.buffer_empty(max_q_out);
@@ -1437,9 +1449,10 @@ impl Gemma4GpuModel {
         let mut v_cache = Vec::with_capacity(num_layers);
         for i in 0..num_layers {
             let hd = config.layer_head_dim(i);
+            let layer_n_kv = config.layer_num_kv_heads(i);
             assert!(hd % 32 == 0, "head_dim must be a multiple of 32 for quantized KV cache");
             let bytes_per_row = kv_cache_type.bytes_per_row(hd);
-            let byte_len = (num_kv_heads * kv_capacity as usize * bytes_per_row) as u64;
+            let byte_len = (layer_n_kv * kv_capacity as usize * bytes_per_row) as u64;
             k_cache.push(
                 ctx.device
                     .new_buffer(byte_len, MTLResourceOptions::StorageModeShared),
@@ -1449,8 +1462,8 @@ impl Gemma4GpuModel {
                     .new_buffer(byte_len, MTLResourceOptions::StorageModeShared),
             );
         }
-        let f16_bytes = num_kv_heads * kv_capacity as usize * config.head_dim * 2 + num_kv_heads * kv_capacity as usize * config.global_head_dim * 2;
-        let quant_bytes = num_kv_heads * kv_capacity as usize * kv_cache_type.bytes_per_row(config.head_dim) + num_kv_heads * kv_capacity as usize * kv_cache_type.bytes_per_row(config.global_head_dim);
+        let f16_bytes = num_kv_heads_max * kv_capacity as usize * config.head_dim * 2 + num_kv_heads_max * kv_capacity as usize * config.global_head_dim * 2;
+        let quant_bytes = num_kv_heads_max * kv_capacity as usize * kv_cache_type.bytes_per_row(config.head_dim) + num_kv_heads_max * kv_capacity as usize * kv_cache_type.bytes_per_row(config.global_head_dim);
         println!("  KV cache type: {}, est. memory per layer: {:.1} MB (vs f16: {:.1} MB, {:.0}% savings)",
             kv_cache_type,
             quant_bytes as f64 / num_layers as f64 / 1024.0 / 1024.0,
@@ -1469,7 +1482,7 @@ impl Gemma4GpuModel {
             num_layers,
             ple_dim,
             kv_capacity,
-            num_kv_heads as u32,
+            num_kv_heads_max as u32,
             max_head_dim as u32,
         );
         let decode_batch_scratch = DecodeBatchScratch::new(
@@ -1511,7 +1524,7 @@ impl Gemma4GpuModel {
             per_layer_decode_batch_kv_start_bufs
                 .push(ctx.buffer_empty_u32(DEFAULT_MAX_DECODE_BATCH));
             per_layer_decode_batch_kv_len_bufs.push(ctx.buffer_empty_u32(DEFAULT_MAX_DECODE_BATCH));
-            per_layer_ple_bufs.push(ctx.buffer_empty(ple_dim));
+            per_layer_ple_bufs.push(ctx.buffer_empty(ple_dim.max(1)));
         }
 
         // MTP verify scratch buffers
@@ -1525,7 +1538,7 @@ impl Gemma4GpuModel {
             &ctx,
             MAX_MTP_VERIFY_SEQ,
             hidden_size,
-            num_layers * ple_dim,
+            (num_layers * ple_dim).max(1),
             &mtp_head_dims,
         );
 
@@ -1616,7 +1629,7 @@ impl Gemma4GpuModel {
             total_tokens: 0,
             weights_mmap_offset: None,
             embed_decode_scratch: vec![0.0f32; hidden_size],
-            ple_decode_scratch: vec![0.0f32; num_layers * ple_dim],
+            ple_decode_scratch: vec![0.0f32; (num_layers * ple_dim).max(1)],
         };
 
         crate::decode_fused::log_fused_decode_status(&model);
@@ -1727,50 +1740,57 @@ impl Gemma4GpuModel {
         // --- Shared norms / projections ---
         let final_norm_weight =
             BufferView::from_buffer(ctx.buffer_from_slice(&g.dequant_to_f32("output_norm.weight")));
-        let per_layer_projection_norm_weight = BufferView::from_buffer(
-            ctx.buffer_from_slice(&g.dequant_to_f32("per_layer_proj_norm.weight")),
-        );
-        let per_layer_model_proj_f32 = g.dequant_to_f32("per_layer_model_proj.weight");
-        // GGUF Q4_K_M stores this as BF16 (llama uses dense mul_mm). Keep f16 —
-        // requantizing to Q4_0 forced the slow projection_q4_batch path.
-        let per_layer_model_projection_weight = {
-            use crate::gguf::ggml_type;
-            use crate::gpu::weight_fmt;
-            match g.tensor_type("per_layer_model_proj.weight") {
-                ggml_type::Q4_K => BufferView::from_buffer(
-                    ctx.buffer_from_slice_no_copy(g.tensor_raw("per_layer_model_proj.weight")),
-                )
-                .with_format(weight_fmt::Q4_K),
-                ggml_type::Q6_K => BufferView::from_buffer(
-                    ctx.buffer_from_slice_no_copy(g.tensor_raw("per_layer_model_proj.weight")),
-                )
-                .with_format(weight_fmt::Q6_K),
-                ggml_type::BF16 | ggml_type::F16 => BufferView::from_buffer(
-                    ctx.buffer_from_slice_no_copy(g.tensor_raw("per_layer_model_proj.weight")),
-                )
-                .with_format(weight_fmt::F16),
-                ggml_type::F32 => BufferView::from_buffer(
-                    ctx.buffer_from_f32_as_f16(&per_layer_model_proj_f32),
-                )
-                .with_format(weight_fmt::F16),
-                _ => BufferView::from_buffer(ctx.buffer_from_f32_as_q4(
-                    &per_layer_model_proj_f32,
-                    ple_total_dim,
-                    hidden_size,
-                )),
-            }
+        let per_layer_projection_norm_weight = if ple_total_dim > 0 {
+            BufferView::from_buffer(
+                ctx.buffer_from_slice(&g.dequant_to_f32("per_layer_proj_norm.weight")),
+            )
+        } else {
+            BufferView::from_buffer(ctx.buffer_empty(1))
         };
-        drop(per_layer_model_proj_f32);
-        println!(
-            "  per_layer_model_proj: format={} ({:.1} MB)",
-            match per_layer_model_projection_weight.format {
-                crate::gpu::weight_fmt::F16 => "F16",
-                crate::gpu::weight_fmt::Q4_K => "Q4_K",
-                crate::gpu::weight_fmt::Q6_K => "Q6_K",
-                _ => "Q4_0",
-            },
-            per_layer_model_projection_weight.length as f64 / (1024.0 * 1024.0)
-        );
+        let per_layer_model_projection_weight = if ple_total_dim > 0 && g.has_tensor("per_layer_model_proj.weight") {
+            let proj_f32 = g.dequant_to_f32("per_layer_model_proj.weight");
+            let pw = {
+                use crate::gguf::ggml_type;
+                use crate::gpu::weight_fmt;
+                match g.tensor_type("per_layer_model_proj.weight") {
+                    ggml_type::Q4_K => BufferView::from_buffer(
+                        ctx.buffer_from_slice_no_copy(g.tensor_raw("per_layer_model_proj.weight")),
+                    )
+                    .with_format(weight_fmt::Q4_K),
+                    ggml_type::Q6_K => BufferView::from_buffer(
+                        ctx.buffer_from_slice_no_copy(g.tensor_raw("per_layer_model_proj.weight")),
+                    )
+                    .with_format(weight_fmt::Q6_K),
+                    ggml_type::BF16 | ggml_type::F16 => BufferView::from_buffer(
+                        ctx.buffer_from_slice_no_copy(g.tensor_raw("per_layer_model_proj.weight")),
+                    )
+                    .with_format(weight_fmt::F16),
+                    ggml_type::F32 => BufferView::from_buffer(
+                        ctx.buffer_from_f32_as_f16(&proj_f32),
+                    )
+                    .with_format(weight_fmt::F16),
+                    _ => BufferView::from_buffer(ctx.buffer_from_f32_as_q4(
+                        &proj_f32,
+                        ple_total_dim,
+                        hidden_size,
+                    )),
+                }
+            };
+            drop(proj_f32);
+            println!(
+                "  per_layer_model_proj: format={} ({:.1} MB)",
+                match pw.format {
+                    crate::gpu::weight_fmt::F16 => "F16",
+                    crate::gpu::weight_fmt::Q4_K => "Q4_K",
+                    crate::gpu::weight_fmt::Q6_K => "Q6_K",
+                    _ => "Q4_0",
+                },
+                pw.length as f64 / (1024.0 * 1024.0)
+            );
+            pw
+        } else {
+            BufferView::from_buffer(ctx.buffer_empty(1))
+        };
 
         // --- Layers ---
         let q6k_to_q4 = std::env::var("Q6K_TO_Q4").as_deref() == Ok("1");
@@ -1786,7 +1806,8 @@ impl Gemma4GpuModel {
             let is_full = config.is_full_attention(layer_idx);
             let head_dim = config.layer_head_dim(layer_idx);
             let q_out = num_heads * head_dim;
-            let kv_out = num_kv_heads * head_dim;
+            let layer_kv_heads = config.layer_num_kv_heads(layer_idx);
+            let kv_out = layer_kv_heads * head_dim;
             let p = |suffix: &str| format!("blk.{}.{}", layer_idx, suffix);
 
             // Quantized projection weight: keep community K-quant blocks native
@@ -1838,13 +1859,26 @@ impl Gemma4GpuModel {
 
             let q_proj = qw(p("attn_q.weight"), q_out, hidden_size);
             let k_proj = qw(p("attn_k.weight"), kv_out, hidden_size);
-            let v_proj = qw(p("attn_v.weight"), kv_out, hidden_size);
+            let v_proj = if g.has_tensor(&p("attn_v.weight")) {
+                qw(p("attn_v.weight"), kv_out, hidden_size)
+            } else {
+                // Joint KV attention: no separate V weight; reuse K projection as V.
+                qw(p("attn_k.weight"), kv_out, hidden_size)
+            };
             let o_proj = qw(p("attn_output.weight"), hidden_size, q_out);
             let gate_proj = qw(p("ffn_gate.weight"), layer_inter, hidden_size);
             let up_proj = qw(p("ffn_up.weight"), layer_inter, hidden_size);
             let down_proj = qw(p("ffn_down.weight"), hidden_size, layer_inter);
-            let per_layer_input_gate_weight = qw(p("inp_gate.weight"), ple_dim, hidden_size);
-            let per_layer_projection_weight = qw(p("proj.weight"), hidden_size, ple_dim);
+            let per_layer_input_gate_weight = if ple_dim > 0 {
+                qw(p("inp_gate.weight"), ple_dim, hidden_size)
+            } else {
+                BufferView::from_buffer(ctx.buffer_empty(1))
+            };
+            let per_layer_projection_weight = if ple_dim > 0 {
+                qw(p("proj.weight"), hidden_size, ple_dim)
+            } else {
+                BufferView::from_buffer(ctx.buffer_empty(1))
+            };
 
             // A layer is "K-quant" if any projection kept native K-quant blocks;
             // this disables the Q4_0-only fused/mega paths for the layer while
@@ -1874,7 +1908,7 @@ impl Gemma4GpuModel {
                 post_attention_layernorm_weight: f32buf(p("post_attention_norm.weight")),
                 pre_feedforward_layernorm_weight: f32buf(p("ffn_norm.weight")),
                 post_feedforward_layernorm_weight: f32buf(p("post_ffw_norm.weight")),
-                post_per_layer_input_norm_weight: f32buf(p("post_norm.weight")),
+                post_per_layer_input_norm_weight: if ple_dim > 0 { f32buf(p("post_norm.weight")) } else { BufferView::from_buffer(ctx.buffer_empty(1)) },
 
                 per_layer_input_gate_weight,
                 per_layer_projection_weight,
@@ -2579,7 +2613,7 @@ impl Gemma4GpuModel {
             per_layer_decode_batch_kv_start_bufs
                 .push(ctx.buffer_empty_u32(DEFAULT_MAX_DECODE_BATCH));
             per_layer_decode_batch_kv_len_bufs.push(ctx.buffer_empty_u32(DEFAULT_MAX_DECODE_BATCH));
-            per_layer_ple_bufs.push(ctx.buffer_empty(ple_dim));
+            per_layer_ple_bufs.push(ctx.buffer_empty(ple_dim.max(1)));
         }
 
         if layers.iter().any(|l| l.weight_format == WeightFormat::F16) {
@@ -2613,7 +2647,7 @@ impl Gemma4GpuModel {
             &ctx,
             MAX_MTP_VERIFY_SEQ,
             hidden_size,
-            num_layers * ple_dim,
+            (num_layers * ple_dim).max(1),
             &mtp_head_dims,
         );
 
@@ -2679,7 +2713,7 @@ impl Gemma4GpuModel {
             total_tokens: 0,
             weights_mmap_offset,
             embed_decode_scratch: vec![0.0f32; hidden_size],
-            ple_decode_scratch: vec![0.0f32; num_layers * ple_dim],
+            ple_decode_scratch: vec![0.0f32; (num_layers * ple_dim).max(1)],
         };
         crate::decode_fused::log_fused_decode_status(&model);
         model
@@ -3365,13 +3399,15 @@ impl Gemma4GpuModel {
         self.embed_tables
             .decode_embed_into(token_id, hidden_size, &mut self.embed_decode_scratch);
         MetalContext::write_buffer(&self.hidden_buf, &self.embed_decode_scratch);
-        self.embed_tables.decode_ple_into(
-            token_id,
-            ple_total_dim,
-            ple_dim,
-            &mut self.ple_decode_scratch,
-        );
-        MetalContext::write_buffer(&self.ple_token_id_buf, &self.ple_decode_scratch);
+        if ple_dim > 0 {
+            self.embed_tables.decode_ple_into(
+                token_id,
+                ple_total_dim,
+                ple_dim,
+                &mut self.ple_decode_scratch,
+            );
+            MetalContext::write_buffer(&self.ple_token_id_buf, &self.ple_decode_scratch);
+        }
 
         let kv_seq = self.kv_seq_len;
         let pos = self.total_tokens as f32;
@@ -5338,8 +5374,10 @@ impl Gemma4GpuModel {
         for i in 0..batch_size {
             let emb = &mut batch_hidden[i * hidden_size..(i + 1) * hidden_size];
             self.embed_tables.decode_embed_into(token_ids[i], hidden_size, emb);
-            let ple = &mut batch_ple[i * ple_total_dim..(i + 1) * ple_total_dim];
-            self.embed_tables.decode_ple_into(token_ids[i], ple_total_dim, ple_dim, ple);
+            if ple_dim > 0 {
+                let ple = &mut batch_ple[i * ple_total_dim..(i + 1) * ple_total_dim];
+                self.embed_tables.decode_ple_into(token_ids[i], ple_total_dim, ple_dim, ple);
+            }
         }
 
         MetalContext::write_buffer(&self.decode_batch_scratch.hidden_buf, &batch_hidden);
@@ -5743,13 +5781,15 @@ impl Gemma4GpuModel {
                 &mut hidden[hidden_offset..hidden_offset + hidden_size],
             );
 
-            let ple_out_offset = pos * ple_total_dim;
-            self.embed_tables.decode_ple_into(
-                token_id,
-                ple_total_dim,
-                ple_dim,
-                &mut ple_token_identity[ple_out_offset..ple_out_offset + ple_total_dim],
-            );
+            if ple_dim > 0 {
+                let ple_out_offset = pos * ple_total_dim;
+                self.embed_tables.decode_ple_into(
+                    token_id,
+                    ple_total_dim,
+                    ple_dim,
+                    &mut ple_token_identity[ple_out_offset..ple_out_offset + ple_total_dim],
+                );
+            }
         }
 
         Ok(BatchedTokenInputs {
@@ -6025,7 +6065,7 @@ impl Gemma4GpuModel {
             .ok_or_else(|| format!("invalid layer index {}", layer_idx))?;
         let hidden_size = self.config.hidden_size;
         let num_heads = self.config.num_attention_heads;
-        let num_kv_heads = self.config.num_key_value_heads;
+        let num_kv_heads = layer.kv_out_dim / layer.head_dim;
         let head_dim = layer.head_dim;
         let eps = self.config.rms_norm_eps as f32;
 
@@ -6221,7 +6261,7 @@ impl Gemma4GpuModel {
         let hidden_size = self.config.hidden_size;
         let intermediate_size = layer.intermediate_size;
         let num_heads = self.config.num_attention_heads;
-        let num_kv_heads = self.config.num_key_value_heads;
+        let num_kv_heads = layer.kv_out_dim / layer.head_dim;
         let num_kv_groups = (num_heads / num_kv_heads) as u32;
         let ple_dim = self.config.hidden_size_per_layer_input;
         let eps = self.config.rms_norm_eps as f32;
@@ -6610,7 +6650,7 @@ impl Gemma4GpuModel {
         let hidden_size = self.config.hidden_size;
         let intermediate_size = layer.intermediate_size;
         let num_heads = self.config.num_attention_heads;
-        let num_kv_heads = self.config.num_key_value_heads;
+        let num_kv_heads = layer.kv_out_dim / layer.head_dim;
         let num_kv_groups = (num_heads / num_kv_heads) as u32;
         let ple_dim = self.config.hidden_size_per_layer_input;
         let eps = self.config.rms_norm_eps as f32;
@@ -6972,7 +7012,7 @@ impl Gemma4GpuModel {
                 .ok_or_else(|| format!("invalid layer index {}", layer_idx))?;
             let intermediate_size = layer.intermediate_size;
             let num_heads = self.config.num_attention_heads;
-            let num_kv_heads = self.config.num_key_value_heads;
+            let num_kv_heads = layer.kv_out_dim / layer.head_dim;
             let num_kv_groups = (num_heads / num_kv_heads) as u32;
             let ple_dim = self.config.hidden_size_per_layer_input;
             let head_dim = layer.head_dim;
@@ -7593,6 +7633,8 @@ impl Gemma4GpuModel {
             let layer = &self.layers[layer_idx];
             let intermediate_size = layer.intermediate_size;
             let head_dim = layer.head_dim;
+            let num_kv_heads = layer.kv_out_dim / layer.head_dim;
+            let num_kv_groups = (num_heads / num_kv_heads) as u32;
             let q_out = layer.q_out_dim;
             let kv_out = layer.kv_out_dim;
             let scale = 1.0f32;
@@ -8967,7 +9009,15 @@ fn gemma4_config_from_gguf(g: &crate::gguf::Gguf) -> Gemma4TextConfig {
     let hidden_size = mu("gemma4.embedding_length");
     let num_hidden_layers = mu("gemma4.block_count");
     let num_attention_heads = mu("gemma4.attention.head_count");
-    let num_key_value_heads = mu("gemma4.attention.head_count_kv");
+    let head_count_kv_list = g
+        .get_usize_list("gemma4.attention.head_count_kv")
+        .unwrap_or_else(|| panic!("gguf missing gemma4.attention.head_count_kv"));
+    let num_key_value_heads = *head_count_kv_list.iter().max().unwrap_or(&1);
+    let num_key_value_heads_per_layer = if head_count_kv_list.len() > 1 {
+        head_count_kv_list
+    } else {
+        Vec::new()
+    };
     let head_dim = mu("gemma4.attention.key_length_swa"); // sliding head dim (e.g. 256)
     let global_head_dim = mu("gemma4.attention.key_length"); // full head dim (e.g. 512)
     let intermediate_sizes = g
@@ -9082,6 +9132,7 @@ fn gemma4_config_from_gguf(g: &crate::gguf::Gguf) -> Gemma4TextConfig {
         final_logit_softcapping,
         tie_word_embeddings: !g.has_tensor("output.weight"),
         rope_parameters,
+        num_key_value_heads_per_layer,
     }
 }
 

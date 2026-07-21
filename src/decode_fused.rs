@@ -127,7 +127,7 @@ impl Gemma4GpuModel {
         let layer = &self.layers[layer_idx];
         let hidden_size = self.config.hidden_size as u32;
         let num_heads = self.config.num_attention_heads as u32;
-        let num_kv_heads = self.config.num_key_value_heads as u32;
+        let num_kv_heads = self.config.layer_num_kv_heads(layer_idx) as u32;
         let num_kv_groups = (num_heads / num_kv_heads.max(1)) as u32;
         let head_dim = layer.head_dim as u32;
         let q_out = layer.q_out_dim as u32;

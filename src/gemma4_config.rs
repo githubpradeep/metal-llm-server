@@ -35,6 +35,9 @@ pub struct Gemma4TextConfig {
     pub tie_word_embeddings: bool,
     #[serde(default)]
     pub rope_parameters: Option<RopeParameters>,
+    /// Per-layer KV head counts. Empty = uniform (use num_key_value_heads).
+    #[serde(default)]
+    pub num_key_value_heads_per_layer: Vec<usize>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -116,8 +119,20 @@ impl Gemma4TextConfig {
             .unwrap_or(self.intermediate_size)
     }
 
+    pub fn layer_num_kv_heads(&self, layer_idx: usize) -> usize {
+        self.num_key_value_heads_per_layer
+            .get(layer_idx)
+            .copied()
+            .unwrap_or(self.num_key_value_heads)
+    }
+
     pub fn num_kv_groups(&self) -> usize {
         self.num_attention_heads / self.num_key_value_heads
+    }
+
+    pub fn layer_num_kv_groups(&self, layer_idx: usize) -> usize {
+        let kv = self.layer_num_kv_heads(layer_idx);
+        if kv == 0 { 1 } else { self.num_attention_heads / kv }
     }
 
     pub fn is_full_attention(&self, layer_idx: usize) -> bool {
