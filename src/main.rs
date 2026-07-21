@@ -707,35 +707,17 @@ fn adaptive_draft_tail_steps(accept_history: &[usize], max_steps: usize) -> usiz
     }
 }
 
-fn context_limited_draft_tail_steps(tail_steps: usize, context_len: usize, sliding_window: usize) -> usize {
-    if tail_steps == 0 {
-        return 0;
-    }
-    if context_len > sliding_window.saturating_mul(2) {
-        return 0;
-    }
-    if context_len > sliding_window {
-        return tail_steps.min(1);
-    }
-    if context_len > sliding_window * 3 / 4 {
-        return tail_steps.min(2);
-    }
-    tail_steps
-}
-
+/// llama.cpp draft-mtp: depth = n_max (or adaptive), no SWA/context clamp.
 fn effective_draft_tail_steps(
     accept_history: &[usize],
     max_steps: usize,
     mtp_adaptive: bool,
-    context_len: usize,
-    sliding_window: usize,
 ) -> usize {
-    let tail = if mtp_adaptive {
+    if mtp_adaptive {
         adaptive_draft_tail_steps(accept_history, max_steps)
     } else {
         max_steps.saturating_sub(1)
-    };
-    context_limited_draft_tail_steps(tail, context_len, sliding_window)
+    }
 }
 
 fn print_gemma_token(
@@ -822,8 +804,6 @@ fn generate_gemma4_gpu_mtp(
             &accept_history,
             draft_steps,
             mtp_adaptive,
-            model.kv_seq_len as usize,
-            model.config.sliding_window,
         );
         let n_draft = tail_steps + 1;
 

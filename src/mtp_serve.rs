@@ -238,8 +238,6 @@ impl MtpScheduler {
             }
         }
 
-        let sliding_window = self.model.config.sliding_window;
-
         loop {
             if completion_tokens >= params.max_tokens {
                 self.finish_stop(
@@ -284,8 +282,6 @@ impl MtpScheduler {
                 &stats.accepted_per_cycle,
                 self.draft_steps,
                 self.adaptive,
-                self.model.kv_seq_len as usize,
-                sliding_window,
             );
             let n_draft = tail_steps + 1;
 
@@ -601,47 +597,25 @@ fn adaptive_draft_tail_steps(accept_history: &[usize], max_steps: usize) -> usiz
         max_steps - 1
     } else if avg >= 2.0 {
         (max_steps - 1).min(2)
-    } else if avg >= 1.2 {
-        1
     } else {
+        // Keep one tail as a probe. Zero tails self-locks: cycles can never
+        // accept enough to climb the avg threshold again.
         1
     }
 }
 
-fn context_limited_draft_tail_steps(
-    tail_steps: usize,
-    context_len: usize,
-    sliding_window: usize,
-) -> usize {
-    if tail_steps == 0 {
-        return 0;
-    }
-    if context_len > sliding_window.saturating_mul(2) {
-        return 0;
-    }
-    if context_len > sliding_window {
-        return tail_steps.min(1);
-    }
-    if context_len > sliding_window * 3 / 4 {
-        return tail_steps.min(2);
-    }
-    tail_steps
-}
-
+/// llama.cpp draft-mtp: depth = n_max (or adaptive), no SWA/context clamp.
 fn effective_draft_tail_steps(
     accept_history: &[usize],
     max_steps: usize,
     adaptive: bool,
-    context_len: usize,
-    sliding_window: usize,
 ) -> usize {
     let tail = if adaptive {
         adaptive_draft_tail_steps(accept_history, max_steps)
     } else {
         max_steps.saturating_sub(1)
     };
-    let tail = tail.min(MAX_DRAFT_STEPS);
-    context_limited_draft_tail_steps(tail, context_len, sliding_window)
+    tail.min(MAX_DRAFT_STEPS)
 }
 
 /// Silence unused-import lints on the cancel constants imported for symmetry.
