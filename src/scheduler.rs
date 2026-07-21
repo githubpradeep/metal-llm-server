@@ -695,7 +695,7 @@ fn prepare_decode_token(active: &mut ActiveRequest) -> DecodePreparation {
     DecodePreparation::Forward(next_token)
 }
 
-fn cancellation_finish_reason(request: &InferenceRequest) -> Option<&'static str> {
+pub fn cancellation_finish_reason(request: &InferenceRequest) -> Option<&'static str> {
     match request.cancel.load(Ordering::Relaxed) {
         CANCEL_STOP => Some("stop"),
         CANCEL_CLIENT => Some("cancelled"),

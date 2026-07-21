@@ -334,3 +334,114 @@ test occupancy vs dispatch overhead tradeoff.
 Unresolved hypotheses (unchanged): KV-cache Q4_0 write bandwidth during decode,
 pipeline bubbles between attention and MLP, K-norm/RoPE path differences vs
 llama.cpp. Phase timing (E16) should narrow these.
+
+---
+
+## MTP (E2B Q4_K_M + F16 draft head) — verify path optimization (2026-07-17)
+
+Goal: MTP ≥ non-MTP baseline (~44 tok/s, `ATTENTION_KERNEL=auto`, Q4_0 KV,
+8192 ctx). Started at ~25 tok/s (sequential verify, 90% of wall in verify).
+
+### M1. Parallel prefill verify now correct + default
+
+Earlier garbage traced to two bugs (fixed prior session): draft-head attention
+scratch sized to `hidden_head` instead of `max_head_dim` (512), and f16 MLP
+cast feeding the f32 matvec fallback when `should_use_mul_mm` was false.
+`MTP_VERIFY_CROSSCHECK=1` now passes on every cycle (parallel == sequential,
+all rows). `forward_verify_parallel` (batched prefill chunk) is the default;
+`MTP_VERIFY_SEQUENTIAL=1` / `MTP_VERIFY_DECODE_BATCH=1` opt back.
+
+### M2. K-quant `mul_mv_ext` small-batch kernels (batch 2–8)
+
+Ported llama.cpp `kernel_mul_mv_ext_q4x4_f32` (r1ptg=2..5, nxpsg=8) for
+Q4_K/Q6_K into `ggml_mul_mv_q4.metal` (`matvec_ggml_ext_q{4,6}K_nx8_r{2..5}`).
+Weight row dequantized once, dotted against all batch rows. Routed in
+`encode_prefill_kquant_projection` + stacked gate/up for `2 ≤ seq ≤ 8`.
+(`mul_mm` at these sizes is **worse**: `MUL_MM_MIN_SEQ=1` → 20 tok/s.)
+
+### M3. Batched lm_head for verify rows
+
+Verify computed logits per row with `encode_matvec_auto_at_view` — the
+~440 MB vocab matrix was read once *per row*. Replaced with one
+`encode_prefill_projection_auto_batch_view` over all rows. +1 tok/s.
+
+### M4. Tiled flash_attn_ext for small q (default `TILED_EXT_MIN_Q=2`)
+
+Biggest win. Per-row causal attention (one dispatch per q row ×
+per-row KV reads) was the verify bottleneck. The tiled ext kernel already
+handled small q fine — the `q_len ≥ 20` gate was just llama.cpp's vec/tiled
+switch, but our sub-20 fallback is much worse than their vec path. Lowering
+the gate to 2 shares KV tile loads across verify rows: seq=3 verify GPU
+44 → 36 ms; e2e 37.7 → 42.4 tok/s. Crosscheck still passes.
+(`MTP_VERIFY_DECODE_FA=1` per-row decode attention: 73 ms — far worse.)
+
+### Results (399-token essay, adaptive draft, ~42% accept, 1.85 tok/forward)
+
+| Config | tok/s |
+|--------|-------|
+| Non-MTP baseline (auto) | 43.5–44.5 |
+| MTP sequential verify (old default) | 23.5–26 |
+| MTP parallel verify + ext matvec | 34.8 |
+| + batched lm_head | 37.7 |
+| + tiled ext attention (new default) | **42.4** (auto) / **43.1** (specialized) |
+
+Draft-steps sweep (2/3/4/6/7): flat 42–43.8; `p_min` 0.3/0.5 raises accept to
+44–48% but lowers tok/s (draft passes cost more than they save). Verify cap
+`MAX_MTP_VERIFY_SEQ=8` → max draft steps 7.
+
+### M5. h_nextn pre-final-norm "fix" — WRONG for Gemma4 (reverted)
+
+The generic `llama-graph.h` comment says `t_h_nextn` is "hidden state before
+final output norm", but **gemma4.cpp sets it AFTER `output_norm`** (post-final-
+norm, the LM-head input) — matching transformers/vLLM/SGLang for this arch.
+Tried switching all MTP h_nextn capture sites from `normed_buf` to
+`hidden_buf`: accept rate collapsed 42.5% → 21.8%, tok/s 41 → 30. Reverted.
+Our existing post-norm capture was already correct. Kept: last-row fix in
+`forward_prefill_parallel_self` (was reading row 0 instead of the last row for
+multi-token prefill).
+
+### M6. Draft confidence normalized over top-k=10 (llama.cpp parity)
+
+llama.cpp's draft-mtp sampler is `top_k=10`: `cur_p->data[0].p` (the p_min
+gate) is the greedy token's softmax over the **top 10 candidates**, not the
+full vocab. Ours was full-vocab softmax — systematically lower p, so p_min cut
+drafts too early. Now `draft_token_confidence` normalizes over top-k
+(`LLAMA_MTP_DRAFT_TOP_K`, default 10; 0 = full vocab).
+
+Sweep (adaptive, auto, 442-tok essay): p_min 0.3 → 44.0% accept / 40.6 tok/s;
+0.5 → 46.5% / 39.6–43.7; 0.75 → 50.5% / 43.4. Baseline greedy no-p_min:
+42.5% / 41.1–43.5. Accept rises with p_min but tok/s stays within run-to-run
+noise (±2) — the extra draft passes still roughly cancel the accept gain.
+p_min remains opt-in.
+
+### M7. Fused gate∥up+GeLU ext matvec for verify seq 2–8 (default on)
+
+**What**: Ported the decode-style fused Q4_K gate∥up+GeLU pattern onto the
+K-quant `mul_mv_ext` path (`matvec_ggml_ext_q4K_gelu_nx8_r{2..5}`). Each TG
+dequants gate row i + up row i, shares activation tiles across the batch, and
+writes `GeLU(gate·x)*(up·x)` directly — skips the 2·M·batch intermediate and
+the separate `gelu_mul_stacked` dispatch. Wired in `encode_prefill_mlp_gate_up`
+when `PREFILL_GATE_UP_EXT_GELU=1` (default), both weights Q4_K, seq ∈ [2,8].
+
+**Result** (adaptive MTP, auto, 442-tok essay, 2 runs each):
+- fused ON:  42.4 / 43.3 tok/s (accept 42.5%, identical draft path)
+- fused OFF: 42.1 / 41.9 tok/s
+- Essay coherent; accept rate unchanged (same greedy tokens).
+
+**Conclusion**: Correct and ~0.5–1.5 tok/s — within run noise / tiny. Expected:
+weight bandwidth for gate+up is unchanged (still read both matrices once); only
+activation scratch + one gelu dispatch are saved. Does **not** close the
+"batch-3 MLP ≈ 1.6× batch-1" gap — that cost is the three weight streams
+(gate/up/down) plus occupancy, not the gelu glue. Keep default-on as a clean
+path; next verify MLP lever needs a different angle (down-proj / occupancy /
+phase timing).
+
+### Remaining gap to >45 tok/s
+
+Verify seq=3 is ~36 ms vs ~22 ms single decode (1.6x for 3 rows). Ablation:
+MLP ≈ 12 ms of it (batched ext matvec already; gate∥up + down at batch 3 cost
+~1.6x batch-1 despite weight reuse — bandwidth model says should be ~1.1x).
+Acceptance is the structural limit: at 42% accept and 1.85 tok/forward, even
+free batching caps at ~1.85× per-forward cost. M7 fused gelu was a wash for
+e2e. Next levers: draft head quality (accept ~42% → 60%+), or deeper verify
+phase timing to find where the 1.6× MLP tax actually lives.

@@ -1,6 +1,121 @@
 #include <metal_stdlib>
 using namespace metal;
 
+// ─── Argmax over rows (batched logits → token ids) ────────────────────────────
+
+kernel void argmax_rows_f32(
+    device const float* logits [[buffer(0)]],
+    device uint* out_tokens [[buffer(1)]],
+    constant uint& rows [[buffer(2)]],
+    constant uint& cols [[buffer(3)]],
+    uint row [[threadgroup_position_in_grid]],
+    uint tid [[thread_index_in_threadgroup]]
+) {
+    if (row >= rows) return;
+
+    threadgroup float best_vals[256];
+    threadgroup uint best_idxs[256];
+
+    float best = -INFINITY;
+    uint best_idx = 0;
+    uint base = row * cols;
+    for (uint i = tid; i < cols; i += 256) {
+        float v = logits[base + i];
+        if (v > best) { best = v; best_idx = i; }
+    }
+    best_vals[tid] = best;
+    best_idxs[tid] = best_idx;
+
+    threadgroup_barrier(mem_flags::mem_none);
+
+    // Parallel reduction (256 → 1)
+    for (uint s = 128; s > 0; s >>= 1) {
+        if (tid < s && best_vals[tid + s] > best_vals[tid]) {
+            best_vals[tid] = best_vals[tid + s];
+            best_idxs[tid] = best_idxs[tid + s];
+        }
+        threadgroup_barrier(mem_flags::mem_none);
+    }
+    if (tid == 0) {
+        out_tokens[row] = best_idxs[0];
+    }
+}
+
+// Gemma final logit softcap + per-row argmax (MTP verify).
+kernel void softcap_argmax_rows_f32(
+    device float* logits [[buffer(0)]],
+    device uint* out_tokens [[buffer(1)]],
+    constant uint& rows [[buffer(2)]],
+    constant uint& cols [[buffer(3)]],
+    constant float& cap [[buffer(4)]],
+    uint row [[threadgroup_position_in_grid]],
+    uint tid [[thread_index_in_threadgroup]]
+) {
+    if (row >= rows) return;
+
+    threadgroup float best_vals[256];
+    threadgroup uint best_idxs[256];
+
+    float best = -INFINITY;
+    uint best_idx = 0;
+    uint base = row * cols;
+    for (uint i = tid; i < cols; i += 256) {
+        float v = logits[base + i];
+        float x = clamp(v / cap, -10.0f, 10.0f);
+        float sc = cap * precise::tanh(x);
+        logits[base + i] = sc;
+        if (sc > best) { best = sc; best_idx = i; }
+    }
+    best_vals[tid] = best;
+    best_idxs[tid] = best_idx;
+
+    threadgroup_barrier(mem_flags::mem_none);
+
+    for (uint s = 128; s > 0; s >>= 1) {
+        if (tid < s && best_vals[tid + s] > best_vals[tid]) {
+            best_vals[tid] = best_vals[tid + s];
+            best_idxs[tid] = best_idxs[tid + s];
+        }
+        threadgroup_barrier(mem_flags::mem_none);
+    }
+    if (tid == 0) {
+        out_tokens[row] = best_idxs[0];
+    }
+}
+
+// Single-row argmax (MTP draft greedy token).
+kernel void argmax_f32(
+    device const float* logits [[buffer(0)]],
+    device uint* out_token [[buffer(1)]],
+    constant uint& cols [[buffer(2)]],
+    uint tid [[thread_index_in_threadgroup]]
+) {
+    threadgroup float best_vals[256];
+    threadgroup uint best_idxs[256];
+
+    float best = -INFINITY;
+    uint best_idx = 0;
+    for (uint i = tid; i < cols; i += 256) {
+        float v = logits[i];
+        if (v > best) { best = v; best_idx = i; }
+    }
+    best_vals[tid] = best;
+    best_idxs[tid] = best_idx;
+
+    threadgroup_barrier(mem_flags::mem_none);
+
+    for (uint s = 128; s > 0; s >>= 1) {
+        if (tid < s && best_vals[tid + s] > best_vals[tid]) {
+            best_vals[tid] = best_vals[tid + s];
+            best_idxs[tid] = best_idxs[tid + s];
+        }
+        threadgroup_barrier(mem_flags::mem_none);
+    }
+    if (tid == 0) {
+        out_token[0] = best_idxs[0];
+    }
+}
+
 // ─── SIMD-Group Matrix-Vector Multiply (f32 weights) ─────────────────────────
 // Computes y = W * x where W is (M, K) f32 and x is (K,) f32, y is (M,) f32
 // Uses SIMD groups (32 threads) to parallelize the dot product per row.

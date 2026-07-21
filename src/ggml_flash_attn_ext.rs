@@ -84,12 +84,22 @@ fn pad_to(x: u64, n: u64) -> u64 {
 /// back to legacy causal attention.
 pub const MAX_TILED_PREFILL_KV: u32 = 65536;
 
-/// Use tiled flash_attn_ext when q_len ≥ 20 (matches llama.cpp vec/tiled switch).
+/// Use tiled flash_attn_ext when q_len ≥ 2 (`TILED_EXT_MIN_Q` to override).
 ///
 /// Enabled for h256 (SWA) and h512 (full) once pad/mask/NSG fixes landed.
 /// Host `nsg_for_head_dim` must match Metal entry NSG (h256=8, h512=4).
+/// llama.cpp switches vec→tiled at 20, but our alternative below 20 is per-row
+/// causal attention (one dispatch per q row); tiled shares KV tile loads across
+/// rows and wins for MTP verify batches (2–8 rows, +10% e2e).
 pub fn prefill_use_tiled_ext(q_len: u32, head_dim: u32) -> bool {
-    q_len >= 20 && matches!(head_dim, 256 | 512)
+    static MIN_Q: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    let min_q = *MIN_Q.get_or_init(|| {
+        std::env::var("TILED_EXT_MIN_Q")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(2)
+    });
+    q_len >= min_q && matches!(head_dim, 256 | 512)
 }
 
 pub fn mask_bytes(q_len: u32, kv_seq: u32) -> u64 {

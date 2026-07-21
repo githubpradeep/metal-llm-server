@@ -59,6 +59,39 @@ pub struct KvSlotView {
 }
 
 impl KvCachePool {
+    /// Create a one-slot adapter over an existing model-owned KV cache.
+    ///
+    /// Metal buffers are reference-counted handles, so cloning them aliases the
+    /// same storage. Used by MTP verify to run the parallel prefill kernels
+    /// against the live decode cache without a full copy.
+    pub(crate) fn from_existing(
+        k_cache: &[Buffer],
+        v_cache: &[Buffer],
+        seq_len: u32,
+        total_tokens: usize,
+        max_seq_len: u32,
+        kv_cache_type: KvCacheType,
+    ) -> (Self, KvSlot) {
+        assert_eq!(k_cache.len(), v_cache.len());
+        let slot = KvSlot(0);
+        (
+            Self {
+                slots: vec![KvCacheSlot {
+                    k_cache: k_cache.to_vec(),
+                    v_cache: v_cache.to_vec(),
+                    seq_len,
+                    total_tokens,
+                    in_use: true,
+                }],
+                free_slots: Vec::new(),
+                max_seq_len,
+                num_layers: k_cache.len(),
+                kv_cache_type,
+            },
+            slot,
+        )
+    }
+
     pub fn new(
         ctx: &MetalContext,
         config: &Gemma4TextConfig,
