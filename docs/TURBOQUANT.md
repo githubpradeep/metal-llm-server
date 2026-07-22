@@ -18,7 +18,8 @@ vs F16 the quality-safe configs are ~2–5×; vs our existing Q4_0 another ~1.3�
 ## Config
 
 ```bash
-ATTENTION_KERNEL=specialized \
+# CLI
+ATTENTION_KERNEL=auto \
 LLAMA_KV_CACHE_TYPE=turboquant \
 TURBOQUANT_K_BITS=3 TURBOQUANT_V_BITS=2 \
 TURBOQUANT_RESIDUAL_WINDOW=128 \
@@ -26,6 +27,15 @@ TURBOQUANT_HOT_WINDOW=2048 \
 LLAMA_CTX_SIZE=8192 \
 ./target/release/llama-sinks \
   --gpu "$HOME/Downloads/models/e2b/gemma-4-E2B-it-Q4_K_M.gguf"
+
+# OpenAI server (same KV env)
+ATTENTION_KERNEL=auto \
+LLAMA_KV_CACHE_TYPE=turboquant \
+TURBOQUANT_K_BITS=3 TURBOQUANT_V_BITS=2 \
+TURBOQUANT_HOT_WINDOW=2048 \
+LLAMA_CTX_SIZE=8192 LLAMA_KV_POOL_SLOTS=4 \
+./target/release/llama-sinks \
+  --gpu "$HOME/Downloads/models/e2b/gemma-4-E2B-it-Q4_K_M.gguf" --serve
 ```
 
 | Env | Meaning |
@@ -36,15 +46,18 @@ LLAMA_CTX_SIZE=8192 \
 | `TURBOQUANT_RESIDUAL_WINDOW` | Recent tokens kept fp32 in Haar frame (default 128) |
 | `TURBOQUANT_HOT_WINDOW` | Model-frame Q4_0 ring for fast attn/prefill (default **2048**; `0` = pure TQ) |
 | `TURBOQUANT_DUAL_WRITE` | `1` = also pack TQ cold while in hot window (needed before ctx > hot). Default off for speed. |
+| `LLAMA_KV_POOL_SLOTS` | Serve concurrency (default 4). Each slot owns its own Q4 hot ring (~25 MB @2048 on E2B). |
 
 **Recommended demo:** `K3/V2` + `rw=128` + `hot=2048` (decode ≈ Q4 flash while ctx ≤ hot).  
 **Quality-safer:** `K6/V4` + `rw=128` if available / when raising bits.
 
-**Speed model:** While `attn_kv_seq ≤ TURBOQUANT_HOT_WINDOW`, fused decode uses the same Q4 attention stack as `LLAMA_KV_CACHE_TYPE=q4_0` on the hot ring — including `ATTENTION_KERNEL=auto` (fused &lt;128, ggml MWG ≥128). The first token past the window **spills** hot Q4 → TQ cold once (`turboquant_spill_q4_to_v3`), then decode uses `turboquant_attn_v3`. Prefill is parallel (zero-alloc alias) while the prompt fits in the hot window.
+**Speed model:** While `attn_kv_seq ≤ TURBOQUANT_HOT_WINDOW`, fused decode / serve decode-batch use the same Q4 attention stack as `LLAMA_KV_CACHE_TYPE=q4_0` on the hot ring — including `ATTENTION_KERNEL=auto` (fused &lt;128, ggml MWG ≥128). The first token past the window **spills** hot Q4 → TQ cold once (`turboquant_spill_q4_to_v3`), then decode uses `turboquant_attn_v3`. Prefill is parallel (zero-alloc alias) while the prompt fits in the hot window.
+
+**`--serve`:** Per-slot hot rings + residual + spill flag live in `KvCachePool` (not model-global). Concurrent requests do not share a hot ring. When the scheduler batches multiple TQ slots in one tick, prefill/decode run **serially per slot** via the single-slot swap path (correctness); same-slot continuous generation still uses fused/hot Q4. Cold/past-hot spills then continues on `attn_v3`.
 
 Set `TURBOQUANT_DUAL_WRITE=1` to also pack TQ during the hot window (avoids a big spill; slight hot-path tax).
 
-**MTP:** Allowed when `TURBOQUANT_HOT_WINDOW>0` (verify stays on the hot/Q4 path). Pure TQ (`HOT_WINDOW=0`) still refuses `--mtp`.
+**MTP:** Allowed when `TURBOQUANT_HOT_WINDOW>0` (verify stays on the hot/Q4 path). Pure TQ (`HOT_WINDOW=0`) still refuses `--mtp`. Same gate for `--serve --mtp`.
 
 ## Phase map
 
@@ -56,6 +69,7 @@ Set `TURBOQUANT_DUAL_WRITE=1` to also pack TQ during the hot window (avoids a bi
 | **P3** | Shipped | KV meter on CLI/scheduler; `kv_persist` TQ type tag |
 | **P3b** | Shipped | Hybrid Q4 hot window + fused decode + parallel prefill-in-hot + faster `attn_v3` |
 | **P3c** | Shipped | Auto spill hot→TQ at boundary (`turboquant_spill_q4_to_v3`); zero-alloc TQ prefill alias |
+| **P3d** | Shipped | Serve path: per-slot hot/rw/spill in `KvCachePool`; batched hot prefill/decode; cold via spill + single-slot |
 | **P4** | Stub only | Disk-backed cold TQ pages for 1M-class docs — see below |
 
 ## Design (runtime)

@@ -10,14 +10,11 @@ use serde::Deserialize;
 
 use crate::gemma4_config::{Gemma4TextConfig, KvCacheType, RopeConfig, RopeParameters};
 use crate::gpu::{BufferView, GpuTimestampProfiler, MetalContext, ProfileAblate, profile_gpu_enabled};
-use crate::kv_pool::{KvCachePool, KvPoolError, KvSlot, KvSlotView};
+use crate::kv_pool::{KvCachePool, KvPoolError, KvSlot, KvSlotView, TqPoolConfig};
 
-/// Paths that do not yet implement TurboQuant rotation reject it with this message
-/// (rotation must be applied consistently across prefill and decode, so silently
-/// falling back to plain Q4_0 on some paths would corrupt the cache).
-const TURBOQUANT_UNSUPPORTED: &str = "TurboQuant KV cache is only supported on the \
-interactive single-token path (forward_single_token / forward_prefill_sample_last). \
-Use LLAMA_KV_CACHE_TYPE=q4_0 for batched/server/parallel-prefill paths.";
+/// Rejected only for paths that still cannot apply TQ consistently (e.g. affine).
+const TURBOQUANT_UNSUPPORTED: &str = "TurboQuant KV cache is not supported on this path. \
+Use LLAMA_KV_CACHE_TYPE=q4_0, or V3 TurboQuant with TURBOQUANT_HOT_WINDOW>0.";
 
 /// TurboQuant scratch + optional Q4 hot-ring caches (hybrid fast path).
 struct TurboQuantState {
@@ -5304,9 +5301,40 @@ impl Gemma4GpuModel {
         self.tq_hot_enabled() && !self.tq_hot_spilled && kv_seq >= self.tq_hot_w
     }
 
-    /// One-shot: pack Q4 hot ring `[0, tq_hot_w)` into TQ V3 for every KV-owning layer.
+    /// Spill model-owned hot ring into model cold K/V (CLI / after slot swap).
     fn spill_tq_hot_to_cold(&mut self) {
         if self.tq_hot_spilled || !self.tq_hot_enabled() {
+            return;
+        }
+        let n_tokens = self.tq_hot_w.min(self.kv_seq_len);
+        self.spill_tq_hot_buffers(
+            &self.tq_hot_k.clone(),
+            &self.tq_hot_v.clone(),
+            &self.k_cache.clone(),
+            &self.v_cache.clone(),
+            if self.tq_rw > 0 {
+                Some((&self.tq_rw_k, &self.tq_rw_v))
+            } else {
+                None
+            },
+            n_tokens,
+            self.kv_capacity,
+        );
+        self.tq_hot_spilled = true;
+    }
+
+    /// Pack Q4 hot `[0, n_tokens)` into TQ V3 cold for every KV-owning layer.
+    fn spill_tq_hot_buffers(
+        &self,
+        hot_k: &[Buffer],
+        hot_v: &[Buffer],
+        cold_k: &[Buffer],
+        cold_v: &[Buffer],
+        rw: Option<(&[Buffer], &[Buffer])>,
+        n_tokens: u32,
+        cold_capacity: u32,
+    ) {
+        if !self.tq_hot_enabled() || n_tokens == 0 {
             return;
         }
         let KvCacheType::TurboQuant { k_bits, v_bits } = self.kv_cache_type else {
@@ -5315,16 +5343,14 @@ impl Gemma4GpuModel {
         let Some(tq) = self.turboquant.as_ref() else {
             return;
         };
-        let n_tokens = self.tq_hot_w.min(self.kv_seq_len);
-        if n_tokens == 0 {
-            self.tq_hot_spilled = true;
-            return;
-        }
 
         let cmd = self.ctx.queue.new_command_buffer();
         let encoder = cmd.new_compute_command_encoder();
         for (layer_idx, layer) in self.layers.iter().enumerate() {
             if !layer.has_kv {
+                continue;
+            }
+            if layer_idx >= hot_k.len() || layer_idx >= cold_k.len() {
                 continue;
             }
             let head_dim = layer.head_dim as u32;
@@ -5333,27 +5359,21 @@ impl Gemma4GpuModel {
             let k_row = self.kv_cache_type.k_row_bytes(layer.head_dim) as u32;
             let v_row = self.kv_cache_type.v_row_bytes(layer.head_dim) as u32;
             let fwd = tq.fwd(layer.head_dim);
-            let kwin = if self.tq_rw > 0 {
-                &self.tq_rw_k[layer_idx]
-            } else {
-                &self.tq_k_rot
-            };
-            let vwin = if self.tq_rw > 0 {
-                &self.tq_rw_v[layer_idx]
-            } else {
-                &self.tq_v_rot
+            let (kwin, vwin) = match rw {
+                Some((rk, rv)) if layer_idx < rk.len() => (&rk[layer_idx], &rv[layer_idx]),
+                _ => (&self.tq_k_rot, &self.tq_v_rot),
             };
             self.ctx.encode_turboquant_spill_q4_to_v3(
                 &encoder,
-                &self.tq_hot_k[layer_idx],
-                &self.k_cache[layer_idx],
+                &hot_k[layer_idx],
+                &cold_k[layer_idx],
                 tq.centroids_k(layer.head_dim),
                 fwd,
                 kwin,
                 num_kv_heads,
                 head_dim,
                 self.tq_hot_w,
-                self.kv_capacity,
+                cold_capacity,
                 n_tokens,
                 k_bits as u32,
                 q4_row,
@@ -5362,15 +5382,15 @@ impl Gemma4GpuModel {
             );
             self.ctx.encode_turboquant_spill_q4_to_v3(
                 &encoder,
-                &self.tq_hot_v[layer_idx],
-                &self.v_cache[layer_idx],
+                &hot_v[layer_idx],
+                &cold_v[layer_idx],
                 tq.centroids_v(layer.head_dim),
                 fwd,
                 vwin,
                 num_kv_heads,
                 head_dim,
                 self.tq_hot_w,
-                self.kv_capacity,
+                cold_capacity,
                 n_tokens,
                 v_bits as u32,
                 q4_row,
@@ -5381,11 +5401,59 @@ impl Gemma4GpuModel {
         encoder.end_encoding();
         cmd.commit();
         cmd.wait_until_completed();
-        self.tq_hot_spilled = true;
         eprintln!(
             "  TurboQuant: spilled {} hot Q4 tokens → TQ cold (ctx now uses attn_v3)",
             n_tokens
         );
+    }
+
+    /// Spill a pool slot's hot ring into that slot's cold TQ buffers.
+    fn spill_tq_slot(&self, kv_pool: &mut KvCachePool, slot: KvSlot) -> Result<(), String> {
+        let spilled = kv_pool.tq_hot_spilled(slot).map_err(|e| e.to_string())?;
+        if spilled || !self.tq_hot_enabled() {
+            return Ok(());
+        }
+        let seq_len = kv_pool.seq_len(slot).map_err(|e| e.to_string())?;
+        let n_tokens = self.tq_hot_w.min(seq_len);
+        if n_tokens == 0 {
+            kv_pool
+                .set_tq_hot_spilled(slot, true)
+                .map_err(|e| e.to_string())?;
+            return Ok(());
+        }
+        // Clone Metal handles (RC) so we can spill without holding slot borrows.
+        let (hot_k, hot_v, cold_k, cold_v, rw) = kv_pool
+            .with_slot_mut(slot, |s| {
+                let rw = if !s.tq_rw_k.is_empty() {
+                    Some((s.tq_rw_k.clone(), s.tq_rw_v.clone()))
+                } else {
+                    None
+                };
+                (
+                    s.tq_hot_k.clone(),
+                    s.tq_hot_v.clone(),
+                    s.k_cache.clone(),
+                    s.v_cache.clone(),
+                    rw,
+                )
+            })
+            .map_err(|e| e.to_string())?;
+        let rw_ref = rw
+            .as_ref()
+            .map(|(k, v)| (k.as_slice(), v.as_slice()));
+        self.spill_tq_hot_buffers(
+            &hot_k,
+            &hot_v,
+            &cold_k,
+            &cold_v,
+            rw_ref,
+            n_tokens,
+            kv_pool.capacity(),
+        );
+        kv_pool
+            .set_tq_hot_spilled(slot, true)
+            .map_err(|e| e.to_string())?;
+        Ok(())
     }
 
     pub fn kv_meter_line(&self) -> Option<String> {
@@ -5805,14 +5873,7 @@ impl Gemma4GpuModel {
         let base_seq = self.kv_seq_len;
         let base_total = self.total_tokens;
 
-        let (mut kv_pool, slot) = KvCachePool::from_existing(
-            &self.k_cache,
-            &self.v_cache,
-            base_seq,
-            base_total,
-            self.kv_capacity,
-            self.kv_cache_type,
-        );
+        let (mut kv_pool, slot) = self.kv_pool_from_model_caches_at(base_seq, base_total);
 
         self.prepare_parallel_prefill_inputs(token_ids)?;
         if !crate::gpu::prefill_gpu_rope_enabled() {
@@ -5851,14 +5912,7 @@ impl Gemma4GpuModel {
         // writes the Q4 hot ring on the model; pool K/V are unused unless dual-write.
         let use_alias = self.tq_prefill_fits_hot(self.kv_seq_len as usize, token_ids.len());
         let (mut kv_pool, slot) = if use_alias {
-            KvCachePool::from_existing(
-                &self.k_cache,
-                &self.v_cache,
-                self.kv_seq_len,
-                self.total_tokens,
-                self.kv_capacity,
-                self.kv_cache_type,
-            )
+            self.kv_pool_from_model_caches()
         } else {
             // Fresh pool + swap: matches the historical Q4_0 / MTP prefill path.
             let mut kv_pool = self.create_kv_pool(1, self.kv_capacity);
@@ -5985,15 +6039,7 @@ impl Gemma4GpuModel {
 
         let base_seq = self.kv_seq_len;
         let base_total = self.total_tokens;
-        let capacity = self.kv_capacity;
-        let (mut kv_pool, slot) = KvCachePool::from_existing(
-            &self.k_cache,
-            &self.v_cache,
-            base_seq,
-            base_total,
-            capacity,
-            self.kv_cache_type,
-        );
+        let (mut kv_pool, slot) = self.kv_pool_from_model_caches_at(base_seq, base_total);
 
         self.prepare_decode_batch_inputs(token_ids)?;
         let slot_views: Vec<KvSlotView> = (0..batch_size)
@@ -6301,9 +6347,88 @@ impl Gemma4GpuModel {
         best_idx
     }
 
+    pub fn tq_pool_config(&self) -> TqPoolConfig {
+        TqPoolConfig {
+            hot_w: if self.tq_hot_enabled() {
+                self.tq_hot_w
+            } else {
+                0
+            },
+            rw: if self.tq_hot_enabled() && self.tq_rw > 0 {
+                self.tq_rw
+            } else {
+                0
+            },
+        }
+    }
+
+    /// One-slot pool aliasing this model's cold (+ TQ hot/rw) buffers.
+    fn kv_pool_from_model_caches(&self) -> (KvCachePool, KvSlot) {
+        let tq = self.tq_pool_config();
+        let tq_hot = if self.tq_hot_enabled() && !self.tq_hot_k.is_empty() {
+            Some((self.tq_hot_k.as_slice(), self.tq_hot_v.as_slice()))
+        } else {
+            None
+        };
+        let tq_rw = if self.tq_rw > 0 && !self.tq_rw_k.is_empty() {
+            Some((self.tq_rw_k.as_slice(), self.tq_rw_v.as_slice()))
+        } else {
+            None
+        };
+        KvCachePool::from_existing(
+            &self.k_cache,
+            &self.v_cache,
+            self.kv_seq_len,
+            self.total_tokens,
+            self.kv_capacity,
+            self.kv_cache_type,
+            tq,
+            tq_hot,
+            tq_rw,
+            self.tq_hot_spilled,
+        )
+    }
+
+    fn kv_pool_from_model_caches_at(
+        &self,
+        seq_len: u32,
+        total_tokens: usize,
+    ) -> (KvCachePool, KvSlot) {
+        let tq = self.tq_pool_config();
+        let tq_hot = if self.tq_hot_enabled() && !self.tq_hot_k.is_empty() {
+            Some((self.tq_hot_k.as_slice(), self.tq_hot_v.as_slice()))
+        } else {
+            None
+        };
+        let tq_rw = if self.tq_rw > 0 && !self.tq_rw_k.is_empty() {
+            Some((self.tq_rw_k.as_slice(), self.tq_rw_v.as_slice()))
+        } else {
+            None
+        };
+        KvCachePool::from_existing(
+            &self.k_cache,
+            &self.v_cache,
+            seq_len,
+            total_tokens,
+            self.kv_capacity,
+            self.kv_cache_type,
+            tq,
+            tq_hot,
+            tq_rw,
+            self.tq_hot_spilled,
+        )
+    }
+
     pub fn create_kv_pool(&self, num_slots: usize, max_seq_len: u32) -> KvCachePool {
         let max_seq_len = max_seq_len.min(self.kv_capacity as u32);
-        KvCachePool::new(&self.ctx, &self.config, num_slots, max_seq_len, self.kv_cache_type)
+        KvCachePool::new(
+            &self.ctx,
+            &self.config,
+            num_slots,
+            max_seq_len,
+            self.kv_cache_type,
+            self.tq_pool_config(),
+        )
     }
 
     pub fn max_parallel_prefill_seq(&self) -> usize {
@@ -6923,7 +7048,7 @@ impl Gemma4GpuModel {
         true
     }
 
-    /// Dual-write one prefill chunk: Q4 into the hot ring + TQ V3 into `k/v_cache`.
+    /// Dual-write one prefill chunk: Q4 into `hot_k`/`hot_v` + optional TQ V3 into cold.
     /// Requires `tq_prefill_fits_hot(start_pos, seq_len)`.
     fn encode_tq_hot_prefill_kv_append(
         &self,
@@ -6931,8 +7056,12 @@ impl Gemma4GpuModel {
         layer_idx: usize,
         k_src: &Buffer,
         v_src: &Buffer,
+        hot_k: &Buffer,
+        hot_v: &Buffer,
         k_cache: &Buffer,
         v_cache: &Buffer,
+        rw_k: Option<&Buffer>,
+        rw_v: Option<&Buffer>,
         num_kv_heads: u32,
         head_dim: u32,
         start_pos: u32,
@@ -6945,11 +7074,10 @@ impl Gemma4GpuModel {
             return Err(TURBOQUANT_UNSUPPORTED.to_string());
         };
 
-        // Fast attention path: model-frame Q4 hot ring.
         self.ctx.encode_kv_batch_append_q4_0(
             encoder,
             k_src,
-            &self.tq_hot_k[layer_idx],
+            hot_k,
             num_kv_heads,
             head_dim,
             self.tq_hot_w,
@@ -6959,7 +7087,7 @@ impl Gemma4GpuModel {
         self.ctx.encode_kv_batch_append_q4_0(
             encoder,
             v_src,
-            &self.tq_hot_v[layer_idx],
+            hot_v,
             num_kv_heads,
             head_dim,
             self.tq_hot_w,
@@ -6967,7 +7095,6 @@ impl Gemma4GpuModel {
             seq_len,
         );
 
-        // Optional TQ cold dual-write (expensive: one quant dispatch per token).
         let dual_write = matches!(
             std::env::var("TURBOQUANT_DUAL_WRITE").as_deref(),
             Ok("1") | Ok("true") | Ok("TRUE")
@@ -6980,16 +7107,8 @@ impl Gemma4GpuModel {
             let fwd = tq.fwd(head_dim as usize);
             let k_row_bytes = self.kv_cache_type.k_row_bytes(head_dim as usize) as u32;
             let v_row_bytes = self.kv_cache_type.v_row_bytes(head_dim as usize) as u32;
-            let kwin = if self.tq_rw > 0 {
-                &self.tq_rw_k[layer_idx]
-            } else {
-                &self.tq_k_rot
-            };
-            let vwin = if self.tq_rw > 0 {
-                &self.tq_rw_v[layer_idx]
-            } else {
-                &self.tq_v_rot
-            };
+            let kwin = rw_k.unwrap_or(&self.tq_k_rot);
+            let vwin = rw_v.unwrap_or(&self.tq_v_rot);
             for s in 0..seq_len {
                 let cur = start_pos + s;
                 self.ctx.encode_turboquant_rotate_quant_v3_strided(
@@ -7028,9 +7147,52 @@ impl Gemma4GpuModel {
                 );
             }
         } else {
-            let _ = (k_cache, v_cache, k_bits, v_bits);
+            let _ = (k_cache, v_cache, k_bits, v_bits, layer_idx);
         }
         Ok(())
+    }
+
+    /// Resolve slot (or model) TQ hot / residual buffers for a layer.
+    fn tq_slot_hot_bufs<'a>(
+        &'a self,
+        kv_pool: &'a KvCachePool,
+        slot: KvSlot,
+        layer_idx: usize,
+    ) -> Result<(&'a Buffer, &'a Buffer), String> {
+        if kv_pool.has_tq_hot(slot).unwrap_or(false) {
+            let k = kv_pool
+                .layer_tq_hot_k(slot, layer_idx)
+                .map_err(|e| e.to_string())?;
+            let v = kv_pool
+                .layer_tq_hot_v(slot, layer_idx)
+                .map_err(|e| e.to_string())?;
+            Ok((k, v))
+        } else if self.tq_hot_enabled() && layer_idx < self.tq_hot_k.len() {
+            Ok((&self.tq_hot_k[layer_idx], &self.tq_hot_v[layer_idx]))
+        } else {
+            Err(TURBOQUANT_UNSUPPORTED.to_string())
+        }
+    }
+
+    fn tq_slot_rw_bufs<'a>(
+        &'a self,
+        kv_pool: &'a KvCachePool,
+        slot: KvSlot,
+        layer_idx: usize,
+    ) -> (Option<&'a Buffer>, Option<&'a Buffer>) {
+        if self.tq_rw > 0 && kv_pool.tq_rw > 0 {
+            if let (Ok(k), Ok(v)) = (
+                kv_pool.layer_tq_rw_k(slot, layer_idx),
+                kv_pool.layer_tq_rw_v(slot, layer_idx),
+            ) {
+                return (Some(k), Some(v));
+            }
+        }
+        if self.tq_rw > 0 && layer_idx < self.tq_rw_k.len() {
+            (Some(&self.tq_rw_k[layer_idx]), Some(&self.tq_rw_v[layer_idx]))
+        } else {
+            (None, None)
+        }
     }
 
     fn encode_parallel_prefill_layer(
@@ -7145,13 +7307,19 @@ impl Gemma4GpuModel {
                 }
             
                 KvCacheType::TurboQuant { .. } => {
+                    let (hot_k, hot_v) = self.tq_slot_hot_bufs(kv_pool, slot, layer_idx)?;
+                    let (rw_k, rw_v) = self.tq_slot_rw_bufs(kv_pool, slot, layer_idx);
                     self.encode_tq_hot_prefill_kv_append(
                         encoder,
                         layer_idx,
                         &self.prefill_scratch.k_buf,
                         &self.prefill_scratch.v_buf,
+                        hot_k,
+                        hot_v,
                         k_cache,
                         v_cache,
+                        rw_k,
+                        rw_v,
                         num_kv_heads as u32,
                         head_dim as u32,
                         start_pos as u32,
@@ -7266,6 +7434,7 @@ impl Gemma4GpuModel {
                         return Err(TURBOQUANT_UNSUPPORTED.to_string());
                     }
                     let src = layer.kv_source_layer;
+                    let (hot_k, hot_v) = self.tq_slot_hot_bufs(kv_pool, slot, src)?;
                     let groups_per_row = (head_dim / 32) as u32;
                     let row_bytes = groups_per_row * 18;
                     let use_ext_attn = crate::gpu::prefill_flash_attn_ext_enabled()
@@ -7294,8 +7463,8 @@ impl Gemma4GpuModel {
                     self.ctx.encode_prefill_attention_causal_q4_0(
                         encoder,
                         &self.prefill_scratch.q_buf,
-                        &self.tq_hot_k[src],
-                        &self.tq_hot_v[src],
+                        hot_k,
+                        hot_v,
                         attn_out,
                         q_f16_scratch,
                         num_heads as u32,
@@ -7615,7 +7784,46 @@ impl Gemma4GpuModel {
                         );
                     }
                 
-                KvCacheType::TurboQuant { .. } => return Err(TURBOQUANT_UNSUPPORTED.to_string()),
+                KvCacheType::TurboQuant { .. } => {
+                    let spilled = kv_pool
+                        .tq_hot_spilled(segment.slot)
+                        .map_err(|e| e.to_string())?;
+                    if spilled
+                        || !self.tq_prefill_fits_hot(segment.start_pos, segment.token_count)
+                    {
+                        return Err(
+                            "TurboQuant batched prefill requires all segments inside the Q4 hot window"
+                                .to_string(),
+                        );
+                    }
+                    let (hot_k, hot_v) =
+                        self.tq_slot_hot_bufs(kv_pool, segment.slot, layer_idx)?;
+                    self.ctx.encode_kv_batch_append_strided_q4_0(
+                        encoder,
+                        &self.prefill_scratch.k_buf,
+                        hot_k,
+                        num_kv_heads as u32,
+                        head_dim as u32,
+                        self.tq_hot_w,
+                        segment.start_pos as u32,
+                        segment.token_count as u32,
+                        total_seq_len as u32,
+                        segment.row_start as u32,
+                    );
+                    self.ctx.encode_kv_batch_append_strided_q4_0(
+                        encoder,
+                        &self.prefill_scratch.v_buf,
+                        hot_v,
+                        num_kv_heads as u32,
+                        head_dim as u32,
+                        self.tq_hot_w,
+                        segment.start_pos as u32,
+                        segment.token_count as u32,
+                        total_seq_len as u32,
+                        segment.row_start as u32,
+                    );
+                    let _ = (k_cache, v_cache);
+                }
             }
             }
         }
@@ -7699,8 +7907,46 @@ impl Gemma4GpuModel {
                         row_bytes,
                     );
                 }
-            
-                KvCacheType::TurboQuant { .. } => return Err(TURBOQUANT_UNSUPPORTED.to_string()),
+                KvCacheType::TurboQuant { .. } => {
+                    let spilled = kv_pool
+                        .tq_hot_spilled(segment.slot)
+                        .map_err(|e| e.to_string())?;
+                    if spilled
+                        || !self.tq_prefill_fits_hot(segment.start_pos, segment.token_count)
+                    {
+                        return Err(
+                            "TurboQuant batched prefill requires all segments inside the Q4 hot window"
+                                .to_string(),
+                        );
+                    }
+                    let src = layer.kv_source_layer;
+                    let (hot_k, hot_v) =
+                        self.tq_slot_hot_bufs(kv_pool, segment.slot, src)?;
+                    let groups_per_row = (head_dim / 32) as u32;
+                    let row_bytes = groups_per_row * 18;
+                    self.ctx.encode_attention_causal_strided_q4_0(
+                        encoder,
+                        &self.prefill_scratch.q_buf,
+                        hot_k,
+                        hot_v,
+                        &self.prefill_scratch.attn_out_buf,
+                        num_heads as u32,
+                        num_kv_heads as u32,
+                        num_kv_groups,
+                        head_dim as u32,
+                        (segment.start_pos + segment.token_count) as u32,
+                        self.tq_hot_w,
+                        scale,
+                        segment.token_count as u32,
+                        segment.start_pos as u32,
+                        attention_window,
+                        total_seq_len as u32,
+                        segment.row_start as u32,
+                        groups_per_row,
+                        row_bytes,
+                    );
+                    let _ = (k_cache, v_cache);
+                }
             }
         }
 
@@ -7986,13 +8232,19 @@ impl Gemma4GpuModel {
                     }
                 
                 KvCacheType::TurboQuant { .. } => {
+                    let (hot_k, hot_v) = self.tq_slot_hot_bufs(kv_pool, slot, layer_idx)?;
+                    let (rw_k, rw_v) = self.tq_slot_rw_bufs(kv_pool, slot, layer_idx);
                     self.encode_tq_hot_prefill_kv_append(
                         encoder,
                         layer_idx,
                         &self.prefill_scratch.k_buf,
                         &self.prefill_scratch.v_buf,
+                        hot_k,
+                        hot_v,
                         k_cache,
                         v_cache,
+                        rw_k,
+                        rw_v,
                         num_kv_heads as u32,
                         head_dim as u32,
                         start_pos as u32,
@@ -8162,6 +8414,7 @@ impl Gemma4GpuModel {
                         return Err(TURBOQUANT_UNSUPPORTED.to_string());
                     }
                     let src = layer.kv_source_layer;
+                    let (hot_k, hot_v) = self.tq_slot_hot_bufs(kv_pool, slot, src)?;
                     let groups_per_row = (head_dim / 32) as u32;
                     let row_bytes = groups_per_row * 18;
                     let use_ext_attn = crate::gpu::prefill_flash_attn_ext_enabled()
@@ -8190,8 +8443,8 @@ impl Gemma4GpuModel {
                     self.ctx.encode_prefill_attention_causal_q4_0(
                         encoder,
                         &self.prefill_scratch.q_buf,
-                        &self.tq_hot_k[src],
-                        &self.tq_hot_v[src],
+                        hot_k,
+                        hot_v,
                         attn_out,
                         q_f16_scratch,
                         num_heads as u32,
@@ -8822,7 +9075,45 @@ impl Gemma4GpuModel {
                             }
                         }
                     
-                KvCacheType::TurboQuant { .. } => return Err(TURBOQUANT_UNSUPPORTED.to_string()),
+                KvCacheType::TurboQuant { .. } => {
+                            let spilled = kv_pool
+                                .tq_hot_spilled(slot_view.slot)
+                                .map_err(|e| e.to_string())?;
+                            let use_hot = self.tq_hot_enabled()
+                                && !spilled
+                                && (append_pos + 1) <= self.tq_hot_w;
+                            if !use_hot {
+                                return Err(
+                                    "TurboQuant decode-batch cold path: use single-slot decode"
+                                        .to_string(),
+                                );
+                            }
+                            // Always explicit append into hot — skip fused-append
+                            // attention so we don't double-write the ring.
+                            let (hot_k, hot_v) =
+                                self.tq_slot_hot_bufs(kv_pool, slot_view.slot, layer_idx)?;
+                            self.ctx.encode_kv_append_q4_0_at(
+                                encoder,
+                                &self.decode_batch_scratch.k_normed_buf,
+                                offsets.kv,
+                                hot_k,
+                                num_kv_heads as u32,
+                                head_dim as u32,
+                                self.tq_hot_w,
+                                append_pos,
+                            );
+                            self.ctx.encode_kv_append_q4_0_at(
+                                encoder,
+                                &self.decode_batch_scratch.gate_buf,
+                                offsets.intermediate,
+                                hot_v,
+                                num_kv_heads as u32,
+                                head_dim as u32,
+                                self.tq_hot_w,
+                                append_pos,
+                            );
+                            let _ = (k_cache, v_cache);
+                        }
             }
                 }
 
@@ -8977,7 +9268,98 @@ impl Gemma4GpuModel {
                         }
                     }
                 
-                KvCacheType::TurboQuant { .. } => return Err(TURBOQUANT_UNSUPPORTED.to_string()),
+                KvCacheType::TurboQuant { .. } => {
+                        let spilled = kv_pool
+                            .tq_hot_spilled(slot_view.slot)
+                            .map_err(|e| e.to_string())?;
+                        let use_hot = self.tq_hot_enabled()
+                            && !spilled
+                            && effective_kv_seq <= self.tq_hot_w;
+                        if !use_hot {
+                            return Err(
+                                "TurboQuant decode-batch cold path: use single-slot decode"
+                                    .to_string(),
+                            );
+                        }
+                        let src = layer.kv_source_layer;
+                        let (hot_k, hot_v) =
+                            self.tq_slot_hot_bufs(kv_pool, slot_view.slot, src)?;
+                        let groups_per_row = (head_dim / 32) as u32;
+                        let row_bytes = groups_per_row * 18;
+                        // Prefer ggml / offset — never fused-append (KV already written).
+                        if crate::gpu::attention_use_ggml_for_layer_kv(
+                            layer.has_kv,
+                            effective_kv_seq,
+                        ) && self.ctx.use_flash_attention
+                        {
+                            self.ctx.encode_attention_ggml_q4_0_at(
+                                encoder,
+                                &self.decode_batch_scratch.q_normed_buf,
+                                offsets.q,
+                                hot_k,
+                                0,
+                                hot_v,
+                                0,
+                                &self.decode_batch_scratch.ggml_fa_tmp_buf,
+                                0,
+                                &self.decode_batch_scratch.attn_out_buf,
+                                offsets.q,
+                                num_heads as u32,
+                                num_kv_heads as u32,
+                                head_dim as u32,
+                                effective_kv_seq,
+                                self.tq_hot_w,
+                                scale,
+                                kv_start,
+                                row_bytes,
+                            );
+                        } else if self.ctx.use_flash_attention
+                            && num_kv_groups > 1
+                            && (8 % num_kv_groups) == 0
+                            && crate::gpu::attention_gqa_q4_0_enabled(num_kv_groups)
+                        {
+                            self.ctx.encode_attention_with_offset_q4_0_gqa_at(
+                                encoder,
+                                &self.decode_batch_scratch.q_normed_buf,
+                                offsets.q,
+                                hot_k,
+                                hot_v,
+                                &self.decode_batch_scratch.attn_out_buf,
+                                offsets.q,
+                                num_heads as u32,
+                                num_kv_heads as u32,
+                                num_kv_groups,
+                                head_dim as u32,
+                                effective_kv_seq,
+                                self.tq_hot_w,
+                                scale,
+                                kv_start,
+                                groups_per_row,
+                                row_bytes,
+                            );
+                        } else {
+                            self.ctx.encode_attention_with_offset_q4_0_at(
+                                encoder,
+                                &self.decode_batch_scratch.q_normed_buf,
+                                offsets.q,
+                                hot_k,
+                                hot_v,
+                                &self.decode_batch_scratch.attn_out_buf,
+                                offsets.q,
+                                num_heads as u32,
+                                num_kv_heads as u32,
+                                num_kv_groups,
+                                head_dim as u32,
+                                effective_kv_seq,
+                                self.tq_hot_w,
+                                scale,
+                                kv_start,
+                                groups_per_row,
+                                row_bytes,
+                            );
+                        }
+                        let _ = (k_cache, v_cache);
+                    }
             }
 
                 self.ctx.encode_matvec_auto_at_view(
@@ -9642,6 +10024,17 @@ impl Gemma4GpuModel {
         kv_pool.with_slot_mut(slot, |slot_state| {
             std::mem::swap(&mut self.k_cache, &mut slot_state.k_cache);
             std::mem::swap(&mut self.v_cache, &mut slot_state.v_cache);
+            let swap_hot = !slot_state.tq_hot_k.is_empty() && !self.tq_hot_k.is_empty();
+            let swap_rw = !slot_state.tq_rw_k.is_empty() && !self.tq_rw_k.is_empty();
+            if swap_hot {
+                std::mem::swap(&mut self.tq_hot_k, &mut slot_state.tq_hot_k);
+                std::mem::swap(&mut self.tq_hot_v, &mut slot_state.tq_hot_v);
+            }
+            if swap_rw {
+                std::mem::swap(&mut self.tq_rw_k, &mut slot_state.tq_rw_k);
+                std::mem::swap(&mut self.tq_rw_v, &mut slot_state.tq_rw_v);
+            }
+            std::mem::swap(&mut self.tq_hot_spilled, &mut slot_state.tq_hot_spilled);
 
             let legacy_kv_seq_len = self.kv_seq_len;
             let legacy_total_tokens = self.total_tokens;
@@ -9658,6 +10051,15 @@ impl Gemma4GpuModel {
             self.total_tokens = legacy_total_tokens;
             self.kv_capacity = legacy_kv_capacity;
 
+            std::mem::swap(&mut self.tq_hot_spilled, &mut slot_state.tq_hot_spilled);
+            if swap_rw {
+                std::mem::swap(&mut self.tq_rw_v, &mut slot_state.tq_rw_v);
+                std::mem::swap(&mut self.tq_rw_k, &mut slot_state.tq_rw_k);
+            }
+            if swap_hot {
+                std::mem::swap(&mut self.tq_hot_v, &mut slot_state.tq_hot_v);
+                std::mem::swap(&mut self.tq_hot_k, &mut slot_state.tq_hot_k);
+            }
             std::mem::swap(&mut self.v_cache, &mut slot_state.v_cache);
             std::mem::swap(&mut self.k_cache, &mut slot_state.k_cache);
 
@@ -9701,6 +10103,25 @@ impl Gemma4GpuModel {
         }
 
         if inputs.len() > 1 {
+            // TurboQuant: always decode one slot at a time. The encoded multi-row
+            // hot path still corrupts concurrent requests (garbage tokens). Slot
+            // hot rings remain isolated via swap; only the GPU forward is serial.
+            if matches!(self.kv_cache_type, KvCacheType::TurboQuant { .. }) {
+                return inputs
+                    .iter()
+                    .map(|&(slot, token_id)| {
+                        let seq = kv_pool.seq_len(slot).unwrap_or(0);
+                        let spilled = kv_pool.tq_hot_spilled(slot).unwrap_or(false);
+                        if self.tq_hot_enabled() && !spilled && seq >= self.tq_hot_w {
+                            if let Err(err) = self.spill_tq_slot(kv_pool, slot) {
+                                return Err(err);
+                            }
+                        }
+                        self.forward_single_token_with_kv_slot(token_id, kv_pool, slot)
+                            .map_err(|err| err.to_string())
+                    })
+                    .collect();
+            }
             return match self.forward_decode_batch_encoded_with_kv_slots(
                 inputs,
                 &slot_views,
@@ -9737,6 +10158,17 @@ impl Gemma4GpuModel {
                 slot,
                 true,
             )];
+        }
+
+        // TurboQuant: never multi-slot strided prefill in one CB — concurrent
+        // batches corrupted output. Isolate per slot (same kernels, separate CBs).
+        if matches!(self.kv_cache_type, KvCacheType::TurboQuant { .. }) {
+            return inputs
+                .iter()
+                .map(|&(slot, token_ids)| {
+                    self.forward_prefill_chunk_with_kv_slot(token_ids, kv_pool, slot, true)
+                })
+                .collect();
         }
 
         let total_seq_len: usize = inputs.iter().map(|(_, token_ids)| token_ids.len()).sum();
