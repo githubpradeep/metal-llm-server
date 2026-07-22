@@ -72,6 +72,11 @@ pub enum KvCacheType {
     F16,
     Q8_0,
     Q4_0,
+    /// TurboQuant: Haar-random rotation + quantization of each K/V vector.
+    /// `bits == 4` on both sides uses the Q4_0 block layout (affine path);
+    /// otherwise V3 Lloyd–Max (fp16 norm + bit-packed indices). Keys/values
+    /// may use different bit-widths (e.g. K3/V2).
+    TurboQuant { k_bits: u8, v_bits: u8 },
 }
 
 impl KvCacheType {
@@ -79,7 +84,51 @@ impl KvCacheType {
         match std::env::var("LLAMA_KV_CACHE_TYPE").as_deref() {
             Ok("q8_0") | Ok("Q8_0") => KvCacheType::Q8_0,
             Ok("q4_0") | Ok("Q4_0") => KvCacheType::Q4_0,
+            Ok("turboquant") | Ok("TurboQuant") | Ok("TURBOQUANT") | Ok("tq") => {
+                let parse = |name: &str, default: u8| -> u8 {
+                    std::env::var(name)
+                        .ok()
+                        .and_then(|s| s.trim().parse::<u8>().ok())
+                        .filter(|b| (2..=4).contains(b))
+                        .unwrap_or(default)
+                };
+                let bits = parse("TURBOQUANT_BITS", 4);
+                let k_bits = parse("TURBOQUANT_K_BITS", bits);
+                let v_bits = parse("TURBOQUANT_V_BITS", bits);
+                KvCacheType::TurboQuant { k_bits, v_bits }
+            }
             _ => KvCacheType::F16,
+        }
+    }
+
+    /// Fast affine Q4_0 storage when both K and V are 4-bit.
+    pub fn tq_affine(&self) -> bool {
+        matches!(self, KvCacheType::TurboQuant { k_bits: 4, v_bits: 4 })
+    }
+
+    fn tq_side_row_bytes(head_dim: usize, bits: u8, affine: bool) -> usize {
+        if affine {
+            (head_dim / 32) * 18
+        } else {
+            2 + (head_dim * (bits as usize)) / 8
+        }
+    }
+
+    pub fn k_row_bytes(&self, head_dim: usize) -> usize {
+        match self {
+            KvCacheType::TurboQuant { k_bits, .. } => {
+                Self::tq_side_row_bytes(head_dim, *k_bits, self.tq_affine())
+            }
+            _ => self.bytes_per_row(head_dim),
+        }
+    }
+
+    pub fn v_row_bytes(&self, head_dim: usize) -> usize {
+        match self {
+            KvCacheType::TurboQuant { v_bits, .. } => {
+                Self::tq_side_row_bytes(head_dim, *v_bits, self.tq_affine())
+            }
+            _ => self.bytes_per_row(head_dim),
         }
     }
 
@@ -89,6 +138,9 @@ impl KvCacheType {
             KvCacheType::F16 => head_dim * 2,
             KvCacheType::Q8_0 => (head_dim / 32) * 34,
             KvCacheType::Q4_0 => (head_dim / 32) * 18,
+            KvCacheType::TurboQuant { k_bits, .. } => {
+                Self::tq_side_row_bytes(head_dim, *k_bits, self.tq_affine())
+            }
         }
     }
 }
@@ -99,6 +151,13 @@ impl std::fmt::Display for KvCacheType {
             KvCacheType::F16 => write!(f, "f16"),
             KvCacheType::Q8_0 => write!(f, "q8_0"),
             KvCacheType::Q4_0 => write!(f, "q4_0"),
+            KvCacheType::TurboQuant { k_bits, v_bits } => {
+                if k_bits == v_bits {
+                    write!(f, "turboquant-{}bit", k_bits)
+                } else {
+                    write!(f, "turboquant-K{}V{}", k_bits, v_bits)
+                }
+            }
         }
     }
 }

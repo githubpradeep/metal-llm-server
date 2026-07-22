@@ -13,6 +13,7 @@ mod gpu_model;
 mod gemma4_config;
 mod gemma4_gpu_model;
 mod gemma4_mtp;
+mod turboquant;
 mod decode_fused;
 mod speculative;
 mod kv_persist;
@@ -298,6 +299,25 @@ fn main() {
             };
 
             println!("Model loaded in {:.2}s", start.elapsed().as_secs_f64());
+            if let Some(line) = gpu_model.kv_meter_line() {
+                println!("  {}", line);
+            }
+
+            let wants_mtp = args.iter().any(|a| a == "--mtp");
+            if wants_mtp {
+                if matches!(
+                    gpu_model.kv_cache_type,
+                    gemma4_config::KvCacheType::TurboQuant { .. }
+                ) && !gpu_model.tq_hot_enabled()
+                {
+                    eprintln!(
+                        "error: --mtp with TurboQuant requires TURBOQUANT_HOT_WINDOW>0 \
+                         (hybrid Q4 hot path). Pure TQ has no batched verify yet.\n\
+                         Set TURBOQUANT_HOT_WINDOW=2048 (default), or use q4_0, or drop --mtp."
+                    );
+                    std::process::exit(1);
+                }
+            }
 
             if bench_decode {
                 bench_decode_gemma4(
@@ -361,16 +381,26 @@ fn main() {
                 run_mtp_chat_cli(&tokenizer, &mut gpu_model, &mut assistant, &model_dir);
             } else {
                 println!("{}", "=".repeat(60));
-                println!("GEMMA4 E4B GENERATION (Metal GPU, Q4_0)");
+                println!("GEMMA4 GENERATION (Metal GPU, {})", gpu_model.kv_cache_type);
                 println!("{}", "=".repeat(60));
 
-                let gen_start = Instant::now();
-                generate_gemma4_gpu(
-                    "<start_of_turn>user\n Write a short essay about the benefits of exercise. Include an introduction, 3 key points, and a conclusion.<end_of_turn>\n<start_of_turn>model\n",
-                    &tokenizer,
-                    &mut gpu_model,
-                    1000,
+                // `LLAMA_PROMPT` = raw user text (chat-templated here). If unset,
+                // fall back to the classic essay smoke prompt. Needed for TQ
+                // needle tests — without --mtp the CLI is not interactive.
+                let user_text = std::env::var("LLAMA_PROMPT").unwrap_or_else(|_| {
+                    "Write a short essay about the benefits of exercise. Include an introduction, 3 key points, and a conclusion.".to_string()
+                });
+                let prompt = format!(
+                    "<start_of_turn>user\n{}<end_of_turn>\n<start_of_turn>model\n",
+                    user_text
                 );
+                let max_tokens = std::env::var("LLAMA_MAX_TOKENS")
+                    .ok()
+                    .and_then(|v| v.parse::<usize>().ok())
+                    .unwrap_or(1000);
+
+                let gen_start = Instant::now();
+                generate_gemma4_gpu(&prompt, &tokenizer, &mut gpu_model, max_tokens);
                 println!("\nTotal time: {:.2}s", gen_start.elapsed().as_secs_f64());
             }
         } else {
@@ -522,6 +552,9 @@ fn bench_decode_gemma4(
     println!("  Prompt tokens: {}", prompt_tokens);
     println!("  Generated tokens: {}", generated);
     println!("  Context after bench: {} tokens", model.num_items());
+    if let Some(line) = model.kv_meter_line() {
+        println!("  {}", line);
+    }
     println!(
         "  [ Prompt: {:.1} t/s | Generation: {:.1} t/s ]",
         prefill_tps, decode_tps
@@ -617,8 +650,17 @@ fn generate_gemma4_gpu(
     let token_ids: Vec<usize> = input_ids.iter().map(|&t| t as usize).collect();
     let mut rng = rand::thread_rng();
     let seed: u32 = rng.gen();
+    // Needle / quality gates should be greedy. Default stays 0.7 for casual smoke.
+    let temperature: f32 = std::env::var("LLAMA_TEMPERATURE")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0.7);
+    let min_p: f32 = std::env::var("LLAMA_MIN_P")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0.1);
     let mut next_token =
-        model.forward_prefill_sample_last(&token_ids, 0.7, 0.1, seed);
+        model.forward_prefill_sample_last(&token_ids, temperature, min_p, seed);
 
     // Decode loop
     let start_time = Instant::now();
@@ -638,7 +680,7 @@ fn generate_gemma4_gpu(
         tokens_generated += 1;
 
         let seed: u32 = rng.gen();
-        next_token = model.forward_single_token_sample(next_token, 0.7, 0.1, seed);
+        next_token = model.forward_single_token_sample(next_token, temperature, min_p, seed);
     }
 
     printer.finish();
@@ -649,6 +691,9 @@ fn generate_gemma4_gpu(
     println!("  Tokens: {}", tokens_generated);
     println!("  Throughput: {:.2} tok/s", tps);
     println!("  Context length: {} tokens", model.num_items());
+    if let Some(line) = model.kv_meter_line() {
+        println!("  {}", line);
+    }
     println!("  Elapsed: {:.2}s", elapsed);
 }
 

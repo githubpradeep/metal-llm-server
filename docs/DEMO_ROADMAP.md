@@ -16,16 +16,17 @@
 
 See `docs/DEMO.md` for the exact commands and a 60–90s screen-record script.
 
-## Phase 2 — NOT implemented, stub only
+## Phase 2 — TurboQuant KV (in progress on `feature/turboquant-kv`)
 
-### Moonshot: extreme KV compression ("turboquant")
+One-liner: **“100k-token Gemma chat in ~2 GB-class KV — needle still found. Watch the meter.”**
 
-One-liner: compress the on-disk (and eventually on-GPU) KV cache far below
-Q4_0 — think learned/vector-quantized KV codebooks or residual coding — so a
-200k-token session fits on disk/unified memory in tens of MB instead of
-hundreds, making warm-reopen sessions and long-context chat viable at scale.
+See `docs/TURBOQUANT.md` for config, phase map (P0–P4), and honest claim bounds.
 
-Not started. No format changes, no kernels, no integration in this pass —
-`kv_persist.rs`'s on-disk format has a `kv_type` byte reserved specifically so
-a future turboquant codec can be added as a new tag without breaking the
-existing Q4_0/Q8_0/F16 session files.
+| Phase | Goal |
+|---|---|
+| P0 | Needle quality gate (`tools/turboquant_needle.md`) |
+| P1–P2 | Port from `mega-kernel-gguf-turboquant-1`: Lloyd–Max V3 + Metal fused attn, residual window, asymmetric K/V |
+| P3 | Live KV meter + `kv_persist` type tag + CLI/Brain |
+| P4 | Disk-backed cold TQ pages for 1M-class docs (stub — placement only changes speed) |
+
+`kv_persist.rs` keeps a `kv_type` byte so TQ sessions do not silently load as Q4_0.

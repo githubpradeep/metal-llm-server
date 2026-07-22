@@ -381,6 +381,9 @@ impl Scheduler {
                 "finish_reason": finish.reason,
             })
         );
+        if let Some(line) = self.engine.kv_meter_line() {
+            println!("  {}", line);
+        }
     }
 }
 

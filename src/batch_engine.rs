@@ -51,6 +51,10 @@ impl BatchEngine {
         self.model.max_decode_batch_size().max(1)
     }
 
+    pub fn kv_meter_line(&self) -> Option<String> {
+        self.model.kv_meter_line()
+    }
+
     pub fn prefill_chunk(
         &mut self,
         token_ids: &[usize],

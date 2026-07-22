@@ -110,15 +110,15 @@ impl KvCachePool {
             for layer_idx in 0..num_layers {
                 let head_dim = config.layer_head_dim(layer_idx);
                 assert!(head_dim % 32 == 0, "head_dim must be multiple of 32 for quantized KV cache");
-                let bytes_per_row = kv_cache_type.bytes_per_row(head_dim);
-                let byte_len = (num_kv_heads * max_seq_len as usize * bytes_per_row) as u64;
+                let k_byte_len = (num_kv_heads * max_seq_len as usize * kv_cache_type.k_row_bytes(head_dim)) as u64;
+                let v_byte_len = (num_kv_heads * max_seq_len as usize * kv_cache_type.v_row_bytes(head_dim)) as u64;
                 k_cache.push(
                     ctx.device
-                        .new_buffer(byte_len, MTLResourceOptions::StorageModeShared),
+                        .new_buffer(k_byte_len, MTLResourceOptions::StorageModeShared),
                 );
                 v_cache.push(
                     ctx.device
-                        .new_buffer(byte_len, MTLResourceOptions::StorageModeShared),
+                        .new_buffer(v_byte_len, MTLResourceOptions::StorageModeShared),
                 );
             }
 

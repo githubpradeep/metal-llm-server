@@ -39,6 +39,10 @@ fn kv_type_tag(t: KvCacheType) -> u8 {
         KvCacheType::F16 => 0,
         KvCacheType::Q8_0 => 1,
         KvCacheType::Q4_0 => 2,
+        // Encode bit-widths in the high nibble so K3/V2 ≠ K4/V4 sessions.
+        KvCacheType::TurboQuant { k_bits, v_bits } => {
+            0x30 | ((k_bits & 0x3) << 2) | (v_bits & 0x3)
+        }
     }
 }
 

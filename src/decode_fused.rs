@@ -36,12 +36,21 @@ pub fn log_fused_decode_status(model: &Gemma4GpuModel) {
         println!("  Fused decode executor disabled (FUSED_DECODE=0)");
         return;
     }
-    if model.kv_cache_type != KvCacheType::Q4_0 {
-        println!(
-            "  Fused decode executor skipped (KV cache {:?}, need q4_0)",
-            model.kv_cache_type
-        );
-        return;
+    match model.kv_cache_type {
+        KvCacheType::Q4_0 => {}
+        KvCacheType::TurboQuant { .. } if model.tq_hot_enabled() => {
+            println!(
+                "  Fused decode executor: TurboQuant hybrid (Q4 hot ≤{}, TQ cold beyond)",
+                model.tq_hot_w
+            );
+        }
+        other => {
+            println!(
+                "  Fused decode executor skipped (KV cache {:?}; need q4_0 or TQ with hot window)",
+                other
+            );
+            return;
+        }
     }
     if !model.ctx.use_flash_attention {
         println!("  Fused decode executor skipped (flash attention disabled)");
@@ -63,12 +72,12 @@ pub fn log_fused_decode_status(model: &Gemma4GpuModel) {
     let q4 = model.layers.len() - kq;
     if kq > 0 {
         println!(
-            "  Fused decode executor enabled ({} K-quant + {} Q4_0 layers, Q4_0 KV)",
+            "  Fused decode executor enabled ({} K-quant + {} Q4_0 layers)",
             kq, q4
         );
     } else {
         println!(
-            "  Fused decode executor enabled ({} Q4_0 layers, Q4_0 KV)",
+            "  Fused decode executor enabled ({} Q4_0 layers)",
             q4
         );
     }
@@ -97,12 +106,17 @@ pub struct FusedDecodeScratch<'a> {
 }
 
 impl Gemma4GpuModel {
-    /// Fused fast path: Q4_0 KV cache, Q4_0 and/or K-quant weight layers.
+    /// Fused fast path: Q4_0 KV, or TurboQuant with a Q4 hot window (hybrid).
     pub fn fused_decode_eligible(&self) -> bool {
         if !fused_decode_enabled() {
             return false;
         }
-        if self.kv_cache_type != KvCacheType::Q4_0 {
+        let kv_ok = match self.kv_cache_type {
+            KvCacheType::Q4_0 => true,
+            KvCacheType::TurboQuant { .. } => self.tq_hot_enabled(),
+            _ => false,
+        };
+        if !kv_ok {
             return false;
         }
         if !self.ctx.use_flash_attention {
@@ -302,7 +316,470 @@ impl Gemma4GpuModel {
             n += 2;
         }
 
-        if layer.has_kv
+        let attn_kv_seq = kv_seq + 1;
+        let tq_v3 = matches!(self.kv_cache_type, KvCacheType::TurboQuant { .. })
+            && !self.kv_cache_type.tq_affine();
+        let use_hot = tq_v3 && self.tq_attn_fits_hot(attn_kv_seq);
+        // Dual-write TQ during the hot window (needed before ctx exceeds hot).
+        // Default OFF for speed — essay-length gens stay in the hot window.
+        // Set TURBOQUANT_DUAL_WRITE=1 before long contexts that will exceed hot.
+        let dual_write = tq_v3
+            && layer.has_kv
+            && matches!(
+                std::env::var("TURBOQUANT_DUAL_WRITE").as_deref(),
+                Ok("1") | Ok("true") | Ok("TRUE")
+            );
+
+        if use_hot {
+            // Same mega-fusion as Q4_0, targeting the hot ring.
+            let src = layer.kv_source_layer;
+            if layer.has_kv
+                && matches!(head_dim, 128 | 256 | 512)
+                && !gpu::attention_use_ggml_for_layer_kv(true, effective_kv_seq)
+            {
+                self.ctx.encode_attention_full_fused_q4_0(
+                    encoder,
+                    scratch.q,
+                    &layer.q_norm_weight,
+                    scratch.cos_packed,
+                    rope_off,
+                    scratch.sin_packed,
+                    rope_off,
+                    scratch.k,
+                    &layer.k_norm_weight,
+                    scratch.v,
+                    scratch.attn_out,
+                    &self.tq_hot_k[src],
+                    &self.tq_hot_v[src],
+                    num_heads,
+                    num_kv_heads,
+                    num_kv_groups,
+                    head_dim,
+                    effective_kv_seq,
+                    self.tq_hot_w,
+                    scale,
+                    kv_start,
+                    kv_seq,
+                    groups_per_row,
+                    row_bytes,
+                    eps,
+                );
+                n += 1;
+            } else if !layer.has_kv
+                && matches!(head_dim, 128 | 256 | 512)
+                && !gpu::attention_use_ggml_for_layer_kv(false, effective_kv_seq)
+            {
+                self.ctx.encode_attention_qknorm_rope_q4_0(
+                    encoder,
+                    scratch.q,
+                    &layer.q_norm_weight,
+                    scratch.cos_packed,
+                    rope_off,
+                    scratch.sin_packed,
+                    rope_off,
+                    &self.tq_hot_k[src],
+                    &self.tq_hot_v[src],
+                    scratch.attn_out,
+                    num_heads,
+                    num_kv_heads,
+                    num_kv_groups,
+                    head_dim,
+                    effective_kv_seq,
+                    self.tq_hot_w,
+                    scale,
+                    kv_start,
+                    groups_per_row,
+                    row_bytes,
+                    eps,
+                );
+                n += 1;
+            } else {
+                // Decompose + Q4 hot — same ggml MWG / GQA / offset split as Q4_0.
+                // Without ggml here, ATTENTION_KERNEL=auto falls to offset flash past
+                // 128 tok and loses ~5–6 tok/s vs Q4 (essay-length interactive).
+                self.ctx.encode_rmsnorm_per_head_view(
+                    encoder,
+                    scratch.q,
+                    &layer.q_norm_weight,
+                    scratch.q_normed,
+                    num_heads,
+                    head_dim,
+                    eps,
+                );
+                self.ctx.encode_rotary_at(
+                    encoder,
+                    scratch.q_normed,
+                    0,
+                    scratch.k_normed,
+                    0,
+                    scratch.cos_packed,
+                    rope_off,
+                    scratch.sin_packed,
+                    rope_off,
+                    num_heads,
+                    0,
+                    head_dim,
+                );
+                n += 2;
+                if layer.has_kv {
+                    self.ctx.encode_rmsnorm_per_head_view(
+                        encoder,
+                        scratch.k,
+                        &layer.k_norm_weight,
+                        scratch.k_normed,
+                        num_kv_heads,
+                        head_dim,
+                        eps,
+                    );
+                    self.ctx.encode_rotary_at(
+                        encoder,
+                        scratch.q,
+                        0,
+                        scratch.k_normed,
+                        0,
+                        scratch.cos_packed,
+                        rope_off,
+                        scratch.sin_packed,
+                        rope_off,
+                        0,
+                        num_kv_heads,
+                        head_dim,
+                    );
+                    self.ctx.encode_rmsnorm_per_head_noweight(
+                        encoder,
+                        scratch.v,
+                        scratch.gate,
+                        num_kv_heads,
+                        head_dim,
+                        eps,
+                    );
+                    // Always append here: this branch never uses full_fused
+                    // (ggml or rare head dims), so inline append is unavailable.
+                    self.ctx.encode_kv_append_q4_0(
+                        encoder,
+                        scratch.k_normed,
+                        &self.tq_hot_k[layer_idx],
+                        num_kv_heads,
+                        head_dim,
+                        self.tq_hot_w,
+                        kv_seq,
+                    );
+                    self.ctx.encode_kv_append_q4_0(
+                        encoder,
+                        scratch.gate,
+                        &self.tq_hot_v[layer_idx],
+                        num_kv_heads,
+                        head_dim,
+                        self.tq_hot_w,
+                        kv_seq,
+                    );
+                    n += 5;
+                }
+                if gpu::attention_use_ggml_for_layer_kv(layer.has_kv, effective_kv_seq)
+                    && matches!(head_dim, 128 | 256 | 512)
+                    && self.ctx.use_flash_attention
+                {
+                    self.ctx.encode_attention_ggml_q4_0(
+                        encoder,
+                        scratch.q_normed,
+                        &self.tq_hot_k[src],
+                        &self.tq_hot_v[src],
+                        &self.ggml_fa_tmp_buf,
+                        scratch.attn_out,
+                        num_heads,
+                        num_kv_heads,
+                        head_dim,
+                        effective_kv_seq,
+                        self.tq_hot_w,
+                        scale,
+                        kv_start,
+                        row_bytes,
+                    );
+                } else if gpu::attention_gqa_q4_0_enabled(num_kv_groups) {
+                    self.ctx.encode_attention_with_offset_q4_0_gqa(
+                        encoder,
+                        scratch.q_normed,
+                        &self.tq_hot_k[src],
+                        &self.tq_hot_v[src],
+                        scratch.attn_out,
+                        num_heads,
+                        num_kv_heads,
+                        num_kv_groups,
+                        head_dim,
+                        effective_kv_seq,
+                        self.tq_hot_w,
+                        scale,
+                        kv_start,
+                        groups_per_row,
+                        row_bytes,
+                    );
+                } else {
+                    self.ctx.encode_attention_with_offset_q4_0(
+                        encoder,
+                        scratch.q_normed,
+                        &self.tq_hot_k[src],
+                        &self.tq_hot_v[src],
+                        scratch.attn_out,
+                        num_heads,
+                        num_kv_heads,
+                        num_kv_groups,
+                        head_dim,
+                        effective_kv_seq,
+                        self.tq_hot_w,
+                        scale,
+                        kv_start,
+                        groups_per_row,
+                        row_bytes,
+                    );
+                }
+                n += 1;
+            }
+
+            // Optional TQ cold dual-write (needs its own K/V norm — full_fused hides them).
+            if dual_write && layer.has_kv {
+                self.ctx.encode_rmsnorm_per_head_view(
+                    encoder,
+                    scratch.k,
+                    &layer.k_norm_weight,
+                    scratch.k_normed,
+                    num_kv_heads,
+                    head_dim,
+                    eps,
+                );
+                self.ctx.encode_rotary_at(
+                    encoder,
+                    scratch.q,
+                    0,
+                    scratch.k_normed,
+                    0,
+                    scratch.cos_packed,
+                    rope_off,
+                    scratch.sin_packed,
+                    rope_off,
+                    0,
+                    num_kv_heads,
+                    head_dim,
+                );
+                self.ctx.encode_rmsnorm_per_head_noweight(
+                    encoder,
+                    scratch.v,
+                    scratch.gate,
+                    num_kv_heads,
+                    head_dim,
+                    eps,
+                );
+                let KvCacheType::TurboQuant { k_bits, v_bits } = self.kv_cache_type else {
+                    unreachable!()
+                };
+                let tq = self.turboquant.as_ref().expect("turboquant state");
+                let fwd = tq.fwd(head_dim as usize);
+                let k_row_bytes = self.kv_cache_type.k_row_bytes(head_dim as usize) as u32;
+                let v_row_bytes = self.kv_cache_type.v_row_bytes(head_dim as usize) as u32;
+                let kwin = if self.tq_rw > 0 {
+                    &self.tq_rw_k[layer_idx]
+                } else {
+                    &self.tq_k_rot
+                };
+                let vwin = if self.tq_rw > 0 {
+                    &self.tq_rw_v[layer_idx]
+                } else {
+                    &self.tq_v_rot
+                };
+                self.ctx.encode_turboquant_rotate_quant_v3(
+                    encoder,
+                    scratch.k_normed,
+                    &self.k_cache[layer_idx],
+                    tq.centroids_k(head_dim as usize),
+                    num_kv_heads,
+                    head_dim,
+                    self.kv_capacity,
+                    kv_seq,
+                    k_bits as u32,
+                    k_row_bytes,
+                    kwin,
+                    self.tq_rw,
+                    fwd,
+                );
+                self.ctx.encode_turboquant_rotate_quant_v3(
+                    encoder,
+                    scratch.gate,
+                    &self.v_cache[layer_idx],
+                    tq.centroids_v(head_dim as usize),
+                    num_kv_heads,
+                    head_dim,
+                    self.kv_capacity,
+                    kv_seq,
+                    v_bits as u32,
+                    v_row_bytes,
+                    vwin,
+                    self.tq_rw,
+                    fwd,
+                );
+                n += 5;
+            }
+        } else if tq_v3 {
+            // Cold path: TQ V3 attention (ctx > hot window).
+            self.ctx.encode_rmsnorm_per_head_view(
+                encoder,
+                scratch.q,
+                &layer.q_norm_weight,
+                scratch.q_normed,
+                num_heads,
+                head_dim,
+                eps,
+            );
+            self.ctx.encode_rotary_at(
+                encoder,
+                scratch.q_normed,
+                0,
+                scratch.k_normed,
+                0,
+                scratch.cos_packed,
+                rope_off,
+                scratch.sin_packed,
+                rope_off,
+                num_heads,
+                0,
+                head_dim,
+            );
+            n += 2;
+
+            if layer.has_kv {
+                self.ctx.encode_rmsnorm_per_head_view(
+                    encoder,
+                    scratch.k,
+                    &layer.k_norm_weight,
+                    scratch.k_normed,
+                    num_kv_heads,
+                    head_dim,
+                    eps,
+                );
+                self.ctx.encode_rotary_at(
+                    encoder,
+                    scratch.q,
+                    0,
+                    scratch.k_normed,
+                    0,
+                    scratch.cos_packed,
+                    rope_off,
+                    scratch.sin_packed,
+                    rope_off,
+                    0,
+                    num_kv_heads,
+                    head_dim,
+                );
+                self.ctx.encode_rmsnorm_per_head_noweight(
+                    encoder,
+                    scratch.v,
+                    scratch.gate,
+                    num_kv_heads,
+                    head_dim,
+                    eps,
+                );
+                n += 3;
+
+                let KvCacheType::TurboQuant { k_bits, v_bits } = self.kv_cache_type else {
+                    unreachable!()
+                };
+                let tq = self.turboquant.as_ref().expect("turboquant state");
+                let fwd = tq.fwd(head_dim as usize);
+                let k_row_bytes = self.kv_cache_type.k_row_bytes(head_dim as usize) as u32;
+                let v_row_bytes = self.kv_cache_type.v_row_bytes(head_dim as usize) as u32;
+                let kwin = if self.tq_rw > 0 {
+                    &self.tq_rw_k[layer_idx]
+                } else {
+                    &self.tq_k_rot
+                };
+                let vwin = if self.tq_rw > 0 {
+                    &self.tq_rw_v[layer_idx]
+                } else {
+                    &self.tq_v_rot
+                };
+                self.ctx.encode_turboquant_rotate_quant_v3(
+                    encoder,
+                    scratch.k_normed,
+                    &self.k_cache[layer_idx],
+                    tq.centroids_k(head_dim as usize),
+                    num_kv_heads,
+                    head_dim,
+                    self.kv_capacity,
+                    kv_seq,
+                    k_bits as u32,
+                    k_row_bytes,
+                    kwin,
+                    self.tq_rw,
+                    fwd,
+                );
+                self.ctx.encode_turboquant_rotate_quant_v3(
+                    encoder,
+                    scratch.gate,
+                    &self.v_cache[layer_idx],
+                    tq.centroids_v(head_dim as usize),
+                    num_kv_heads,
+                    head_dim,
+                    self.kv_capacity,
+                    kv_seq,
+                    v_bits as u32,
+                    v_row_bytes,
+                    vwin,
+                    self.tq_rw,
+                    fwd,
+                );
+                n += 2;
+            }
+
+            let src = layer.kv_source_layer;
+            let KvCacheType::TurboQuant { k_bits, v_bits } = self.kv_cache_type else {
+                unreachable!()
+            };
+            let tq = self.turboquant.as_ref().expect("turboquant state");
+            let k_row_bytes = self.kv_cache_type.k_row_bytes(head_dim as usize) as u32;
+            let v_row_bytes = self.kv_cache_type.v_row_bytes(head_dim as usize) as u32;
+            let window_lo = if self.tq_rw > 0 {
+                kv_start.max(attn_kv_seq.saturating_sub(self.tq_rw))
+            } else {
+                0
+            };
+            let kwin = if self.tq_rw > 0 {
+                &self.tq_rw_k[src]
+            } else {
+                scratch.q_normed
+            };
+            let vwin = if self.tq_rw > 0 {
+                &self.tq_rw_v[src]
+            } else {
+                scratch.q_normed
+            };
+            self.ctx.encode_turboquant_attn_v3(
+                encoder,
+                scratch.q_normed,
+                &self.k_cache[src],
+                &self.v_cache[src],
+                scratch.attn_out,
+                tq.centroids_k(head_dim as usize),
+                tq.centroids_v(head_dim as usize),
+                num_heads,
+                num_kv_heads,
+                num_kv_groups,
+                head_dim,
+                attn_kv_seq,
+                self.kv_capacity,
+                scale,
+                kv_start,
+                k_bits as u32,
+                v_bits as u32,
+                k_row_bytes,
+                v_row_bytes,
+                kwin,
+                vwin,
+                self.tq_rw,
+                window_lo,
+                tq.fwd(head_dim as usize),
+                tq.inv(head_dim as usize),
+                &self.tq_scores,
+            );
+            n += 1;
+        } else if layer.has_kv
             && matches!(head_dim, 128 | 256 | 512)
             && !gpu::attention_use_ggml_for_layer_kv(true, effective_kv_seq)
         {

@@ -569,6 +569,11 @@ impl MtpDraftHead {
                             row_bytes,
                         );
                     }
+                    KvCacheType::TurboQuant { .. } => {
+                        panic!(
+                            "TurboQuant KV cache is not supported on the draft/speculative path"
+                        );
+                    }
                 }
             }
 

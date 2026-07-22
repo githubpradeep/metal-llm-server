@@ -12,6 +12,158 @@ use crate::gemma4_config::{Gemma4TextConfig, KvCacheType, RopeConfig, RopeParame
 use crate::gpu::{BufferView, GpuTimestampProfiler, MetalContext, ProfileAblate, profile_gpu_enabled};
 use crate::kv_pool::{KvCachePool, KvPoolError, KvSlot, KvSlotView};
 
+/// Paths that do not yet implement TurboQuant rotation reject it with this message
+/// (rotation must be applied consistently across prefill and decode, so silently
+/// falling back to plain Q4_0 on some paths would corrupt the cache).
+const TURBOQUANT_UNSUPPORTED: &str = "TurboQuant KV cache is only supported on the \
+interactive single-token path (forward_single_token / forward_prefill_sample_last). \
+Use LLAMA_KV_CACHE_TYPE=q4_0 for batched/server/parallel-prefill paths.";
+
+/// TurboQuant scratch + optional Q4 hot-ring caches (hybrid fast path).
+struct TurboQuantState {
+    turboquant: Option<crate::turboquant::TurboQuant>,
+    tq_q_rot: Buffer,
+    tq_k_rot: Buffer,
+    tq_v_rot: Buffer,
+    tq_out: Buffer,
+    tq_scores: Buffer,
+    tq_rw_k: Vec<Buffer>,
+    tq_rw_v: Vec<Buffer>,
+    tq_rw: u32,
+    /// Model-frame Q4_0 ring for the most recent `tq_hot_w` tokens. While
+    /// `attn_kv_seq <= tq_hot_w`, decode/prefill attend with the fast Q4 flash
+    /// path; TQ V3 still receives a dual-write so cold attention stays valid
+    /// after the window fills.
+    tq_hot_k: Vec<Buffer>,
+    tq_hot_v: Vec<Buffer>,
+    tq_hot_w: u32,
+}
+
+/// Build TurboQuant rotation state (matrices + rotation scratch buffers).
+///
+/// Returns `None` rotation state for non-TurboQuant cache types, but always
+/// allocates the (tiny) scratch buffers so the struct fields are always valid.
+fn build_turboquant_state(
+    ctx: &MetalContext,
+    config: &Gemma4TextConfig,
+    kv_cache_type: KvCacheType,
+    kv_capacity: u32,
+) -> TurboQuantState {
+    let max_head_dim = config.head_dim.max(config.global_head_dim);
+    let n_heads = config.num_attention_heads;
+    let n_kv_heads = config.num_key_value_heads;
+    let mk = |elems: usize| -> Buffer {
+        ctx.device.new_buffer(
+            (elems.max(1) * 4) as u64,
+            MTLResourceOptions::StorageModeShared,
+        )
+    };
+    let tq_q_rot = mk(n_heads * max_head_dim);
+    let tq_out = mk(n_heads * max_head_dim);
+    let tq_k_rot = mk(n_kv_heads * max_head_dim);
+    let tq_v_rot = mk(n_kv_heads * max_head_dim);
+    // Device scores for turboquant_attn_v3: [num_heads, capacity] — avoids
+    // overflowing threadgroup memory at long context (8–16k).
+    let tq_scores = mk(n_heads * kv_capacity as usize);
+
+    let mut tq_rw_k: Vec<Buffer> = Vec::new();
+    let mut tq_rw_v: Vec<Buffer> = Vec::new();
+    let mut tq_rw: u32 = 0;
+    let mut tq_hot_k: Vec<Buffer> = Vec::new();
+    let mut tq_hot_v: Vec<Buffer> = Vec::new();
+    let mut tq_hot_w: u32 = 0;
+
+    let turboquant = if let KvCacheType::TurboQuant { k_bits, v_bits } = kv_cache_type {
+        let mut dims: Vec<usize> = vec![config.head_dim, config.global_head_dim];
+        dims.sort_unstable();
+        dims.dedup();
+        let affine = kv_cache_type.tq_affine();
+        let variant = if affine {
+            "rotation + Q4_0"
+        } else {
+            "rotation + Lloyd-Max V3"
+        };
+
+        if !affine {
+            tq_rw = std::env::var("TURBOQUANT_RESIDUAL_WINDOW")
+                .ok()
+                .and_then(|v| v.parse::<u32>().ok())
+                .unwrap_or(128);
+            tq_rw = tq_rw.min(kv_capacity);
+            if tq_rw > 0 {
+                let window_elems = n_kv_heads * tq_rw as usize * max_head_dim;
+                for _ in 0..config.num_hidden_layers {
+                    tq_rw_k.push(mk(window_elems));
+                    tq_rw_v.push(mk(window_elems));
+                }
+                let mb = (config.num_hidden_layers * window_elems * 4 * 2) as f64 / 1.0e6;
+                println!(
+                    "  TurboQuant: residual window {} tokens (fp32 K/V, ~{:.0} MB)",
+                    tq_rw, mb
+                );
+            }
+
+            // Hybrid hot ring: default 2048 so short/medium gens stay on Q4 flash.
+            // Set TURBOQUANT_HOT_WINDOW=0 to force pure TQ attention always.
+            tq_hot_w = std::env::var("TURBOQUANT_HOT_WINDOW")
+                .ok()
+                .and_then(|v| v.parse::<u32>().ok())
+                .unwrap_or(2048);
+            tq_hot_w = tq_hot_w.min(kv_capacity);
+            if tq_hot_w > 0 {
+                for i in 0..config.num_hidden_layers {
+                    let hd = config.layer_head_dim(i);
+                    let layer_n_kv = config.layer_num_kv_heads(i);
+                    let q4_row = (hd / 32) * 18;
+                    let bytes =
+                        (layer_n_kv * tq_hot_w as usize * q4_row).max(1) as u64;
+                    tq_hot_k.push(
+                        ctx.device
+                            .new_buffer(bytes, MTLResourceOptions::StorageModeShared),
+                    );
+                    tq_hot_v.push(
+                        ctx.device
+                            .new_buffer(bytes, MTLResourceOptions::StorageModeShared),
+                    );
+                }
+                let hot_bytes: u64 = tq_hot_k.iter().map(|b| b.length()).sum::<u64>()
+                    + tq_hot_v.iter().map(|b| b.length()).sum::<u64>();
+                println!(
+                    "  TurboQuant: Q4 hot window {} tokens (~{:.1} MB) — fast path while ctx ≤ {}",
+                    tq_hot_w,
+                    hot_bytes as f64 / 1e6,
+                    tq_hot_w
+                );
+            }
+        }
+
+        println!(
+            "  TurboQuant: K{}/V{} ({}), Haar rotations + codebooks for head_dims {:?}",
+            k_bits, v_bits, variant, dims
+        );
+        Some(crate::turboquant::TurboQuant::new(
+            &ctx.device, &dims, k_bits, v_bits,
+        ))
+    } else {
+        None
+    };
+
+    TurboQuantState {
+        turboquant,
+        tq_q_rot,
+        tq_k_rot,
+        tq_v_rot,
+        tq_out,
+        tq_scores,
+        tq_rw_k,
+        tq_rw_v,
+        tq_rw,
+        tq_hot_k,
+        tq_hot_v,
+        tq_hot_w,
+    }
+}
+
 /// Fused 3→1 operation: projection + norm + residual add
 /// 
 /// This combines three operations into one:
@@ -263,6 +415,25 @@ pub struct Gemma4GpuModel {
     pub kv_seq_len: u32,
     pub kv_capacity: u32,
     pub kv_cache_type: KvCacheType,
+
+    // TurboQuant: per-head_dim Haar rotation matrices + rotation scratch buffers.
+    // `Some` only when `kv_cache_type == KvCacheType::TurboQuant`.
+    pub(crate) turboquant: Option<crate::turboquant::TurboQuant>,
+    pub(crate) tq_q_rot: Buffer, // [num_heads * max_head_dim] rotated query
+    pub(crate) tq_k_rot: Buffer, // [num_kv_heads * max_head_dim] rotated key
+    pub(crate) tq_v_rot: Buffer, // [num_kv_heads * max_head_dim] rotated value
+    pub(crate) tq_out: Buffer,   // [num_heads * max_head_dim] un-rotated attention output
+    pub(crate) tq_scores: Buffer, // [num_heads * capacity] device softmax scores for V3 attn
+    // Residual window (V3 2/3-bit only): most recent `tq_rw` tokens' rotated K/V
+    pub(crate) tq_rw_k: Vec<Buffer>,
+    pub(crate) tq_rw_v: Vec<Buffer>,
+    pub(crate) tq_rw: u32,
+    // Hybrid Q4_0 hot ring (model frame); see TurboQuantState.
+    pub(crate) tq_hot_k: Vec<Buffer>,
+    pub(crate) tq_hot_v: Vec<Buffer>,
+    pub(crate) tq_hot_w: u32,
+    /// Set after the first spill of the Q4 hot ring into TQ cold (ctx > hot).
+    pub(crate) tq_hot_spilled: bool,
 
     // Rotary precomputed buffers (per-layer since sliding/full differ)
     pub cos_buf: Buffer,
@@ -1451,19 +1622,40 @@ impl Gemma4GpuModel {
             let hd = config.layer_head_dim(i);
             let layer_n_kv = config.layer_num_kv_heads(i);
             assert!(hd % 32 == 0, "head_dim must be a multiple of 32 for quantized KV cache");
-            let bytes_per_row = kv_cache_type.bytes_per_row(hd);
-            let byte_len = (layer_n_kv * kv_capacity as usize * bytes_per_row) as u64;
+            // K and V may use different bit-widths (asymmetric TurboQuant).
+            let k_byte_len = (layer_n_kv * kv_capacity as usize * kv_cache_type.k_row_bytes(hd)) as u64;
+            let v_byte_len = (layer_n_kv * kv_capacity as usize * kv_cache_type.v_row_bytes(hd)) as u64;
             k_cache.push(
                 ctx.device
-                    .new_buffer(byte_len, MTLResourceOptions::StorageModeShared),
+                    .new_buffer(k_byte_len, MTLResourceOptions::StorageModeShared),
             );
             v_cache.push(
                 ctx.device
-                    .new_buffer(byte_len, MTLResourceOptions::StorageModeShared),
+                    .new_buffer(v_byte_len, MTLResourceOptions::StorageModeShared),
             );
         }
+        let tq_state = build_turboquant_state(&ctx, &config, kv_cache_type, kv_capacity);
+        let TurboQuantState {
+            turboquant,
+            tq_q_rot,
+            tq_k_rot,
+            tq_v_rot,
+            tq_out,
+            tq_scores,
+            tq_rw_k,
+            tq_rw_v,
+            tq_rw,
+            tq_hot_k,
+            tq_hot_v,
+            tq_hot_w,
+        } = tq_state;
         let f16_bytes = num_kv_heads_max * kv_capacity as usize * config.head_dim * 2 + num_kv_heads_max * kv_capacity as usize * config.global_head_dim * 2;
-        let quant_bytes = num_kv_heads_max * kv_capacity as usize * kv_cache_type.bytes_per_row(config.head_dim) + num_kv_heads_max * kv_capacity as usize * kv_cache_type.bytes_per_row(config.global_head_dim);
+        let quant_bytes = num_kv_heads_max * kv_capacity as usize
+            * (kv_cache_type.k_row_bytes(config.head_dim) + kv_cache_type.v_row_bytes(config.head_dim))
+            / 2
+            + num_kv_heads_max * kv_capacity as usize
+            * (kv_cache_type.k_row_bytes(config.global_head_dim) + kv_cache_type.v_row_bytes(config.global_head_dim))
+            / 2;
         println!("  KV cache type: {}, est. memory per layer: {:.1} MB (vs f16: {:.1} MB, {:.0}% savings)",
             kv_cache_type,
             quant_bytes as f64 / num_layers as f64 / 1024.0 / 1024.0,
@@ -1612,6 +1804,19 @@ impl Gemma4GpuModel {
             kv_seq_len: 0,
             kv_capacity,
             kv_cache_type,
+            turboquant,
+            tq_q_rot,
+            tq_k_rot,
+            tq_v_rot,
+            tq_out,
+            tq_scores,
+            tq_rw_k,
+            tq_rw_v,
+            tq_rw,
+            tq_hot_k,
+            tq_hot_v,
+            tq_hot_w,
+            tq_hot_spilled: false,
             cos_buf,
             sin_buf,
             decode_rope_cos_packed,
@@ -2538,21 +2743,41 @@ impl Gemma4GpuModel {
         for i in 0..num_layers {
             let hd = config.layer_head_dim(i);
             assert!(hd % 32 == 0, "head_dim must be a multiple of 32 for quantized KV cache");
-            let bytes_per_row = kv_cache_type.bytes_per_row(hd);
-            let byte_len = (num_kv_heads * kv_capacity as usize * bytes_per_row) as u64;
+            // K and V may use different bit-widths (asymmetric TurboQuant).
+            let k_byte_len = (num_kv_heads * kv_capacity as usize * kv_cache_type.k_row_bytes(hd)) as u64;
+            let v_byte_len = (num_kv_heads * kv_capacity as usize * kv_cache_type.v_row_bytes(hd)) as u64;
             k_cache.push(
                 ctx.device
-                    .new_buffer(byte_len, MTLResourceOptions::StorageModeShared),
+                    .new_buffer(k_byte_len, MTLResourceOptions::StorageModeShared),
             );
             v_cache.push(
                 ctx.device
-                    .new_buffer(byte_len, MTLResourceOptions::StorageModeShared),
+                    .new_buffer(v_byte_len, MTLResourceOptions::StorageModeShared),
             );
         }
+        let tq_state = build_turboquant_state(&ctx, &config, kv_cache_type, kv_capacity);
+        let TurboQuantState {
+            turboquant,
+            tq_q_rot,
+            tq_k_rot,
+            tq_v_rot,
+            tq_out,
+            tq_scores,
+            tq_rw_k,
+            tq_rw_v,
+            tq_rw,
+            tq_hot_k,
+            tq_hot_v,
+            tq_hot_w,
+        } = tq_state;
         let f16_bytes = num_kv_heads * kv_capacity as usize * config.head_dim * 2
             + num_kv_heads * kv_capacity as usize * config.global_head_dim * 2;
-        let quant_bytes = num_kv_heads * kv_capacity as usize * kv_cache_type.bytes_per_row(config.head_dim)
-            + num_kv_heads * kv_capacity as usize * kv_cache_type.bytes_per_row(config.global_head_dim);
+        let quant_bytes = num_kv_heads * kv_capacity as usize
+            * (kv_cache_type.k_row_bytes(config.head_dim) + kv_cache_type.v_row_bytes(config.head_dim))
+            / 2
+            + num_kv_heads * kv_capacity as usize
+            * (kv_cache_type.k_row_bytes(config.global_head_dim) + kv_cache_type.v_row_bytes(config.global_head_dim))
+            / 2;
         println!(
             "  KV cache type: {}, est. memory per layer: {:.1} MB (vs f16: {:.1} MB, {:.0}% savings)",
             kv_cache_type,
@@ -2696,6 +2921,19 @@ impl Gemma4GpuModel {
             kv_seq_len: 0,
             kv_capacity,
             kv_cache_type,
+            turboquant,
+            tq_q_rot,
+            tq_k_rot,
+            tq_v_rot,
+            tq_out,
+            tq_scores,
+            tq_rw_k,
+            tq_rw_v,
+            tq_rw,
+            tq_hot_k,
+            tq_hot_v,
+            tq_hot_w,
+            tq_hot_spilled: false,
             cos_buf,
             sin_buf,
             decode_rope_cos_packed,
@@ -3412,6 +3650,11 @@ impl Gemma4GpuModel {
         let kv_seq = self.kv_seq_len;
         let pos = self.total_tokens as f32;
 
+        // First token past the Q4 hot window: pack hot → TQ cold once.
+        if self.tq_needs_spill(kv_seq) {
+            self.spill_tq_hot_to_cold();
+        }
+
         // ─── PLE: Compute per-layer inputs on GPU ───
         let ple_input_scale = std::f32::consts::FRAC_1_SQRT_2; // 1/sqrt(2)
         let context_proj_scale = 1.0 / (hidden_size as f32).sqrt();
@@ -3873,6 +4116,122 @@ impl Gemma4GpuModel {
                             );
                         }
                     }
+                    KvCacheType::TurboQuant { k_bits, v_bits } => {
+                        let tq = self
+                            .turboquant
+                            .as_ref()
+                            .expect("turboquant rotation state");
+                        let fwd = tq.fwd(head_dim);
+                        if self.kv_cache_type.tq_affine() {
+                            self.ctx.encode_turboquant_rotate(
+                                encoder,
+                                &self.k_normed_buf,
+                                &self.tq_k_rot,
+                                fwd,
+                                num_kv_heads as u32,
+                                head_dim as u32,
+                            );
+                            self.ctx.encode_turboquant_rotate(
+                                encoder,
+                                &self.gate_buf,
+                                &self.tq_v_rot,
+                                fwd,
+                                num_kv_heads as u32,
+                                head_dim as u32,
+                            );
+                            self.ctx.encode_kv_append_q4_0(
+                                encoder,
+                                &self.tq_k_rot,
+                                &self.k_cache[layer_idx],
+                                num_kv_heads as u32,
+                                head_dim as u32,
+                                self.kv_capacity,
+                                kv_seq,
+                            );
+                            self.ctx.encode_kv_append_q4_0(
+                                encoder,
+                                &self.tq_v_rot,
+                                &self.v_cache[layer_idx],
+                                num_kv_heads as u32,
+                                head_dim as u32,
+                                self.kv_capacity,
+                                kv_seq,
+                            );
+                        } else {
+                            let k_row_bytes = self.kv_cache_type.k_row_bytes(head_dim) as u32;
+                            let v_row_bytes = self.kv_cache_type.v_row_bytes(head_dim) as u32;
+                            let cen_k = tq.centroids_k(head_dim);
+                            let cen_v = tq.centroids_v(head_dim);
+                            let kwin = if self.tq_rw > 0 {
+                                &self.tq_rw_k[layer_idx]
+                            } else {
+                                &self.tq_k_rot
+                            };
+                            let vwin = if self.tq_rw > 0 {
+                                &self.tq_rw_v[layer_idx]
+                            } else {
+                                &self.tq_v_rot
+                            };
+                            let dual_write = matches!(
+                                std::env::var("TURBOQUANT_DUAL_WRITE").as_deref(),
+                                Ok("1") | Ok("true") | Ok("TRUE")
+                            );
+                            let write_hot = self.tq_hot_enabled() && kv_seq < self.tq_hot_w;
+                            // Prefer Q4 hot-only while ctx fits (skip TQ quant tax).
+                            if write_hot {
+                                self.ctx.encode_kv_append_q4_0(
+                                    encoder,
+                                    &self.k_normed_buf,
+                                    &self.tq_hot_k[layer_idx],
+                                    num_kv_heads as u32,
+                                    head_dim as u32,
+                                    self.tq_hot_w,
+                                    kv_seq,
+                                );
+                                self.ctx.encode_kv_append_q4_0(
+                                    encoder,
+                                    &self.gate_buf,
+                                    &self.tq_hot_v[layer_idx],
+                                    num_kv_heads as u32,
+                                    head_dim as u32,
+                                    self.tq_hot_w,
+                                    kv_seq,
+                                );
+                            }
+                            if dual_write || !write_hot {
+                                self.ctx.encode_turboquant_rotate_quant_v3(
+                                    encoder,
+                                    &self.k_normed_buf,
+                                    &self.k_cache[layer_idx],
+                                    cen_k,
+                                    num_kv_heads as u32,
+                                    head_dim as u32,
+                                    self.kv_capacity,
+                                    kv_seq,
+                                    k_bits as u32,
+                                    k_row_bytes,
+                                    kwin,
+                                    self.tq_rw,
+                                    fwd,
+                                );
+                                self.ctx.encode_turboquant_rotate_quant_v3(
+                                    encoder,
+                                    &self.gate_buf,
+                                    &self.v_cache[layer_idx],
+                                    cen_v,
+                                    num_kv_heads as u32,
+                                    head_dim as u32,
+                                    self.kv_capacity,
+                                    kv_seq,
+                                    v_bits as u32,
+                                    v_row_bytes,
+                                    vwin,
+                                    self.tq_rw,
+                                    fwd,
+                                );
+                            }
+                        }
+                    }
                 }
             }
 
@@ -3892,6 +4251,10 @@ impl Gemma4GpuModel {
             } else {
                 0u32
             };
+
+            // Buffer feeding the O-projection. TurboQuant affine redirects this
+            // to the un-rotated attention output; V3 writes model-frame into attn_out.
+            let mut attn_src: &Buffer = &self.attn_out_buf;
 
             match self.kv_cache_type {
                 KvCacheType::F16 => {
@@ -4119,13 +4482,172 @@ impl Gemma4GpuModel {
                         );
                     }
                 }
+                KvCacheType::TurboQuant { k_bits, v_bits } => {
+                    let tq = self
+                        .turboquant
+                        .as_ref()
+                        .expect("turboquant rotation state");
+                    if self.kv_cache_type.tq_affine() {
+                        self.ctx.encode_turboquant_rotate(
+                            encoder,
+                            &self.q_normed_buf,
+                            &self.tq_q_rot,
+                            tq.fwd(head_dim),
+                            num_heads as u32,
+                            head_dim as u32,
+                        );
+                        let groups_per_row = (head_dim / 32) as u32;
+                        let row_bytes = groups_per_row * 18;
+                        self.ctx.encode_attention_with_offset_q4_0(
+                            encoder,
+                            &self.tq_q_rot,
+                            &self.k_cache[layer.kv_source_layer],
+                            &self.v_cache[layer.kv_source_layer],
+                            &self.attn_out_buf,
+                            num_heads as u32,
+                            num_kv_heads as u32,
+                            num_kv_groups,
+                            head_dim as u32,
+                            effective_kv_seq,
+                            self.kv_capacity,
+                            scale,
+                            kv_start,
+                            groups_per_row,
+                            row_bytes,
+                        );
+                        self.ctx.encode_turboquant_rotate(
+                            encoder,
+                            &self.attn_out_buf,
+                            &self.tq_out,
+                            tq.inv(head_dim),
+                            num_heads as u32,
+                            head_dim as u32,
+                        );
+                        attn_src = &self.tq_out;
+                    } else if self.tq_attn_fits_hot(attn_kv_seq) {
+                        // Hybrid fast path: model-frame Q4 over the hot ring
+                        // (ggml MWG when ATTENTION_KERNEL=auto and kv≥128).
+                        let groups_per_row = (head_dim / 32) as u32;
+                        let row_bytes = groups_per_row * 18;
+                        let src = layer.kv_source_layer;
+                        if crate::gpu::attention_use_ggml_for_layer_kv(
+                            layer.has_kv,
+                            effective_kv_seq,
+                        ) && self.ctx.use_flash_attention
+                        {
+                            self.ctx.encode_attention_ggml_q4_0(
+                                encoder,
+                                &self.q_normed_buf,
+                                &self.tq_hot_k[src],
+                                &self.tq_hot_v[src],
+                                &self.ggml_fa_tmp_buf,
+                                &self.attn_out_buf,
+                                num_heads as u32,
+                                num_kv_heads as u32,
+                                head_dim as u32,
+                                effective_kv_seq,
+                                self.tq_hot_w,
+                                scale,
+                                kv_start,
+                                row_bytes,
+                            );
+                        } else if crate::gpu::attention_gqa_q4_0_enabled(num_kv_groups) {
+                            self.ctx.encode_attention_with_offset_q4_0_gqa(
+                                encoder,
+                                &self.q_normed_buf,
+                                &self.tq_hot_k[src],
+                                &self.tq_hot_v[src],
+                                &self.attn_out_buf,
+                                num_heads as u32,
+                                num_kv_heads as u32,
+                                num_kv_groups,
+                                head_dim as u32,
+                                effective_kv_seq,
+                                self.tq_hot_w,
+                                scale,
+                                kv_start,
+                                groups_per_row,
+                                row_bytes,
+                            );
+                        } else {
+                            self.ctx.encode_attention_with_offset_q4_0(
+                                encoder,
+                                &self.q_normed_buf,
+                                &self.tq_hot_k[src],
+                                &self.tq_hot_v[src],
+                                &self.attn_out_buf,
+                                num_heads as u32,
+                                num_kv_heads as u32,
+                                num_kv_groups,
+                                head_dim as u32,
+                                effective_kv_seq,
+                                self.tq_hot_w,
+                                scale,
+                                kv_start,
+                                groups_per_row,
+                                row_bytes,
+                            );
+                        }
+                    } else {
+                        let k_row_bytes = self.kv_cache_type.k_row_bytes(head_dim) as u32;
+                        let v_row_bytes = self.kv_cache_type.v_row_bytes(head_dim) as u32;
+                        // turboquant_attn_v3 treats `kv_seq` as the *absolute end*
+                        // position (n_pos = kv_seq - kv_start). Q4 offset kernels
+                        // instead take window *length* as kv_seq — do NOT pass
+                        // effective_kv_seq here or SWA layers get n_pos=0 once
+                        // attn_kv_seq > sliding_window (garbage long-context decode).
+                        let window_lo = if self.tq_rw > 0 {
+                            kv_start.max(attn_kv_seq.saturating_sub(self.tq_rw))
+                        } else {
+                            0
+                        };
+                        let kwin = if self.tq_rw > 0 {
+                            &self.tq_rw_k[layer.kv_source_layer]
+                        } else {
+                            &self.q_normed_buf
+                        };
+                        let vwin = if self.tq_rw > 0 {
+                            &self.tq_rw_v[layer.kv_source_layer]
+                        } else {
+                            &self.q_normed_buf
+                        };
+                        self.ctx.encode_turboquant_attn_v3(
+                            encoder,
+                            &self.q_normed_buf,
+                            &self.k_cache[layer.kv_source_layer],
+                            &self.v_cache[layer.kv_source_layer],
+                            &self.attn_out_buf,
+                            tq.centroids_k(head_dim),
+                            tq.centroids_v(head_dim),
+                            num_heads as u32,
+                            num_kv_heads as u32,
+                            num_kv_groups,
+                            head_dim as u32,
+                            attn_kv_seq,
+                            self.kv_capacity,
+                            scale,
+                            kv_start,
+                            k_bits as u32,
+                            v_bits as u32,
+                            k_row_bytes,
+                            v_row_bytes,
+                            kwin,
+                            vwin,
+                            self.tq_rw,
+                            window_lo,
+                            tq.fwd(head_dim),
+                            tq.inv(head_dim),
+                            &self.tq_scores,
+                        );
+                    }
+                }
             }
 
             // O projection (Q4 on middle layers, f16 on sensitive layers)
             self.ctx.encode_matvec_auto_view(
                 encoder,
                 &layer.o_proj,
-                &self.attn_out_buf,
+                attn_src,
                 &self.o_out_buf,
                 hidden_size as u32,
                 q_out as u32,
@@ -4753,9 +5275,148 @@ impl Gemma4GpuModel {
         self.total_tokens
     }
 
+    /// Live KV meter line for TurboQuant demos:
+    /// `KV: X.XX MB / N tok (turboquant-KaVb, vs F16 Y.YY MB, Z×)`.
+    /// Returns `None` for non-TurboQuant cache types.
+    /// True when V3 TurboQuant keeps a model-frame Q4 hot ring for fast attention.
+    #[inline]
+    pub fn tq_hot_enabled(&self) -> bool {
+        self.tq_hot_w > 0
+            && matches!(self.kv_cache_type, KvCacheType::TurboQuant { .. })
+            && !self.kv_cache_type.tq_affine()
+    }
+
+    /// Attend with Q4 flash on the hot ring while the full context still fits.
+    #[inline]
+    pub fn tq_attn_fits_hot(&self, attn_kv_seq: u32) -> bool {
+        self.tq_hot_enabled() && attn_kv_seq <= self.tq_hot_w
+    }
+
+    /// Parallel prefill may use the Q4 hot ring when the whole chunk stays inside it.
+    #[inline]
+    pub fn tq_prefill_fits_hot(&self, start_pos: usize, seq_len: usize) -> bool {
+        self.tq_hot_enabled() && (start_pos + seq_len) as u32 <= self.tq_hot_w
+    }
+
+    /// True when the next decode step will leave the hot window and TQ cold is empty.
+    #[inline]
+    fn tq_needs_spill(&self, kv_seq: u32) -> bool {
+        self.tq_hot_enabled() && !self.tq_hot_spilled && kv_seq >= self.tq_hot_w
+    }
+
+    /// One-shot: pack Q4 hot ring `[0, tq_hot_w)` into TQ V3 for every KV-owning layer.
+    fn spill_tq_hot_to_cold(&mut self) {
+        if self.tq_hot_spilled || !self.tq_hot_enabled() {
+            return;
+        }
+        let KvCacheType::TurboQuant { k_bits, v_bits } = self.kv_cache_type else {
+            return;
+        };
+        let Some(tq) = self.turboquant.as_ref() else {
+            return;
+        };
+        let n_tokens = self.tq_hot_w.min(self.kv_seq_len);
+        if n_tokens == 0 {
+            self.tq_hot_spilled = true;
+            return;
+        }
+
+        let cmd = self.ctx.queue.new_command_buffer();
+        let encoder = cmd.new_compute_command_encoder();
+        for (layer_idx, layer) in self.layers.iter().enumerate() {
+            if !layer.has_kv {
+                continue;
+            }
+            let head_dim = layer.head_dim as u32;
+            let num_kv_heads = self.config.layer_num_kv_heads(layer_idx) as u32;
+            let q4_row = (head_dim / 32) * 18;
+            let k_row = self.kv_cache_type.k_row_bytes(layer.head_dim) as u32;
+            let v_row = self.kv_cache_type.v_row_bytes(layer.head_dim) as u32;
+            let fwd = tq.fwd(layer.head_dim);
+            let kwin = if self.tq_rw > 0 {
+                &self.tq_rw_k[layer_idx]
+            } else {
+                &self.tq_k_rot
+            };
+            let vwin = if self.tq_rw > 0 {
+                &self.tq_rw_v[layer_idx]
+            } else {
+                &self.tq_v_rot
+            };
+            self.ctx.encode_turboquant_spill_q4_to_v3(
+                &encoder,
+                &self.tq_hot_k[layer_idx],
+                &self.k_cache[layer_idx],
+                tq.centroids_k(layer.head_dim),
+                fwd,
+                kwin,
+                num_kv_heads,
+                head_dim,
+                self.tq_hot_w,
+                self.kv_capacity,
+                n_tokens,
+                k_bits as u32,
+                q4_row,
+                k_row,
+                self.tq_rw,
+            );
+            self.ctx.encode_turboquant_spill_q4_to_v3(
+                &encoder,
+                &self.tq_hot_v[layer_idx],
+                &self.v_cache[layer_idx],
+                tq.centroids_v(layer.head_dim),
+                fwd,
+                vwin,
+                num_kv_heads,
+                head_dim,
+                self.tq_hot_w,
+                self.kv_capacity,
+                n_tokens,
+                v_bits as u32,
+                q4_row,
+                v_row,
+                self.tq_rw,
+            );
+        }
+        encoder.end_encoding();
+        cmd.commit();
+        cmd.wait_until_completed();
+        self.tq_hot_spilled = true;
+        eprintln!(
+            "  TurboQuant: spilled {} hot Q4 tokens → TQ cold (ctx now uses attn_v3)",
+            n_tokens
+        );
+    }
+
+    pub fn kv_meter_line(&self) -> Option<String> {
+        let KvCacheType::TurboQuant { .. } = self.kv_cache_type else {
+            return None;
+        };
+        let n = self.kv_seq_len.max(1) as usize;
+        let mut tq_bytes = 0usize;
+        let mut f16_bytes = 0usize;
+        for (layer_idx, layer) in self.layers.iter().enumerate() {
+            if !layer.has_kv {
+                continue;
+            }
+            let hd = layer.head_dim;
+            let n_kv = self.config.layer_num_kv_heads(layer_idx);
+            tq_bytes += n_kv * n * (self.kv_cache_type.k_row_bytes(hd) + self.kv_cache_type.v_row_bytes(hd));
+            f16_bytes += n_kv * n * hd * 2 * 2; // K + V, f16
+        }
+        let tq_mb = tq_bytes as f64 / (1024.0 * 1024.0);
+        let f16_mb = f16_bytes as f64 / (1024.0 * 1024.0);
+        let ratio = if tq_mb > 0.0 { f16_mb / tq_mb } else { 0.0 };
+        Some(format!(
+            "KV: {:.2} MB / {} tok ({}, vs F16 {:.2} MB, {:.1}×)",
+            tq_mb, self.kv_seq_len, self.kv_cache_type, f16_mb, ratio
+        ))
+    }
+
     pub fn reset_legacy_state(&mut self) {
         self.kv_seq_len = 0;
         self.total_tokens = 0;
+        self.tq_hot_spilled = false;
     }
 
     /// Raw (unscaled) input embedding row, matching a plain `nn.Embedding` lookup.
@@ -5185,35 +5846,51 @@ impl Gemma4GpuModel {
         if token_ids.is_empty() {
             return Ok(Vec::new());
         }
-        // Use a fresh pool slot then swap buffers into the model so we exercise
-        // the same allocation/path as the working prefill bench. from_existing
-        // over model-owned caches has disagreed with that path in practice.
-        let mut kv_pool = self.create_kv_pool(1, self.kv_capacity);
-        let slot = kv_pool
-            .allocate()
-            .ok_or_else(|| "failed to allocate MTP KV slot".to_string())?;
 
-        // Move model caches into the pool slot (pool starts with its own empty
-        // buffers; swap so we keep a single set of Metal buffers for drafting).
-        kv_pool
-            .with_slot_mut(slot, |slot_state| {
-                std::mem::swap(&mut self.k_cache, &mut slot_state.k_cache);
-                std::mem::swap(&mut self.v_cache, &mut slot_state.v_cache);
-                slot_state.seq_len = 0;
-                slot_state.total_tokens = 0;
-            })
-            .map_err(|e| e.to_string())?;
+        // TurboQuant hot-only: alias model caches (no fresh Metal alloc). Prefill
+        // writes the Q4 hot ring on the model; pool K/V are unused unless dual-write.
+        let use_alias = self.tq_prefill_fits_hot(self.kv_seq_len as usize, token_ids.len());
+        let (mut kv_pool, slot) = if use_alias {
+            KvCachePool::from_existing(
+                &self.k_cache,
+                &self.v_cache,
+                self.kv_seq_len,
+                self.total_tokens,
+                self.kv_capacity,
+                self.kv_cache_type,
+            )
+        } else {
+            // Fresh pool + swap: matches the historical Q4_0 / MTP prefill path.
+            let mut kv_pool = self.create_kv_pool(1, self.kv_capacity);
+            let slot = kv_pool
+                .allocate()
+                .ok_or_else(|| "failed to allocate MTP KV slot".to_string())?;
+            kv_pool
+                .with_slot_mut(slot, |slot_state| {
+                    std::mem::swap(&mut self.k_cache, &mut slot_state.k_cache);
+                    std::mem::swap(&mut self.v_cache, &mut slot_state.v_cache);
+                    slot_state.seq_len = self.kv_seq_len;
+                    slot_state.total_tokens = self.total_tokens;
+                })
+                .map_err(|e| e.to_string())?;
+            (kv_pool, slot)
+        };
 
         let logits = self.forward_prefill_chunked_with_kv_slot(token_ids, &mut kv_pool, slot)?;
 
-        kv_pool
-            .with_slot_mut(slot, |slot_state| {
-                std::mem::swap(&mut self.k_cache, &mut slot_state.k_cache);
-                std::mem::swap(&mut self.v_cache, &mut slot_state.v_cache);
-                self.kv_seq_len = slot_state.seq_len;
-                self.total_tokens = slot_state.total_tokens;
-            })
-            .map_err(|e| e.to_string())?;
+        if use_alias {
+            self.kv_seq_len = kv_pool.seq_len(slot).map_err(|e| e.to_string())?;
+            self.total_tokens = kv_pool.total_tokens(slot).map_err(|e| e.to_string())?;
+        } else {
+            kv_pool
+                .with_slot_mut(slot, |slot_state| {
+                    std::mem::swap(&mut self.k_cache, &mut slot_state.k_cache);
+                    std::mem::swap(&mut self.v_cache, &mut slot_state.v_cache);
+                    self.kv_seq_len = slot_state.seq_len;
+                    self.total_tokens = slot_state.total_tokens;
+                })
+                .map_err(|e| e.to_string())?;
+        }
 
         // Last-row normed → decode-facing buffer for MTP h_nextn.
         let chunk_size = self.max_parallel_prefill_seq().max(1);
@@ -6238,8 +6915,122 @@ impl Gemma4GpuModel {
         if start_pos + seq_len > kv_pool.capacity() as usize {
             return false;
         }
+        // TurboQuant parallel prefill is only implemented for the Q4 hot window.
+        if matches!(self.kv_cache_type, KvCacheType::TurboQuant { .. }) {
+            return self.tq_prefill_fits_hot(start_pos, seq_len);
+        }
 
         true
+    }
+
+    /// Dual-write one prefill chunk: Q4 into the hot ring + TQ V3 into `k/v_cache`.
+    /// Requires `tq_prefill_fits_hot(start_pos, seq_len)`.
+    fn encode_tq_hot_prefill_kv_append(
+        &self,
+        encoder: &metal::ComputeCommandEncoderRef,
+        layer_idx: usize,
+        k_src: &Buffer,
+        v_src: &Buffer,
+        k_cache: &Buffer,
+        v_cache: &Buffer,
+        num_kv_heads: u32,
+        head_dim: u32,
+        start_pos: u32,
+        seq_len: u32,
+    ) -> Result<(), String> {
+        if !self.tq_prefill_fits_hot(start_pos as usize, seq_len as usize) {
+            return Err(TURBOQUANT_UNSUPPORTED.to_string());
+        }
+        let KvCacheType::TurboQuant { k_bits, v_bits } = self.kv_cache_type else {
+            return Err(TURBOQUANT_UNSUPPORTED.to_string());
+        };
+
+        // Fast attention path: model-frame Q4 hot ring.
+        self.ctx.encode_kv_batch_append_q4_0(
+            encoder,
+            k_src,
+            &self.tq_hot_k[layer_idx],
+            num_kv_heads,
+            head_dim,
+            self.tq_hot_w,
+            start_pos,
+            seq_len,
+        );
+        self.ctx.encode_kv_batch_append_q4_0(
+            encoder,
+            v_src,
+            &self.tq_hot_v[layer_idx],
+            num_kv_heads,
+            head_dim,
+            self.tq_hot_w,
+            start_pos,
+            seq_len,
+        );
+
+        // Optional TQ cold dual-write (expensive: one quant dispatch per token).
+        let dual_write = matches!(
+            std::env::var("TURBOQUANT_DUAL_WRITE").as_deref(),
+            Ok("1") | Ok("true") | Ok("TRUE")
+        );
+        if dual_write {
+            let tq = self
+                .turboquant
+                .as_ref()
+                .ok_or_else(|| TURBOQUANT_UNSUPPORTED.to_string())?;
+            let fwd = tq.fwd(head_dim as usize);
+            let k_row_bytes = self.kv_cache_type.k_row_bytes(head_dim as usize) as u32;
+            let v_row_bytes = self.kv_cache_type.v_row_bytes(head_dim as usize) as u32;
+            let kwin = if self.tq_rw > 0 {
+                &self.tq_rw_k[layer_idx]
+            } else {
+                &self.tq_k_rot
+            };
+            let vwin = if self.tq_rw > 0 {
+                &self.tq_rw_v[layer_idx]
+            } else {
+                &self.tq_v_rot
+            };
+            for s in 0..seq_len {
+                let cur = start_pos + s;
+                self.ctx.encode_turboquant_rotate_quant_v3_strided(
+                    encoder,
+                    k_src,
+                    k_cache,
+                    tq.centroids_k(head_dim as usize),
+                    num_kv_heads,
+                    head_dim,
+                    self.kv_capacity,
+                    cur,
+                    k_bits as u32,
+                    k_row_bytes,
+                    kwin,
+                    self.tq_rw,
+                    fwd,
+                    seq_len,
+                    s,
+                );
+                self.ctx.encode_turboquant_rotate_quant_v3_strided(
+                    encoder,
+                    v_src,
+                    v_cache,
+                    tq.centroids_v(head_dim as usize),
+                    num_kv_heads,
+                    head_dim,
+                    self.kv_capacity,
+                    cur,
+                    v_bits as u32,
+                    v_row_bytes,
+                    vwin,
+                    self.tq_rw,
+                    fwd,
+                    seq_len,
+                    s,
+                );
+            }
+        } else {
+            let _ = (k_cache, v_cache, k_bits, v_bits);
+        }
+        Ok(())
     }
 
     fn encode_parallel_prefill_layer(
@@ -6352,6 +7143,21 @@ impl Gemma4GpuModel {
                         seq_len as u32,
                     );
                 }
+            
+                KvCacheType::TurboQuant { .. } => {
+                    self.encode_tq_hot_prefill_kv_append(
+                        encoder,
+                        layer_idx,
+                        &self.prefill_scratch.k_buf,
+                        &self.prefill_scratch.v_buf,
+                        k_cache,
+                        v_cache,
+                        num_kv_heads as u32,
+                        head_dim as u32,
+                        start_pos as u32,
+                        seq_len as u32,
+                    )?;
+                }
             }
         }
 
@@ -6454,7 +7260,62 @@ impl Gemma4GpuModel {
                     Some(&mut ext_mask_cache),
                 );
             }
-        }
+        
+                KvCacheType::TurboQuant { .. } => {
+                    if !self.tq_prefill_fits_hot(start_pos, seq_len) {
+                        return Err(TURBOQUANT_UNSUPPORTED.to_string());
+                    }
+                    let src = layer.kv_source_layer;
+                    let groups_per_row = (head_dim / 32) as u32;
+                    let row_bytes = groups_per_row * 18;
+                    let use_ext_attn = crate::gpu::prefill_flash_attn_ext_enabled()
+                        && crate::gpu::prefill_use_flash_attn_ext_tiled(
+                            seq_len as u32,
+                            head_dim as u32,
+                        );
+                    let attn_out = if use_ext_attn {
+                        &self.prefill_scratch.q_normed_buf
+                    } else {
+                        &self.prefill_scratch.attn_out_buf
+                    };
+                    let q_f16_scratch = if use_ext_attn {
+                        Some(&self.prefill_scratch.attn_out_buf)
+                    } else {
+                        None
+                    };
+                    let (fa_scratch, fa_layout) = if use_ext_attn {
+                        (
+                            Some(&self.prefill_scratch.fa_ext_scratch),
+                            Some(&self.prefill_scratch.fa_ext_layout),
+                        )
+                    } else {
+                        (None, None)
+                    };
+                    self.ctx.encode_prefill_attention_causal_q4_0(
+                        encoder,
+                        &self.prefill_scratch.q_buf,
+                        &self.tq_hot_k[src],
+                        &self.tq_hot_v[src],
+                        attn_out,
+                        q_f16_scratch,
+                        num_heads as u32,
+                        num_kv_heads as u32,
+                        num_kv_groups,
+                        head_dim as u32,
+                        (start_pos + seq_len) as u32,
+                        self.tq_hot_w,
+                        scale,
+                        seq_len as u32,
+                        start_pos as u32,
+                        attention_window,
+                        groups_per_row,
+                        row_bytes,
+                        fa_scratch,
+                        fa_layout,
+                        Some(&mut ext_mask_cache),
+                    );
+                }
+            }
 
         self.ctx.encode_copy(
             encoder,
@@ -6464,7 +7325,8 @@ impl Gemma4GpuModel {
         );
         let use_ext_attn = crate::gpu::prefill_flash_attn_ext_enabled()
             && crate::gpu::prefill_use_flash_attn_ext_tiled(seq_len as u32, head_dim as u32)
-            && matches!(self.kv_cache_type, KvCacheType::Q4_0);
+            && (matches!(self.kv_cache_type, KvCacheType::Q4_0)
+                || self.tq_prefill_fits_hot(start_pos, seq_len));
         if !use_ext_attn {
             self.ctx.encode_transpose_hsd(
                 encoder,
@@ -6752,7 +7614,9 @@ impl Gemma4GpuModel {
                             segment.row_start as u32,
                         );
                     }
-                }
+                
+                KvCacheType::TurboQuant { .. } => return Err(TURBOQUANT_UNSUPPORTED.to_string()),
+            }
             }
         }
 
@@ -6835,6 +7699,8 @@ impl Gemma4GpuModel {
                         row_bytes,
                     );
                 }
+            
+                KvCacheType::TurboQuant { .. } => return Err(TURBOQUANT_UNSUPPORTED.to_string()),
             }
         }
 
@@ -7118,7 +7984,22 @@ impl Gemma4GpuModel {
                             seq_len as u32,
                         );
                     }
+                
+                KvCacheType::TurboQuant { .. } => {
+                    self.encode_tq_hot_prefill_kv_append(
+                        encoder,
+                        layer_idx,
+                        &self.prefill_scratch.k_buf,
+                        &self.prefill_scratch.v_buf,
+                        k_cache,
+                        v_cache,
+                        num_kv_heads as u32,
+                        head_dim as u32,
+                        start_pos as u32,
+                        seq_len as u32,
+                    )?;
                 }
+            }
             }
 
             let k_cache = kv_pool
@@ -7275,6 +8156,61 @@ impl Gemma4GpuModel {
                     );
                     }
                 }
+            
+                KvCacheType::TurboQuant { .. } => {
+                    if !self.tq_prefill_fits_hot(start_pos, seq_len) {
+                        return Err(TURBOQUANT_UNSUPPORTED.to_string());
+                    }
+                    let src = layer.kv_source_layer;
+                    let groups_per_row = (head_dim / 32) as u32;
+                    let row_bytes = groups_per_row * 18;
+                    let use_ext_attn = crate::gpu::prefill_flash_attn_ext_enabled()
+                        && crate::gpu::prefill_use_flash_attn_ext_tiled(
+                            seq_len as u32,
+                            head_dim as u32,
+                        );
+                    let attn_out = if use_ext_attn {
+                        &self.prefill_scratch.q_normed_buf
+                    } else {
+                        &self.prefill_scratch.attn_out_buf
+                    };
+                    let q_f16_scratch = if use_ext_attn {
+                        Some(&self.prefill_scratch.attn_out_buf)
+                    } else {
+                        None
+                    };
+                    let (fa_scratch, fa_layout) = if use_ext_attn {
+                        (
+                            Some(&self.prefill_scratch.fa_ext_scratch),
+                            Some(&self.prefill_scratch.fa_ext_layout),
+                        )
+                    } else {
+                        (None, None)
+                    };
+                    self.ctx.encode_prefill_attention_causal_q4_0(
+                        encoder,
+                        &self.prefill_scratch.q_buf,
+                        &self.tq_hot_k[src],
+                        &self.tq_hot_v[src],
+                        attn_out,
+                        q_f16_scratch,
+                        num_heads as u32,
+                        num_kv_heads as u32,
+                        num_kv_groups,
+                        head_dim as u32,
+                        (start_pos + seq_len) as u32,
+                        self.tq_hot_w,
+                        scale,
+                        seq_len as u32,
+                        start_pos as u32,
+                        attention_window,
+                        groups_per_row,
+                        row_bytes,
+                        fa_scratch,
+                        fa_layout,
+                        Some(&mut ext_mask_cache),
+                    );
+                }
             }
             } // !skip_attn_flash
 
@@ -7283,7 +8219,8 @@ impl Gemma4GpuModel {
             if !ablate.skip_attn_o() {
             let use_ext_attn = crate::gpu::prefill_flash_attn_ext_enabled()
                 && crate::gpu::prefill_use_flash_attn_ext_tiled(seq_len as u32, head_dim as u32)
-                && matches!(self.kv_cache_type, KvCacheType::Q4_0);
+                && (matches!(self.kv_cache_type, KvCacheType::Q4_0)
+                    || self.tq_prefill_fits_hot(start_pos, seq_len));
             if !use_ext_attn && !use_decode_fa {
                 self.ctx.encode_transpose_hsd(
                     encoder,
@@ -7884,7 +8821,9 @@ impl Gemma4GpuModel {
                                 );
                             }
                         }
-                    }
+                    
+                KvCacheType::TurboQuant { .. } => return Err(TURBOQUANT_UNSUPPORTED.to_string()),
+            }
                 }
 
                 let k_cache = kv_pool
@@ -8037,7 +8976,9 @@ impl Gemma4GpuModel {
                             );
                         }
                     }
-                }
+                
+                KvCacheType::TurboQuant { .. } => return Err(TURBOQUANT_UNSUPPORTED.to_string()),
+            }
 
                 self.ctx.encode_matvec_auto_at_view(
                     encoder,
@@ -8640,6 +9581,14 @@ impl Gemma4GpuModel {
         if token_ids.len() == 1 {
             return self.forward_single_token(token_ids[0]);
         }
+        // Prefer parallel prefill (Q4_0 always; TurboQuant while prompt fits hot window).
+        let can_parallel = !matches!(self.kv_cache_type, KvCacheType::TurboQuant { .. })
+            || self.tq_prefill_fits_hot(0, token_ids.len());
+        if can_parallel {
+            if let Ok(logits) = self.forward_prefill_parallel_self(token_ids) {
+                return logits;
+            }
+        }
         for &tid in &token_ids[..token_ids.len() - 1] {
             self.forward_advance(tid);
         }
@@ -8659,6 +9608,18 @@ impl Gemma4GpuModel {
         }
         if token_ids.len() == 1 {
             return self.forward_single_token_sample(token_ids[0], temperature, min_p, seed);
+        }
+        let can_parallel = !matches!(self.kv_cache_type, KvCacheType::TurboQuant { .. })
+            || self.tq_prefill_fits_hot(0, token_ids.len());
+        if can_parallel {
+            if let Ok(logits) = self.forward_prefill_parallel_self(token_ids) {
+                // Parallel path materializes last-token logits; sample on CPU.
+                return if temperature <= 0.0 {
+                    crate::sampling::argmax(&logits)
+                } else {
+                    crate::sampling::min_p_sampling(&logits, min_p)
+                };
+            }
         }
         for &tid in &token_ids[..token_ids.len() - 1] {
             self.forward_advance(tid);
