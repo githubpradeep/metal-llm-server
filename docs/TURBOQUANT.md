@@ -45,16 +45,16 @@ LLAMA_CTX_SIZE=8192 LLAMA_KV_POOL_SLOTS=4 \
 | `TURBOQUANT_K_BITS` / `V_BITS` | Asymmetric (prefer K ≥ V) |
 | `TURBOQUANT_RESIDUAL_WINDOW` | Recent tokens kept fp32 in Haar frame (default 128) |
 | `TURBOQUANT_HOT_WINDOW` | Decode spill threshold / short-ctx Q4 window (default **2048**; `0` = pure TQ) |
-| `TURBOQUANT_PREFILL_Q4` | Prefill with full-ctx Q4 flash then spill (default **on**; `0` = legacy per-row cold attn) |
+| `TURBOQUANT_PREFILL_Q4` | **Opt-in only** (`=1`): Q4-flash whole prompt then spill. Default **off** — past-hot uses TQ multi-query causal attn. |
 | `TURBOQUANT_DUAL_WRITE` | `1` = also pack TQ cold while in hot window. Default off for speed. |
 | `LLAMA_KV_POOL_SLOTS` | Serve concurrency (default 4). Each slot owns its own Q4 hot ring (~25 MB @2048 on E2B). |
 
 **Recommended demo:** `K3/V2` + `rw=128` + `hot=2048` (decode ≈ Q4 flash while ctx ≤ hot).  
 **Quality-safer:** `K6/V4` + `rw=128` if available / when raising bits.
 
-**Speed model:** While `attn_kv_seq ≤ TURBOQUANT_HOT_WINDOW`, decode stays on the Q4 flash stack (same as `q4_0`, including `ATTENTION_KERNEL=auto`). Prefill (default **`TURBOQUANT_PREFILL_Q4=1`**) allocates a Q4 ring for the full ctx, attends with that flash stack for the **entire** prompt, then **spills once** to TQ cold if `seq > HOT_WINDOW` — so ~7k prompts are Q4-prefill-fast, not per-row `attn_v3`. Set `TURBOQUANT_PREFILL_Q4=0` to restore legacy past-hot per-row cold attention (slow). Peak RAM during prefill ≈ full Q4 KV + TQ cold allocation.
+**Speed model:** While `attn_kv_seq ≤ TURBOQUANT_HOT_WINDOW`, decode stays on the Q4 flash stack. Past-hot **prefill** batch-rotates Q/K/V, packs each cold chunk in two dispatches, and attends with **`turboquant_attn_v3_causal`** (four-query TQ flash tiles with SIMD groups distributed across query/KV pairs) — not Q4 and not per-row decode attn. Spill once at the hot boundary. On E2B K3/V2, the 7,127-token needle improved from **167.45s → 53.86s** and still returns `AURORA-7749`. Decode past hot still uses single-token `attn_v3` (next lever). `TURBOQUANT_PREFILL_Q4=1` is an explicit escape hatch only.
 
-**`--serve`:** Per-slot hot rings + residual + spill flag live in `KvCachePool` (not model-global). Concurrent requests do not share a hot ring. When the scheduler batches multiple TQ slots in one tick, prefill/decode run **serially per slot** via the single-slot swap path (correctness). With default prefill-Q4, each slot’s hot ring is sized to ctx; long prefills spill once at the end.
+**`--serve`:** Per-slot hot rings + residual + spill flag live in `KvCachePool`. Multi-slot TQ runs serially per slot. Past-hot prefill uses TQ multi-query causal attention on each slot’s cold cache.
 
 Set `TURBOQUANT_DUAL_WRITE=1` to also pack TQ during the hot window (avoids a big spill; slight hot-path tax).
 
@@ -72,7 +72,9 @@ Set `TURBOQUANT_DUAL_WRITE=1` to also pack TQ during the hot window (avoids a bi
 | **P3c** | Shipped | Auto spill hot→TQ at boundary (`turboquant_spill_q4_to_v3`); zero-alloc TQ prefill alias |
 | **P3d** | Shipped | Serve path: per-slot hot/rw/spill in `KvCachePool`; batched hot prefill/decode; cold via spill + single-slot |
 | **P3e** | Shipped | Chunked past-hot prefill: split at `HOT_WINDOW`, spill once, batched QKV/MLP + per-row `attn_v3` |
-| **P3f** | Shipped | Prefill-Q4 (default): full-ctx Q4 flash for whole prompt, one spill to TQ if `seq > HOT` |
+| **P3f** | Opt-in only | `TURBOQUANT_PREFILL_Q4=1` Q4-flash whole prompt (escape hatch; default off) |
+| **P3g** | Shipped | `turboquant_attn_v3_causal`: multi-query TQ flash for past-hot prefill chunks |
+| **P3h** | Shipped | Native TQ prefill: batched f16 Haar matmuls, chunk-wide K/V packing, four-query tiles, SIMD-pair score mapping |
 | **P4** | Stub only | Disk-backed cold TQ pages for 1M-class docs — see below |
 
 ## Design (runtime)

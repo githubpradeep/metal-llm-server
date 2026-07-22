@@ -124,6 +124,10 @@ fn generate_rotation(dim: usize, seed: u64) -> Vec<f32> {
 struct RotationMatrices {
     fwd: Buffer,
     inv: Buffer,
+    /// Dense half weights arranged for batched mul_mm:
+    /// fwd_mm computes X @ R^T, inv_mm computes X @ R.
+    fwd_mm_f16: Buffer,
+    inv_mm_f16: Buffer,
     /// Lloyd–Max centroids for the key cache (`2^k_bits` f32), scaled for
     /// unit-vector coordinates (std 1/sqrt(dim)). V3 path only.
     centroids_k: Buffer,
@@ -178,6 +182,10 @@ impl TurboQuant {
             // at long contexts — so we keep full precision for all bit-widths.
             let fwd_buf = Self::upload(device, &fwd);
             let inv_buf = Self::upload(device, &r);
+            // mul_mm computes X @ W^T. Forward rotation X @ R^T therefore uses
+            // W=R; inverse rotation X @ R uses W=R^T.
+            let fwd_mm_f16_buf = Self::upload_f16(device, &r);
+            let inv_mm_f16_buf = Self::upload_f16(device, &fwd);
             let cen_k_buf = Self::upload(device, &cen_k);
             let cen_v_buf = Self::upload(device, &cen_v);
             by_dim.insert(
@@ -185,6 +193,8 @@ impl TurboQuant {
                 RotationMatrices {
                     fwd: fwd_buf,
                     inv: inv_buf,
+                    fwd_mm_f16: fwd_mm_f16_buf,
+                    inv_mm_f16: inv_mm_f16_buf,
                     centroids_k: cen_k_buf,
                     centroids_v: cen_v_buf,
                 },
@@ -228,6 +238,18 @@ impl TurboQuant {
         )
     }
 
+    fn upload_f16(device: &Device, data: &[f32]) -> Buffer {
+        let half: Vec<u16> = data
+            .iter()
+            .map(|&value| crate::gpu::f32_to_f16(value))
+            .collect();
+        device.new_buffer_with_data(
+            half.as_ptr() as *const std::ffi::c_void,
+            std::mem::size_of_val(half.as_slice()) as u64,
+            MTLResourceOptions::StorageModeShared,
+        )
+    }
+
     /// Forward-rotation matrix (Rᵀ) for the given head dimension. Apply to Q, K, V.
     pub fn fwd(&self, head_dim: usize) -> &Buffer {
         &self
@@ -244,6 +266,22 @@ impl TurboQuant {
             .get(&head_dim)
             .unwrap_or_else(|| panic!("TurboQuant: no rotation matrix for head_dim={head_dim}"))
             .inv
+    }
+
+    pub fn fwd_mm_f16(&self, head_dim: usize) -> &Buffer {
+        &self
+            .by_dim
+            .get(&head_dim)
+            .unwrap_or_else(|| panic!("TurboQuant: no rotation matrix for head_dim={head_dim}"))
+            .fwd_mm_f16
+    }
+
+    pub fn inv_mm_f16(&self, head_dim: usize) -> &Buffer {
+        &self
+            .by_dim
+            .get(&head_dim)
+            .unwrap_or_else(|| panic!("TurboQuant: no rotation matrix for head_dim={head_dim}"))
+            .inv_mm_f16
     }
 }
 
