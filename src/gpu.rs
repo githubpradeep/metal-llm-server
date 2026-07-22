@@ -6458,11 +6458,76 @@ impl MetalContext {
         inv: &Buffer,
         scores: &Buffer,
     ) {
+        self.encode_turboquant_attn_v3_at(
+            encoder,
+            q_buf,
+            0,
+            k_cache,
+            v_cache,
+            out_buf,
+            0,
+            k_centroids,
+            v_centroids,
+            num_heads,
+            num_kv_heads,
+            num_kv_groups,
+            head_dim,
+            kv_seq,
+            capacity,
+            scale,
+            kv_start,
+            k_bits,
+            v_bits,
+            k_row_bytes,
+            v_row_bytes,
+            kwin,
+            vwin,
+            rw,
+            window_lo,
+            fwd,
+            inv,
+            scores,
+        );
+    }
+
+    /// Same as `encode_turboquant_attn_v3` with byte offsets into Q / out
+    /// (token-major `[heads*dim]` rows for past-hot chunked prefill).
+    pub fn encode_turboquant_attn_v3_at(
+        &self,
+        encoder: &metal::ComputeCommandEncoderRef,
+        q_buf: &Buffer,
+        q_offset: u64,
+        k_cache: &Buffer,
+        v_cache: &Buffer,
+        out_buf: &Buffer,
+        out_offset: u64,
+        k_centroids: &Buffer,
+        v_centroids: &Buffer,
+        num_heads: u32,
+        num_kv_heads: u32,
+        num_kv_groups: u32,
+        head_dim: u32,
+        kv_seq: u32,
+        capacity: u32,
+        scale: f32,
+        kv_start: u32,
+        k_bits: u32,
+        v_bits: u32,
+        k_row_bytes: u32,
+        v_row_bytes: u32,
+        kwin: &Buffer,
+        vwin: &Buffer,
+        rw: u32,
+        window_lo: u32,
+        fwd: &Buffer,
+        inv: &Buffer,
+        scores: &Buffer,
+    ) {
         encoder.set_compute_pipeline_state(&self.turboquant_attn_v3_pipeline);
-        encoder.set_buffer(0, Some(q_buf), 0);
+        encoder.set_buffer(0, Some(q_buf), q_offset);
         encoder.set_buffer(1, Some(k_cache), 0);
         encoder.set_buffer(2, Some(v_cache), 0);
-        encoder.set_buffer(3, Some(out_buf), 0);
+        encoder.set_buffer(3, Some(out_buf), out_offset);
         encoder.set_bytes(4, 4, &num_heads as *const u32 as *const _);
         encoder.set_bytes(5, 4, &num_kv_heads as *const u32 as *const _);
         encoder.set_bytes(6, 4, &num_kv_groups as *const u32 as *const _);

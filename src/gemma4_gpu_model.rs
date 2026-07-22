@@ -27,13 +27,18 @@ struct TurboQuantState {
     tq_rw_k: Vec<Buffer>,
     tq_rw_v: Vec<Buffer>,
     tq_rw: u32,
-    /// Model-frame Q4_0 ring for the most recent `tq_hot_w` tokens. While
-    /// `attn_kv_seq <= tq_hot_w`, decode/prefill attend with the fast Q4 flash
-    /// path; TQ V3 still receives a dual-write so cold attention stays valid
-    /// after the window fills.
+    /// Model-frame Q4_0 ring. Physical length is `tq_hot_cap` (≥ `tq_hot_w`).
+    /// Decode stays on Q4 flash while `attn_kv_seq ≤ tq_hot_w`; past that we
+    /// spill to TQ cold. Prefill (default) uses the full `tq_hot_cap` so long
+    /// prompts never fall into per-row `attn_v3`.
     tq_hot_k: Vec<Buffer>,
     tq_hot_v: Vec<Buffer>,
+    /// Decode spill threshold / short-ctx hot window (`TURBOQUANT_HOT_WINDOW`).
     tq_hot_w: u32,
+    /// Q4 ring capacity in tokens (usually `kv_capacity` when prefill-Q4 on).
+    tq_hot_cap: u32,
+    /// Prefill attends with Q4 flash for the whole prompt, then spills once.
+    tq_prefill_q4: bool,
 }
 
 /// Build TurboQuant rotation state (matrices + rotation scratch buffers).
@@ -69,6 +74,8 @@ fn build_turboquant_state(
     let mut tq_hot_k: Vec<Buffer> = Vec::new();
     let mut tq_hot_v: Vec<Buffer> = Vec::new();
     let mut tq_hot_w: u32 = 0;
+    let mut tq_hot_cap: u32 = 0;
+    let mut tq_prefill_q4 = false;
 
     let turboquant = if let KvCacheType::TurboQuant { k_bits, v_bits } = kv_cache_type {
         let mut dims: Vec<usize> = vec![config.head_dim, config.global_head_dim];
@@ -107,13 +114,26 @@ fn build_turboquant_state(
                 .and_then(|v| v.parse::<u32>().ok())
                 .unwrap_or(2048);
             tq_hot_w = tq_hot_w.min(kv_capacity);
+            // Prefill-Q4 (default): allocate the Q4 ring for full ctx so past-hot
+            // prefill uses the same flash stack as q4_0, then spill once to TQ.
+            // TURBOQUANT_PREFILL_Q4=0 restores per-row attn_v3 past HOT_WINDOW.
+            tq_prefill_q4 = tq_hot_w > 0
+                && !matches!(
+                    std::env::var("TURBOQUANT_PREFILL_Q4").as_deref(),
+                    Ok("0") | Ok("false") | Ok("FALSE")
+                );
+            tq_hot_cap = if tq_prefill_q4 {
+                kv_capacity
+            } else {
+                tq_hot_w
+            };
             if tq_hot_w > 0 {
                 for i in 0..config.num_hidden_layers {
                     let hd = config.layer_head_dim(i);
                     let layer_n_kv = config.layer_num_kv_heads(i);
                     let q4_row = (hd / 32) * 18;
                     let bytes =
-                        (layer_n_kv * tq_hot_w as usize * q4_row).max(1) as u64;
+                        (layer_n_kv * tq_hot_cap as usize * q4_row).max(1) as u64;
                     tq_hot_k.push(
                         ctx.device
                             .new_buffer(bytes, MTLResourceOptions::StorageModeShared),
@@ -125,12 +145,21 @@ fn build_turboquant_state(
                 }
                 let hot_bytes: u64 = tq_hot_k.iter().map(|b| b.length()).sum::<u64>()
                     + tq_hot_v.iter().map(|b| b.length()).sum::<u64>();
-                println!(
-                    "  TurboQuant: Q4 hot window {} tokens (~{:.1} MB) — fast path while ctx ≤ {}",
-                    tq_hot_w,
-                    hot_bytes as f64 / 1e6,
-                    tq_hot_w
-                );
+                if tq_prefill_q4 {
+                    println!(
+                        "  TurboQuant: Q4 hot decode≤{} / prefill-Q4 cap {} tok (~{:.1} MB) — spill once after long prefill",
+                        tq_hot_w,
+                        tq_hot_cap,
+                        hot_bytes as f64 / 1e6
+                    );
+                } else {
+                    println!(
+                        "  TurboQuant: Q4 hot window {} tokens (~{:.1} MB) — fast path while ctx ≤ {}",
+                        tq_hot_w,
+                        hot_bytes as f64 / 1e6,
+                        tq_hot_w
+                    );
+                }
             }
         }
 
@@ -158,6 +187,8 @@ fn build_turboquant_state(
         tq_hot_k,
         tq_hot_v,
         tq_hot_w,
+        tq_hot_cap,
+        tq_prefill_q4,
     }
 }
 
@@ -429,6 +460,8 @@ pub struct Gemma4GpuModel {
     pub(crate) tq_hot_k: Vec<Buffer>,
     pub(crate) tq_hot_v: Vec<Buffer>,
     pub(crate) tq_hot_w: u32,
+    pub(crate) tq_hot_cap: u32,
+    pub(crate) tq_prefill_q4: bool,
     /// Set after the first spill of the Q4 hot ring into TQ cold (ctx > hot).
     pub(crate) tq_hot_spilled: bool,
 
@@ -1645,6 +1678,8 @@ impl Gemma4GpuModel {
             tq_hot_k,
             tq_hot_v,
             tq_hot_w,
+            tq_hot_cap,
+            tq_prefill_q4,
         } = tq_state;
         let f16_bytes = num_kv_heads_max * kv_capacity as usize * config.head_dim * 2 + num_kv_heads_max * kv_capacity as usize * config.global_head_dim * 2;
         let quant_bytes = num_kv_heads_max * kv_capacity as usize
@@ -1813,6 +1848,8 @@ impl Gemma4GpuModel {
             tq_hot_k,
             tq_hot_v,
             tq_hot_w,
+            tq_hot_cap,
+            tq_prefill_q4,
             tq_hot_spilled: false,
             cos_buf,
             sin_buf,
@@ -2766,6 +2803,8 @@ impl Gemma4GpuModel {
             tq_hot_k,
             tq_hot_v,
             tq_hot_w,
+            tq_hot_cap,
+            tq_prefill_q4,
         } = tq_state;
         let f16_bytes = num_kv_heads * kv_capacity as usize * config.head_dim * 2
             + num_kv_heads * kv_capacity as usize * config.global_head_dim * 2;
@@ -2930,6 +2969,8 @@ impl Gemma4GpuModel {
             tq_hot_k,
             tq_hot_v,
             tq_hot_w,
+            tq_hot_cap,
+            tq_prefill_q4,
             tq_hot_spilled: false,
             cos_buf,
             sin_buf,
@@ -4182,7 +4223,7 @@ impl Gemma4GpuModel {
                                     &self.tq_hot_k[layer_idx],
                                     num_kv_heads as u32,
                                     head_dim as u32,
-                                    self.tq_hot_w,
+                                    self.tq_hot_cap,
                                     kv_seq,
                                 );
                                 self.ctx.encode_kv_append_q4_0(
@@ -4191,7 +4232,7 @@ impl Gemma4GpuModel {
                                     &self.tq_hot_v[layer_idx],
                                     num_kv_heads as u32,
                                     head_dim as u32,
-                                    self.tq_hot_w,
+                                    self.tq_hot_cap,
                                     kv_seq,
                                 );
                             }
@@ -4543,7 +4584,7 @@ impl Gemma4GpuModel {
                                 num_kv_heads as u32,
                                 head_dim as u32,
                                 effective_kv_seq,
-                                self.tq_hot_w,
+                                self.tq_hot_cap,
                                 scale,
                                 kv_start,
                                 row_bytes,
@@ -4560,7 +4601,7 @@ impl Gemma4GpuModel {
                                 num_kv_groups,
                                 head_dim as u32,
                                 effective_kv_seq,
-                                self.tq_hot_w,
+                                self.tq_hot_cap,
                                 scale,
                                 kv_start,
                                 groups_per_row,
@@ -4578,7 +4619,7 @@ impl Gemma4GpuModel {
                                 num_kv_groups,
                                 head_dim as u32,
                                 effective_kv_seq,
-                                self.tq_hot_w,
+                                self.tq_hot_cap,
                                 scale,
                                 kv_start,
                                 groups_per_row,
@@ -5289,10 +5330,11 @@ impl Gemma4GpuModel {
         self.tq_hot_enabled() && attn_kv_seq <= self.tq_hot_w
     }
 
-    /// Parallel prefill may use the Q4 hot ring when the whole chunk stays inside it.
+    /// Parallel prefill may use the Q4 hot ring when the chunk fits in `tq_hot_cap`
+    /// (full ctx when `tq_prefill_q4`, else the decode hot window).
     #[inline]
     pub fn tq_prefill_fits_hot(&self, start_pos: usize, seq_len: usize) -> bool {
-        self.tq_hot_enabled() && (start_pos + seq_len) as u32 <= self.tq_hot_w
+        self.tq_hot_enabled() && (start_pos + seq_len) as u32 <= self.tq_hot_cap
     }
 
     /// True when the next decode step will leave the hot window and TQ cold is empty.
@@ -5306,7 +5348,9 @@ impl Gemma4GpuModel {
         if self.tq_hot_spilled || !self.tq_hot_enabled() {
             return;
         }
-        let n_tokens = self.tq_hot_w.min(self.kv_seq_len);
+        // Spill every token currently resident in the Q4 ring (full prefill when
+        // tq_prefill_q4, else up to tq_hot_w).
+        let n_tokens = self.kv_seq_len.min(self.tq_hot_cap);
         self.spill_tq_hot_buffers(
             &self.tq_hot_k.clone(),
             &self.tq_hot_v.clone(),
@@ -5372,7 +5416,7 @@ impl Gemma4GpuModel {
                 kwin,
                 num_kv_heads,
                 head_dim,
-                self.tq_hot_w,
+                self.tq_hot_cap,
                 cold_capacity,
                 n_tokens,
                 k_bits as u32,
@@ -5389,7 +5433,7 @@ impl Gemma4GpuModel {
                 vwin,
                 num_kv_heads,
                 head_dim,
-                self.tq_hot_w,
+                self.tq_hot_cap,
                 cold_capacity,
                 n_tokens,
                 v_bits as u32,
@@ -5414,7 +5458,7 @@ impl Gemma4GpuModel {
             return Ok(());
         }
         let seq_len = kv_pool.seq_len(slot).map_err(|e| e.to_string())?;
-        let n_tokens = self.tq_hot_w.min(seq_len);
+        let n_tokens = self.tq_hot_cap.min(seq_len);
         if n_tokens == 0 {
             kv_pool
                 .set_tq_hot_spilled(slot, true)
@@ -5908,9 +5952,9 @@ impl Gemma4GpuModel {
             return Ok(Vec::new());
         }
 
-        // TurboQuant hot-only: alias model caches (no fresh Metal alloc). Prefill
-        // writes the Q4 hot ring on the model; pool K/V are unused unless dual-write.
-        let use_alias = self.tq_prefill_fits_hot(self.kv_seq_len as usize, token_ids.len());
+        // TurboQuant: always alias model cold (+ hot/rw) so spill and past-hot
+        // cold chunks update the live CLI cache. Q4_0 / MTP: fresh pool + swap.
+        let use_alias = matches!(self.kv_cache_type, KvCacheType::TurboQuant { .. });
         let (mut kv_pool, slot) = if use_alias {
             self.kv_pool_from_model_caches()
         } else {
@@ -5935,6 +5979,9 @@ impl Gemma4GpuModel {
         if use_alias {
             self.kv_seq_len = kv_pool.seq_len(slot).map_err(|e| e.to_string())?;
             self.total_tokens = kv_pool.total_tokens(slot).map_err(|e| e.to_string())?;
+            self.tq_hot_spilled = kv_pool
+                .tq_hot_spilled(slot)
+                .unwrap_or(self.tq_hot_spilled);
         } else {
             kv_pool
                 .with_slot_mut(slot, |slot_state| {
@@ -6349,8 +6396,9 @@ impl Gemma4GpuModel {
 
     pub fn tq_pool_config(&self) -> TqPoolConfig {
         TqPoolConfig {
+            // Allocate pool hot rings at physical Q4 capacity (prefill-Q4 = ctx).
             hot_w: if self.tq_hot_enabled() {
-                self.tq_hot_w
+                self.tq_hot_cap
             } else {
                 0
             },
@@ -7033,6 +7081,7 @@ impl Gemma4GpuModel {
         start_pos: usize,
         seq_len: usize,
         kv_pool: &KvCachePool,
+        slot: KvSlot,
     ) -> bool {
         if seq_len <= 1 || seq_len > self.prefill_scratch.max_seq_len {
             return false;
@@ -7040,12 +7089,172 @@ impl Gemma4GpuModel {
         if start_pos + seq_len > kv_pool.capacity() as usize {
             return false;
         }
-        // TurboQuant parallel prefill is only implemented for the Q4 hot window.
         if matches!(self.kv_cache_type, KvCacheType::TurboQuant { .. }) {
-            return self.tq_prefill_fits_hot(start_pos, seq_len);
+            if !self.tq_hot_enabled() {
+                return false;
+            }
+            // Hot: chunk fully inside Q4 ring. Cold: past hot (or already spilled).
+            if self.tq_prefill_fits_hot(start_pos, seq_len) {
+                return true;
+            }
+            let spilled = kv_pool.tq_hot_spilled(slot).unwrap_or(false) || self.tq_hot_spilled;
+            return spilled || start_pos as u32 >= self.tq_hot_w;
         }
 
         true
+    }
+
+    /// Pack one prefill chunk into TQ V3 cold (no hot Q4 write).
+    fn encode_tq_cold_prefill_kv_append(
+        &self,
+        encoder: &metal::ComputeCommandEncoderRef,
+        layer_idx: usize,
+        k_src: &Buffer,
+        v_src: &Buffer,
+        k_cache: &Buffer,
+        v_cache: &Buffer,
+        rw_k: Option<&Buffer>,
+        rw_v: Option<&Buffer>,
+        num_kv_heads: u32,
+        head_dim: u32,
+        capacity: u32,
+        start_pos: u32,
+        seq_len: u32,
+    ) -> Result<(), String> {
+        let KvCacheType::TurboQuant { k_bits, v_bits } = self.kv_cache_type else {
+            return Err(TURBOQUANT_UNSUPPORTED.to_string());
+        };
+        let tq = self
+            .turboquant
+            .as_ref()
+            .ok_or_else(|| TURBOQUANT_UNSUPPORTED.to_string())?;
+        let fwd = tq.fwd(head_dim as usize);
+        let k_row_bytes = self.kv_cache_type.k_row_bytes(head_dim as usize) as u32;
+        let v_row_bytes = self.kv_cache_type.v_row_bytes(head_dim as usize) as u32;
+        let kwin = rw_k.unwrap_or(&self.tq_k_rot);
+        let vwin = rw_v.unwrap_or(&self.tq_v_rot);
+        let _ = layer_idx;
+        for s in 0..seq_len {
+            let cur = start_pos + s;
+            self.ctx.encode_turboquant_rotate_quant_v3_strided(
+                encoder,
+                k_src,
+                k_cache,
+                tq.centroids_k(head_dim as usize),
+                num_kv_heads,
+                head_dim,
+                capacity,
+                cur,
+                k_bits as u32,
+                k_row_bytes,
+                kwin,
+                self.tq_rw,
+                fwd,
+                seq_len,
+                s,
+            );
+            self.ctx.encode_turboquant_rotate_quant_v3_strided(
+                encoder,
+                v_src,
+                v_cache,
+                tq.centroids_v(head_dim as usize),
+                num_kv_heads,
+                head_dim,
+                capacity,
+                cur,
+                v_bits as u32,
+                v_row_bytes,
+                vwin,
+                self.tq_rw,
+                fwd,
+                seq_len,
+                s,
+            );
+        }
+        Ok(())
+    }
+
+    /// Per-row cold TQ attention for a prefill chunk (Q already token-major in `q_shd`).
+    fn encode_tq_cold_prefill_attn_rows(
+        &self,
+        encoder: &metal::ComputeCommandEncoderRef,
+        q_shd: &Buffer,
+        attn_out_shd: &Buffer,
+        k_cache: &Buffer,
+        v_cache: &Buffer,
+        rw_k: Option<&Buffer>,
+        rw_v: Option<&Buffer>,
+        layer_idx: usize,
+        num_heads: u32,
+        num_kv_heads: u32,
+        num_kv_groups: u32,
+        head_dim: u32,
+        q_out: usize,
+        start_pos: usize,
+        seq_len: usize,
+        capacity: u32,
+        scale: f32,
+        is_full_attention: bool,
+    ) -> Result<(), String> {
+        let KvCacheType::TurboQuant { k_bits, v_bits } = self.kv_cache_type else {
+            return Err(TURBOQUANT_UNSUPPORTED.to_string());
+        };
+        let tq = self
+            .turboquant
+            .as_ref()
+            .ok_or_else(|| TURBOQUANT_UNSUPPORTED.to_string())?;
+        let sliding_window = self.config.sliding_window as u32;
+        let k_row_bytes = self.kv_cache_type.k_row_bytes(head_dim as usize) as u32;
+        let v_row_bytes = self.kv_cache_type.v_row_bytes(head_dim as usize) as u32;
+        // Prefill appends the whole chunk into TQ (+ residual ring) before these
+        // dispatches. Using the residual window here would let later tokens in the
+        // chunk overwrite ring slots that earlier query rows still need. Decode
+        // still uses residual; cold prefill attends pure TQ (rw=0).
+        let kwin = rw_k.unwrap_or(&self.tq_k_rot);
+        let vwin = rw_v.unwrap_or(&self.tq_v_rot);
+        let _ = (kwin, vwin);
+        let _ = layer_idx;
+        for qi in 0..seq_len {
+            let append_pos = start_pos as u32 + qi as u32;
+            let attn_kv_seq = append_pos + 1;
+            let kv_start = if !is_full_attention && attn_kv_seq > sliding_window {
+                attn_kv_seq - sliding_window
+            } else {
+                0
+            };
+            let q_offset = (qi * q_out * 4) as u64;
+            self.ctx.encode_turboquant_attn_v3_at(
+                encoder,
+                q_shd,
+                q_offset,
+                k_cache,
+                v_cache,
+                attn_out_shd,
+                q_offset,
+                tq.centroids_k(head_dim as usize),
+                tq.centroids_v(head_dim as usize),
+                num_heads,
+                num_kv_heads,
+                num_kv_groups,
+                head_dim,
+                attn_kv_seq,
+                capacity,
+                scale,
+                kv_start,
+                k_bits as u32,
+                v_bits as u32,
+                k_row_bytes,
+                v_row_bytes,
+                &self.tq_k_rot,
+                &self.tq_v_rot,
+                0, // rw disabled for cold chunk prefill (see comment above)
+                0, // window_lo
+                tq.fwd(head_dim as usize),
+                tq.inv(head_dim as usize),
+                &self.tq_scores,
+            );
+        }
+        Ok(())
     }
 
     /// Dual-write one prefill chunk: Q4 into `hot_k`/`hot_v` + optional TQ V3 into cold.
@@ -7080,7 +7289,7 @@ impl Gemma4GpuModel {
             hot_k,
             num_kv_heads,
             head_dim,
-            self.tq_hot_w,
+            self.tq_hot_cap,
             start_pos,
             seq_len,
         );
@@ -7090,7 +7299,7 @@ impl Gemma4GpuModel {
             hot_v,
             num_kv_heads,
             head_dim,
-            self.tq_hot_w,
+            self.tq_hot_cap,
             start_pos,
             seq_len,
         );
@@ -7307,24 +7516,43 @@ impl Gemma4GpuModel {
                 }
             
                 KvCacheType::TurboQuant { .. } => {
-                    let (hot_k, hot_v) = self.tq_slot_hot_bufs(kv_pool, slot, layer_idx)?;
+                    let use_hot = self.tq_prefill_fits_hot(start_pos, seq_len);
                     let (rw_k, rw_v) = self.tq_slot_rw_bufs(kv_pool, slot, layer_idx);
-                    self.encode_tq_hot_prefill_kv_append(
-                        encoder,
-                        layer_idx,
-                        &self.prefill_scratch.k_buf,
-                        &self.prefill_scratch.v_buf,
-                        hot_k,
-                        hot_v,
-                        k_cache,
-                        v_cache,
-                        rw_k,
-                        rw_v,
-                        num_kv_heads as u32,
-                        head_dim as u32,
-                        start_pos as u32,
-                        seq_len as u32,
-                    )?;
+                    if use_hot {
+                        let (hot_k, hot_v) = self.tq_slot_hot_bufs(kv_pool, slot, layer_idx)?;
+                        self.encode_tq_hot_prefill_kv_append(
+                            encoder,
+                            layer_idx,
+                            &self.prefill_scratch.k_buf,
+                            &self.prefill_scratch.v_buf,
+                            hot_k,
+                            hot_v,
+                            k_cache,
+                            v_cache,
+                            rw_k,
+                            rw_v,
+                            num_kv_heads as u32,
+                            head_dim as u32,
+                            start_pos as u32,
+                            seq_len as u32,
+                        )?;
+                    } else {
+                        self.encode_tq_cold_prefill_kv_append(
+                            encoder,
+                            layer_idx,
+                            &self.prefill_scratch.k_buf,
+                            &self.prefill_scratch.v_buf,
+                            k_cache,
+                            v_cache,
+                            rw_k,
+                            rw_v,
+                            num_kv_heads as u32,
+                            head_dim as u32,
+                            kv_pool.capacity(),
+                            start_pos as u32,
+                            seq_len as u32,
+                        )?;
+                    }
                 }
             }
         }
@@ -7430,59 +7658,89 @@ impl Gemma4GpuModel {
             }
         
                 KvCacheType::TurboQuant { .. } => {
-                    if !self.tq_prefill_fits_hot(start_pos, seq_len) {
-                        return Err(TURBOQUANT_UNSUPPORTED.to_string());
-                    }
                     let src = layer.kv_source_layer;
-                    let (hot_k, hot_v) = self.tq_slot_hot_bufs(kv_pool, slot, src)?;
-                    let groups_per_row = (head_dim / 32) as u32;
-                    let row_bytes = groups_per_row * 18;
-                    let use_ext_attn = crate::gpu::prefill_flash_attn_ext_enabled()
-                        && crate::gpu::prefill_use_flash_attn_ext_tiled(
+                    let (rw_k, rw_v) = self.tq_slot_rw_bufs(kv_pool, slot, src);
+                    if self.tq_prefill_fits_hot(start_pos, seq_len) {
+                        let (hot_k, hot_v) = self.tq_slot_hot_bufs(kv_pool, slot, src)?;
+                        let groups_per_row = (head_dim / 32) as u32;
+                        let row_bytes = groups_per_row * 18;
+                        let use_ext_attn = crate::gpu::prefill_flash_attn_ext_enabled()
+                            && crate::gpu::prefill_use_flash_attn_ext_tiled(
+                                seq_len as u32,
+                                head_dim as u32,
+                            );
+                        let attn_out = if use_ext_attn {
+                            &self.prefill_scratch.q_normed_buf
+                        } else {
+                            &self.prefill_scratch.attn_out_buf
+                        };
+                        let q_f16_scratch = if use_ext_attn {
+                            Some(&self.prefill_scratch.attn_out_buf)
+                        } else {
+                            None
+                        };
+                        let (fa_scratch, fa_layout) = if use_ext_attn {
+                            (
+                                Some(&self.prefill_scratch.fa_ext_scratch),
+                                Some(&self.prefill_scratch.fa_ext_layout),
+                            )
+                        } else {
+                            (None, None)
+                        };
+                        self.ctx.encode_prefill_attention_causal_q4_0(
+                            encoder,
+                            &self.prefill_scratch.q_buf,
+                            hot_k,
+                            hot_v,
+                            attn_out,
+                            q_f16_scratch,
+                            num_heads as u32,
+                            num_kv_heads as u32,
+                            num_kv_groups,
+                            head_dim as u32,
+                            (start_pos + seq_len) as u32,
+                            self.tq_hot_cap,
+                            scale,
                             seq_len as u32,
+                            start_pos as u32,
+                            attention_window,
+                            groups_per_row,
+                            row_bytes,
+                            fa_scratch,
+                            fa_layout,
+                            Some(&mut ext_mask_cache),
+                        );
+                    } else {
+                        // Past-hot: Q is HSD → SHD, then per-row attn_v3 (decode-shaped).
+                        self.ctx.encode_transpose_hsd(
+                            encoder,
+                            &self.prefill_scratch.q_buf,
+                            &self.prefill_scratch.q_normed_buf,
+                            seq_len as u32,
+                            num_heads as u32,
                             head_dim as u32,
                         );
-                    let attn_out = if use_ext_attn {
-                        &self.prefill_scratch.q_normed_buf
-                    } else {
-                        &self.prefill_scratch.attn_out_buf
-                    };
-                    let q_f16_scratch = if use_ext_attn {
-                        Some(&self.prefill_scratch.attn_out_buf)
-                    } else {
-                        None
-                    };
-                    let (fa_scratch, fa_layout) = if use_ext_attn {
-                        (
-                            Some(&self.prefill_scratch.fa_ext_scratch),
-                            Some(&self.prefill_scratch.fa_ext_layout),
-                        )
-                    } else {
-                        (None, None)
-                    };
-                    self.ctx.encode_prefill_attention_causal_q4_0(
-                        encoder,
-                        &self.prefill_scratch.q_buf,
-                        hot_k,
-                        hot_v,
-                        attn_out,
-                        q_f16_scratch,
-                        num_heads as u32,
-                        num_kv_heads as u32,
-                        num_kv_groups,
-                        head_dim as u32,
-                        (start_pos + seq_len) as u32,
-                        self.tq_hot_w,
-                        scale,
-                        seq_len as u32,
-                        start_pos as u32,
-                        attention_window,
-                        groups_per_row,
-                        row_bytes,
-                        fa_scratch,
-                        fa_layout,
-                        Some(&mut ext_mask_cache),
-                    );
+                        self.encode_tq_cold_prefill_attn_rows(
+                            encoder,
+                            &self.prefill_scratch.q_normed_buf,
+                            &self.prefill_scratch.attn_out_buf,
+                            k_cache,
+                            v_cache,
+                            rw_k,
+                            rw_v,
+                            src,
+                            num_heads as u32,
+                            num_kv_heads as u32,
+                            num_kv_groups,
+                            head_dim as u32,
+                            q_out,
+                            start_pos,
+                            seq_len,
+                            kv_pool.capacity(),
+                            scale,
+                            layer.is_full_attention,
+                        )?;
+                    }
                 }
             }
 
@@ -7492,11 +7750,13 @@ impl Gemma4GpuModel {
             &self.prefill_scratch.residual_buf,
             total_hidden,
         );
+        let tq_cold_rows = matches!(self.kv_cache_type, KvCacheType::TurboQuant { .. })
+            && !self.tq_prefill_fits_hot(start_pos, seq_len);
         let use_ext_attn = crate::gpu::prefill_flash_attn_ext_enabled()
             && crate::gpu::prefill_use_flash_attn_ext_tiled(seq_len as u32, head_dim as u32)
             && (matches!(self.kv_cache_type, KvCacheType::Q4_0)
                 || self.tq_prefill_fits_hot(start_pos, seq_len));
-        if !use_ext_attn {
+        if !use_ext_attn && !tq_cold_rows {
             self.ctx.encode_transpose_hsd(
                 encoder,
                 &self.prefill_scratch.attn_out_buf,
@@ -7509,7 +7769,11 @@ impl Gemma4GpuModel {
         self.ctx.encode_prefill_projection_auto_batch_view(
             encoder,
             &layer.o_proj,
-            &self.prefill_scratch.q_normed_buf,
+            if tq_cold_rows {
+                &self.prefill_scratch.attn_out_buf
+            } else {
+                &self.prefill_scratch.q_normed_buf
+            },
             &self.prefill_scratch.o_out_buf,
             hidden_size as u32,
             q_out as u32,
@@ -7804,7 +8068,7 @@ impl Gemma4GpuModel {
                         hot_k,
                         num_kv_heads as u32,
                         head_dim as u32,
-                        self.tq_hot_w,
+                        self.tq_hot_cap,
                         segment.start_pos as u32,
                         segment.token_count as u32,
                         total_seq_len as u32,
@@ -7816,7 +8080,7 @@ impl Gemma4GpuModel {
                         hot_v,
                         num_kv_heads as u32,
                         head_dim as u32,
-                        self.tq_hot_w,
+                        self.tq_hot_cap,
                         segment.start_pos as u32,
                         segment.token_count as u32,
                         total_seq_len as u32,
@@ -7935,7 +8199,7 @@ impl Gemma4GpuModel {
                         num_kv_groups,
                         head_dim as u32,
                         (segment.start_pos + segment.token_count) as u32,
-                        self.tq_hot_w,
+                        self.tq_hot_cap,
                         scale,
                         segment.token_count as u32,
                         segment.start_pos as u32,
@@ -8232,24 +8496,43 @@ impl Gemma4GpuModel {
                     }
                 
                 KvCacheType::TurboQuant { .. } => {
-                    let (hot_k, hot_v) = self.tq_slot_hot_bufs(kv_pool, slot, layer_idx)?;
+                    let use_hot = self.tq_prefill_fits_hot(start_pos, seq_len);
                     let (rw_k, rw_v) = self.tq_slot_rw_bufs(kv_pool, slot, layer_idx);
-                    self.encode_tq_hot_prefill_kv_append(
-                        encoder,
-                        layer_idx,
-                        &self.prefill_scratch.k_buf,
-                        &self.prefill_scratch.v_buf,
-                        hot_k,
-                        hot_v,
-                        k_cache,
-                        v_cache,
-                        rw_k,
-                        rw_v,
-                        num_kv_heads as u32,
-                        head_dim as u32,
-                        start_pos as u32,
-                        seq_len as u32,
-                    )?;
+                    if use_hot {
+                        let (hot_k, hot_v) = self.tq_slot_hot_bufs(kv_pool, slot, layer_idx)?;
+                        self.encode_tq_hot_prefill_kv_append(
+                            encoder,
+                            layer_idx,
+                            &self.prefill_scratch.k_buf,
+                            &self.prefill_scratch.v_buf,
+                            hot_k,
+                            hot_v,
+                            k_cache,
+                            v_cache,
+                            rw_k,
+                            rw_v,
+                            num_kv_heads as u32,
+                            head_dim as u32,
+                            start_pos as u32,
+                            seq_len as u32,
+                        )?;
+                    } else {
+                        self.encode_tq_cold_prefill_kv_append(
+                            encoder,
+                            layer_idx,
+                            &self.prefill_scratch.k_buf,
+                            &self.prefill_scratch.v_buf,
+                            k_cache,
+                            v_cache,
+                            rw_k,
+                            rw_v,
+                            num_kv_heads as u32,
+                            head_dim as u32,
+                            kv_pool.capacity(),
+                            start_pos as u32,
+                            seq_len as u32,
+                        )?;
+                    }
                 }
             }
             }
@@ -8410,59 +8693,88 @@ impl Gemma4GpuModel {
                 }
             
                 KvCacheType::TurboQuant { .. } => {
-                    if !self.tq_prefill_fits_hot(start_pos, seq_len) {
-                        return Err(TURBOQUANT_UNSUPPORTED.to_string());
-                    }
                     let src = layer.kv_source_layer;
-                    let (hot_k, hot_v) = self.tq_slot_hot_bufs(kv_pool, slot, src)?;
-                    let groups_per_row = (head_dim / 32) as u32;
-                    let row_bytes = groups_per_row * 18;
-                    let use_ext_attn = crate::gpu::prefill_flash_attn_ext_enabled()
-                        && crate::gpu::prefill_use_flash_attn_ext_tiled(
+                    let (rw_k, rw_v) = self.tq_slot_rw_bufs(kv_pool, slot, src);
+                    if self.tq_prefill_fits_hot(start_pos, seq_len) {
+                        let (hot_k, hot_v) = self.tq_slot_hot_bufs(kv_pool, slot, src)?;
+                        let groups_per_row = (head_dim / 32) as u32;
+                        let row_bytes = groups_per_row * 18;
+                        let use_ext_attn = crate::gpu::prefill_flash_attn_ext_enabled()
+                            && crate::gpu::prefill_use_flash_attn_ext_tiled(
+                                seq_len as u32,
+                                head_dim as u32,
+                            );
+                        let attn_out = if use_ext_attn {
+                            &self.prefill_scratch.q_normed_buf
+                        } else {
+                            &self.prefill_scratch.attn_out_buf
+                        };
+                        let q_f16_scratch = if use_ext_attn {
+                            Some(&self.prefill_scratch.attn_out_buf)
+                        } else {
+                            None
+                        };
+                        let (fa_scratch, fa_layout) = if use_ext_attn {
+                            (
+                                Some(&self.prefill_scratch.fa_ext_scratch),
+                                Some(&self.prefill_scratch.fa_ext_layout),
+                            )
+                        } else {
+                            (None, None)
+                        };
+                        self.ctx.encode_prefill_attention_causal_q4_0(
+                            encoder,
+                            &self.prefill_scratch.q_buf,
+                            hot_k,
+                            hot_v,
+                            attn_out,
+                            q_f16_scratch,
+                            num_heads as u32,
+                            num_kv_heads as u32,
+                            num_kv_groups,
+                            head_dim as u32,
+                            (start_pos + seq_len) as u32,
+                            self.tq_hot_cap,
+                            scale,
                             seq_len as u32,
+                            start_pos as u32,
+                            attention_window,
+                            groups_per_row,
+                            row_bytes,
+                            fa_scratch,
+                            fa_layout,
+                            Some(&mut ext_mask_cache),
+                        );
+                    } else {
+                        self.ctx.encode_transpose_hsd(
+                            encoder,
+                            &self.prefill_scratch.q_buf,
+                            &self.prefill_scratch.q_normed_buf,
+                            seq_len as u32,
+                            num_heads as u32,
                             head_dim as u32,
                         );
-                    let attn_out = if use_ext_attn {
-                        &self.prefill_scratch.q_normed_buf
-                    } else {
-                        &self.prefill_scratch.attn_out_buf
-                    };
-                    let q_f16_scratch = if use_ext_attn {
-                        Some(&self.prefill_scratch.attn_out_buf)
-                    } else {
-                        None
-                    };
-                    let (fa_scratch, fa_layout) = if use_ext_attn {
-                        (
-                            Some(&self.prefill_scratch.fa_ext_scratch),
-                            Some(&self.prefill_scratch.fa_ext_layout),
-                        )
-                    } else {
-                        (None, None)
-                    };
-                    self.ctx.encode_prefill_attention_causal_q4_0(
-                        encoder,
-                        &self.prefill_scratch.q_buf,
-                        hot_k,
-                        hot_v,
-                        attn_out,
-                        q_f16_scratch,
-                        num_heads as u32,
-                        num_kv_heads as u32,
-                        num_kv_groups,
-                        head_dim as u32,
-                        (start_pos + seq_len) as u32,
-                        self.tq_hot_w,
-                        scale,
-                        seq_len as u32,
-                        start_pos as u32,
-                        attention_window,
-                        groups_per_row,
-                        row_bytes,
-                        fa_scratch,
-                        fa_layout,
-                        Some(&mut ext_mask_cache),
-                    );
+                        self.encode_tq_cold_prefill_attn_rows(
+                            encoder,
+                            &self.prefill_scratch.q_normed_buf,
+                            &self.prefill_scratch.attn_out_buf,
+                            k_cache,
+                            v_cache,
+                            rw_k,
+                            rw_v,
+                            src,
+                            num_heads as u32,
+                            num_kv_heads as u32,
+                            num_kv_groups,
+                            head_dim as u32,
+                            q_out,
+                            start_pos,
+                            seq_len,
+                            kv_pool.capacity(),
+                            scale,
+                            layer.is_full_attention,
+                        )?;
+                    }
                 }
             }
             } // !skip_attn_flash
@@ -8470,11 +8782,13 @@ impl Gemma4GpuModel {
             // Post-attn: hidden += RMSNorm(o_proj(attn)). Keep hidden as residual
             // for pre-FFN (no copy into residual_buf).
             if !ablate.skip_attn_o() {
+            let tq_cold_rows = matches!(self.kv_cache_type, KvCacheType::TurboQuant { .. })
+                && !self.tq_prefill_fits_hot(start_pos, seq_len);
             let use_ext_attn = crate::gpu::prefill_flash_attn_ext_enabled()
                 && crate::gpu::prefill_use_flash_attn_ext_tiled(seq_len as u32, head_dim as u32)
                 && (matches!(self.kv_cache_type, KvCacheType::Q4_0)
                     || self.tq_prefill_fits_hot(start_pos, seq_len));
-            if !use_ext_attn && !use_decode_fa {
+            if !use_ext_attn && !use_decode_fa && !tq_cold_rows {
                 self.ctx.encode_transpose_hsd(
                     encoder,
                     &self.prefill_scratch.attn_out_buf,
@@ -8487,7 +8801,7 @@ impl Gemma4GpuModel {
             self.ctx.encode_prefill_projection_auto_batch_view(
                 encoder,
                 &layer.o_proj,
-                if use_decode_fa {
+                if use_decode_fa || tq_cold_rows {
                     &self.prefill_scratch.attn_out_buf
                 } else {
                     &self.prefill_scratch.q_normed_buf
@@ -9099,7 +9413,7 @@ impl Gemma4GpuModel {
                                 hot_k,
                                 num_kv_heads as u32,
                                 head_dim as u32,
-                                self.tq_hot_w,
+                                self.tq_hot_cap,
                                 append_pos,
                             );
                             self.ctx.encode_kv_append_q4_0_at(
@@ -9109,7 +9423,7 @@ impl Gemma4GpuModel {
                                 hot_v,
                                 num_kv_heads as u32,
                                 head_dim as u32,
-                                self.tq_hot_w,
+                                self.tq_hot_cap,
                                 append_pos,
                             );
                             let _ = (k_cache, v_cache);
@@ -9308,7 +9622,7 @@ impl Gemma4GpuModel {
                                 num_kv_heads as u32,
                                 head_dim as u32,
                                 effective_kv_seq,
-                                self.tq_hot_w,
+                                self.tq_hot_cap,
                                 scale,
                                 kv_start,
                                 row_bytes,
@@ -9331,7 +9645,7 @@ impl Gemma4GpuModel {
                                 num_kv_groups,
                                 head_dim as u32,
                                 effective_kv_seq,
-                                self.tq_hot_w,
+                                self.tq_hot_cap,
                                 scale,
                                 kv_start,
                                 groups_per_row,
@@ -9351,7 +9665,7 @@ impl Gemma4GpuModel {
                                 num_kv_groups,
                                 head_dim as u32,
                                 effective_kv_seq,
-                                self.tq_hot_w,
+                                self.tq_hot_cap,
                                 scale,
                                 kv_start,
                                 groups_per_row,
@@ -9963,13 +10277,9 @@ impl Gemma4GpuModel {
         if token_ids.len() == 1 {
             return self.forward_single_token(token_ids[0]);
         }
-        // Prefer parallel prefill (Q4_0 always; TurboQuant while prompt fits hot window).
-        let can_parallel = !matches!(self.kv_cache_type, KvCacheType::TurboQuant { .. })
-            || self.tq_prefill_fits_hot(0, token_ids.len());
-        if can_parallel {
-            if let Ok(logits) = self.forward_prefill_parallel_self(token_ids) {
-                return logits;
-            }
+        // Prefer parallel / chunked prefill (Q4_0 always; TurboQuant hot + past-hot cold).
+        if let Ok(logits) = self.forward_prefill_parallel_self(token_ids) {
+            return logits;
         }
         for &tid in &token_ids[..token_ids.len() - 1] {
             self.forward_advance(tid);
@@ -9991,17 +10301,13 @@ impl Gemma4GpuModel {
         if token_ids.len() == 1 {
             return self.forward_single_token_sample(token_ids[0], temperature, min_p, seed);
         }
-        let can_parallel = !matches!(self.kv_cache_type, KvCacheType::TurboQuant { .. })
-            || self.tq_prefill_fits_hot(0, token_ids.len());
-        if can_parallel {
-            if let Ok(logits) = self.forward_prefill_parallel_self(token_ids) {
-                // Parallel path materializes last-token logits; sample on CPU.
-                return if temperature <= 0.0 {
-                    crate::sampling::argmax(&logits)
-                } else {
-                    crate::sampling::min_p_sampling(&logits, min_p)
-                };
-            }
+        if let Ok(logits) = self.forward_prefill_parallel_self(token_ids) {
+            // Parallel path materializes last-token logits; sample on CPU.
+            return if temperature <= 0.0 {
+                crate::sampling::argmax(&logits)
+            } else {
+                crate::sampling::min_p_sampling(&logits, min_p)
+            };
         }
         for &tid in &token_ids[..token_ids.len() - 1] {
             self.forward_advance(tid);
@@ -10330,17 +10636,44 @@ impl Gemma4GpuModel {
         }
 
         let chunk_size = self.max_parallel_prefill_seq().max(1);
-        let chunks: Vec<&[usize]> = token_ids.chunks(chunk_size).collect();
+        let hot_w = self.tq_hot_w as usize;
+        let tq = matches!(self.kv_cache_type, KvCacheType::TurboQuant { .. }) && hot_w > 0;
+        // Prefill-Q4: entire prompt stays on the Q4 flash stack (cap = ctx);
+        // spill once at the end if we exceeded the decode hot window.
+        let prefill_q4 = tq && self.tq_prefill_q4;
         let mut logits = Vec::new();
+        let mut offset = 0usize;
 
-        for (idx, chunk) in chunks.iter().enumerate() {
-            let is_last = idx + 1 == chunks.len();
+        while offset < token_ids.len() {
+            let start_pos = kv_pool.total_tokens(slot).map_err(|e| e.to_string())?;
+            let mut take = chunk_size.min(token_ids.len() - offset);
+            // Legacy cold path: never straddle the Q4 hot / TQ cold boundary.
+            if tq && !prefill_q4 && start_pos < hot_w && start_pos + take > hot_w {
+                take = hot_w - start_pos;
+            }
+            let chunk = &token_ids[offset..offset + take];
+            let is_last = offset + take >= token_ids.len();
             logits = self.forward_prefill_chunk_with_kv_slot(
                 chunk,
                 kv_pool,
                 slot,
                 is_last,
             )?;
+            offset += take;
+
+            if tq && !prefill_q4 {
+                let end_pos = kv_pool.total_tokens(slot).map_err(|e| e.to_string())?;
+                if end_pos >= hot_w {
+                    self.spill_tq_slot(kv_pool, slot)?;
+                }
+            }
+        }
+
+        if prefill_q4 {
+            let end_pos = kv_pool.total_tokens(slot).map_err(|e| e.to_string())?;
+            if end_pos > hot_w {
+                self.spill_tq_slot(kv_pool, slot)?;
+            }
         }
 
         Ok(logits)
@@ -10369,7 +10702,7 @@ impl Gemma4GpuModel {
             );
         }
 
-        if self.can_use_parallel_prefill_chunk(start_pos, token_ids.len(), kv_pool) {
+        if self.can_use_parallel_prefill_chunk(start_pos, token_ids.len(), kv_pool, slot) {
             return self.forward_prefill_chunk_parallel_with_kv_slot(
                 token_ids,
                 kv_pool,
