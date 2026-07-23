@@ -64,6 +64,41 @@ inline uint tq_unpack(device const uchar* qs, uint d, uint bits, uint mask) {
     return ((lo | (hi << 8)) >> wi) & mask;
 }
 
+// Cooperative row unpack. Process one packed word per lane instead of one
+// coordinate per lane: K3 decodes 8 values from 3 bytes, V2 decodes 4 from 1.
+inline void tq_dequant_tile(
+    device const uchar* cache,
+    uint cache_base,
+    uint pos_start,
+    uint row_bytes,
+    uint head_dim,
+    uint bits,
+    threadgroup const float* centroids,
+    threadgroup float* dst,
+    uint tile_count,
+    uint tid,
+    uint tg_size)
+{
+    uint values_per_pack = bits == 3u ? 8u : (8u / bits);
+    uint packs_per_row = head_dim / values_per_pack;
+    uint total_packs = tile_count * packs_per_row;
+    uint bytes_per_pack = bits == 3u ? 3u : 1u;
+    uint mask = (1u << bits) - 1u;
+    for (uint i = tid; i < total_packs; i += tg_size) {
+        uint row_in_tile = i / packs_per_row;
+        uint pack = i - row_in_tile * packs_per_row;
+        uint row = cache_base + (pos_start + row_in_tile) * row_bytes;
+        device const uchar* src = cache + row + 2 + pack * bytes_per_pack;
+        uint word = uint(src[0]);
+        if (bits == 3u) word |= uint(src[1]) << 8 | uint(src[2]) << 16;
+        float norm = float(*reinterpret_cast<device const half*>(&cache[row]));
+        uint d0 = row_in_tile * head_dim + pack * values_per_pack;
+        for (uint j = 0; j < values_per_pack; j++) {
+            dst[d0 + j] = norm * centroids[(word >> (j * bits)) & mask];
+        }
+    }
+}
+
 // Quantize already-rotated vectors into the V3 layout. One thread per row
 // (= per kv head); decode only ever appends a single token, so rows is tiny.
 kernel void turboquant_quant_v3(
@@ -613,6 +648,256 @@ kernel void turboquant_attn_v3(
     }
 }
 
+// Decode GQA with f32 device Q/O staging. One TG per KV head unpacks each K/V
+// tile once for every query head while retaining the full-precision residual
+// window. Device staging avoids the h512 threadgroup-memory limit.
+template <uint HEAD_DIM, uint TILE_KV>
+void turboquant_attn_v3_gqa_impl(
+    device const float* Q_in, device const uchar* K_cache,
+    device const uchar* V_cache, device float* output,
+    constant uint& num_heads, constant uint& num_kv_heads,
+    constant uint& num_kv_groups, constant uint& head_dim,
+    constant uint& kv_seq, constant uint& capacity, constant float& scale,
+    constant uint& kv_start, constant uint& k_bits, constant uint& k_row_bytes,
+    device const float* k_centroids, device const float* Kwin,
+    device const float* Vwin, constant uint& rw, constant uint& window_lo,
+    device const float* fwd, device const float* inv,
+    constant uint& v_bits, constant uint& v_row_bytes,
+    device const float* v_centroids, device float* scores_all,
+    threadgroup float* cen_k, threadgroup float* cen_v,
+    threadgroup float* qrot,
+    threadgroup float* kv_values, threadgroup float* tile_scores,
+    threadgroup float* tile_exp, threadgroup float* update,
+    uint tid, uint tg_size, uint simd_id, uint lane, uint kv_h, uint wg)
+{
+    constexpr uint MAX_G = 8;
+    constexpr uint NWG = 8;
+    if (kv_h >= num_kv_heads || head_dim != HEAD_DIM
+        || num_kv_groups == 0u || num_kv_groups > MAX_G) return;
+    uint g_count = min(num_kv_groups, num_heads - kv_h * num_kv_groups);
+    uint k_mask = (1u << k_bits) - 1u;
+    uint v_mask = (1u << v_bits) - 1u;
+    uint kv_base_k = kv_h * capacity * k_row_bytes;
+    uint kv_base_v = kv_h * capacity * v_row_bytes;
+    uint n_pos = min(min(kv_seq - min(kv_seq, kv_start), capacity), (uint)TQ_MAX_KV);
+    uint num_simds = tg_size / 32u;
+
+    for (uint i = tid; i < (1u << k_bits); i += tg_size) cen_k[i] = k_centroids[i];
+    for (uint i = tid; i < (1u << v_bits); i += tg_size) cen_v[i] = v_centroids[i];
+    for (uint g = 0; g < g_count; g++) {
+        uint h = kv_h * num_kv_groups + g;
+        uint off = h * HEAD_DIM;
+        device float* o = scores_all + ((kv_h * NWG + wg) * MAX_G + g) * HEAD_DIM;
+        for (uint c = tid; c < HEAD_DIM; c += tg_size) {
+            float acc = 0.0f;
+            uint mi = c;
+            for (uint k = 0; k < HEAD_DIM; k++) {
+                acc += Q_in[off + k] * fwd[mi];
+                mi += HEAD_DIM;
+            }
+            qrot[g * HEAD_DIM + c] = acc;
+            o[c] = 0.0f;
+        }
+        if (tid == g) {
+            update[g * 4] = -INFINITY;
+            update[g * 4 + 1] = 0.0f;
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint j0 = wg * TILE_KV; j0 < n_pos; j0 += NWG * TILE_KV) {
+        uint count = min(TILE_KV, n_pos - j0);
+        for (uint i = tid; i < count * HEAD_DIM; i += tg_size) {
+            uint ko = i / HEAD_DIM;
+            uint d = i - ko * HEAD_DIM;
+            uint pos = kv_start + j0 + ko;
+            if (rw > 0u && pos >= window_lo) {
+                kv_values[ko * HEAD_DIM + d] =
+                    Kwin[(kv_h * rw + pos % rw) * HEAD_DIM + d];
+            } else {
+                uint row = kv_base_k + pos * k_row_bytes;
+                float norm = float(*reinterpret_cast<device const half*>(&K_cache[row]));
+                kv_values[ko * HEAD_DIM + d] =
+                    norm * cen_k[tq_unpack(K_cache + row + 2, d, k_bits, k_mask)];
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        for (uint pair = simd_id; pair < g_count * count; pair += num_simds) {
+            uint g = pair / count;
+            uint ko = pair - g * count;
+            float acc = 0.0f;
+            for (uint d = lane * 4; d + 3 < HEAD_DIM; d += 128u) {
+                acc += metal::dot(
+                    float4(qrot[g*HEAD_DIM+d], qrot[g*HEAD_DIM+d+1],
+                           qrot[g*HEAD_DIM+d+2], qrot[g*HEAD_DIM+d+3]),
+                    float4(kv_values[ko*HEAD_DIM+d], kv_values[ko*HEAD_DIM+d+1],
+                           kv_values[ko*HEAD_DIM+d+2], kv_values[ko*HEAD_DIM+d+3]));
+            }
+            acc = simd_sum(acc);
+            if (lane == 0) tile_scores[g * TILE_KV + ko] = acc * scale;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        for (uint g = tid; g < g_count; g += tg_size) {
+            uint ui = g * 4;
+            float old_m = update[ui];
+            float old_l = update[ui + 1];
+            float new_m = old_m;
+            for (uint ko = 0; ko < count; ko++)
+                new_m = max(new_m, tile_scores[g * TILE_KV + ko]);
+            float sum = 0.0f;
+            for (uint ko = 0; ko < count; ko++) {
+                float e = exp(tile_scores[g * TILE_KV + ko] - new_m);
+                tile_exp[g * TILE_KV + ko] = e;
+                sum += e;
+            }
+            float new_l = old_l * exp(old_m - new_m) + sum;
+            update[ui] = new_m;
+            update[ui + 1] = new_l;
+            update[ui + 2] = new_l > 0.0f ? old_l * exp(old_m - new_m) / new_l : 0.0f;
+            update[ui + 3] = new_l > 0.0f ? 1.0f / new_l : 0.0f;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        for (uint i = tid; i < count * HEAD_DIM; i += tg_size) {
+            uint ko = i / HEAD_DIM;
+            uint d = i - ko * HEAD_DIM;
+            uint pos = kv_start + j0 + ko;
+            if (rw > 0u && pos >= window_lo) {
+                kv_values[ko * HEAD_DIM + d] =
+                    Vwin[(kv_h * rw + pos % rw) * HEAD_DIM + d];
+            } else {
+                uint row = kv_base_v + pos * v_row_bytes;
+                float norm = float(*reinterpret_cast<device const half*>(&V_cache[row]));
+                kv_values[ko * HEAD_DIM + d] =
+                    norm * cen_v[tq_unpack(V_cache + row + 2, d, v_bits, v_mask)];
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        for (uint g = 0; g < g_count; g++) {
+            device float* o =
+                scores_all + ((kv_h * NWG + wg) * MAX_G + g) * HEAD_DIM;
+            float old_factor = update[g * 4 + 2];
+            float inv_l = update[g * 4 + 3];
+            for (uint d = tid; d < HEAD_DIM; d += tg_size) {
+                float acc = o[d] * old_factor;
+                for (uint ko = 0; ko < count; ko++)
+                    acc += tile_exp[g * TILE_KV + ko] * inv_l
+                        * kv_values[ko * HEAD_DIM + d];
+                o[d] = acc;
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup | mem_flags::mem_device);
+    }
+
+    uint stats_base = num_kv_heads * NWG * MAX_G * HEAD_DIM;
+    for (uint g = tid; g < g_count; g += tg_size) {
+        uint si = stats_base + ((kv_h * NWG + wg) * MAX_G + g) * 2;
+        scores_all[si] = update[g * 4];
+        scores_all[si + 1] = update[g * 4 + 1];
+    }
+}
+
+#define TQ_GQA_DECODE_ENTRY(NAME, HD, KT) \
+kernel void NAME( \
+    device const float* Q [[buffer(0)]], device const uchar* K [[buffer(1)]], \
+    device const uchar* V [[buffer(2)]], device float* O [[buffer(3)]], \
+    constant uint& nh [[buffer(4)]], constant uint& nkh [[buffer(5)]], \
+    constant uint& ng [[buffer(6)]], constant uint& hd [[buffer(7)]], \
+    constant uint& n [[buffer(8)]], constant uint& cap [[buffer(9)]], \
+    constant float& scale [[buffer(10)]], constant uint& start [[buffer(11)]], \
+    constant uint& kb [[buffer(12)]], constant uint& krb [[buffer(13)]], \
+    device const float* ck [[buffer(14)]], device const float* Kw [[buffer(15)]], \
+    device const float* Vw [[buffer(16)]], constant uint& rw [[buffer(17)]], \
+    constant uint& wlo [[buffer(18)]], device const float* fwd [[buffer(19)]], \
+    device const float* inv [[buffer(20)]], constant uint& vb [[buffer(21)]], \
+    constant uint& vrb [[buffer(22)]], device const float* cv [[buffer(23)]], \
+    device float* scratch [[buffer(24)]], uint tid [[thread_index_in_threadgroup]], \
+    uint tg [[threads_per_threadgroup]], uint sid [[simdgroup_index_in_threadgroup]], \
+    uint lane [[thread_index_in_simdgroup]], uint gid [[threadgroup_position_in_grid]]) { \
+    constexpr uint NWG = 8; \
+    threadgroup float cen_k[16], cen_v[16], qrot[8 * HD], kv[KT * HD]; \
+    threadgroup float scores[8 * KT], exps[8 * KT], update[8 * 4]; \
+    uint kv_h = gid / NWG; uint wg = gid % NWG; \
+    turboquant_attn_v3_gqa_impl<HD, KT>(Q, K, V, O, nh, nkh, ng, hd, n, cap, scale, \
+        start, kb, krb, ck, Kw, Vw, rw, wlo, fwd, inv, vb, vrb, cv, scratch, \
+        cen_k, cen_v, qrot, kv, scores, exps, update, tid, tg, sid, lane, kv_h, wg); \
+}
+
+TQ_GQA_DECODE_ENTRY(turboquant_attn_v3_gqa_h256, 256, 8)
+TQ_GQA_DECODE_ENTRY(turboquant_attn_v3_gqa_h512, 512, 4)
+
+template <uint HEAD_DIM>
+void turboquant_attn_v3_gqa_reduce_impl(
+    device float* output, device float* scratch, device const float* inv,
+    constant uint& num_heads, constant uint& num_kv_heads,
+    constant uint& num_kv_groups, threadgroup float* factors,
+    threadgroup float* combined, threadgroup float& global_l,
+    uint tid, uint tg_size, uint kv_h)
+{
+    constexpr uint NWG = 8;
+    constexpr uint MAX_G = 8;
+    if (kv_h >= num_kv_heads) return;
+    uint g_count = min(num_kv_groups, num_heads - kv_h * num_kv_groups);
+    uint stats_base = num_kv_heads * NWG * MAX_G * HEAD_DIM;
+    for (uint g = 0; g < g_count; g++) {
+        if (tid == 0) {
+            float m = -INFINITY;
+            for (uint wg = 0; wg < NWG; wg++) {
+                uint si = stats_base + ((kv_h * NWG + wg) * MAX_G + g) * 2;
+                m = max(m, scratch[si]);
+            }
+            float l = 0.0f;
+            for (uint wg = 0; wg < NWG; wg++) {
+                uint si = stats_base + ((kv_h * NWG + wg) * MAX_G + g) * 2;
+                float f = scratch[si + 1] * exp(scratch[si] - m);
+                factors[wg] = f;
+                l += f;
+            }
+            global_l = l;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint d = tid; d < HEAD_DIM; d += tg_size) {
+            float acc = 0.0f;
+            for (uint wg = 0; wg < NWG; wg++) {
+                device float* po =
+                    scratch + ((kv_h * NWG + wg) * MAX_G + g) * HEAD_DIM;
+                acc += factors[wg] * po[d];
+            }
+            combined[d] = global_l > 0.0f ? acc / global_l : 0.0f;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        uint h = kv_h * num_kv_groups + g;
+        uint off = h * HEAD_DIM;
+        for (uint c = tid; c < HEAD_DIM; c += tg_size) {
+            float acc = 0.0f;
+            uint mi = c;
+            for (uint k = 0; k < HEAD_DIM; k++) {
+                acc += combined[k] * inv[mi];
+                mi += HEAD_DIM;
+            }
+            output[off + c] = acc;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+}
+
+#define TQ_GQA_REDUCE_ENTRY(NAME, HD) \
+kernel void NAME(device float* O [[buffer(0)]], device float* scratch [[buffer(1)]], \
+    device const float* inv [[buffer(2)]], constant uint& nh [[buffer(3)]], \
+    constant uint& nkh [[buffer(4)]], constant uint& ng [[buffer(5)]], \
+    uint tid [[thread_index_in_threadgroup]], uint tg [[threads_per_threadgroup]], \
+    uint gid [[threadgroup_position_in_grid]]) { \
+    threadgroup float factors[8], combined[HD], global_l; \
+    turboquant_attn_v3_gqa_reduce_impl<HD>(O, scratch, inv, nh, nkh, ng, \
+        factors, combined, global_l, tid, tg, gid); \
+}
+
+TQ_GQA_REDUCE_ENTRY(turboquant_attn_v3_gqa_reduce_h256, 256)
+TQ_GQA_REDUCE_ENTRY(turboquant_attn_v3_gqa_reduce_h512, 512)
+
 // Multi-query causal TQ attention for past-hot prefill chunks.
 // Layout: Q/out are SHD [q_len, num_heads, head_dim].
 // One TG handles four adjacent queries and dequantizes each K/V tile once for
@@ -763,18 +1048,27 @@ void turboquant_attn_v3_causal_impl(
                 tile_scores[kv_offset] = s;
                 m_new = max(m_new, s);
             }
-            float tile_sum = 0.0f;
-            for (uint kv_offset = 0; kv_offset < tile_count; kv_offset++) {
-                float e = exp(tile_scores[kv_offset] - m_new);
-                shared_exp[q * TILE_KV + kv_offset] = e;
-                tile_sum += e;
+            // All-masked tile: leave running stats unchanged (avoid exp(x+Inf)=NaN).
+            if (m_new == -INFINITY) {
+                shared_update[ui + 2] = 1.0f;
+                shared_update[ui + 3] = 0.0f;
+                for (uint kv_offset = 0; kv_offset < tile_count; kv_offset++) {
+                    shared_exp[q * TILE_KV + kv_offset] = 0.0f;
+                }
+            } else {
+                float tile_sum = 0.0f;
+                for (uint kv_offset = 0; kv_offset < tile_count; kv_offset++) {
+                    float e = exp(tile_scores[kv_offset] - m_new);
+                    shared_exp[q * TILE_KV + kv_offset] = e;
+                    tile_sum += e;
+                }
+                float l_new = l_old * exp(m_old - m_new) + tile_sum;
+                shared_update[ui + 0] = m_new;
+                shared_update[ui + 1] = l_new;
+                shared_update[ui + 2] =
+                    l_new > 0.0f ? (l_old * exp(m_old - m_new)) / l_new : 0.0f;
+                shared_update[ui + 3] = l_new > 0.0f ? 1.0f / l_new : 0.0f;
             }
-            float l_new = l_old * exp(m_old - m_new) + tile_sum;
-            shared_update[ui + 0] = m_new;
-            shared_update[ui + 1] = l_new;
-            shared_update[ui + 2] =
-                l_new > 0.0f ? (l_old * exp(m_old - m_new)) / l_new : 0.0f;
-            shared_update[ui + 3] = l_new > 0.0f ? 1.0f / l_new : 0.0f;
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
@@ -807,7 +1101,7 @@ void turboquant_attn_v3_causal_impl(
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
 
-    // Leave outputs in the Haar frame; one batched inverse matmul follows.
+    // Leave outputs in the Haar frame; one batched f32 inverse rotation follows.
     for (uint q = 0; q < q_count; q++) {
         uint q_tg = q * HEAD_DIM;
         uint out_off = ((q_base + q) * num_heads + h) * head_dim;
@@ -859,5 +1153,291 @@ kernel void NAME( \
         shared_scores, shared_exp, shared_update, tid, tg_size, tgid); \
 }
 
-TQ_CAUSAL_ENTRY(turboquant_attn_v3_causal_h256, 256, 4, 4)
-TQ_CAUSAL_ENTRY(turboquant_attn_v3_causal_h512, 512, 4, 4)
+TQ_CAUSAL_ENTRY(turboquant_attn_v3_causal_h256, 256, 4, 8)
+TQ_CAUSAL_ENTRY(turboquant_attn_v3_causal_h512, 512, 4, 8)
+
+// Causal GQA: one TG owns one KV head and a query tile. K/V are unpacked once
+// and reused by every query head in the group. O stays in device memory because
+// 8 query heads × Q_TILE × h512 does not fit in threadgroup memory.
+template <uint HEAD_DIM, uint Q_TILE, uint TILE_KV>
+void turboquant_attn_v3_causal_gqa_impl(
+    device const float* Q_in,
+    device const uchar* K_cache,
+    device const uchar* V_cache,
+    device float* output,
+    constant uint& num_heads,
+    constant uint& num_kv_heads,
+    constant uint& num_kv_groups,
+    constant uint& head_dim,
+    constant uint& kv_seq,
+    constant uint& capacity,
+    constant float& scale,
+    constant uint& q_len,
+    constant uint& q_start,
+    constant uint& attention_window,
+    constant uint& k_bits,
+    constant uint& k_row_bytes,
+    device const float* k_centroids,
+    constant uint& v_bits,
+    constant uint& v_row_bytes,
+    device const float* v_centroids,
+    threadgroup float* cen_k,
+    threadgroup float* cen_v,
+    threadgroup float* kv_values,
+    threadgroup float* shared_scores,
+    threadgroup float* shared_exp,
+    threadgroup float* shared_update,
+    uint tid,
+    uint tg_size,
+    uint tgid)
+{
+    constexpr uint SIMD_SIZE = 32;
+    constexpr uint MAX_G = 8;
+
+    if (head_dim != HEAD_DIM || num_kv_groups == 0u || num_kv_groups > MAX_G) return;
+
+    uint q_tiles = (q_len + Q_TILE - 1u) / Q_TILE;
+    uint kv_h = tgid / q_tiles;
+    uint q_base = (tgid % q_tiles) * Q_TILE;
+    if (kv_h >= num_kv_heads || q_base >= q_len) return;
+    uint q_count = min(Q_TILE, q_len - q_base);
+    uint n_q = num_kv_groups * q_count;
+
+    uint kv_base_k = kv_h * capacity * k_row_bytes;
+    uint kv_base_v = kv_h * capacity * v_row_bytes;
+    uint k_mask = (1u << k_bits) - 1u;
+    uint v_mask = (1u << v_bits) - 1u;
+
+    uint attend_len[Q_TILE];
+    uint attend_start[Q_TILE];
+    uint tile_start = capacity;
+    uint tile_end_all = 0u;
+    for (uint q = 0; q < q_count; q++) {
+        uint end = min(q_start + q_base + q + 1u, min(kv_seq, capacity));
+        end = min(end, (uint)TQ_MAX_KV);
+        uint start = (attention_window > 0u && end > attention_window)
+            ? end - attention_window : 0u;
+        attend_len[q] = end;
+        attend_start[q] = start;
+        tile_start = min(tile_start, start);
+        tile_end_all = max(tile_end_all, end);
+    }
+
+    for (uint i = tid; i < (1u << k_bits); i += tg_size) cen_k[i] = k_centroids[i];
+    for (uint i = tid; i < (1u << v_bits); i += tg_size) cen_v[i] = v_centroids[i];
+
+    uint simd_id = tid / SIMD_SIZE;
+    uint lane = tid % SIMD_SIZE;
+    uint num_simds = tg_size / SIMD_SIZE;
+
+    for (uint gq = tid; gq < n_q; gq += tg_size) {
+        shared_update[gq * 4 + 0] = -INFINITY;
+        shared_update[gq * 4 + 1] = 0.0f;
+    }
+    for (uint gq = 0; gq < n_q; gq++) {
+        uint g = gq / q_count;
+        uint q = gq - g * q_count;
+        uint h = kv_h * num_kv_groups + g;
+        if (h >= num_heads) continue;
+        uint out_off = ((q_base + q) * num_heads + h) * HEAD_DIM;
+        for (uint d = tid; d < HEAD_DIM; d += tg_size) output[out_off + d] = 0.0f;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint kv_tile = tile_start; kv_tile < tile_end_all; kv_tile += TILE_KV) {
+        uint tile_count = min(TILE_KV, tile_end_all - kv_tile);
+
+        tq_dequant_tile(K_cache, kv_base_k, kv_tile, k_row_bytes, HEAD_DIM,
+                        k_bits, cen_k, kv_values, tile_count, tid, tg_size);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        uint score_pairs = n_q * tile_count;
+        for (uint pair = simd_id; pair < score_pairs; pair += num_simds) {
+            uint gq = pair / tile_count;
+            uint ko = pair - gq * tile_count;
+            uint g = gq / q_count;
+            uint q = gq - g * q_count;
+            uint h = kv_h * num_kv_groups + g;
+            uint pos = kv_tile + ko;
+            float partial = 0.0f;
+            if (h < num_heads) {
+                uint q_off = ((q_base + q) * num_heads + h) * HEAD_DIM;
+                for (uint d = lane * 4; d + 3 < HEAD_DIM; d += SIMD_SIZE * 4) {
+                    partial += metal::dot(
+                        float4(Q_in[q_off+d], Q_in[q_off+d+1], Q_in[q_off+d+2], Q_in[q_off+d+3]),
+                        float4(kv_values[ko*HEAD_DIM+d], kv_values[ko*HEAD_DIM+d+1],
+                               kv_values[ko*HEAD_DIM+d+2], kv_values[ko*HEAD_DIM+d+3]));
+                }
+            }
+            partial = simd_sum(partial);
+            if (lane == 0) {
+                shared_scores[gq * TILE_KV + ko] =
+                    (h < num_heads && pos >= attend_start[q] && pos < attend_len[q])
+                    ? partial * scale : -INFINITY;
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        for (uint gq = tid; gq < n_q; gq += tg_size) {
+            uint ui = gq * 4;
+            float m_old = shared_update[ui];
+            float l_old = shared_update[ui + 1];
+            float m_new = m_old;
+            for (uint ko = 0; ko < tile_count; ko++)
+                m_new = max(m_new, shared_scores[gq * TILE_KV + ko]);
+            if (m_new == -INFINITY) {
+                shared_update[ui + 2] = 1.0f;
+                shared_update[ui + 3] = 0.0f;
+                for (uint ko = 0; ko < tile_count; ko++)
+                    shared_exp[gq * TILE_KV + ko] = 0.0f;
+            } else {
+                float tile_sum = 0.0f;
+                for (uint ko = 0; ko < tile_count; ko++) {
+                    float e = exp(shared_scores[gq * TILE_KV + ko] - m_new);
+                    shared_exp[gq * TILE_KV + ko] = e;
+                    tile_sum += e;
+                }
+                float l_new = l_old * exp(m_old - m_new) + tile_sum;
+                shared_update[ui] = m_new;
+                shared_update[ui + 1] = l_new;
+                shared_update[ui + 2] = l_new > 0.0f
+                    ? (l_old * exp(m_old - m_new)) / l_new : 0.0f;
+                shared_update[ui + 3] = l_new > 0.0f ? 1.0f / l_new : 0.0f;
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        tq_dequant_tile(V_cache, kv_base_v, kv_tile, v_row_bytes, HEAD_DIM,
+                        v_bits, cen_v, kv_values, tile_count, tid, tg_size);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        for (uint gq = 0; gq < n_q; gq++) {
+            uint g = gq / q_count;
+            uint q = gq - g * q_count;
+            uint h = kv_h * num_kv_groups + g;
+            if (h >= num_heads) continue;
+            uint out_off = ((q_base + q) * num_heads + h) * HEAD_DIM;
+            float old_factor = shared_update[gq * 4 + 2];
+            float inv_l = shared_update[gq * 4 + 3];
+            for (uint d = tid; d < HEAD_DIM; d += tg_size) {
+                float acc = output[out_off + d] * old_factor;
+                for (uint ko = 0; ko < tile_count; ko++)
+                    acc += shared_exp[gq * TILE_KV + ko] * inv_l
+                        * kv_values[ko * HEAD_DIM + d];
+                output[out_off + d] = acc;
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+}
+
+#define TQ_CAUSAL_GQA_ENTRY(NAME, HD, QT, KT) \
+kernel void NAME( \
+    device const float* Q_in [[buffer(0)]], device const uchar* K_cache [[buffer(1)]], \
+    device const uchar* V_cache [[buffer(2)]], device float* output [[buffer(3)]], \
+    constant uint& num_heads [[buffer(4)]], constant uint& num_kv_heads [[buffer(5)]], \
+    constant uint& num_kv_groups [[buffer(6)]], constant uint& head_dim [[buffer(7)]], \
+    constant uint& kv_seq [[buffer(8)]], constant uint& capacity [[buffer(9)]], \
+    constant float& scale [[buffer(10)]], constant uint& q_len [[buffer(11)]], \
+    constant uint& q_start [[buffer(12)]], constant uint& attention_window [[buffer(13)]], \
+    constant uint& k_bits [[buffer(14)]], constant uint& k_row_bytes [[buffer(15)]], \
+    device const float* k_centroids [[buffer(16)]], constant uint& v_bits [[buffer(17)]], \
+    constant uint& v_row_bytes [[buffer(18)]], device const float* v_centroids [[buffer(19)]], \
+    device const float* fwd [[buffer(20)]], device const float* inv [[buffer(21)]], \
+    uint tid [[thread_index_in_threadgroup]], uint tg_size [[threads_per_threadgroup]], \
+    uint tgid [[threadgroup_position_in_grid]]) { \
+    (void)fwd; (void)inv; constexpr uint MAX_G = 8; \
+    threadgroup float cen_k[16]; threadgroup float cen_v[16]; \
+    threadgroup float kv_values[KT * HD]; \
+    threadgroup float shared_scores[MAX_G * QT * KT]; \
+    threadgroup float shared_exp[MAX_G * QT * KT]; \
+    threadgroup float shared_update[MAX_G * QT * 4]; \
+    turboquant_attn_v3_causal_gqa_impl<HD, QT, KT>(Q_in, K_cache, V_cache, output, \
+        num_heads, num_kv_heads, num_kv_groups, head_dim, kv_seq, capacity, scale, \
+        q_len, q_start, attention_window, k_bits, k_row_bytes, k_centroids, v_bits, \
+        v_row_bytes, v_centroids, cen_k, cen_v, kv_values, shared_scores, shared_exp, \
+        shared_update, tid, tg_size, tgid); \
+}
+
+TQ_CAUSAL_GQA_ENTRY(turboquant_attn_v3_causal_gqa_h256, 256, 4, 8)
+TQ_CAUSAL_GQA_ENTRY(turboquant_attn_v3_causal_gqa_h512, 512, 2, 8)
+
+// ─── V3 cold cache → Q4_0 temp conversion for prefill flash attention ─────────
+//
+// Dequantizes a V3 row (fp16 norm + Lloyd-Max centroid indices), inverse-Haar
+// rotates back to the model frame, then re-quantizes as Q4_0. One threadgroup
+// per (kv_head, token). Output layout matches the Q4_0 cache so the existing
+// flash attention (`attention_flash_causal_q4_0`) can consume it directly.
+kernel void turboquant_v3_to_q4_0(
+    device const uchar* v3_cache   [[buffer(0)]],
+    device uchar*       q4_cache   [[buffer(1)]],
+    device const float* centroids  [[buffer(2)]],
+    device const float* inv        [[buffer(3)]],
+    constant uint&      rows       [[buffer(4)]],
+    constant uint&      head_dim   [[buffer(5)]],
+    constant uint&      capacity   [[buffer(6)]],
+    constant uint&      start_pos  [[buffer(7)]],
+    constant uint&      num_tokens [[buffer(8)]],
+    constant uint&      bits       [[buffer(9)]],
+    constant uint&      v3_rb      [[buffer(10)]],
+    constant uint&      q4_groups  [[buffer(11)]],
+    constant uint&      q4_rb      [[buffer(12)]],
+    uint tid     [[thread_index_in_threadgroup]],
+    uint tg_size [[threads_per_threadgroup]],
+    uint tgid    [[threadgroup_position_in_grid]])
+{
+    if (rows == 0 || num_tokens == 0) return;
+    uint kv_h = tgid / num_tokens;
+    uint t = tgid % num_tokens;
+    if (kv_h >= rows || t >= num_tokens) return;
+    uint pos = start_pos + t;
+
+    uint k_mask = (1u << bits) - 1u;
+    uint v3_base = kv_h * capacity * v3_rb + pos * v3_rb;
+
+    threadgroup float xs[512];
+    threadgroup float model[512];
+
+    // Dequantize V3 row: xs[d] = norm * centroids[index[d]]
+    float norm = float(*reinterpret_cast<device const half*>(&v3_cache[v3_base]));
+    device const uchar* qs = v3_cache + v3_base + 2;
+    for (uint d = tid; d < head_dim; d += tg_size) {
+        xs[d] = norm * centroids[tq_unpack(qs, d, bits, k_mask)];
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // Inverse Haar: model[c] = sum_k xs[k] * inv[k*head_dim + c]
+    for (uint c = tid; c < head_dim; c += tg_size) {
+        float acc = 0.0f;
+        uint mi = c;
+        for (uint k = 0; k < head_dim; k++) {
+            acc += xs[k] * inv[mi];
+            mi += head_dim;
+        }
+        model[c] = acc;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // Q4_0 block quantize (thread 0, serial — fast for small blocks)
+    if (tid == 0) {
+        uint q4_base = kv_h * capacity * q4_rb + pos * q4_rb;
+        device uchar* q4 = q4_cache + q4_base;
+        for (uint g = 0; g < q4_groups; g++) {
+            uint gd = g * 32;
+            float amax = 0.0f;
+            for (uint i = 0; i < 32; i++) amax = max(amax, fabs(model[gd + i]));
+            float d = amax / 7.0f;
+            if (d == 0.0f) d = 1.0f;
+            float id = 1.0f / d;
+            *reinterpret_cast<device half*>(&q4[g * 18]) = half(d);
+            device uchar* blk_qs = q4 + g * 18 + 2;
+            for (uint i = 0; i < 16; i++) {
+                float v0 = model[gd + i] * id;
+                float v1 = model[gd + 16 + i] * id;
+                int q0 = max(0, min(15, (int)(v0 + 8.5f)));
+                int q1 = max(0, min(15, (int)(v1 + 8.5f)));
+                blk_qs[i] = (uchar)(q0 | (q1 << 4));
+            }
+        }
+    }
+}

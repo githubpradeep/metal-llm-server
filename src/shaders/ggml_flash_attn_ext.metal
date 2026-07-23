@@ -70,6 +70,85 @@ void dequantize_q4_0(device const block_q4_0 * xb, short il, thread type4x4 & re
     reg = (type4x4) reg_f;
 }
 
+// Native TurboQuant K3/V2 rows. One row is one logical quant block, so `nl`
+// below is 16 for h256 and 32 for h512. Centroids are pipeline constants because
+// they depend only on bit-width and head dimension.
+struct block_tq3_h256 { half d; uchar qs[96]; };
+struct block_tq2_h256 { half d; uchar qs[64]; };
+struct block_tq3_h512 { half d; uchar qs[192]; };
+struct block_tq2_h512 { half d; uchar qs[128]; };
+
+constant float FC_tq_k0 [[function_constant(2)]];
+constant float FC_tq_k1 [[function_constant(3)]];
+constant float FC_tq_k2 [[function_constant(4)]];
+constant float FC_tq_k3 [[function_constant(5)]];
+constant float FC_tq_k4 [[function_constant(6)]];
+constant float FC_tq_k5 [[function_constant(7)]];
+constant float FC_tq_k6 [[function_constant(8)]];
+constant float FC_tq_k7 [[function_constant(9)]];
+constant float FC_tq_v0 [[function_constant(10)]];
+constant float FC_tq_v1 [[function_constant(11)]];
+constant float FC_tq_v2 [[function_constant(12)]];
+constant float FC_tq_v3 [[function_constant(13)]];
+
+inline float tq_flash_k_centroid(uint i) {
+    switch (i) {
+        case 0: return FC_tq_k0; case 1: return FC_tq_k1;
+        case 2: return FC_tq_k2; case 3: return FC_tq_k3;
+        case 4: return FC_tq_k4; case 5: return FC_tq_k5;
+        case 6: return FC_tq_k6; default: return FC_tq_k7;
+    }
+}
+inline float tq_flash_v_centroid(uint i) {
+    switch (i) {
+        case 0: return FC_tq_v0; case 1: return FC_tq_v1;
+        case 2: return FC_tq_v2; default: return FC_tq_v3;
+    }
+}
+
+template <typename block_t, typename type4x4>
+void dequantize_tq3(device const block_t * xb, short il, thread type4x4 & reg) {
+    float4x4 rf;
+    const uint base = uint(il) * 16u;
+    for (uint i = 0; i < 16u; i++) {
+        uint bit = (base + i) * 3u;
+        uint bi = bit >> 3;
+        uint sh = bit & 7u;
+        uint word = uint(xb->qs[bi]);
+        if (sh > 5u) word |= uint(xb->qs[bi + 1]) << 8;
+        rf[i / 4][i % 4] = float(xb->d) * tq_flash_k_centroid((word >> sh) & 7u);
+    }
+    reg = (type4x4)rf;
+}
+template <typename block_t, typename type4x4>
+void dequantize_tq2(device const block_t * xb, short il, thread type4x4 & reg) {
+    float4x4 rf;
+    const uint base = uint(il) * 16u;
+    for (uint i = 0; i < 16u; i++) {
+        uint d = base + i;
+        uint idx = (uint(xb->qs[d >> 2]) >> ((d & 3u) * 2u)) & 3u;
+        rf[i / 4][i % 4] = float(xb->d) * tq_flash_v_centroid(idx);
+    }
+    reg = (type4x4)rf;
+}
+
+template <typename type4x4>
+void dequantize_tq3_h256(device const block_tq3_h256 * xb, short il, thread type4x4 & reg) {
+    dequantize_tq3(xb, il, reg);
+}
+template <typename type4x4>
+void dequantize_tq2_h256(device const block_tq2_h256 * xb, short il, thread type4x4 & reg) {
+    dequantize_tq2(xb, il, reg);
+}
+template <typename type4x4>
+void dequantize_tq3_h512(device const block_tq3_h512 * xb, short il, thread type4x4 & reg) {
+    dequantize_tq3(xb, il, reg);
+}
+template <typename type4x4>
+void dequantize_tq2_h512(device const block_tq2_h512 * xb, short il, thread type4x4 & reg) {
+    dequantize_tq2(xb, il, reg);
+}
+
 // Must be true: when has_kvpad, the main kernel redirects mask reads into the
 // pad buffer (llama.cpp/ds4). If pad skips the mask, the last KV chunk attends
 // with garbage scores.
@@ -1582,4 +1661,46 @@ kernel void flash_attn_ext_prefill_q4_0_h512(
     ushort sgitg [[simdgroup_index_in_threadgroup]]) {
     kernel_flash_attn_ext_impl_h512<FA_TYPES, block_q4_0, 2, dequantize_q4_0, block_q4_0, 2, dequantize_q4_0, 512, 512, 8, 64, 4>(
         args, q, k, v, mask, (device const char *)nullptr, pad, blk, dst, shmem_f16, tgpig, tiisg, sgitg);
+}
+
+kernel void flash_attn_ext_prefill_tq_k3v2_h256(
+    constant ggml_metal_kargs_flash_attn_ext & args [[buffer(0)]],
+    device const char * q [[buffer(1)]],
+    device const char * k [[buffer(2)]],
+    device const char * v [[buffer(3)]],
+    device const char * mask [[buffer(4)]],
+    device const char * pad [[buffer(5)]],
+    device const char * blk [[buffer(6)]],
+    device char * dst [[buffer(7)]],
+    threadgroup half * shmem_f16 [[threadgroup(0)]],
+    uint3 tgpig [[threadgroup_position_in_grid]],
+    ushort tiisg [[thread_index_in_simdgroup]],
+    ushort sgitg [[simdgroup_index_in_threadgroup]]) {
+    kernel_flash_attn_ext_impl<FA_TYPES,
+        block_tq3_h256, 16, dequantize_tq3_h256,
+        block_tq2_h256, 16, dequantize_tq2_h256,
+        256, 256, 8, 64, 8>(
+        args, q, k, v, mask, (device const char *)nullptr, pad, blk, dst,
+        shmem_f16, tgpig, tiisg, sgitg);
+}
+
+kernel void flash_attn_ext_prefill_tq_k3v2_h512(
+    constant ggml_metal_kargs_flash_attn_ext & args [[buffer(0)]],
+    device const char * q [[buffer(1)]],
+    device const char * k [[buffer(2)]],
+    device const char * v [[buffer(3)]],
+    device const char * mask [[buffer(4)]],
+    device const char * pad [[buffer(5)]],
+    device const char * blk [[buffer(6)]],
+    device char * dst [[buffer(7)]],
+    threadgroup half * shmem_f16 [[threadgroup(0)]],
+    uint3 tgpig [[threadgroup_position_in_grid]],
+    ushort tiisg [[thread_index_in_simdgroup]],
+    ushort sgitg [[simdgroup_index_in_threadgroup]]) {
+    kernel_flash_attn_ext_impl_h512<FA_TYPES,
+        block_tq3_h512, 32, dequantize_tq3_h512,
+        block_tq2_h512, 32, dequantize_tq2_h512,
+        512, 512, 8, 64, 4>(
+        args, q, k, v, mask, (device const char *)nullptr, pad, blk, dst,
+        shmem_f16, tgpig, tiisg, sgitg);
 }

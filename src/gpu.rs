@@ -658,9 +658,17 @@ pub struct MetalContext {
     pub turboquant_spill_q4_to_v3_pipeline: ComputePipelineState,
     /// TurboQuant V3 (2/3-bit): single-token attention with centroid dequant.
     pub turboquant_attn_v3_pipeline: ComputePipelineState,
+    pub turboquant_attn_v3_gqa_h256_pipeline: ComputePipelineState,
+    pub turboquant_attn_v3_gqa_h512_pipeline: ComputePipelineState,
+    pub turboquant_attn_v3_gqa_reduce_h256_pipeline: ComputePipelineState,
+    pub turboquant_attn_v3_gqa_reduce_h512_pipeline: ComputePipelineState,
     /// TurboQuant V3: multi-query causal flash attention for past-hot prefill.
     pub turboquant_attn_v3_causal_h256_pipeline: ComputePipelineState,
     pub turboquant_attn_v3_causal_h512_pipeline: ComputePipelineState,
+    /// TurboQuant V3: causal GQA, one TG per KV head × query tile.
+    pub turboquant_attn_v3_causal_gqa_h256_pipeline: ComputePipelineState,
+    pub turboquant_attn_v3_causal_gqa_h512_pipeline: ComputePipelineState,
+    pub turboquant_v3_to_q4_0_pipeline: ComputePipelineState,
     pub attention_offset_q8_0_pipeline: ComputePipelineState,
     pub attention_causal_q8_0_pipeline: ComputePipelineState,
     pub attention_causal_strided_q8_0_pipeline: ComputePipelineState,
@@ -698,6 +706,9 @@ pub struct MetalContext {
     /// [0]=safe (kvpad+bc_mask), [1]=aligned (no kvpad, no bc_mask).
     pub flash_attn_ext_prefill_q4_h256_pipeline: [ComputePipelineState; 2],
     pub flash_attn_ext_prefill_q4_h512_pipeline: [ComputePipelineState; 2],
+    /// Native TurboQuant K3/V2 tiled prefill (aligned bulk chunks).
+    pub flash_attn_ext_prefill_tq_h256_pipeline: ComputePipelineState,
+    pub flash_attn_ext_prefill_tq_h512_pipeline: ComputePipelineState,
     pub embed_gather_bf16_pipeline: ComputePipelineState,
     pub embed_gather_bf16_batch_pipeline: ComputePipelineState,
     pub sample_token_pipeline: ComputePipelineState,
@@ -795,6 +806,44 @@ impl MetalContext {
                         name, has_kvpad, bc_mask, e
                     )
                 })
+        };
+        let get_fn_tq_flash = |name: &str, head_dim: u32| -> ComputePipelineState {
+            let constants = FunctionConstantValues::new();
+            let kvpad = false;
+            let bcm = false;
+            constants.set_constant_value_at_index(
+                &kvpad as *const bool as *const std::ffi::c_void,
+                MTLDataType::Bool,
+                0,
+            );
+            constants.set_constant_value_at_index(
+                &bcm as *const bool as *const std::ffi::c_void,
+                MTLDataType::Bool,
+                1,
+            );
+            let sigma = 1.0 / (head_dim as f64).sqrt();
+            let ck = crate::turboquant::lloyd_max_centroids(3, sigma, 200_000);
+            let cv = crate::turboquant::lloyd_max_centroids(2, sigma, 200_000);
+            for (i, value) in ck.iter().enumerate() {
+                constants.set_constant_value_at_index(
+                    value as *const f32 as *const std::ffi::c_void,
+                    MTLDataType::Float,
+                    2 + i as u64,
+                );
+            }
+            for (i, value) in cv.iter().enumerate() {
+                constants.set_constant_value_at_index(
+                    value as *const f32 as *const std::ffi::c_void,
+                    MTLDataType::Float,
+                    10 + i as u64,
+                );
+            }
+            let func = library
+                .get_function(name, Some(constants))
+                .unwrap_or_else(|e| panic!("Failed to get TQ flash function '{}': {:?}", name, e));
+            device
+                .new_compute_pipeline_state_with_function(&func)
+                .unwrap_or_else(|e| panic!("Failed to create TQ flash pipeline '{}': {:?}", name, e))
         };
 
         let matvec_pipeline = get_fn("matvec");
@@ -952,10 +1001,22 @@ impl MetalContext {
         let turboquant_quant_v3_batch_pipeline = get_fn("turboquant_quant_v3_batch");
         let turboquant_spill_q4_to_v3_pipeline = get_fn("turboquant_spill_q4_to_v3");
         let turboquant_attn_v3_pipeline = get_fn("turboquant_attn_v3");
+        let turboquant_attn_v3_gqa_h256_pipeline = get_fn("turboquant_attn_v3_gqa_h256");
+        let turboquant_attn_v3_gqa_h512_pipeline = get_fn("turboquant_attn_v3_gqa_h512");
+        let turboquant_attn_v3_gqa_reduce_h256_pipeline =
+            get_fn("turboquant_attn_v3_gqa_reduce_h256");
+        let turboquant_attn_v3_gqa_reduce_h512_pipeline =
+            get_fn("turboquant_attn_v3_gqa_reduce_h512");
         let turboquant_attn_v3_causal_h256_pipeline =
             get_fn("turboquant_attn_v3_causal_h256");
         let turboquant_attn_v3_causal_h512_pipeline =
             get_fn("turboquant_attn_v3_causal_h512");
+        let turboquant_attn_v3_causal_gqa_h256_pipeline =
+            get_fn("turboquant_attn_v3_causal_gqa_h256");
+        let turboquant_attn_v3_causal_gqa_h512_pipeline =
+            get_fn("turboquant_attn_v3_causal_gqa_h512");
+        let turboquant_v3_to_q4_0_pipeline =
+            get_fn("turboquant_v3_to_q4_0");
         let attention_offset_q8_0_pipeline = get_fn("attention_single_token_offset_q8_0");
         let attention_causal_q8_0_pipeline = get_fn("attention_causal_q8_0");
         let attention_causal_strided_q8_0_pipeline = get_fn("attention_causal_strided_q8_0");
@@ -1023,6 +1084,10 @@ impl MetalContext {
             get_fn_flash("flash_attn_ext_prefill_q4_0_h512", true, true),
             get_fn_flash("flash_attn_ext_prefill_q4_0_h512", false, false),
         ];
+        let flash_attn_ext_prefill_tq_h256_pipeline =
+            get_fn_tq_flash("flash_attn_ext_prefill_tq_k3v2_h256", 256);
+        let flash_attn_ext_prefill_tq_h512_pipeline =
+            get_fn_tq_flash("flash_attn_ext_prefill_tq_k3v2_h512", 512);
         let embed_gather_bf16_pipeline = get_fn("embed_gather_bf16");
         let embed_gather_bf16_batch_pipeline = get_fn("embed_gather_bf16_batch");
         let sample_token_pipeline = get_fn("sample_token");
@@ -1230,8 +1295,15 @@ impl MetalContext {
             turboquant_quant_v3_batch_pipeline,
             turboquant_spill_q4_to_v3_pipeline,
             turboquant_attn_v3_pipeline,
+            turboquant_attn_v3_gqa_h256_pipeline,
+            turboquant_attn_v3_gqa_h512_pipeline,
+            turboquant_attn_v3_gqa_reduce_h256_pipeline,
+            turboquant_attn_v3_gqa_reduce_h512_pipeline,
             turboquant_attn_v3_causal_h256_pipeline,
             turboquant_attn_v3_causal_h512_pipeline,
+            turboquant_attn_v3_causal_gqa_h256_pipeline,
+            turboquant_attn_v3_causal_gqa_h512_pipeline,
+            turboquant_v3_to_q4_0_pipeline,
             attention_offset_q8_0_pipeline,
             attention_causal_q8_0_pipeline,
             attention_causal_strided_q8_0_pipeline,
@@ -1268,6 +1340,8 @@ impl MetalContext {
             flash_attn_ext_prefill_mask_fill_pipeline,
             flash_attn_ext_prefill_q4_h256_pipeline,
             flash_attn_ext_prefill_q4_h512_pipeline,
+            flash_attn_ext_prefill_tq_h256_pipeline,
+            flash_attn_ext_prefill_tq_h512_pipeline,
             embed_gather_bf16_pipeline,
             embed_gather_bf16_batch_pipeline,
             sample_token_pipeline,
@@ -6607,6 +6681,8 @@ impl MetalContext {
         inv: &Buffer,
         scores: &Buffer,
     ) {
+        // Keep decode on the known-correct per-head native TQ kernel. The MWG
+        // GQA reduction path remains experimental until it crosschecks exactly.
         encoder.set_compute_pipeline_state(&self.turboquant_attn_v3_pipeline);
         encoder.set_buffer(0, Some(q_buf), q_offset);
         encoder.set_buffer(1, Some(k_cache), 0);
@@ -6669,10 +6745,42 @@ impl MetalContext {
         if q_len == 0 {
             return;
         }
-        let (pipeline, q_tile) = match head_dim {
-            256 => (&self.turboquant_attn_v3_causal_h256_pipeline, 4u64),
-            512 => (&self.turboquant_attn_v3_causal_h512_pipeline, 4u64),
-            _ => panic!("unsupported TQ causal head_dim={head_dim}"),
+        // GQA causal is opt-in: default stays per-Q-head (matches attn_v3).
+        // Enable with TURBOQUANT_CAUSAL_GQA=1 after numerical crosscheck.
+        let use_gqa = matches!(head_dim, 256 | 512)
+            && matches!(num_kv_groups, 2 | 4 | 8)
+            && matches!(
+                std::env::var("TURBOQUANT_CAUSAL_GQA").as_deref(),
+                Ok("1") | Ok("true") | Ok("TRUE")
+            );
+        let (pipeline, q_tile, grid_heads) = if use_gqa {
+            match head_dim {
+                256 => (
+                    &self.turboquant_attn_v3_causal_gqa_h256_pipeline,
+                    4u64,
+                    num_kv_heads as u64,
+                ),
+                512 => (
+                    &self.turboquant_attn_v3_causal_gqa_h512_pipeline,
+                    2u64,
+                    num_kv_heads as u64,
+                ),
+                _ => unreachable!(),
+            }
+        } else {
+            match head_dim {
+                256 => (
+                    &self.turboquant_attn_v3_causal_h256_pipeline,
+                    4u64,
+                    num_heads as u64,
+                ),
+                512 => (
+                    &self.turboquant_attn_v3_causal_h512_pipeline,
+                    4u64,
+                    num_heads as u64,
+                ),
+                _ => panic!("unsupported TQ causal head_dim={head_dim}"),
+            }
         };
         encoder.set_compute_pipeline_state(pipeline);
         encoder.set_buffer(0, Some(q_shd), 0);
@@ -6698,7 +6806,7 @@ impl MetalContext {
         encoder.set_buffer(20, Some(fwd), 0);
         encoder.set_buffer(21, Some(inv), 0);
         let q_tiles = (q_len as u64 + q_tile - 1) / q_tile;
-        let n_tg = (num_heads as u64).saturating_mul(q_tiles);
+        let n_tg = grid_heads.saturating_mul(q_tiles);
         encoder.dispatch_thread_groups(MTLSize::new(n_tg, 1, 1), MTLSize::new(256, 1, 1));
     }
 
@@ -6722,6 +6830,42 @@ impl MetalContext {
         encoder.set_bytes(4, 4, &capacity as *const u32 as *const _);
         encoder.set_bytes(5, 4, &cur_seq as *const u32 as *const _);
         encoder.dispatch_threads(MTLSize::new(total as u64, 1, 1), MTLSize::new(256, 1, 1));
+    }
+
+    pub fn encode_turboquant_v3_to_q4_0(
+        &self,
+        encoder: &metal::ComputeCommandEncoderRef,
+        v3_cache: &Buffer,
+        q4_temp: &Buffer,
+        centroids: &Buffer,
+        inv_rot: &Buffer,
+        num_kv_heads: u32,
+        head_dim: u32,
+        capacity: u32,
+        start_pos: u32,
+        num_tokens: u32,
+        v3_row_bytes: u32,
+        k_bits: u32,
+    ) {
+        let q4_groups = head_dim / 32;
+        let q4_row_bytes = q4_groups * 18;
+        let total = (num_kv_heads * num_tokens) as u64;
+        encoder.set_compute_pipeline_state(&self.turboquant_v3_to_q4_0_pipeline);
+        encoder.set_buffer(0, Some(v3_cache), 0);
+        encoder.set_buffer(1, Some(q4_temp), 0);
+        encoder.set_buffer(2, Some(centroids), 0);
+        encoder.set_buffer(3, Some(inv_rot), 0);
+        encoder.set_bytes(4, 4, &num_kv_heads as *const u32 as *const _);
+        encoder.set_bytes(5, 4, &head_dim as *const u32 as *const _);
+        encoder.set_bytes(6, 4, &capacity as *const u32 as *const _);
+        encoder.set_bytes(7, 4, &start_pos as *const u32 as *const _);
+        encoder.set_bytes(8, 4, &num_tokens as *const u32 as *const _);
+        encoder.set_bytes(9, 4, &k_bits as *const u32 as *const _);
+        encoder.set_bytes(10, 4, &v3_row_bytes as *const u32 as *const _);
+        encoder.set_bytes(11, 4, &q4_groups as *const u32 as *const _);
+        encoder.set_bytes(12, 4, &q4_row_bytes as *const u32 as *const _);
+        // One threadgroup per (kv_head, token) — kernel indexes by threadgroup_position.
+        encoder.dispatch_thread_groups(MTLSize::new(total, 1, 1), MTLSize::new(256, 1, 1));
     }
 
     pub fn encode_kv_append_q4_0_at(
@@ -7398,6 +7542,120 @@ impl MetalContext {
         encoder.set_threadgroup_memory_length(0, smem_bytes(head_dim, nsg));
         encoder.dispatch_thread_groups(
             metal::MTLSize::new(((q_len + NQPTG - 1) / NQPTG) as u64, num_heads as u64, 1),
+            metal::MTLSize::new(32, nsg as u64, 1),
+        );
+    }
+
+    /// Tiled MMA prefill directly over native TurboQuant K3/V2 rows.
+    /// Bulk chunks are aligned, so no Q4-shaped pad buffer is involved.
+    pub fn encode_prefill_flash_attn_ext_tq_k3v2(
+        &self,
+        encoder: &metal::ComputeCommandEncoderRef,
+        q_f32_buf: &Buffer,
+        k_cache_buf: &Buffer,
+        v_cache_buf: &Buffer,
+        out_buf: &Buffer,
+        scratch: &Buffer,
+        layout: &crate::ggml_flash_attn_ext::ScratchLayout,
+        mask_cache: Option<&mut crate::ggml_flash_attn_ext::PrefillExtMaskCache>,
+        num_heads: u32,
+        num_kv_heads: u32,
+        head_dim: u32,
+        kv_seq: u32,
+        capacity: u32,
+        scale: f32,
+        q_len: u32,
+        q_start: u32,
+        attention_window: u32,
+        k_row_bytes: u64,
+        v_row_bytes: u64,
+    ) {
+        use crate::ggml_flash_attn_ext::{
+            blk_args, flash_attn_ext_args, mask_fill_args, nsg_for_head_dim, smem_bytes,
+            FlashAttnExtArgs, FlashAttnExtBlkArgs, FlashAttnExtMaskFillArgs, NCPSG, NQPTG,
+        };
+        debug_assert_eq!(kv_seq % NCPSG, 0);
+        debug_assert_eq!(q_len % NQPTG, 0);
+
+        let (mask_off, blk_off) = layout.mask_blk_off(attention_window);
+        let need_mask_blk = match mask_cache.as_ref() {
+            Some(cache) => !cache.matches(q_len, kv_seq, q_start, attention_window),
+            None => true,
+        };
+        if need_mask_blk {
+            let fill = mask_fill_args(q_len, kv_seq, q_start, attention_window);
+            encoder.set_compute_pipeline_state(&self.flash_attn_ext_prefill_mask_fill_pipeline);
+            encoder.set_bytes(
+                0,
+                std::mem::size_of::<FlashAttnExtMaskFillArgs>() as u64,
+                &fill as *const _ as *const _,
+            );
+            encoder.set_buffer(1, Some(scratch), mask_off);
+            let tg = 16u64;
+            encoder.dispatch_thread_groups(
+                metal::MTLSize::new((kv_seq as u64 + tg - 1) / tg, (q_len as u64 + tg - 1) / tg, 1),
+                metal::MTLSize::new(tg, tg, 1),
+            );
+
+            let ba = blk_args(q_len, kv_seq);
+            encoder.set_compute_pipeline_state(&self.flash_attn_ext_prefill_blk_pipeline);
+            encoder.set_bytes(
+                0,
+                std::mem::size_of::<FlashAttnExtBlkArgs>() as u64,
+                &ba as *const _ as *const _,
+            );
+            encoder.set_buffer(1, Some(scratch), mask_off);
+            encoder.set_buffer(2, Some(scratch), blk_off);
+            encoder.dispatch_thread_groups(
+                metal::MTLSize::new(
+                    ((kv_seq + NCPSG - 1) / NCPSG) as u64,
+                    ((q_len + NQPTG - 1) / NQPTG) as u64,
+                    1,
+                ),
+                metal::MTLSize::new(32, 1, 1),
+            );
+            if let Some(cache) = mask_cache {
+                cache.mark(q_len, kv_seq, q_start, attention_window);
+            }
+        }
+
+        let mut args = flash_attn_ext_args(
+            num_heads,
+            num_kv_heads,
+            head_dim,
+            kv_seq,
+            capacity,
+            k_row_bytes,
+            q_len,
+            scale,
+        );
+        args.ns10 = 1;
+        args.ns20 = 1;
+        args.nb21 = v_row_bytes;
+        args.nb22 = capacity as u64 * v_row_bytes;
+
+        let main_pipeline = match head_dim {
+            256 => &self.flash_attn_ext_prefill_tq_h256_pipeline,
+            512 => &self.flash_attn_ext_prefill_tq_h512_pipeline,
+            _ => unreachable!("TQ flash_attn_ext only supports h256/h512"),
+        };
+        encoder.set_compute_pipeline_state(main_pipeline);
+        encoder.set_bytes(
+            0,
+            std::mem::size_of::<FlashAttnExtArgs>() as u64,
+            &args as *const _ as *const _,
+        );
+        encoder.set_buffer(1, Some(q_f32_buf), 0);
+        encoder.set_buffer(2, Some(k_cache_buf), 0);
+        encoder.set_buffer(3, Some(v_cache_buf), 0);
+        encoder.set_buffer(4, Some(scratch), mask_off);
+        encoder.set_buffer(5, Some(scratch), layout.pad_off);
+        encoder.set_buffer(6, Some(scratch), blk_off);
+        encoder.set_buffer(7, Some(out_buf), 0);
+        let nsg = nsg_for_head_dim(head_dim);
+        encoder.set_threadgroup_memory_length(0, smem_bytes(head_dim, nsg));
+        encoder.dispatch_thread_groups(
+            metal::MTLSize::new((q_len / NQPTG) as u64, num_heads as u64, 1),
             metal::MTLSize::new(32, nsg as u64, 1),
         );
     }

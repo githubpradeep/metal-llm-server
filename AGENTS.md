@@ -445,3 +445,35 @@ Acceptance is the structural limit: at 42% accept and 1.85 tok/forward, even
 free batching caps at ~1.85× per-forward cost. M7 fused gelu was a wash for
 e2e. Next levers: draft head quality (accept ~42% → 60%+), or deeper verify
 phase timing to find where the 1.6× MLP tax actually lives.
+
+---
+
+## E24. V3 cold prefill V3→Q4_0 conversion (2026-07-23) — fix 8k+ timeout
+
+**What**: The V3 causal attention kernel (`turboquant_attn_v3_causal`) is 20× slower
+than Q4_0 flash attention at 8k+ context because it dequantizes V3 per tile with
+centroid lookups instead of simdgroup matmul. Prefill at 8.2k tok timed out at
+398s.
+
+**Fix (v1)**: Wrote `turboquant_v3_to_q4_0` kernel that batch-converts V3 cold K/V to
+Q4_0 on the GPU. Allocated per-layer `tq_cold_q4_k`/`tq_cold_q4_v` temp buffers.
+
+**Fix (v2, 2026-07-23)**: `TURBOQUANT_HOT_WINDOW=0` was still catastrophic:
+1. `can_use_parallel_prefill_chunk` returned false → **token-by-token** prefill
+2. Fused decode skipped → every decode token used slow `attn_v3`
+3. `encode_turboquant_v3_to_q4_0` used `dispatch_threads` instead of
+   `dispatch_thread_groups` (one TG per token)
+
+v2 dual-writes a model-frame Q4 attention mirror at cold KV append, enables
+parallel prefill + fused decode for pure TQ, and attends with Q4 flash on the
+mirror (no per-chunk V3→Q4). V3 remains the compressed store.
+
+**Files changed**:
+- `turboquant.metal` — `turboquant_v3_to_q4_0` (kept as fallback)
+- `gpu.rs` — `dispatch_thread_groups` fix for V3→Q4
+- `gemma4_gpu_model.rs` — parallel cold prefill, Q4 mirror dual-write, decode
+- `decode_fused.rs` — pure-TQ fused decode via cold Q4 mirror
+
+**Result**: Build clean. With `HOT_WINDOW=0`, 8k prefill/decode should track Q4
+flash speed (plus V3 pack tax). Note: Q4 mirror is sized to `LLAMA_CTX_SIZE`
+(~2.4 GB @ 200k on E2B) — prefer `HOT_WINDOW=2048` when you do not need pure TQ.

@@ -38,11 +38,17 @@ pub fn log_fused_decode_status(model: &Gemma4GpuModel) {
     }
     match model.kv_cache_type {
         KvCacheType::Q4_0 => {}
-        KvCacheType::TurboQuant { .. } if model.tq_hot_enabled() => {
-            println!(
-                "  Fused decode executor: TurboQuant hybrid (Q4 hot ≤{}, TQ cold beyond)",
-                model.tq_hot_w
-            );
+        KvCacheType::TurboQuant { .. } if model.tq_hot_enabled() || model.tq_cold_q4_enabled() => {
+            if model.tq_hot_enabled() {
+                println!(
+                    "  Fused decode executor: TurboQuant hybrid (Q4 hot ≤{}, TQ cold beyond)",
+                    model.tq_hot_w
+                );
+            } else {
+                println!(
+                    "  Fused decode executor: TurboQuant pure (Q4 cold attention mirror)"
+                );
+            }
         }
         other => {
             println!(
@@ -113,7 +119,9 @@ impl Gemma4GpuModel {
         }
         let kv_ok = match self.kv_cache_type {
             KvCacheType::Q4_0 => true,
-            KvCacheType::TurboQuant { .. } => self.tq_hot_enabled(),
+            KvCacheType::TurboQuant { .. } => {
+                self.tq_hot_enabled() || self.tq_cold_q4_enabled()
+            }
             _ => false,
         };
         if !kv_ok {
@@ -320,19 +328,30 @@ impl Gemma4GpuModel {
         let tq_v3 = matches!(self.kv_cache_type, KvCacheType::TurboQuant { .. })
             && !self.kv_cache_type.tq_affine();
         let use_hot = tq_v3 && self.tq_attn_fits_hot(attn_kv_seq);
-        // Dual-write TQ during the hot window (needed before ctx exceeds hot).
-        // Default OFF for speed — essay-length gens stay in the hot window.
-        // Set TURBOQUANT_DUAL_WRITE=1 before long contexts that will exceed hot.
+        let use_cold_q4 = tq_v3 && !use_hot && self.tq_use_cold_q4_attn(attn_kv_seq);
+        // Dual-write TQ during the hot window (default ON). Ensures the cold TQ cache
+        // has single-quantization (f32 → V3) for all hot-window tokens — prevents the
+        // double-quantization quality loss when the hot ring spills to TQ cold later.
+        // Set TURBOQUANT_NO_DUAL_WRITE=1 to disable (write only to Q4 hot ring).
         let dual_write = tq_v3
             && layer.has_kv
-            && matches!(
-                std::env::var("TURBOQUANT_DUAL_WRITE").as_deref(),
+            && !matches!(
+                std::env::var("TURBOQUANT_NO_DUAL_WRITE").as_deref(),
                 Ok("1") | Ok("true") | Ok("TRUE")
             );
 
-        if use_hot {
-            // Same mega-fusion as Q4_0, targeting the hot ring.
+        if use_hot || use_cold_q4 {
+            // Q4 flash on hot ring or persistent cold mirror (pure TQ / past-hot).
             let src = layer.kv_source_layer;
+            let (q4_k, q4_v, q4_cap) = if use_hot {
+                (&self.tq_hot_k[src], &self.tq_hot_v[src], self.tq_hot_cap)
+            } else {
+                (
+                    &self.tq_cold_q4_k[src],
+                    &self.tq_cold_q4_v[src],
+                    self.kv_capacity,
+                )
+            };
             if layer.has_kv
                 && matches!(head_dim, 128 | 256 | 512)
                 && !gpu::attention_use_ggml_for_layer_kv(true, effective_kv_seq)
@@ -349,14 +368,14 @@ impl Gemma4GpuModel {
                     &layer.k_norm_weight,
                     scratch.v,
                     scratch.attn_out,
-                    &self.tq_hot_k[src],
-                    &self.tq_hot_v[src],
+                    q4_k,
+                    q4_v,
                     num_heads,
                     num_kv_heads,
                     num_kv_groups,
                     head_dim,
                     effective_kv_seq,
-                    self.tq_hot_cap,
+                    q4_cap,
                     scale,
                     kv_start,
                     kv_seq,
@@ -377,15 +396,15 @@ impl Gemma4GpuModel {
                     rope_off,
                     scratch.sin_packed,
                     rope_off,
-                    &self.tq_hot_k[src],
-                    &self.tq_hot_v[src],
+                    q4_k,
+                    q4_v,
                     scratch.attn_out,
                     num_heads,
                     num_kv_heads,
                     num_kv_groups,
                     head_dim,
                     effective_kv_seq,
-                    self.tq_hot_cap,
+                    q4_cap,
                     scale,
                     kv_start,
                     groups_per_row,
@@ -394,9 +413,7 @@ impl Gemma4GpuModel {
                 );
                 n += 1;
             } else {
-                // Decompose + Q4 hot — same ggml MWG / GQA / offset split as Q4_0.
-                // Without ggml here, ATTENTION_KERNEL=auto falls to offset flash past
-                // 128 tok and loses ~5–6 tok/s vs Q4 (essay-length interactive).
+                // Decompose + Q4 — same ggml MWG / GQA / offset split as Q4_0.
                 self.ctx.encode_rmsnorm_per_head_view(
                     encoder,
                     scratch.q,
@@ -455,22 +472,27 @@ impl Gemma4GpuModel {
                     );
                     // Always append here: this branch never uses full_fused
                     // (ggml or rare head dims), so inline append is unavailable.
+                    let (append_k, append_v) = if use_hot {
+                        (&self.tq_hot_k[layer_idx], &self.tq_hot_v[layer_idx])
+                    } else {
+                        (&self.tq_cold_q4_k[layer_idx], &self.tq_cold_q4_v[layer_idx])
+                    };
                     self.ctx.encode_kv_append_q4_0(
                         encoder,
                         scratch.k_normed,
-                        &self.tq_hot_k[layer_idx],
+                        append_k,
                         num_kv_heads,
                         head_dim,
-                        self.tq_hot_cap,
+                        q4_cap,
                         kv_seq,
                     );
                     self.ctx.encode_kv_append_q4_0(
                         encoder,
                         scratch.gate,
-                        &self.tq_hot_v[layer_idx],
+                        append_v,
                         num_kv_heads,
                         head_dim,
-                        self.tq_hot_cap,
+                        q4_cap,
                         kv_seq,
                     );
                     n += 5;
@@ -482,15 +504,15 @@ impl Gemma4GpuModel {
                     self.ctx.encode_attention_ggml_q4_0(
                         encoder,
                         scratch.q_normed,
-                        &self.tq_hot_k[src],
-                        &self.tq_hot_v[src],
+                        q4_k,
+                        q4_v,
                         &self.ggml_fa_tmp_buf,
                         scratch.attn_out,
                         num_heads,
                         num_kv_heads,
                         head_dim,
                         effective_kv_seq,
-                        self.tq_hot_cap,
+                        q4_cap,
                         scale,
                         kv_start,
                         row_bytes,
@@ -499,15 +521,15 @@ impl Gemma4GpuModel {
                     self.ctx.encode_attention_with_offset_q4_0_gqa(
                         encoder,
                         scratch.q_normed,
-                        &self.tq_hot_k[src],
-                        &self.tq_hot_v[src],
+                        q4_k,
+                        q4_v,
                         scratch.attn_out,
                         num_heads,
                         num_kv_heads,
                         num_kv_groups,
                         head_dim,
                         effective_kv_seq,
-                        self.tq_hot_cap,
+                        q4_cap,
                         scale,
                         kv_start,
                         groups_per_row,
@@ -517,15 +539,15 @@ impl Gemma4GpuModel {
                     self.ctx.encode_attention_with_offset_q4_0(
                         encoder,
                         scratch.q_normed,
-                        &self.tq_hot_k[src],
-                        &self.tq_hot_v[src],
+                        q4_k,
+                        q4_v,
                         scratch.attn_out,
                         num_heads,
                         num_kv_heads,
                         num_kv_groups,
                         head_dim,
                         effective_kv_seq,
-                        self.tq_hot_cap,
+                        q4_cap,
                         scale,
                         kv_start,
                         groups_per_row,
@@ -535,8 +557,11 @@ impl Gemma4GpuModel {
                 n += 1;
             }
 
-            // Optional TQ cold dual-write (needs its own K/V norm — full_fused hides them).
-            if dual_write && layer.has_kv {
+            // TQ V3 cold write (+ optional Q4 cold mirror during hot dual-write).
+            // full_fused hides K/V norms, so recompute when needed.
+            let write_v3 = layer.has_kv && ((use_hot && dual_write) || use_cold_q4);
+            let write_cold_q4_mirror = use_hot && dual_write && self.tq_cold_q4_enabled();
+            if write_v3 || write_cold_q4_mirror {
                 self.ctx.encode_rmsnorm_per_head_view(
                     encoder,
                     scratch.k,
@@ -568,6 +593,28 @@ impl Gemma4GpuModel {
                     head_dim,
                     eps,
                 );
+                if write_cold_q4_mirror {
+                    self.ctx.encode_kv_append_q4_0(
+                        encoder,
+                        scratch.k_normed,
+                        &self.tq_cold_q4_k[layer_idx],
+                        num_kv_heads,
+                        head_dim,
+                        self.kv_capacity,
+                        kv_seq,
+                    );
+                    self.ctx.encode_kv_append_q4_0(
+                        encoder,
+                        scratch.gate,
+                        &self.tq_cold_q4_v[layer_idx],
+                        num_kv_heads,
+                        head_dim,
+                        self.kv_capacity,
+                        kv_seq,
+                    );
+                    n += 2;
+                }
+                if write_v3 {
                 let KvCacheType::TurboQuant { k_bits, v_bits } = self.kv_cache_type else {
                     unreachable!()
                 };
@@ -616,6 +663,7 @@ impl Gemma4GpuModel {
                     fwd,
                 );
                 n += 5;
+                }
             }
         } else if tq_v3 {
             // Cold path: TQ V3 attention (ctx > hot window).
