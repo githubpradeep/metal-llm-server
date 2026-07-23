@@ -46,15 +46,14 @@ LLAMA_CTX_SIZE=8192 LLAMA_KV_POOL_SLOTS=4 \
 | `TURBOQUANT_RESIDUAL_WINDOW` | Recent tokens kept fp32 in Haar frame (default 128) |
 | `TURBOQUANT_HOT_WINDOW` | Decode spill threshold / short-ctx Q4 window (default **2048**; `0` = pure TQ) |
 | `TURBOQUANT_PREFILL_Q4` | **Opt-in only** (`=1`): Q4-flash whole prompt then spill. Default **off** — past-hot uses TQ multi-query causal attn. |
-| `TURBOQUANT_GQA` | Default **on**. Share KV across Q heads (E2B `8:1`). Decode: `h256` GQA on; prefill: `h256`+`h512` GQA. Set `=0` to force per-Q-head TG. |
-| `TURBOQUANT_GQA_H512` | Opt-in decode GQA for global `h512` (device-accum Haar O). Default **off** — often ≤ per-head flash. |
+| `TURBOQUANT_GQA` | Default **on**. SWA `h256` decode/prefill share KV across Q heads (E2B `8:1`). Set `=0` to force per-Q-head TG. |
 | `TURBOQUANT_DUAL_WRITE` | `1` = also pack TQ cold while in hot window. Default off for speed. |
 | `LLAMA_KV_POOL_SLOTS` | Serve concurrency (default 4). Each slot owns its own Q4 hot ring (~25 MB @2048 on E2B). |
 
 **Recommended demo:** `K3/V2` + `rw=128` + `hot=2048` (decode ≈ Q4 flash while ctx ≤ hot).  
 **Quality-safer:** `K6/V4` + `rw=128` if available / when raising bits.
 
-**Speed model:** While `attn_kv_seq ≤ TURBOQUANT_HOT_WINDOW`, decode stays on the Q4 flash stack. Past-hot **prefill** batch-rotates Q/K/V, packs each cold chunk in two dispatches, and attends with **`turboquant_attn_v3_causal`** / **`_gqa_{h256,h512}`** (flash online softmax, half centroids, GQA KV share, larger query tiles). Spill once at the hot boundary. On E2B K3/V2, the 7,127-token needle is ~**54s** and still returns `AURORA-7749`. Past-hot **decode** uses fused flash `attn_v3` with SWA `h256` GQA by default; global `h512` decode GQA is opt-in (`TURBOQUANT_GQA_H512=1`). `TURBOQUANT_PREFILL_Q4=1` is an explicit escape hatch only.
+**Speed model:** While `attn_kv_seq ≤ TURBOQUANT_HOT_WINDOW`, decode stays on the Q4 flash stack. Past-hot **prefill** batch-rotates Q/K/V, packs each cold chunk in two dispatches, and attends with **`turboquant_attn_v3_causal`** / **`_gqa_h256`** (flash online softmax, half centroids, GQA KV share on SWA). Spill once at the hot boundary. On E2B K3/V2, the 7,127-token needle improved from **167.45s → ~52s** and still returns `AURORA-7749`. Past-hot **decode** uses fused flash `attn_v3` (no device score buffer); SWA layers use GQA (`8:1` on E2B). Global `h512` stays per-Q-head (TG smem). `TURBOQUANT_PREFILL_Q4=1` is an explicit escape hatch only.
 
 **`--serve`:** Per-slot hot rings + residual + spill flag live in `KvCachePool`. Multi-slot TQ runs serially per slot. Past-hot prefill uses TQ multi-query causal attention on each slot’s cold cache.
 
@@ -78,7 +77,6 @@ Set `TURBOQUANT_DUAL_WRITE=1` to also pack TQ during the hot window (avoids a bi
 | **P3g** | Shipped | `turboquant_attn_v3_causal`: multi-query TQ flash for past-hot prefill chunks |
 | **P3h** | Shipped | Native TQ prefill: batched f16 Haar matmuls, chunk-wide K/V packing, four-query tiles, SIMD-pair score mapping |
 | **P3i** | Shipped | Parity path: flash online decode (no score buffer), half centroids, GQA `h256` for groups 2/4/8 (E2B 8:1). Past-hot decode **~23 vs ~13.5 tok/s** (`GQA=1` vs `0`); 7k needle still `AURORA-7749` |
-| **P3j** | Shipped | GQA `h512` device-accum (prefill on; decode via `TURBOQUANT_GQA_H512`); causal Q_TILE bumps (`h256` GQA 2→4, non-GQA 4→8) |
 | **P4** | Stub only | Disk-backed cold TQ pages for 1M-class docs — see below |
 
 ## Design (runtime)

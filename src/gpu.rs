@@ -658,16 +658,13 @@ pub struct MetalContext {
     pub turboquant_spill_q4_to_v3_pipeline: ComputePipelineState,
     /// TurboQuant V3 (2/3-bit): single-token flash attention with centroid dequant.
     pub turboquant_attn_v3_pipeline: ComputePipelineState,
-    /// TurboQuant V3: GQA decode h256 — one TG per KV head.
+    /// TurboQuant V3: GQA decode — one TG per KV head.
     pub turboquant_attn_v3_gqa_pipeline: ComputePipelineState,
-    /// TurboQuant V3: GQA decode h512 — device-accum O (E2B 8:1).
-    pub turboquant_attn_v3_gqa_h512_pipeline: ComputePipelineState,
     /// TurboQuant V3: multi-query causal flash attention for past-hot prefill.
     pub turboquant_attn_v3_causal_h256_pipeline: ComputePipelineState,
     pub turboquant_attn_v3_causal_h512_pipeline: ComputePipelineState,
-    /// TurboQuant V3: GQA causal prefill — one TG per KV head × query tile.
+    /// TurboQuant V3: GQA causal prefill (h256) — one TG per KV head × query tile.
     pub turboquant_attn_v3_causal_gqa_h256_pipeline: ComputePipelineState,
-    pub turboquant_attn_v3_causal_gqa_h512_pipeline: ComputePipelineState,
     pub attention_offset_q8_0_pipeline: ComputePipelineState,
     pub attention_causal_q8_0_pipeline: ComputePipelineState,
     pub attention_causal_strided_q8_0_pipeline: ComputePipelineState,
@@ -960,15 +957,12 @@ impl MetalContext {
         let turboquant_spill_q4_to_v3_pipeline = get_fn("turboquant_spill_q4_to_v3");
         let turboquant_attn_v3_pipeline = get_fn("turboquant_attn_v3");
         let turboquant_attn_v3_gqa_pipeline = get_fn("turboquant_attn_v3_gqa");
-        let turboquant_attn_v3_gqa_h512_pipeline = get_fn("turboquant_attn_v3_gqa_h512");
         let turboquant_attn_v3_causal_h256_pipeline =
             get_fn("turboquant_attn_v3_causal_h256");
         let turboquant_attn_v3_causal_h512_pipeline =
             get_fn("turboquant_attn_v3_causal_h512");
         let turboquant_attn_v3_causal_gqa_h256_pipeline =
             get_fn("turboquant_attn_v3_causal_gqa_h256");
-        let turboquant_attn_v3_causal_gqa_h512_pipeline =
-            get_fn("turboquant_attn_v3_causal_gqa_h512");
         let attention_offset_q8_0_pipeline = get_fn("attention_single_token_offset_q8_0");
         let attention_causal_q8_0_pipeline = get_fn("attention_causal_q8_0");
         let attention_causal_strided_q8_0_pipeline = get_fn("attention_causal_strided_q8_0");
@@ -1244,11 +1238,9 @@ impl MetalContext {
             turboquant_spill_q4_to_v3_pipeline,
             turboquant_attn_v3_pipeline,
             turboquant_attn_v3_gqa_pipeline,
-            turboquant_attn_v3_gqa_h512_pipeline,
             turboquant_attn_v3_causal_h256_pipeline,
             turboquant_attn_v3_causal_h512_pipeline,
             turboquant_attn_v3_causal_gqa_h256_pipeline,
-            turboquant_attn_v3_causal_gqa_h512_pipeline,
             attention_offset_q8_0_pipeline,
             attention_causal_q8_0_pipeline,
             attention_causal_strided_q8_0_pipeline,
@@ -6624,24 +6616,14 @@ impl MetalContext {
         inv: &Buffer,
         scores: &Buffer,
     ) {
-        // GQA: one TG per KV head. E2B is 8:1 (head_count_kv=1).
-        // h256 GQA is default-on (big win). h512 device-accum GQA is opt-in
-        // (`TURBOQUANT_GQA_H512=1`) — Haar + device O can lose vs per-head flash.
-        let gqa_on = std::env::var("TURBOQUANT_GQA").map(|v| v != "0").unwrap_or(true);
-        let gqa_h512 = matches!(
-            std::env::var("TURBOQUANT_GQA_H512").as_deref(),
-            Ok("1") | Ok("true") | Ok("TRUE")
-        );
-        let use_gqa = gqa_on
+        // GQA h256: one TG per KV head. E2B is 8:1 (head_count_kv=1).
+        // h512 G=8 exceeds TG smem — stay on per-head flash.
+        let use_gqa = head_dim == 256
             && matches!(num_kv_groups, 2 | 4 | 8)
             && (8 % num_kv_groups == 0)
-            && (head_dim == 256 || (head_dim == 512 && gqa_h512));
+            && std::env::var("TURBOQUANT_GQA").map(|v| v != "0").unwrap_or(true);
         if use_gqa {
-            if head_dim == 512 {
-                encoder.set_compute_pipeline_state(&self.turboquant_attn_v3_gqa_h512_pipeline);
-            } else {
-                encoder.set_compute_pipeline_state(&self.turboquant_attn_v3_gqa_pipeline);
-            }
+            encoder.set_compute_pipeline_state(&self.turboquant_attn_v3_gqa_pipeline);
         } else {
             encoder.set_compute_pipeline_state(&self.turboquant_attn_v3_pipeline);
         }
@@ -6708,29 +6690,21 @@ impl MetalContext {
         if q_len == 0 {
             return;
         }
-        let use_gqa = matches!(head_dim, 256 | 512)
+        let use_gqa = head_dim == 256
             && matches!(num_kv_groups, 2 | 4 | 8)
             && std::env::var("TURBOQUANT_GQA")
                 .map(|v| v != "0")
                 .unwrap_or(true);
         let (pipeline, q_tile, grid_heads) = if use_gqa {
-            match head_dim {
-                256 => (
-                    &self.turboquant_attn_v3_causal_gqa_h256_pipeline,
-                    4u64, // device-accum O frees TG for Q_TILE=4
-                    num_kv_heads as u64,
-                ),
-                512 => (
-                    &self.turboquant_attn_v3_causal_gqa_h512_pipeline,
-                    2u64,
-                    num_kv_heads as u64,
-                ),
-                _ => panic!("unsupported TQ causal GQA head_dim={head_dim}"),
-            }
+            (
+                &self.turboquant_attn_v3_causal_gqa_h256_pipeline,
+                2u64, // Q_TILE=2 keeps MAX_G=8 smem under budget
+                num_kv_heads as u64,
+            )
         } else {
             match head_dim {
-                256 => (&self.turboquant_attn_v3_causal_h256_pipeline, 8u64, num_heads as u64),
-                512 => (&self.turboquant_attn_v3_causal_h512_pipeline, 8u64, num_heads as u64),
+                256 => (&self.turboquant_attn_v3_causal_h256_pipeline, 4u64, num_heads as u64),
+                512 => (&self.turboquant_attn_v3_causal_h512_pipeline, 4u64, num_heads as u64),
                 _ => panic!("unsupported TQ causal head_dim={head_dim}"),
             }
         };
