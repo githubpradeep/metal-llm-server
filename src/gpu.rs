@@ -656,11 +656,15 @@ pub struct MetalContext {
     pub turboquant_quant_v3_batch_pipeline: ComputePipelineState,
     /// TurboQuant: spill Q4_0 hot ring → V3 cold cache.
     pub turboquant_spill_q4_to_v3_pipeline: ComputePipelineState,
-    /// TurboQuant V3 (2/3-bit): single-token attention with centroid dequant.
+    /// TurboQuant V3 (2/3-bit): single-token flash attention with centroid dequant.
     pub turboquant_attn_v3_pipeline: ComputePipelineState,
+    /// TurboQuant V3: GQA decode — one TG per KV head.
+    pub turboquant_attn_v3_gqa_pipeline: ComputePipelineState,
     /// TurboQuant V3: multi-query causal flash attention for past-hot prefill.
     pub turboquant_attn_v3_causal_h256_pipeline: ComputePipelineState,
     pub turboquant_attn_v3_causal_h512_pipeline: ComputePipelineState,
+    /// TurboQuant V3: GQA causal prefill (h256) — one TG per KV head × query tile.
+    pub turboquant_attn_v3_causal_gqa_h256_pipeline: ComputePipelineState,
     pub attention_offset_q8_0_pipeline: ComputePipelineState,
     pub attention_causal_q8_0_pipeline: ComputePipelineState,
     pub attention_causal_strided_q8_0_pipeline: ComputePipelineState,
@@ -952,10 +956,13 @@ impl MetalContext {
         let turboquant_quant_v3_batch_pipeline = get_fn("turboquant_quant_v3_batch");
         let turboquant_spill_q4_to_v3_pipeline = get_fn("turboquant_spill_q4_to_v3");
         let turboquant_attn_v3_pipeline = get_fn("turboquant_attn_v3");
+        let turboquant_attn_v3_gqa_pipeline = get_fn("turboquant_attn_v3_gqa");
         let turboquant_attn_v3_causal_h256_pipeline =
             get_fn("turboquant_attn_v3_causal_h256");
         let turboquant_attn_v3_causal_h512_pipeline =
             get_fn("turboquant_attn_v3_causal_h512");
+        let turboquant_attn_v3_causal_gqa_h256_pipeline =
+            get_fn("turboquant_attn_v3_causal_gqa_h256");
         let attention_offset_q8_0_pipeline = get_fn("attention_single_token_offset_q8_0");
         let attention_causal_q8_0_pipeline = get_fn("attention_causal_q8_0");
         let attention_causal_strided_q8_0_pipeline = get_fn("attention_causal_strided_q8_0");
@@ -1230,8 +1237,10 @@ impl MetalContext {
             turboquant_quant_v3_batch_pipeline,
             turboquant_spill_q4_to_v3_pipeline,
             turboquant_attn_v3_pipeline,
+            turboquant_attn_v3_gqa_pipeline,
             turboquant_attn_v3_causal_h256_pipeline,
             turboquant_attn_v3_causal_h512_pipeline,
+            turboquant_attn_v3_causal_gqa_h256_pipeline,
             attention_offset_q8_0_pipeline,
             attention_causal_q8_0_pipeline,
             attention_causal_strided_q8_0_pipeline,
@@ -6607,7 +6616,17 @@ impl MetalContext {
         inv: &Buffer,
         scores: &Buffer,
     ) {
-        encoder.set_compute_pipeline_state(&self.turboquant_attn_v3_pipeline);
+        // GQA h256: one TG per KV head. E2B is 8:1 (head_count_kv=1).
+        // h512 G=8 exceeds TG smem — stay on per-head flash.
+        let use_gqa = head_dim == 256
+            && matches!(num_kv_groups, 2 | 4 | 8)
+            && (8 % num_kv_groups == 0)
+            && std::env::var("TURBOQUANT_GQA").map(|v| v != "0").unwrap_or(true);
+        if use_gqa {
+            encoder.set_compute_pipeline_state(&self.turboquant_attn_v3_gqa_pipeline);
+        } else {
+            encoder.set_compute_pipeline_state(&self.turboquant_attn_v3_pipeline);
+        }
         encoder.set_buffer(0, Some(q_buf), q_offset);
         encoder.set_buffer(1, Some(k_cache), 0);
         encoder.set_buffer(2, Some(v_cache), 0);
@@ -6633,10 +6652,12 @@ impl MetalContext {
         encoder.set_bytes(22, 4, &v_row_bytes as *const u32 as *const _);
         encoder.set_buffer(23, Some(v_centroids), 0);
         encoder.set_buffer(24, Some(scores), 0);
-        encoder.dispatch_thread_groups(
-            MTLSize::new(num_heads as u64, 1, 1),
-            MTLSize::new(256, 1, 1),
-        );
+        let n_tg = if use_gqa {
+            num_kv_heads as u64
+        } else {
+            num_heads as u64
+        };
+        encoder.dispatch_thread_groups(MTLSize::new(n_tg, 1, 1), MTLSize::new(256, 1, 1));
     }
 
     /// Multi-query causal TQ attention for a prefill chunk (SHD Q/out).
@@ -6669,10 +6690,23 @@ impl MetalContext {
         if q_len == 0 {
             return;
         }
-        let (pipeline, q_tile) = match head_dim {
-            256 => (&self.turboquant_attn_v3_causal_h256_pipeline, 4u64),
-            512 => (&self.turboquant_attn_v3_causal_h512_pipeline, 4u64),
-            _ => panic!("unsupported TQ causal head_dim={head_dim}"),
+        let use_gqa = head_dim == 256
+            && matches!(num_kv_groups, 2 | 4 | 8)
+            && std::env::var("TURBOQUANT_GQA")
+                .map(|v| v != "0")
+                .unwrap_or(true);
+        let (pipeline, q_tile, grid_heads) = if use_gqa {
+            (
+                &self.turboquant_attn_v3_causal_gqa_h256_pipeline,
+                2u64, // Q_TILE=2 keeps MAX_G=8 smem under budget
+                num_kv_heads as u64,
+            )
+        } else {
+            match head_dim {
+                256 => (&self.turboquant_attn_v3_causal_h256_pipeline, 4u64, num_heads as u64),
+                512 => (&self.turboquant_attn_v3_causal_h512_pipeline, 4u64, num_heads as u64),
+                _ => panic!("unsupported TQ causal head_dim={head_dim}"),
+            }
         };
         encoder.set_compute_pipeline_state(pipeline);
         encoder.set_buffer(0, Some(q_shd), 0);
@@ -6698,7 +6732,7 @@ impl MetalContext {
         encoder.set_buffer(20, Some(fwd), 0);
         encoder.set_buffer(21, Some(inv), 0);
         let q_tiles = (q_len as u64 + q_tile - 1) / q_tile;
-        let n_tg = (num_heads as u64).saturating_mul(q_tiles);
+        let n_tg = grid_heads.saturating_mul(q_tiles);
         encoder.dispatch_thread_groups(MTLSize::new(n_tg, 1, 1), MTLSize::new(256, 1, 1));
     }
 
