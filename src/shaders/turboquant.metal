@@ -440,14 +440,19 @@ kernel void turboquant_spill_q4_to_v3(
     }
 }
 
-// Single-token (decode) TQ attention — flash online softmax (Q4 parity).
-// One TG per query head: rotate Q, tile over KV with online m/l, un-rotate O.
-// `scores_all` is unused (kept for ABI); residual window still supported.
+// Single-token (decode) attention over the V3 cache, fully fused: one threadgroup
+// per query head rotates Q into the Haar frame, runs the attention (with parallel
+// softmax reductions), then un-rotates the output back to the model frame — no
+// intermediate global buffers. Q_in and `output` are both in the model frame.
+//
+// Perf notes vs the original scalar kernel:
+//   - Unpacks 2/3-bit indices with wider byte loads + float4 dots where possible
+//   - V accumulation tiles over positions (reuses score weights in registers)
 kernel void turboquant_attn_v3(
-    device const float* Q_in      [[buffer(0)]],
+    device const float* Q_in      [[buffer(0)]],  // [num_heads, head_dim] un-rotated
     device const uchar* K_cache   [[buffer(1)]],
     device const uchar* V_cache   [[buffer(2)]],
-    device float*       output    [[buffer(3)]],
+    device float*       output    [[buffer(3)]],  // [num_heads, head_dim] model frame
     constant uint&      num_heads     [[buffer(4)]],
     constant uint&      num_kv_heads  [[buffer(5)]],
     constant uint&      num_kv_groups [[buffer(6)]],
@@ -459,54 +464,45 @@ kernel void turboquant_attn_v3(
     constant uint&      k_bits        [[buffer(12)]],
     constant uint&      k_row_bytes   [[buffer(13)]],
     device const float* k_centroids   [[buffer(14)]],
-    device const float* Kwin          [[buffer(15)]],
+    device const float* Kwin          [[buffer(15)]],  // [num_kv_heads, rw, head_dim] f32
     device const float* Vwin          [[buffer(16)]],
-    constant uint&      rw            [[buffer(17)]],
-    constant uint&      window_lo     [[buffer(18)]],
-    device const float* fwd           [[buffer(19)]],
-    device const float* inv           [[buffer(20)]],
+    constant uint&      rw            [[buffer(17)]],   // residual window length (0 = disabled)
+    constant uint&      window_lo     [[buffer(18)]],   // smallest absolute pos served from window
+    device const float* fwd           [[buffer(19)]],   // Rᵀ — rotate Q into Haar frame
+    device const float* inv           [[buffer(20)]],   // R  — un-rotate output
     constant uint&      v_bits        [[buffer(21)]],
     constant uint&      v_row_bytes   [[buffer(22)]],
     device const float* v_centroids   [[buffer(23)]],
-    device float*       scores_all    [[buffer(24)]],
+    device float*       scores_all    [[buffer(24)]],  // [num_heads, capacity] device scores
     uint tid     [[thread_index_in_threadgroup]],
     uint tg_size [[threads_per_threadgroup]],
     uint sg_id   [[simdgroup_index_in_threadgroup]],
     uint sg_lane [[thread_index_in_simdgroup]],
     uint tgid    [[threadgroup_position_in_grid]])
 {
-    (void)scores_all;
-    (void)num_kv_heads;
     uint h = tgid;
     if (h >= num_heads) return;
 
-    constexpr uint SIMD_SIZE = 32;
-    // Cap at 8 so h512 KV tiles stay under M1 Pro threadgroup memory (~32 KB).
-    constexpr uint TILE_KV = 8;
-
     uint kv_h = h / num_kv_groups;
     uint q_off = h * head_dim;
-    uint kv_base_k = kv_h * capacity * k_row_bytes;
+    uint kv_base_k = kv_h * capacity * k_row_bytes;   // K and V rows may differ in size
     uint kv_base_v = kv_h * capacity * v_row_bytes;
     uint k_mask = (1u << k_bits) - 1u;
     uint v_mask = (1u << v_bits) - 1u;
+    device float* scores = scores_all + h * capacity;
 
-    uint n_pos = (kv_seq > kv_start) ? (kv_seq - kv_start) : 0u;
-    n_pos = min(n_pos, capacity);
-    n_pos = min(n_pos, (uint)TQ_MAX_KV);
+    threadgroup float cen_k[16];   // key codebook (2^k_bits)
+    threadgroup float cen_v[16];   // value codebook (2^v_bits)
+    threadgroup float qrot[512];   // rotated query
+    threadgroup float orot[512];   // staging for Q row, then rotated output
+    threadgroup float red[32];
+    threadgroup float tg_m;
+    threadgroup float tg_inv_l;
 
-    threadgroup half cen_k[16];
-    threadgroup half cen_v[16];
-    threadgroup float qrot[512];
-    threadgroup float orot[512];
-    threadgroup float kv_values[TILE_KV * 512];
-    threadgroup float shared_scores[TILE_KV];
-    threadgroup float shared_exp[TILE_KV];
-    threadgroup float shared_update[4];
+    for (uint i = tid; i < (1u << k_bits); i += tg_size) cen_k[i] = k_centroids[i];
+    for (uint i = tid; i < (1u << v_bits); i += tg_size) cen_v[i] = v_centroids[i];
 
-    for (uint i = tid; i < (1u << k_bits); i += tg_size) cen_k[i] = half(k_centroids[i]);
-    for (uint i = tid; i < (1u << v_bits); i += tg_size) cen_v[i] = half(v_centroids[i]);
-
+    // Rotate Q into the Haar frame: qrot[c] = sum_k Q_in[k] * fwd[k*dim + c].
     for (uint k = tid; k < head_dim; k += tg_size) orot[k] = Q_in[q_off + k];
     threadgroup_barrier(mem_flags::mem_threadgroup);
     for (uint c = tid; c < head_dim; c += tg_size) {
@@ -515,302 +511,104 @@ kernel void turboquant_attn_v3(
         for (uint k = 0; k < head_dim; k++) { acc += orot[k] * fwd[mi]; mi += head_dim; }
         qrot[c] = acc;
     }
-    if (tid == 0) {
-        shared_update[0] = -INFINITY;
-        shared_update[1] = 0.0f;
-    }
-    for (uint d = tid; d < head_dim; d += tg_size) orot[d] = 0.0f;
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    uint num_simds = tg_size / SIMD_SIZE;
-    uint lane = sg_lane;
+    uint n_pos = (kv_seq > kv_start) ? (kv_seq - kv_start) : 0u;
+    // Soft clamp only if caller undersized the scores buffer; prefer capacity.
+    n_pos = min(n_pos, capacity);
+    n_pos = min(n_pos, (uint)TQ_MAX_KV);
 
-    for (uint j0 = 0; j0 < n_pos; j0 += TILE_KV) {
-        uint tile_count = min(TILE_KV, n_pos - j0);
-
-        for (uint i = tid; i < tile_count * head_dim; i += tg_size) {
-            uint kv_offset = i / head_dim;
-            uint d = i - kv_offset * head_dim;
-            uint pos = kv_start + j0 + kv_offset;
-            if (rw > 0u && pos >= window_lo) {
-                device const float* kw = Kwin + (kv_h * rw + (pos % rw)) * head_dim;
-                kv_values[kv_offset * 512 + d] = kw[d];
-            } else {
-                uint row = kv_base_k + pos * k_row_bytes;
-                float norm = float(*reinterpret_cast<device const half*>(&K_cache[row]));
-                device const uchar* qs = K_cache + row + 2;
-                kv_values[kv_offset * 512 + d] =
-                    norm * float(cen_k[tq_unpack(qs, d, k_bits, k_mask)]);
+    // Pass 1: scores = scale * norm_k * <q_rot, dequant(k_rot)>. Recent positions
+    // (pos >= window_lo) are served from the full-precision residual window instead.
+    for (uint j = tid; j < n_pos; j += tg_size) {
+        uint pos = kv_start + j;
+        float sc;
+        if (rw > 0u && pos >= window_lo) {
+            device const float* kw = Kwin + (kv_h * rw + (pos % rw)) * head_dim;
+            float score_dot = 0.0f;
+            for (uint d = 0; d + 3 < head_dim; d += 4) {
+                float4 qv = float4(qrot[d], qrot[d+1], qrot[d+2], qrot[d+3]);
+                float4 kv = float4(kw[d], kw[d+1], kw[d+2], kw[d+3]);
+                score_dot += metal::dot(qv, kv);
             }
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-
-        for (uint kv_offset = sg_id; kv_offset < tile_count; kv_offset += num_simds) {
-            float partial = 0.0f;
-            for (uint d = lane * 4; d + 3 < head_dim; d += SIMD_SIZE * 4) {
-                float4 qv = float4(qrot[d], qrot[d + 1], qrot[d + 2], qrot[d + 3]);
+            for (uint d = (head_dim & ~3u); d < head_dim; d++) score_dot += qrot[d] * kw[d];
+            sc = score_dot * scale;  // window stores full-magnitude rotated K (no separate norm)
+        } else {
+            uint row = kv_base_k + pos * k_row_bytes;
+            float norm = float(*reinterpret_cast<device const half*>(&K_cache[row]));
+            device const uchar* qs = K_cache + row + 2;
+            float score_dot = 0.0f;
+            // Unroll by 4: pack 4 centroid lookups. Bit unpack still scalar per coord
+            // but float4 MAC amortizes the arithmetic.
+            for (uint d = 0; d + 3 < head_dim; d += 4) {
+                float4 qv = float4(qrot[d], qrot[d+1], qrot[d+2], qrot[d+3]);
                 float4 kv = float4(
-                    kv_values[kv_offset * 512 + d],
-                    kv_values[kv_offset * 512 + d + 1],
-                    kv_values[kv_offset * 512 + d + 2],
-                    kv_values[kv_offset * 512 + d + 3]);
-                partial += metal::dot(qv, kv);
+                    cen_k[tq_unpack(qs, d + 0, k_bits, k_mask)],
+                    cen_k[tq_unpack(qs, d + 1, k_bits, k_mask)],
+                    cen_k[tq_unpack(qs, d + 2, k_bits, k_mask)],
+                    cen_k[tq_unpack(qs, d + 3, k_bits, k_mask)]);
+                score_dot += metal::dot(qv, kv);
             }
-            partial = simd_sum(partial);
-            if (lane == 0) shared_scores[kv_offset] = partial * scale;
+            for (uint d = (head_dim & ~3u); d < head_dim; d++) {
+                score_dot += qrot[d] * cen_k[tq_unpack(qs, d, k_bits, k_mask)];
+            }
+            sc = score_dot * scale * norm;
         }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-
-        if (tid == 0) {
-            float m_old = shared_update[0];
-            float l_old = shared_update[1];
-            float m_new = m_old;
-            for (uint kv_offset = 0; kv_offset < tile_count; kv_offset++) {
-                m_new = max(m_new, shared_scores[kv_offset]);
-            }
-            float tile_sum = 0.0f;
-            for (uint kv_offset = 0; kv_offset < tile_count; kv_offset++) {
-                float e = exp(shared_scores[kv_offset] - m_new);
-                shared_exp[kv_offset] = e;
-                tile_sum += e;
-            }
-            float l_new = l_old * exp(m_old - m_new) + tile_sum;
-            shared_update[0] = m_new;
-            shared_update[1] = l_new;
-            shared_update[2] =
-                l_new > 0.0f ? (l_old * exp(m_old - m_new)) / l_new : 0.0f;
-            shared_update[3] = l_new > 0.0f ? 1.0f / l_new : 0.0f;
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-
-        for (uint i = tid; i < tile_count * head_dim; i += tg_size) {
-            uint kv_offset = i / head_dim;
-            uint d = i - kv_offset * head_dim;
-            uint pos = kv_start + j0 + kv_offset;
-            if (rw > 0u && pos >= window_lo) {
-                device const float* vw = Vwin + (kv_h * rw + (pos % rw)) * head_dim;
-                kv_values[kv_offset * 512 + d] = vw[d];
-            } else {
-                uint row = kv_base_v + pos * v_row_bytes;
-                float norm = float(*reinterpret_cast<device const half*>(&V_cache[row]));
-                device const uchar* qs = V_cache + row + 2;
-                kv_values[kv_offset * 512 + d] =
-                    norm * float(cen_v[tq_unpack(qs, d, v_bits, v_mask)]);
-            }
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-
-        float old_factor = shared_update[2];
-        float inv_l_new = shared_update[3];
-        for (uint d = tid; d < head_dim; d += tg_size) {
-            float acc = orot[d] * old_factor;
-            for (uint kv_offset = 0; kv_offset < tile_count; kv_offset++) {
-                acc += shared_exp[kv_offset] * inv_l_new * kv_values[kv_offset * 512 + d];
-            }
-            orot[d] = acc;
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
+        scores[j] = sc;
     }
+    threadgroup_barrier(mem_flags::mem_device);
 
+    // Softmax max (parallel simdgroup reduction).
+    float local_m = -INFINITY;
+    for (uint j = tid; j < n_pos; j += tg_size) local_m = max(local_m, scores[j]);
+    float m = tq_tg_max(local_m, red, tid, tg_size, sg_id, sg_lane);
+    if (tid == 0) tg_m = m;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    m = tg_m;
+
+    for (uint j = tid; j < n_pos; j += tg_size) scores[j] = exp(scores[j] - m);
+    threadgroup_barrier(mem_flags::mem_device);
+
+    float local_l = 0.0f;
+    for (uint j = tid; j < n_pos; j += tg_size) local_l += scores[j];
+    float l = tq_tg_sum(local_l, red, tid, tg_size, sg_id, sg_lane);
+    if (tid == 0) tg_inv_l = l > 0.0f ? 1.0f / l : 0.0f;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float inv_l = tg_inv_l;
+
+    // Pass 2: orot[d] = (sum_j w_j * v_j[d]) / l.
+    // Outer loop over output dims (parallel across threads); inner tiles over j
+    // so each thread streams scores sequentially with good locality.
+    constexpr uint J_TILE = 16;
+    for (uint d = tid; d < head_dim; d += tg_size) {
+        float acc = 0.0f;
+        for (uint j0 = 0; j0 < n_pos; j0 += J_TILE) {
+            uint j_end = min(j0 + J_TILE, n_pos);
+            for (uint j = j0; j < j_end; j++) {
+                uint pos = kv_start + j;
+                float vv;
+                if (rw > 0u && pos >= window_lo) {
+                    device const float* vw = Vwin + (kv_h * rw + (pos % rw)) * head_dim;
+                    vv = vw[d];
+                } else {
+                    uint row = kv_base_v + pos * v_row_bytes;
+                    float norm = float(*reinterpret_cast<device const half*>(&V_cache[row]));
+                    device const uchar* qs = V_cache + row + 2;
+                    uint idx = tq_unpack(qs, d, v_bits, v_mask);
+                    vv = norm * cen_v[idx];
+                }
+                acc += scores[j] * vv;
+            }
+        }
+        orot[d] = acc * inv_l;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // Un-rotate the output back to the model frame: out[c] = sum_k orot[k]*inv[k*dim+c].
     for (uint c = tid; c < head_dim; c += tg_size) {
         float acc = 0.0f;
         uint mi = c;
         for (uint k = 0; k < head_dim; k++) { acc += orot[k] * inv[mi]; mi += head_dim; }
-        output[q_off + c] = acc;
-    }
-}
-
-// GQA decode (h256, up to 8 groups): one TG per KV head.
-// E2B uses head_count_kv=1 → 8 groups; h512 stays on per-head flash (smem).
-kernel void turboquant_attn_v3_gqa(
-    device const float* Q_in      [[buffer(0)]],
-    device const uchar* K_cache   [[buffer(1)]],
-    device const uchar* V_cache   [[buffer(2)]],
-    device float*       output    [[buffer(3)]],
-    constant uint&      num_heads     [[buffer(4)]],
-    constant uint&      num_kv_heads  [[buffer(5)]],
-    constant uint&      num_kv_groups [[buffer(6)]],
-    constant uint&      head_dim      [[buffer(7)]],
-    constant uint&      kv_seq        [[buffer(8)]],
-    constant uint&      capacity      [[buffer(9)]],
-    constant float&     scale         [[buffer(10)]],
-    constant uint&      kv_start      [[buffer(11)]],
-    constant uint&      k_bits        [[buffer(12)]],
-    constant uint&      k_row_bytes   [[buffer(13)]],
-    device const float* k_centroids   [[buffer(14)]],
-    device const float* Kwin          [[buffer(15)]],
-    device const float* Vwin          [[buffer(16)]],
-    constant uint&      rw            [[buffer(17)]],
-    constant uint&      window_lo     [[buffer(18)]],
-    device const float* fwd           [[buffer(19)]],
-    device const float* inv           [[buffer(20)]],
-    constant uint&      v_bits        [[buffer(21)]],
-    constant uint&      v_row_bytes   [[buffer(22)]],
-    device const float* v_centroids   [[buffer(23)]],
-    device float*       scores_all    [[buffer(24)]],
-    uint tid     [[thread_index_in_threadgroup]],
-    uint tg_size [[threads_per_threadgroup]],
-    uint sg_id   [[simdgroup_index_in_threadgroup]],
-    uint sg_lane [[thread_index_in_simdgroup]],
-    uint tgid    [[threadgroup_position_in_grid]])
-{
-    (void)scores_all;
-    constexpr uint SIMD_SIZE = 32;
-    constexpr uint HEAD_DIM = 256;
-    constexpr uint TILE_KV = 8;
-    constexpr uint MAX_G = 8;
-
-    if (head_dim != HEAD_DIM) return;
-    uint kv_h = tgid;
-    if (kv_h >= num_kv_heads) return;
-    if (num_kv_groups == 0u || num_kv_groups > MAX_G) return;
-    uint num_simds_total = tg_size / SIMD_SIZE;
-    if (num_simds_total % num_kv_groups != 0u) return;
-
-    uint simds_per_head = num_simds_total / num_kv_groups;
-    uint threads_per_head = simds_per_head * SIMD_SIZE;
-    uint group = sg_id / simds_per_head;
-    uint local_sgid = sg_id % simds_per_head;
-    uint local_tid = local_sgid * SIMD_SIZE + sg_lane;
-    uint h = kv_h * num_kv_groups + group;
-    if (h >= num_heads) return;
-
-    uint q_off = h * HEAD_DIM;
-    uint kv_base_k = kv_h * capacity * k_row_bytes;
-    uint kv_base_v = kv_h * capacity * v_row_bytes;
-    uint k_mask = (1u << k_bits) - 1u;
-    uint v_mask = (1u << v_bits) - 1u;
-
-    uint n_pos = (kv_seq > kv_start) ? (kv_seq - kv_start) : 0u;
-    n_pos = min(n_pos, capacity);
-    n_pos = min(n_pos, (uint)TQ_MAX_KV);
-
-    threadgroup half cen_k[16];
-    threadgroup half cen_v[16];
-    threadgroup float qrot[MAX_G * HEAD_DIM];
-    threadgroup float orot[MAX_G * HEAD_DIM];
-    threadgroup float kv_values[TILE_KV * HEAD_DIM];
-    threadgroup float shared_scores[MAX_G * TILE_KV];
-    threadgroup float shared_exp[MAX_G * TILE_KV];
-    threadgroup float shared_update[MAX_G * 4];
-
-    for (uint i = tid; i < (1u << k_bits); i += tg_size) cen_k[i] = half(k_centroids[i]);
-    for (uint i = tid; i < (1u << v_bits); i += tg_size) cen_v[i] = half(v_centroids[i]);
-
-    threadgroup float* q_head = qrot + group * HEAD_DIM;
-    threadgroup float* o_head = orot + group * HEAD_DIM;
-    threadgroup float* scores_head = shared_scores + group * TILE_KV;
-    threadgroup float* exp_head = shared_exp + group * TILE_KV;
-    threadgroup float* update_head = shared_update + group * 4;
-
-    for (uint k = local_tid; k < HEAD_DIM; k += threads_per_head) {
-        o_head[k] = Q_in[q_off + k];
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    for (uint c = local_tid; c < HEAD_DIM; c += threads_per_head) {
-        float acc = 0.0f;
-        uint mi = c;
-        for (uint k = 0; k < HEAD_DIM; k++) { acc += o_head[k] * fwd[mi]; mi += HEAD_DIM; }
-        q_head[c] = acc;
-    }
-    if (local_tid == 0) {
-        update_head[0] = -INFINITY;
-        update_head[1] = 0.0f;
-    }
-    for (uint d = local_tid; d < HEAD_DIM; d += threads_per_head) o_head[d] = 0.0f;
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-
-    for (uint j0 = 0; j0 < n_pos; j0 += TILE_KV) {
-        uint tile_count = min(TILE_KV, n_pos - j0);
-
-        for (uint i = tid; i < tile_count * HEAD_DIM; i += tg_size) {
-            uint kv_offset = i / HEAD_DIM;
-            uint d = i - kv_offset * HEAD_DIM;
-            uint pos = kv_start + j0 + kv_offset;
-            if (rw > 0u && pos >= window_lo) {
-                device const float* kw = Kwin + (kv_h * rw + (pos % rw)) * HEAD_DIM;
-                kv_values[kv_offset * HEAD_DIM + d] = kw[d];
-            } else {
-                uint row = kv_base_k + pos * k_row_bytes;
-                float norm = float(*reinterpret_cast<device const half*>(&K_cache[row]));
-                device const uchar* qs = K_cache + row + 2;
-                kv_values[kv_offset * HEAD_DIM + d] =
-                    norm * float(cen_k[tq_unpack(qs, d, k_bits, k_mask)]);
-            }
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-
-        for (uint kv_offset = local_sgid; kv_offset < tile_count; kv_offset += simds_per_head) {
-            float partial = 0.0f;
-            for (uint d = sg_lane * 4; d + 3 < HEAD_DIM; d += SIMD_SIZE * 4) {
-                float4 qv = float4(q_head[d], q_head[d+1], q_head[d+2], q_head[d+3]);
-                float4 kv = float4(
-                    kv_values[kv_offset * HEAD_DIM + d],
-                    kv_values[kv_offset * HEAD_DIM + d + 1],
-                    kv_values[kv_offset * HEAD_DIM + d + 2],
-                    kv_values[kv_offset * HEAD_DIM + d + 3]);
-                partial += metal::dot(qv, kv);
-            }
-            partial = simd_sum(partial);
-            if (sg_lane == 0) scores_head[kv_offset] = partial * scale;
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-
-        if (local_tid == 0) {
-            float m_old = update_head[0];
-            float l_old = update_head[1];
-            float m_new = m_old;
-            for (uint kv_offset = 0; kv_offset < tile_count; kv_offset++) {
-                m_new = max(m_new, scores_head[kv_offset]);
-            }
-            float tile_sum = 0.0f;
-            for (uint kv_offset = 0; kv_offset < tile_count; kv_offset++) {
-                float e = exp(scores_head[kv_offset] - m_new);
-                exp_head[kv_offset] = e;
-                tile_sum += e;
-            }
-            float l_new = l_old * exp(m_old - m_new) + tile_sum;
-            update_head[0] = m_new;
-            update_head[1] = l_new;
-            update_head[2] =
-                l_new > 0.0f ? (l_old * exp(m_old - m_new)) / l_new : 0.0f;
-            update_head[3] = l_new > 0.0f ? 1.0f / l_new : 0.0f;
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-
-        for (uint i = tid; i < tile_count * HEAD_DIM; i += tg_size) {
-            uint kv_offset = i / HEAD_DIM;
-            uint d = i - kv_offset * HEAD_DIM;
-            uint pos = kv_start + j0 + kv_offset;
-            if (rw > 0u && pos >= window_lo) {
-                device const float* vw = Vwin + (kv_h * rw + (pos % rw)) * HEAD_DIM;
-                kv_values[kv_offset * HEAD_DIM + d] = vw[d];
-            } else {
-                uint row = kv_base_v + pos * v_row_bytes;
-                float norm = float(*reinterpret_cast<device const half*>(&V_cache[row]));
-                device const uchar* qs = V_cache + row + 2;
-                kv_values[kv_offset * HEAD_DIM + d] =
-                    norm * float(cen_v[tq_unpack(qs, d, v_bits, v_mask)]);
-            }
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-
-        float old_factor = update_head[2];
-        float inv_l_new = update_head[3];
-        for (uint d = local_tid; d < HEAD_DIM; d += threads_per_head) {
-            float acc = o_head[d] * old_factor;
-            for (uint kv_offset = 0; kv_offset < tile_count; kv_offset++) {
-                acc += exp_head[kv_offset] * inv_l_new * kv_values[kv_offset * HEAD_DIM + d];
-            }
-            o_head[d] = acc;
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-    }
-
-    for (uint c = local_tid; c < HEAD_DIM; c += threads_per_head) {
-        float acc = 0.0f;
-        uint mi = c;
-        for (uint k = 0; k < HEAD_DIM; k++) { acc += o_head[k] * inv[mi]; mi += HEAD_DIM; }
         output[q_off + c] = acc;
     }
 }
@@ -844,8 +642,8 @@ void turboquant_attn_v3_causal_impl(
     device const float* v_centroids   [[buffer(19)]],
     device const float* fwd           [[buffer(20)]], // unused: Q is pre-rotated
     device const float* inv           [[buffer(21)]], // unused: output stays rotated
-    threadgroup half* cen_k,
-    threadgroup half* cen_v,
+    threadgroup float* cen_k,
+    threadgroup float* cen_v,
     threadgroup float* orot,
     threadgroup float* kv_values,
     threadgroup float* shared_scores,
@@ -888,8 +686,8 @@ void turboquant_attn_v3_causal_impl(
         tile_end_all = max(tile_end_all, end);
     }
 
-    for (uint i = tid; i < (1u << k_bits); i += tg_size) cen_k[i] = half(k_centroids[i]);
-    for (uint i = tid; i < (1u << v_bits); i += tg_size) cen_v[i] = half(v_centroids[i]);
+    for (uint i = tid; i < (1u << k_bits); i += tg_size) cen_k[i] = k_centroids[i];
+    for (uint i = tid; i < (1u << v_bits); i += tg_size) cen_v[i] = v_centroids[i];
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
     uint simd_id = tid / SIMD_SIZE;
@@ -910,7 +708,7 @@ void turboquant_attn_v3_causal_impl(
         uint tile_end = min(kv_tile + TILE_KV, tile_end_all);
         uint tile_count = tile_end - kv_tile;
 
-        // Dequantize each K coordinate once, then reuse it for all query rows.
+        // Dequantize each K coordinate once, then reuse it for all four queries.
         for (uint i = tid; i < tile_count * head_dim; i += tg_size) {
             uint kv_offset = i / head_dim;
             uint d = i - kv_offset * head_dim;
@@ -919,7 +717,7 @@ void turboquant_attn_v3_causal_impl(
             float norm = float(*reinterpret_cast<device const half*>(&K_cache[row]));
             device const uchar* qs = K_cache + row + 2;
             kv_values[kv_offset * HEAD_DIM + d] =
-                norm * float(cen_k[tq_unpack(qs, d, k_bits, k_mask)]);
+                norm * cen_k[tq_unpack(qs, d, k_bits, k_mask)];
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
@@ -989,7 +787,7 @@ void turboquant_attn_v3_causal_impl(
             float norm = float(*reinterpret_cast<device const half*>(&V_cache[row]));
             device const uchar* qs = V_cache + row + 2;
             kv_values[kv_offset * HEAD_DIM + d] =
-                norm * float(cen_v[tq_unpack(qs, d, v_bits, v_mask)]);
+                norm * cen_v[tq_unpack(qs, d, v_bits, v_mask)];
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
@@ -1046,8 +844,8 @@ kernel void NAME( \
     uint tid [[thread_index_in_threadgroup]], \
     uint tg_size [[threads_per_threadgroup]], \
     uint tgid [[threadgroup_position_in_grid]]) { \
-    threadgroup half cen_k[16]; \
-    threadgroup half cen_v[16]; \
+    threadgroup float cen_k[16]; \
+    threadgroup float cen_v[16]; \
     threadgroup float orot[QT * HD]; \
     threadgroup float kv_values[KT * HD]; \
     threadgroup float shared_scores[QT * KT]; \
@@ -1061,212 +859,5 @@ kernel void NAME( \
         shared_scores, shared_exp, shared_update, tid, tg_size, tgid); \
 }
 
-// h256: larger KV tiles (8) amortize dequant. h512 stays at 4 for smem.
-TQ_CAUSAL_ENTRY(turboquant_attn_v3_causal_h256, 256, 4, 8)
+TQ_CAUSAL_ENTRY(turboquant_attn_v3_causal_h256, 256, 4, 4)
 TQ_CAUSAL_ENTRY(turboquant_attn_v3_causal_h512, 512, 4, 4)
-
-// Prefill GQA causal (h256): one TG per (KV head, query tile).
-// All query heads that share the KV head reuse one K/V dequant per tile.
-kernel void turboquant_attn_v3_causal_gqa_h256(
-    device const float* Q_in [[buffer(0)]],
-    device const uchar* K_cache [[buffer(1)]],
-    device const uchar* V_cache [[buffer(2)]],
-    device float* output [[buffer(3)]],
-    constant uint& num_heads [[buffer(4)]],
-    constant uint& num_kv_heads [[buffer(5)]],
-    constant uint& num_kv_groups [[buffer(6)]],
-    constant uint& head_dim [[buffer(7)]],
-    constant uint& kv_seq [[buffer(8)]],
-    constant uint& capacity [[buffer(9)]],
-    constant float& scale [[buffer(10)]],
-    constant uint& q_len [[buffer(11)]],
-    constant uint& q_start [[buffer(12)]],
-    constant uint& attention_window [[buffer(13)]],
-    constant uint& k_bits [[buffer(14)]],
-    constant uint& k_row_bytes [[buffer(15)]],
-    device const float* k_centroids [[buffer(16)]],
-    constant uint& v_bits [[buffer(17)]],
-    constant uint& v_row_bytes [[buffer(18)]],
-    device const float* v_centroids [[buffer(19)]],
-    device const float* fwd [[buffer(20)]],
-    device const float* inv [[buffer(21)]],
-    uint tid [[thread_index_in_threadgroup]],
-    uint tg_size [[threads_per_threadgroup]],
-    uint tgid [[threadgroup_position_in_grid]])
-{
-    (void)fwd; (void)inv;
-    constexpr uint SIMD_SIZE = 32;
-    constexpr uint HEAD_DIM = 256;
-    constexpr uint Q_TILE = 2;
-    constexpr uint TILE_KV = 8;
-    constexpr uint MAX_G = 8;
-
-    if (head_dim != HEAD_DIM) return;
-    if (num_kv_groups == 0u || num_kv_groups > MAX_G) return;
-
-    uint q_tiles = (q_len + Q_TILE - 1u) / Q_TILE;
-    uint kv_h = tgid / q_tiles;
-    uint q_base = (tgid % q_tiles) * Q_TILE;
-    uint q_count = min(Q_TILE, q_len - q_base);
-    if (kv_h >= num_kv_heads || q_base >= q_len) return;
-
-    uint kv_base_k = kv_h * capacity * k_row_bytes;
-    uint kv_base_v = kv_h * capacity * v_row_bytes;
-    uint k_mask = (1u << k_bits) - 1u;
-    uint v_mask = (1u << v_bits) - 1u;
-
-    uint attend_len[Q_TILE];
-    uint attend_start[Q_TILE];
-    uint tile_start = capacity;
-    uint tile_end_all = 0u;
-    for (uint q = 0; q < q_count; q++) {
-        uint qi = q_base + q;
-        uint end = min(q_start + qi + 1u, kv_seq);
-        end = min(end, capacity);
-        end = min(end, (uint)TQ_MAX_KV);
-        uint start = 0u;
-        if (attention_window > 0u && end > attention_window) {
-            start = end - attention_window;
-        }
-        attend_len[q] = end;
-        attend_start[q] = start;
-        tile_start = min(tile_start, start);
-        tile_end_all = max(tile_end_all, end);
-    }
-
-    threadgroup half cen_k[16];
-    threadgroup half cen_v[16];
-    threadgroup float orot[MAX_G * Q_TILE * HEAD_DIM];
-    threadgroup float kv_values[TILE_KV * HEAD_DIM];
-    threadgroup float shared_scores[MAX_G * Q_TILE * TILE_KV];
-    threadgroup float shared_exp[MAX_G * Q_TILE * TILE_KV];
-    threadgroup float shared_update[MAX_G * Q_TILE * 4];
-
-    for (uint i = tid; i < (1u << k_bits); i += tg_size) cen_k[i] = half(k_centroids[i]);
-    for (uint i = tid; i < (1u << v_bits); i += tg_size) cen_v[i] = half(v_centroids[i]);
-
-    uint simd_id = tid / SIMD_SIZE;
-    uint lane = tid % SIMD_SIZE;
-    uint num_simds = tg_size / SIMD_SIZE;
-    uint n_q = num_kv_groups * q_count;
-
-    for (uint gq = tid; gq < n_q; gq += tg_size) {
-        shared_update[gq * 4 + 0] = -INFINITY;
-        shared_update[gq * 4 + 1] = 0.0f;
-    }
-    for (uint i = tid; i < n_q * HEAD_DIM; i += tg_size) orot[i] = 0.0f;
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-
-    for (uint kv_tile = tile_start; kv_tile < tile_end_all; kv_tile += TILE_KV) {
-        uint tile_end = min(kv_tile + TILE_KV, tile_end_all);
-        uint tile_count = tile_end - kv_tile;
-
-        for (uint i = tid; i < tile_count * HEAD_DIM; i += tg_size) {
-            uint kv_offset = i / HEAD_DIM;
-            uint d = i - kv_offset * HEAD_DIM;
-            uint pos = kv_tile + kv_offset;
-            uint row = kv_base_k + pos * k_row_bytes;
-            float norm = float(*reinterpret_cast<device const half*>(&K_cache[row]));
-            device const uchar* qs = K_cache + row + 2;
-            kv_values[kv_offset * HEAD_DIM + d] =
-                norm * float(cen_k[tq_unpack(qs, d, k_bits, k_mask)]);
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-
-        uint score_pairs = n_q * tile_count;
-        for (uint pair = simd_id; pair < score_pairs; pair += num_simds) {
-            uint gq = pair / tile_count;
-            uint kv_offset = pair - gq * tile_count;
-            uint g = gq / q_count;
-            uint q = gq - g * q_count;
-            uint h = kv_h * num_kv_groups + g;
-            uint q_off = ((q_base + q) * num_heads + h) * HEAD_DIM;
-            uint pos = kv_tile + kv_offset;
-            float partial = 0.0f;
-            for (uint d = lane * 4; d + 3 < HEAD_DIM; d += SIMD_SIZE * 4) {
-                float4 qv = float4(
-                    Q_in[q_off + d], Q_in[q_off + d + 1],
-                    Q_in[q_off + d + 2], Q_in[q_off + d + 3]);
-                float4 kv = float4(
-                    kv_values[kv_offset * HEAD_DIM + d],
-                    kv_values[kv_offset * HEAD_DIM + d + 1],
-                    kv_values[kv_offset * HEAD_DIM + d + 2],
-                    kv_values[kv_offset * HEAD_DIM + d + 3]);
-                partial += metal::dot(qv, kv);
-            }
-            partial = simd_sum(partial);
-            if (lane == 0) {
-                shared_scores[gq * TILE_KV + kv_offset] =
-                    (h < num_heads && pos >= attend_start[q] && pos < attend_len[q])
-                        ? partial * scale
-                        : -INFINITY;
-            }
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-
-        for (uint gq = tid; gq < n_q; gq += tg_size) {
-            uint ui = gq * 4;
-            float m_old = shared_update[ui + 0];
-            float l_old = shared_update[ui + 1];
-            float m_new = m_old;
-            float tile_scores[TILE_KV];
-            for (uint kv_offset = 0; kv_offset < tile_count; kv_offset++) {
-                float s = shared_scores[gq * TILE_KV + kv_offset];
-                tile_scores[kv_offset] = s;
-                m_new = max(m_new, s);
-            }
-            float tile_sum = 0.0f;
-            for (uint kv_offset = 0; kv_offset < tile_count; kv_offset++) {
-                float e = exp(tile_scores[kv_offset] - m_new);
-                shared_exp[gq * TILE_KV + kv_offset] = e;
-                tile_sum += e;
-            }
-            float l_new = l_old * exp(m_old - m_new) + tile_sum;
-            shared_update[ui + 0] = m_new;
-            shared_update[ui + 1] = l_new;
-            shared_update[ui + 2] =
-                l_new > 0.0f ? (l_old * exp(m_old - m_new)) / l_new : 0.0f;
-            shared_update[ui + 3] = l_new > 0.0f ? 1.0f / l_new : 0.0f;
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-
-        for (uint i = tid; i < tile_count * HEAD_DIM; i += tg_size) {
-            uint kv_offset = i / HEAD_DIM;
-            uint d = i - kv_offset * HEAD_DIM;
-            uint pos = kv_tile + kv_offset;
-            uint row = kv_base_v + pos * v_row_bytes;
-            float norm = float(*reinterpret_cast<device const half*>(&V_cache[row]));
-            device const uchar* qs = V_cache + row + 2;
-            kv_values[kv_offset * HEAD_DIM + d] =
-                norm * float(cen_v[tq_unpack(qs, d, v_bits, v_mask)]);
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-
-        for (uint gq = 0; gq < n_q; gq++) {
-            uint q_tg = gq * HEAD_DIM;
-            float old_factor = shared_update[gq * 4 + 2];
-            float inv_l_new = shared_update[gq * 4 + 3];
-            for (uint d = tid; d < HEAD_DIM; d += tg_size) {
-                float acc = orot[q_tg + d] * old_factor;
-                for (uint kv_offset = 0; kv_offset < tile_count; kv_offset++) {
-                    acc += shared_exp[gq * TILE_KV + kv_offset] * inv_l_new
-                        * kv_values[kv_offset * HEAD_DIM + d];
-                }
-                orot[q_tg + d] = acc;
-            }
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-    }
-
-    for (uint gq = 0; gq < n_q; gq++) {
-        uint g = gq / q_count;
-        uint q = gq - g * q_count;
-        uint h = kv_h * num_kv_groups + g;
-        if (h >= num_heads) continue;
-        uint q_tg = gq * HEAD_DIM;
-        uint out_off = ((q_base + q) * num_heads + h) * HEAD_DIM;
-        for (uint c = tid; c < HEAD_DIM; c += tg_size) {
-            output[out_off + c] = orot[q_tg + c];
-        }
-    }
-}
