@@ -7165,9 +7165,11 @@ impl Gemma4GpuModel {
         Ok(())
     }
 
-    /// Multi-query cold TQ attention for a prefill chunk (Q already SHD).
-    /// One `turboquant_attn_v3_causal` dispatch covers all rows (flash online
-    /// softmax). Residual disabled — chunk append would race the ring.
+    /// Per-row cold TQ attention for a prefill chunk (Q already token-major in `q_shd`).
+    ///
+    /// The causal multi-query kernel is intentionally not used here: its
+    /// approximation changes long-context logits. Keep cold prefill on the
+    /// established decode-shaped V3 kernel until causal parity is revalidated.
     fn encode_tq_cold_prefill_attn_rows(
         &self,
         encoder: &metal::ComputeCommandEncoderRef,
@@ -7196,40 +7198,52 @@ impl Gemma4GpuModel {
             .turboquant
             .as_ref()
             .ok_or_else(|| TURBOQUANT_UNSUPPORTED.to_string())?;
-        let _ = (rw_k, rw_v, layer_idx, q_out);
-        let attention_window = if is_full_attention {
-            0
-        } else {
-            self.config.sliding_window as u32
-        };
+        let sliding_window = self.config.sliding_window as u32;
         let k_row_bytes = self.kv_cache_type.k_row_bytes(head_dim as usize) as u32;
         let v_row_bytes = self.kv_cache_type.v_row_bytes(head_dim as usize) as u32;
-        let kv_seq = (start_pos + seq_len) as u32;
-        self.ctx.encode_turboquant_attn_v3_causal(
-            encoder,
-            q_shd,
-            k_cache,
-            v_cache,
-            attn_out_shd,
-            tq.centroids_k(head_dim as usize),
-            tq.centroids_v(head_dim as usize),
-            num_heads,
-            num_kv_heads,
-            num_kv_groups,
-            head_dim,
-            kv_seq,
-            capacity,
-            scale,
-            seq_len as u32,
-            start_pos as u32,
-            attention_window,
-            k_bits as u32,
-            v_bits as u32,
-            k_row_bytes,
-            v_row_bytes,
-            tq.fwd(head_dim as usize),
-            tq.inv(head_dim as usize),
-        );
+        // The whole chunk has already been appended. Do not read the residual
+        // ring: later rows can overwrite slots needed by earlier query rows.
+        let _ = (rw_k, rw_v, layer_idx);
+        for qi in 0..seq_len {
+            let append_pos = start_pos as u32 + qi as u32;
+            let attn_kv_seq = append_pos + 1;
+            let kv_start = if !is_full_attention && attn_kv_seq > sliding_window {
+                attn_kv_seq - sliding_window
+            } else {
+                0
+            };
+            let q_offset = (qi * q_out * 4) as u64;
+            self.ctx.encode_turboquant_attn_v3_at(
+                encoder,
+                q_shd,
+                q_offset,
+                k_cache,
+                v_cache,
+                attn_out_shd,
+                q_offset,
+                tq.centroids_k(head_dim as usize),
+                tq.centroids_v(head_dim as usize),
+                num_heads,
+                num_kv_heads,
+                num_kv_groups,
+                head_dim,
+                attn_kv_seq,
+                capacity,
+                scale,
+                kv_start,
+                k_bits as u32,
+                v_bits as u32,
+                k_row_bytes,
+                v_row_bytes,
+                &self.tq_k_rot,
+                &self.tq_v_rot,
+                0,
+                0,
+                tq.fwd(head_dim as usize),
+                tq.inv(head_dim as usize),
+                &self.tq_scores,
+            );
+        }
         Ok(())
     }
 
@@ -7710,35 +7724,18 @@ impl Gemma4GpuModel {
                             Some(&mut ext_mask_cache),
                         );
                     } else {
-                        let tq = self
-                            .turboquant
-                            .as_ref()
-                            .ok_or_else(|| TURBOQUANT_UNSUPPORTED.to_string())?;
-                        let rotation_rows = (num_heads * seq_len) as u32;
-                        // Batch rotate HSD Q, transpose to SHD, run native TQ
-                        // causal attention in the rotated frame, then batch
-                        // inverse-rotate the SHD outputs.
-                        self.ctx.encode_mul_mm_f16_buffer(
-                            encoder,
-                            tq.fwd_mm_f16(head_dim),
-                            &self.prefill_scratch.q_buf,
-                            &self.prefill_scratch.q_normed_buf,
-                            head_dim as u32,
-                            head_dim as u32,
-                            rotation_rows,
-                        );
                         self.ctx.encode_transpose_hsd(
                             encoder,
+                            &self.prefill_scratch.q_buf,
                             &self.prefill_scratch.q_normed_buf,
-                            &self.prefill_scratch.attn_out_buf,
                             seq_len as u32,
                             num_heads as u32,
                             head_dim as u32,
                         );
                         self.encode_tq_cold_prefill_attn_rows(
                             encoder,
+                            &self.prefill_scratch.q_normed_buf,
                             &self.prefill_scratch.attn_out_buf,
-                            &self.prefill_scratch.q_buf,
                             k_cache,
                             v_cache,
                             rw_k,
@@ -7755,15 +7752,6 @@ impl Gemma4GpuModel {
                             scale,
                             layer.is_full_attention,
                         )?;
-                        self.ctx.encode_mul_mm_f16_buffer(
-                            encoder,
-                            tq.inv_mm_f16(head_dim),
-                            &self.prefill_scratch.q_buf,
-                            &self.prefill_scratch.attn_out_buf,
-                            head_dim as u32,
-                            head_dim as u32,
-                            rotation_rows,
-                        );
                     }
                 }
             }
@@ -8793,32 +8781,18 @@ impl Gemma4GpuModel {
                             Some(&mut ext_mask_cache),
                         );
                     } else {
-                        let tq = self
-                            .turboquant
-                            .as_ref()
-                            .ok_or_else(|| TURBOQUANT_UNSUPPORTED.to_string())?;
-                        let rotation_rows = (num_heads * seq_len) as u32;
-                        self.ctx.encode_mul_mm_f16_buffer(
-                            encoder,
-                            tq.fwd_mm_f16(head_dim),
-                            &self.prefill_scratch.q_buf,
-                            &self.prefill_scratch.q_normed_buf,
-                            head_dim as u32,
-                            head_dim as u32,
-                            rotation_rows,
-                        );
                         self.ctx.encode_transpose_hsd(
                             encoder,
+                            &self.prefill_scratch.q_buf,
                             &self.prefill_scratch.q_normed_buf,
-                            &self.prefill_scratch.attn_out_buf,
                             seq_len as u32,
                             num_heads as u32,
                             head_dim as u32,
                         );
                         self.encode_tq_cold_prefill_attn_rows(
                             encoder,
+                            &self.prefill_scratch.q_normed_buf,
                             &self.prefill_scratch.attn_out_buf,
-                            &self.prefill_scratch.q_buf,
                             k_cache,
                             v_cache,
                             rw_k,
@@ -8835,15 +8809,6 @@ impl Gemma4GpuModel {
                             scale,
                             layer.is_full_attention,
                         )?;
-                        self.ctx.encode_mul_mm_f16_buffer(
-                            encoder,
-                            tq.inv_mm_f16(head_dim),
-                            &self.prefill_scratch.q_buf,
-                            &self.prefill_scratch.attn_out_buf,
-                            head_dim as u32,
-                            head_dim as u32,
-                            rotation_rows,
-                        );
                     }
                 }
             }
