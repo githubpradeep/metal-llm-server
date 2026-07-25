@@ -148,6 +148,15 @@ python3 benchmarks/server_regression.py --port 8080 --requests 10 --max-tokens 3
 python3 benchmarks/prefill_correctness.py --port 8080 --max-tokens 24 --timeout 300
 ```
 
+## Documentation / study curriculum
+
+Start here if you want to **learn the whole system** (kernels → scheduler):
+
+- [`docs/CURRICULUM.md`](docs/CURRICULUM.md) — syllabus
+- [`docs/textbook/`](docs/textbook/) — textbook chapters 00–16 with diagrams
+
+Performance experiment diary: [`AGENTS.md`](AGENTS.md).
+
 ## Architecture
 
 ```text
@@ -159,6 +168,7 @@ src/gguf.rs                 GGUF parse + embedded tokenizer
 src/gpu.rs                  Metal pipelines / encoders
 src/shaders/                Metal kernels (mul_mm, flash_attn_ext, …)
 benchmarks/                 Regression / correctness / stress scripts
+docs/textbook/              Study curriculum (see docs/CURRICULUM.md)
 ```
 
 ## Known limits
