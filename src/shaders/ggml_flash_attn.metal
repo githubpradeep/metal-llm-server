@@ -351,8 +351,15 @@ void flash_attn_ext_vec_reduce_impl(
 
     device const float * ss = (device const float *) htmp + (uint64_t)args.nrows*DV*NWG;
 
-    float S = ss[rid*(2*NWG) + 2*iwg + 0];
-    float M = ss[rid*(2*NWG) + 2*iwg + 1];
+    // The reduction always uses one 32-lane simdgroup across WG partitions.
+    // For NWG < 32, inactive lanes contribute the online-softmax identity.
+    const bool active = iwg < NWG;
+    float S = 0.0f;
+    float M = -FLT_MAX/2;
+    if (active) {
+        S = ss[rid*(2*NWG) + 2*iwg + 0];
+        M = ss[rid*(2*NWG) + 2*iwg + 1];
+    }
 
     const float m  = simd_max(M);
     const float ms = exp(M - m);
@@ -364,7 +371,11 @@ void flash_attn_ext_vec_reduce_impl(
     device       float4 * dst4  = (device       float4 *) dst  + rid*DV4;
 
     for (short i = sgitg; i < DV4; i += NWG) {
-        const float4 v = simd_sum(htmp4[i*NWG + iwg]*ms);
+        float4 partial = 0.0f;
+        if (active) {
+            partial = htmp4[i*NWG + iwg]*ms;
+        }
+        const float4 v = simd_sum(partial);
 
         if (iwg == 0) {
             dst4[i] = v*S;
@@ -373,7 +384,7 @@ void flash_attn_ext_vec_reduce_impl(
 }
 
 #define GGML_FA_KERNEL(DK, DV, NS10, NS20, NWG) \
-kernel void flash_attn_ggml_q4_0_h##DK( \
+kernel void flash_attn_ggml_q4_0_h##DK##_nwg##NWG( \
     constant ggml_flash_attn_args & args [[buffer(0)]], \
     device const char * q [[buffer(1)]], \
     device const char * k [[buffer(2)]], \
@@ -386,7 +397,7 @@ kernel void flash_attn_ggml_q4_0_h##DK( \
     flash_attn_ext_vec_impl<DK, DV, 1, 1, NS10, NS20, NWG>( \
         args, q, k, v, dst, shmem_f16, tgpig, tiisg, sgitg); \
 } \
-kernel void flash_attn_ggml_q4_0_reduce_h##DK( \
+kernel void flash_attn_ggml_q4_0_reduce_h##DK##_nwg##NWG( \
     constant ggml_flash_attn_reduce_args & args [[buffer(0)]], \
     device const char * htmp [[buffer(1)]], \
     device char * dst [[buffer(2)]], \
@@ -396,8 +407,17 @@ kernel void flash_attn_ggml_q4_0_reduce_h##DK( \
     flash_attn_ext_vec_reduce_impl<DV, NWG>(args, htmp, dst, tgpig, tiisg, sgitg); \
 }
 
+GGML_FA_KERNEL(128, 128, 4, 4, 4)
+GGML_FA_KERNEL(128, 128, 4, 4, 8)
+GGML_FA_KERNEL(128, 128, 4, 4, 16)
 GGML_FA_KERNEL(128, 128, 4, 4, 32)
+GGML_FA_KERNEL(256, 256, 8, 8, 4)
+GGML_FA_KERNEL(256, 256, 8, 8, 8)
+GGML_FA_KERNEL(256, 256, 8, 8, 16)
 GGML_FA_KERNEL(256, 256, 8, 8, 32)
+GGML_FA_KERNEL(512, 512, 16, 16, 4)
+GGML_FA_KERNEL(512, 512, 16, 16, 8)
+GGML_FA_KERNEL(512, 512, 16, 16, 16)
 GGML_FA_KERNEL(512, 512, 16, 16, 32)
 
 #undef GGML_FA_KERNEL

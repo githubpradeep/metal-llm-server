@@ -11,6 +11,8 @@ pub mod weight_fmt {
     pub const Q3_0: u8 = 2;
     pub const Q4_K: u8 = 3;
     pub const Q6_K: u8 = 4;
+    /// Two residual/additive binary planes, 12 bytes / 32 weights (3 bpw).
+    pub const Q2_R32: u8 = 5;
 }
 
 /// A sub-range view into a Metal buffer (offset applied at kernel bind time).
@@ -82,6 +84,11 @@ pub fn weight_buf_is_q3(view: &BufferView, m: u32, k: u32) -> bool {
     }
     let q3_bytes = (m as u64) * (k as u64 / 32) * 14;
     view.length <= q3_bytes + 256
+}
+
+/// True when a `[m, k]` weight buffer holds Q2_R32 blocks.
+pub fn weight_buf_is_q2_r32(view: &BufferView, _m: u32, _k: u32) -> bool {
+    view.format == weight_fmt::Q2_R32
 }
 
 /// Q4 matvec kernel used on the batch-1 decode path. Selectable at runtime via
@@ -575,6 +582,9 @@ pub struct MetalContext {
     pub matvec_ggml_q3_dual_pipeline: ComputePipelineState,
     pub matvec_ggml_q3_gelu_mul_pipeline: ComputePipelineState,
     pub matvec_ggml_q3_gelu_mul_r2s4_pipeline: ComputePipelineState,
+    // Q2_R32 residual/additive binary pipelines
+    pub matvec_ggml_q2_r32_pipeline: ComputePipelineState,
+    pub matvec_ggml_q2_r32_gelu_mul_pipeline: ComputePipelineState,
     pub matvec_ggml_ext_q4_nx4_pipeline: ComputePipelineState,
     pub matvec_ggml_ext_q4_nx8_pipeline: ComputePipelineState,
     pub matvec_ggml_ext_q4_nx16_pipeline: ComputePipelineState,
@@ -667,12 +677,13 @@ pub struct MetalContext {
     pub attention_full_fused_q4_0_h256_pipeline: ComputePipelineState,
     pub attention_full_fused_q4_0_h128_pipeline: ComputePipelineState,
     pub attention_full_fused_q4_0_h512_pipeline: ComputePipelineState,
-    pub flash_attn_ggml_q4_h256_pipeline: ComputePipelineState,
-    pub flash_attn_ggml_q4_h128_pipeline: ComputePipelineState,
-    pub flash_attn_ggml_q4_h512_pipeline: ComputePipelineState,
-    pub flash_attn_ggml_reduce_h256_pipeline: ComputePipelineState,
-    pub flash_attn_ggml_reduce_h128_pipeline: ComputePipelineState,
-    pub flash_attn_ggml_reduce_h512_pipeline: ComputePipelineState,
+    /// GGML MWG attention variants indexed by NWG [4, 8, 16, 32].
+    pub flash_attn_ggml_q4_h256_pipelines: [ComputePipelineState; 4],
+    pub flash_attn_ggml_q4_h128_pipelines: [ComputePipelineState; 4],
+    pub flash_attn_ggml_q4_h512_pipelines: [ComputePipelineState; 4],
+    pub flash_attn_ggml_reduce_h256_pipelines: [ComputePipelineState; 4],
+    pub flash_attn_ggml_reduce_h128_pipelines: [ComputePipelineState; 4],
+    pub flash_attn_ggml_reduce_h512_pipelines: [ComputePipelineState; 4],
     pub attention_causal_q4_0_pipeline: ComputePipelineState,
     pub attention_causal_strided_q4_0_pipeline: ComputePipelineState,
     pub attention_causal_q4_0_gqa_h256_pipeline: ComputePipelineState,
@@ -810,6 +821,8 @@ impl MetalContext {
         let matvec_ggml_q3_dual_pipeline = get_fn("matvec_ggml_q3_0_dual");
         let matvec_ggml_q3_gelu_mul_pipeline = get_fn("matvec_ggml_q3_0_gelu_mul");
         let matvec_ggml_q3_gelu_mul_r2s4_pipeline = get_fn("matvec_ggml_q3_0_gelu_mul_r2s4");
+        let matvec_ggml_q2_r32_pipeline = get_fn("matvec_ggml_q2_r32");
+        let matvec_ggml_q2_r32_gelu_mul_pipeline = get_fn("matvec_ggml_q2_r32_gelu_mul");
         let matvec_ggml_ext_q4_nx4_pipeline = get_fn("matvec_ggml_ext_q4_nx4_r4");
         let matvec_ggml_ext_q4_nx8_pipeline = get_fn("matvec_ggml_ext_q4_nx8_r4");
         let matvec_ggml_ext_q4_nx16_pipeline = get_fn("matvec_ggml_ext_q4_nx16_r4");
@@ -959,12 +972,42 @@ impl MetalContext {
             get_fn("attention_flash_decode_full_fused_q4_0_h128");
         let attention_full_fused_q4_0_h512_pipeline =
             get_fn("attention_flash_decode_full_fused_q4_0_h512");
-        let flash_attn_ggml_q4_h256_pipeline = get_fn("flash_attn_ggml_q4_0_h256");
-        let flash_attn_ggml_q4_h128_pipeline = get_fn("flash_attn_ggml_q4_0_h128");
-        let flash_attn_ggml_q4_h512_pipeline = get_fn("flash_attn_ggml_q4_0_h512");
-        let flash_attn_ggml_reduce_h256_pipeline = get_fn("flash_attn_ggml_q4_0_reduce_h256");
-        let flash_attn_ggml_reduce_h128_pipeline = get_fn("flash_attn_ggml_q4_0_reduce_h128");
-        let flash_attn_ggml_reduce_h512_pipeline = get_fn("flash_attn_ggml_q4_0_reduce_h512");
+        let flash_attn_ggml_q4_h256_pipelines = [
+            get_fn("flash_attn_ggml_q4_0_h256_nwg4"),
+            get_fn("flash_attn_ggml_q4_0_h256_nwg8"),
+            get_fn("flash_attn_ggml_q4_0_h256_nwg16"),
+            get_fn("flash_attn_ggml_q4_0_h256_nwg32"),
+        ];
+        let flash_attn_ggml_q4_h128_pipelines = [
+            get_fn("flash_attn_ggml_q4_0_h128_nwg4"),
+            get_fn("flash_attn_ggml_q4_0_h128_nwg8"),
+            get_fn("flash_attn_ggml_q4_0_h128_nwg16"),
+            get_fn("flash_attn_ggml_q4_0_h128_nwg32"),
+        ];
+        let flash_attn_ggml_q4_h512_pipelines = [
+            get_fn("flash_attn_ggml_q4_0_h512_nwg4"),
+            get_fn("flash_attn_ggml_q4_0_h512_nwg8"),
+            get_fn("flash_attn_ggml_q4_0_h512_nwg16"),
+            get_fn("flash_attn_ggml_q4_0_h512_nwg32"),
+        ];
+        let flash_attn_ggml_reduce_h256_pipelines = [
+            get_fn("flash_attn_ggml_q4_0_reduce_h256_nwg4"),
+            get_fn("flash_attn_ggml_q4_0_reduce_h256_nwg8"),
+            get_fn("flash_attn_ggml_q4_0_reduce_h256_nwg16"),
+            get_fn("flash_attn_ggml_q4_0_reduce_h256_nwg32"),
+        ];
+        let flash_attn_ggml_reduce_h128_pipelines = [
+            get_fn("flash_attn_ggml_q4_0_reduce_h128_nwg4"),
+            get_fn("flash_attn_ggml_q4_0_reduce_h128_nwg8"),
+            get_fn("flash_attn_ggml_q4_0_reduce_h128_nwg16"),
+            get_fn("flash_attn_ggml_q4_0_reduce_h128_nwg32"),
+        ];
+        let flash_attn_ggml_reduce_h512_pipelines = [
+            get_fn("flash_attn_ggml_q4_0_reduce_h512_nwg4"),
+            get_fn("flash_attn_ggml_q4_0_reduce_h512_nwg8"),
+            get_fn("flash_attn_ggml_q4_0_reduce_h512_nwg16"),
+            get_fn("flash_attn_ggml_q4_0_reduce_h512_nwg32"),
+        ];
         let attention_causal_q4_0_pipeline = get_fn(if use_flash_attention {
             "attention_flash_causal_q4_0"
         } else {
@@ -1010,13 +1053,16 @@ impl MetalContext {
                     "  Q4 prefill attention: legacy causal (PREFILL_FLASH_ATTN=0)"
                 );
             }
+            let ggml_nwg = std::env::var("ATTENTION_GGML_NWG")
+                .map(|v| format!("forced NWG={v}"))
+                .unwrap_or_else(|_| "adaptive NWG=4/8/16/32".to_string());
             match attention_kernel_mode() {
                 AttentionKernelMode::Ggml => {
-                    println!("  Q4 decode attention: ggml flash_attn_ext_vec nwg=32 (ATTENTION_KERNEL=ggml)");
+                    println!("  Q4 decode attention: ggml flash_attn_ext_vec {ggml_nwg} (ATTENTION_GGML_NWG to force)");
                 }
                 AttentionKernelMode::Auto => {
                     println!(
-                        "  Q4 decode attention: auto hybrid — fused <128 tok, ggml MWG ≥128 (ATTENTION_KERNEL=auto)"
+                        "  Q4 decode attention: auto hybrid — fused <128 tok, ggml MWG ≥128, {ggml_nwg}"
                     );
                 }
                 AttentionKernelMode::Specialized if attention_q4_hd_specialized() => {
@@ -1125,6 +1171,8 @@ impl MetalContext {
             matvec_ggml_q3_dual_pipeline,
             matvec_ggml_q3_gelu_mul_pipeline,
             matvec_ggml_q3_gelu_mul_r2s4_pipeline,
+            matvec_ggml_q2_r32_pipeline,
+            matvec_ggml_q2_r32_gelu_mul_pipeline,
             matvec_ggml_ext_q4_nx4_pipeline,
             matvec_ggml_ext_q4_nx8_pipeline,
             matvec_ggml_ext_q4_nx16_pipeline,
@@ -1214,12 +1262,12 @@ impl MetalContext {
             attention_full_fused_q4_0_h256_pipeline,
             attention_full_fused_q4_0_h128_pipeline,
             attention_full_fused_q4_0_h512_pipeline,
-            flash_attn_ggml_q4_h256_pipeline,
-            flash_attn_ggml_q4_h128_pipeline,
-            flash_attn_ggml_q4_h512_pipeline,
-            flash_attn_ggml_reduce_h256_pipeline,
-            flash_attn_ggml_reduce_h128_pipeline,
-            flash_attn_ggml_reduce_h512_pipeline,
+            flash_attn_ggml_q4_h256_pipelines,
+            flash_attn_ggml_q4_h128_pipelines,
+            flash_attn_ggml_q4_h512_pipelines,
+            flash_attn_ggml_reduce_h256_pipelines,
+            flash_attn_ggml_reduce_h128_pipelines,
+            flash_attn_ggml_reduce_h512_pipelines,
             attention_causal_q4_0_pipeline,
             attention_causal_strided_q4_0_pipeline,
             attention_causal_q4_0_gqa_h256_pipeline,
@@ -1480,6 +1528,23 @@ impl MetalContext {
         )
     }
 
+    /// Create a Metal buffer with Q2_R32 residual/additive binary blocks.
+    /// Each 32-value block stores two f16 scales and two 32-bit sign planes:
+    /// 12 bytes / 32 weights = exactly 3 bits per weight.
+    pub fn buffer_from_f32_as_q2_r32(
+        &self,
+        data: &[f32],
+        rows: usize,
+        cols: usize,
+    ) -> Buffer {
+        let quantized = quantize_q2_r32(data, rows, cols);
+        self.device.new_buffer_with_data(
+            quantized.as_ptr() as *const _,
+            quantized.len() as u64,
+            MTLResourceOptions::StorageModeShared,
+        )
+    }
+
     pub fn buffer_empty(&self, count: usize) -> Buffer {
         let byte_len = (count * std::mem::size_of::<f32>()) as u64;
         self.device
@@ -1653,6 +1718,80 @@ impl MetalContext {
             "\nAuto selection (MATVEC_KERNEL=auto, default): ggml for all shapes on\n\
              end-to-end decode. Set MATVEC_KERNEL=fast|lc|... to override.\n"
         );
+    }
+
+    /// Compare the experimental 3-bpw additive format against Q3_0 and Q4_0
+    /// using representative Gemma E2B decode shapes.
+    pub fn bench_residual_matvec(&self) {
+        use std::time::Instant;
+        let reps = 30u32;
+        let packed = 20u32;
+        let shapes: &[(u32, u32, &str)] = &[
+            (1536, 1536, "q/o hidden x hidden"),
+            (8192, 1536, "gate/up inter x hidden"),
+            (1536, 8192, "down hidden x inter"),
+            (262144, 1536, "lm_head vocab x hidden"),
+        ];
+
+        println!("\n=== residual/additive decode matvec ({packed}/cmdbuf) ===");
+        println!("Q2_R32 = 12 B/32 = 3.00 bpw; Q3_0 = 3.50 bpw; Q4_0 = 4.50 bpw");
+        println!("{:<28} {:>10} {:>10} {:>10}", "shape", "Q2_R32", "Q3_0", "Q4_0");
+
+        for &(m, k, label) in shapes {
+            let blocks = (m as u64) * (k as u64 / 32);
+            let q2 = BufferView::from_buffer(
+                self.device.new_buffer(blocks * 12, MTLResourceOptions::StorageModeShared),
+            )
+            .with_format(weight_fmt::Q2_R32);
+            let q3 = BufferView::from_buffer(
+                self.device.new_buffer(blocks * 14, MTLResourceOptions::StorageModeShared),
+            )
+            .with_format(weight_fmt::Q3_0);
+            let q4 = BufferView::from_buffer(
+                self.device.new_buffer(blocks * 18, MTLResourceOptions::StorageModeShared),
+            )
+            .with_format(weight_fmt::Q4_0);
+            let x = self.buffer_empty(k as usize);
+            let y = self.buffer_empty(m as usize);
+
+            let run_variant = |format: u8, weight: &BufferView| -> f64 {
+                let encode = |enc: &metal::ComputeCommandEncoderRef| match format {
+                    weight_fmt::Q2_R32 => self.encode_matvec_q2_r32_at_view(
+                        enc, weight, &x, 0, &y, 0, m, k, 1,
+                    ),
+                    weight_fmt::Q3_0 => {
+                        self.encode_matvec_q3_at_view(enc, weight, &x, 0, &y, 0, m, k)
+                    }
+                    _ => self.encode_matvec_q4_at_view(enc, weight, &x, 0, &y, 0, m, k),
+                };
+                for _ in 0..3 {
+                    let cmd = self.queue.new_command_buffer();
+                    let enc = cmd.new_compute_command_encoder();
+                    encode(enc);
+                    enc.end_encoding();
+                    cmd.commit();
+                    cmd.wait_until_completed();
+                }
+                let start = Instant::now();
+                for _ in 0..reps {
+                    let cmd = self.queue.new_command_buffer();
+                    let enc = cmd.new_compute_command_encoder();
+                    for _ in 0..packed {
+                        encode(enc);
+                    }
+                    enc.end_encoding();
+                    cmd.commit();
+                    cmd.wait_until_completed();
+                }
+                start.elapsed().as_secs_f64() * 1e3 / (reps * packed) as f64
+            };
+
+            let q2_ms = run_variant(weight_fmt::Q2_R32, &q2);
+            let q3_ms = run_variant(weight_fmt::Q3_0, &q3);
+            let q4_ms = run_variant(weight_fmt::Q4_0, &q4);
+            println!("{:<28} {:>8.3}ms {:>8.3}ms {:>8.3}ms", label, q2_ms, q3_ms, q4_ms);
+        }
+        println!("Lower is better. This isolates kernel speed; it does not measure model quality.");
     }
 
     /// Small-batch K-quant matvec microbench (MTP verify path, batch 1..8).
@@ -2079,7 +2218,7 @@ impl MetalContext {
         );
     }
 
-    /// Matvec dispatching to Q4, Q3, or f16 based on the weight buffer layout.
+    /// Matvec dispatching by the weight buffer's quantization layout.
     pub fn encode_matvec_auto_view(
         &self,
         encoder: &metal::ComputeCommandEncoderRef,
@@ -2089,7 +2228,11 @@ impl MetalContext {
         m: u32,
         k: u32,
     ) {
-        if matches!(weight.format, weight_fmt::Q4_K | weight_fmt::Q6_K) {
+        if weight.format == weight_fmt::Q2_R32 {
+            self.encode_matvec_q2_r32_at_view(
+                encoder, weight, x_buf, 0, y_buf, 0, m, k, 1,
+            );
+        } else if matches!(weight.format, weight_fmt::Q4_K | weight_fmt::Q6_K) {
             self.encode_matvec_qk_at_view(encoder, weight, x_buf, 0, y_buf, 0, m, k, 1);
         } else if weight_buf_is_q3(weight, m, k) {
             self.encode_matvec_q3_at_view(encoder, weight, x_buf, 0, y_buf, 0, m, k);
@@ -2111,7 +2254,11 @@ impl MetalContext {
         m: u32,
         k: u32,
     ) {
-        if matches!(weight.format, weight_fmt::Q4_K | weight_fmt::Q6_K) {
+        if weight.format == weight_fmt::Q2_R32 {
+            self.encode_matvec_q2_r32_at_view(
+                encoder, weight, x_buf, x_offset, y_buf, y_offset, m, k, 1,
+            );
+        } else if matches!(weight.format, weight_fmt::Q4_K | weight_fmt::Q6_K) {
             self.encode_matvec_qk_at_view(
                 encoder, weight, x_buf, x_offset, y_buf, y_offset, m, k, 1,
             );
@@ -2140,7 +2287,11 @@ impl MetalContext {
         k: u32,
         seq_len: u32,
     ) {
-        if matches!(weight.format, weight_fmt::Q4_K | weight_fmt::Q6_K) {
+        if weight.format == weight_fmt::Q2_R32 {
+            self.encode_matvec_q2_r32_at_view(
+                encoder, weight, x_buf, 0, y_buf, 0, m, k, seq_len,
+            );
+        } else if matches!(weight.format, weight_fmt::Q4_K | weight_fmt::Q6_K) {
             self.encode_matvec_qk_at_view(encoder, weight, x_buf, 0, y_buf, 0, m, k, seq_len);
         } else if weight_buf_is_q4(weight, m, k) {
             self.encode_projection_q4_batch_view(encoder, weight, x_buf, y_buf, m, k, seq_len);
@@ -2161,7 +2312,13 @@ impl MetalContext {
         k: u32,
         seq_len: u32,
     ) {
-        if matches!(weight.format, weight_fmt::Q4_K | weight_fmt::Q6_K) {
+        if weight.format == weight_fmt::Q2_R32 {
+            // Functional prefill path for the experimental format. A tiled
+            // Q2_R32 mul_mm is deliberately deferred until decode proves useful.
+            self.encode_matvec_q2_r32_at_view(
+                encoder, weight, x_buf, 0, y_buf, 0, m, k, seq_len,
+            );
+        } else if matches!(weight.format, weight_fmt::Q4_K | weight_fmt::Q6_K) {
             self.encode_prefill_kquant_projection(encoder, weight, x_buf, y_buf, m, k, seq_len);
         } else if weight.format == weight_fmt::F16
             || (!weight_buf_is_q4(weight, m, k) && !weight_buf_is_q3(weight, m, k))
@@ -2853,6 +3010,77 @@ impl MetalContext {
             &args as *const _ as *const _,
         );
         use crate::ggml_gemv::mul_mv_dispatch;
+        let (tg_x, tg_y, tg_z, tw, nsg) = mul_mv_dispatch(m, 1);
+        encoder.dispatch_thread_groups(
+            metal::MTLSize::new(tg_x, tg_y, tg_z),
+            metal::MTLSize::new(tw, nsg, 1),
+        );
+    }
+
+    /// Q2_R32 fused residual/additive matvec. `batch` rows share the same
+    /// compressed weights and are dispatched along the grid's y dimension.
+    #[allow(clippy::too_many_arguments)]
+    pub fn encode_matvec_q2_r32_at_view(
+        &self,
+        encoder: &metal::ComputeCommandEncoderRef,
+        weight: &BufferView,
+        x_buf: &Buffer,
+        x_offset: u64,
+        y_buf: &Buffer,
+        y_offset: u64,
+        m: u32,
+        k: u32,
+        batch: u32,
+    ) {
+        use crate::ggml_gemv::{mul_mv_args, mul_mv_dispatch};
+        debug_assert_eq!(weight.format, weight_fmt::Q2_R32);
+        let mut args = mul_mv_args(m, k);
+        args.ne11 = batch as i32;
+        args.ne1 = batch as i32;
+        encoder.set_compute_pipeline_state(&self.matvec_ggml_q2_r32_pipeline);
+        encoder.set_buffer(0, Some(&weight.buffer), weight.offset);
+        encoder.set_buffer(1, Some(x_buf), x_offset);
+        encoder.set_buffer(2, Some(y_buf), y_offset);
+        encoder.set_bytes(
+            3,
+            std::mem::size_of::<crate::ggml_gemv::GgmlMulMvArgs>() as u64,
+            &args as *const _ as *const _,
+        );
+        let (tg_x, tg_y, tg_z, tw, nsg) = mul_mv_dispatch(m, batch);
+        encoder.dispatch_thread_groups(
+            metal::MTLSize::new(tg_x, tg_y, tg_z),
+            metal::MTLSize::new(tw, nsg, 1),
+        );
+    }
+
+    /// Gate and up Q2_R32 matvecs fused with GeLU multiplication.
+    #[allow(clippy::too_many_arguments)]
+    pub fn encode_matvec_q2_r32_gelu_mul_at_view(
+        &self,
+        encoder: &metal::ComputeCommandEncoderRef,
+        gate: &BufferView,
+        up: &BufferView,
+        x_buf: &Buffer,
+        x_offset: u64,
+        gelu_out: &Buffer,
+        gelu_offset: u64,
+        m: u32,
+        k: u32,
+    ) {
+        use crate::ggml_gemv::{mul_mv_args, mul_mv_dispatch};
+        debug_assert_eq!(gate.format, weight_fmt::Q2_R32);
+        debug_assert_eq!(up.format, weight_fmt::Q2_R32);
+        let args = mul_mv_args(m, k);
+        encoder.set_compute_pipeline_state(&self.matvec_ggml_q2_r32_gelu_mul_pipeline);
+        encoder.set_buffer(0, Some(&gate.buffer), gate.offset);
+        encoder.set_buffer(1, Some(&up.buffer), up.offset);
+        encoder.set_buffer(2, Some(x_buf), x_offset);
+        encoder.set_buffer(3, Some(gelu_out), gelu_offset);
+        encoder.set_bytes(
+            4,
+            std::mem::size_of::<crate::ggml_gemv::GgmlMulMvArgs>() as u64,
+            &args as *const _ as *const _,
+        );
         let (tg_x, tg_y, tg_z, tw, nsg) = mul_mv_dispatch(m, 1);
         encoder.dispatch_thread_groups(
             metal::MTLSize::new(tg_x, tg_y, tg_z),
@@ -5490,20 +5718,38 @@ impl MetalContext {
         }
     }
 
-    fn flash_attn_ggml_pipeline_for(&self, head_dim: u32) -> &ComputePipelineState {
-        match head_dim {
-            256 => &self.flash_attn_ggml_q4_h256_pipeline,
-            128 => &self.flash_attn_ggml_q4_h128_pipeline,
-            512 => &self.flash_attn_ggml_q4_h512_pipeline,
-            _ => panic!("ggml flash attention unsupported head_dim {head_dim} (need 256, 128, or 512)"),
+    fn flash_attn_nwg_index(nwg: u64) -> usize {
+        match nwg {
+            4 => 0,
+            8 => 1,
+            16 => 2,
+            32 => 3,
+            _ => panic!("unsupported ggml flash attention NWG {nwg}"),
         }
     }
 
-    fn flash_attn_ggml_reduce_pipeline_for(&self, head_dim: u32) -> &ComputePipelineState {
+    fn flash_attn_ggml_pipeline_for(&self, head_dim: u32, nwg: u64) -> &ComputePipelineState {
+        let i = Self::flash_attn_nwg_index(nwg);
         match head_dim {
-            256 => &self.flash_attn_ggml_reduce_h256_pipeline,
-            128 => &self.flash_attn_ggml_reduce_h128_pipeline,
-            512 => &self.flash_attn_ggml_reduce_h512_pipeline,
+            256 => &self.flash_attn_ggml_q4_h256_pipelines[i],
+            128 => &self.flash_attn_ggml_q4_h128_pipelines[i],
+            512 => &self.flash_attn_ggml_q4_h512_pipelines[i],
+            _ => panic!(
+                "ggml flash attention unsupported head_dim {head_dim} (need 256, 128, or 512)"
+            ),
+        }
+    }
+
+    fn flash_attn_ggml_reduce_pipeline_for(
+        &self,
+        head_dim: u32,
+        nwg: u64,
+    ) -> &ComputePipelineState {
+        let i = Self::flash_attn_nwg_index(nwg);
+        match head_dim {
+            256 => &self.flash_attn_ggml_reduce_h256_pipelines[i],
+            128 => &self.flash_attn_ggml_reduce_h128_pipelines[i],
+            512 => &self.flash_attn_ggml_reduce_h512_pipelines[i],
             _ => panic!("ggml flash attention reduce unsupported head_dim {head_dim}"),
         }
     }
@@ -5571,8 +5817,8 @@ impl MetalContext {
         row_bytes: u32,
     ) {
         use crate::ggml_flash_attn::{
-            flash_attn_args, flash_attn_dispatch, flash_attn_reduce_dispatch, flash_attn_smem_bytes,
-            GgmlFlashAttnReduceArgs,
+            flash_attn_args, flash_attn_dispatch, flash_attn_nwg, flash_attn_reduce_dispatch,
+            flash_attn_smem_bytes, GgmlFlashAttnReduceArgs,
         };
 
         let args = flash_attn_args(
@@ -5584,8 +5830,9 @@ impl MetalContext {
             row_bytes as u64,
             scale,
         );
+        let nwg = flash_attn_nwg(kv_seq, num_heads);
         let kv_off = (kv_start as u64) * row_bytes as u64;
-        encoder.set_compute_pipeline_state(self.flash_attn_ggml_pipeline_for(head_dim));
+        encoder.set_compute_pipeline_state(self.flash_attn_ggml_pipeline_for(head_dim, nwg));
         encoder.set_bytes(
             0,
             std::mem::size_of::<crate::ggml_flash_attn::GgmlFlashAttnArgs>() as u64,
@@ -5596,7 +5843,7 @@ impl MetalContext {
         encoder.set_buffer(3, Some(v_cache_buf), v_offset + kv_off);
         encoder.set_buffer(4, Some(tmp_buf), tmp_offset);
         encoder.set_threadgroup_memory_length(0, flash_attn_smem_bytes(head_dim));
-        let (tg_x, tg_y, tg_z, tw, nsg) = flash_attn_dispatch(num_heads);
+        let (tg_x, tg_y, tg_z, tw, nsg) = flash_attn_dispatch(num_heads, nwg);
         encoder.dispatch_thread_groups(
             metal::MTLSize::new(tg_x, tg_y, tg_z),
             metal::MTLSize::new(tw, nsg, 1),
@@ -5605,7 +5852,7 @@ impl MetalContext {
         let reduce_args = GgmlFlashAttnReduceArgs {
             nrows: num_heads as i32,
         };
-        encoder.set_compute_pipeline_state(self.flash_attn_ggml_reduce_pipeline_for(head_dim));
+        encoder.set_compute_pipeline_state(self.flash_attn_ggml_reduce_pipeline_for(head_dim, nwg));
         encoder.set_bytes(
             0,
             std::mem::size_of::<GgmlFlashAttnReduceArgs>() as u64,
@@ -5613,7 +5860,7 @@ impl MetalContext {
         );
         encoder.set_buffer(1, Some(tmp_buf), tmp_offset);
         encoder.set_buffer(2, Some(out_buf), out_offset);
-        let (rtg_x, rtg_y, rtg_z, rtw, rnsg, _) = flash_attn_reduce_dispatch(num_heads);
+        let (rtg_x, rtg_y, rtg_z, rtw, rnsg, _) = flash_attn_reduce_dispatch(num_heads, nwg);
         encoder.dispatch_thread_groups(
             metal::MTLSize::new(rtg_x, rtg_y, rtg_z),
             metal::MTLSize::new(rtw, rnsg, 1),
@@ -7114,6 +7361,127 @@ pub fn f32_to_f16(value: f32) -> u16 {
     }
 }
 
+/// Quantize f32 weights to Q2_R32, a two-plane residual/additive binary format.
+///
+/// The initial planes are obtained by binary-quantizing the weights and then
+/// binary-quantizing that approximation's residual. We then alternate exact
+/// four-code assignment with a 2x2 least-squares scale solve. Each block is:
+/// `[f16 d0][f16 d1][u32 signs0][u32 signs1]` = 12 bytes / 32 weights = 3 bpw.
+fn quantize_q2_r32(data: &[f32], rows: usize, cols: usize) -> Vec<u8> {
+    assert_eq!(data.len(), rows * cols);
+    assert_eq!(cols % 32, 0, "cols must be divisible by 32 for Q2_R32");
+    const BLOCK: usize = 32;
+    const BLOCK_BYTES: usize = 12;
+    let blocks_per_row = cols / BLOCK;
+    let mut output = vec![0u8; rows * blocks_per_row * BLOCK_BYTES];
+
+    for row in 0..rows {
+        for block_idx in 0..blocks_per_row {
+            let src = &data[row * cols + block_idx * BLOCK..][..BLOCK];
+            let mut signs0 = 0u32;
+            let mut signs1 = 0u32;
+            let mut d0 = src.iter().map(|v| v.abs()).sum::<f32>() / BLOCK as f32;
+
+            for (i, &v) in src.iter().enumerate() {
+                if v >= 0.0 {
+                    signs0 |= 1u32 << i;
+                }
+            }
+            let mut d1 = 0.0f32;
+            for (i, &v) in src.iter().enumerate() {
+                let s0 = if (signs0 >> i) & 1 != 0 { 1.0 } else { -1.0 };
+                let residual = v - d0 * s0;
+                d1 += residual.abs();
+                if residual >= 0.0 {
+                    signs1 |= 1u32 << i;
+                }
+            }
+            d1 /= BLOCK as f32;
+
+            // Lloyd-style refinement for the four additive reconstruction levels.
+            for _ in 0..4 {
+                signs0 = 0;
+                signs1 = 0;
+                for (i, &v) in src.iter().enumerate() {
+                    let candidates = [
+                        (-d0 - d1, false, false),
+                        (-d0 + d1, false, true),
+                        (d0 - d1, true, false),
+                        (d0 + d1, true, true),
+                    ];
+                    let (_, b0, b1) = candidates
+                        .into_iter()
+                        .min_by(|a, b| {
+                            (v - a.0)
+                                .abs()
+                                .partial_cmp(&(v - b.0).abs())
+                                .unwrap()
+                        })
+                        .unwrap();
+                    if b0 { signs0 |= 1u32 << i; }
+                    if b1 { signs1 |= 1u32 << i; }
+                }
+
+                let mut cross = 0.0f32;
+                let mut rhs0 = 0.0f32;
+                let mut rhs1 = 0.0f32;
+                for (i, &v) in src.iter().enumerate() {
+                    let s0 = if (signs0 >> i) & 1 != 0 { 1.0 } else { -1.0 };
+                    let s1 = if (signs1 >> i) & 1 != 0 { 1.0 } else { -1.0 };
+                    cross += s0 * s1;
+                    rhs0 += v * s0;
+                    rhs1 += v * s1;
+                }
+                let n = BLOCK as f32;
+                let determinant = n * n - cross * cross;
+                if determinant.abs() > 1e-6 {
+                    d0 = (n * rhs0 - cross * rhs1) / determinant;
+                    d1 = (n * rhs1 - cross * rhs0) / determinant;
+                }
+                if d0 < 0.0 {
+                    d0 = -d0;
+                    signs0 = !signs0;
+                }
+                if d1 < 0.0 {
+                    d1 = -d1;
+                    signs1 = !signs1;
+                }
+            }
+
+            let dst = (row * blocks_per_row + block_idx) * BLOCK_BYTES;
+            output[dst..dst + 2].copy_from_slice(&f32_to_f16(d0).to_le_bytes());
+            output[dst + 2..dst + 4].copy_from_slice(&f32_to_f16(d1).to_le_bytes());
+            output[dst + 4..dst + 8].copy_from_slice(&signs0.to_le_bytes());
+            output[dst + 8..dst + 12].copy_from_slice(&signs1.to_le_bytes());
+        }
+    }
+    output
+}
+
+fn dequantize_q2_r32(data: &[u8], rows: usize, cols: usize) -> Vec<f32> {
+    const BLOCK: usize = 32;
+    const BLOCK_BYTES: usize = 12;
+    assert_eq!(cols % BLOCK, 0);
+    let blocks_per_row = cols / BLOCK;
+    assert_eq!(data.len(), rows * blocks_per_row * BLOCK_BYTES);
+    let mut output = vec![0.0f32; rows * cols];
+    for row in 0..rows {
+        for block_idx in 0..blocks_per_row {
+            let src = (row * blocks_per_row + block_idx) * BLOCK_BYTES;
+            let d0 = f16_to_f32(u16::from_le_bytes([data[src], data[src + 1]]));
+            let d1 = f16_to_f32(u16::from_le_bytes([data[src + 2], data[src + 3]]));
+            let signs0 = u32::from_le_bytes(data[src + 4..src + 8].try_into().unwrap());
+            let signs1 = u32::from_le_bytes(data[src + 8..src + 12].try_into().unwrap());
+            for i in 0..BLOCK {
+                let s0 = if (signs0 >> i) & 1 != 0 { 1.0 } else { -1.0 };
+                let s1 = if (signs1 >> i) & 1 != 0 { 1.0 } else { -1.0 };
+                output[row * cols + block_idx * BLOCK + i] = d0 * s0 + d1 * s1;
+            }
+        }
+    }
+    output
+}
+
 /// Quantize f32 weights to Q3_0 format (3-bit symmetric, group=32).
 /// Block = 14 bytes: f16 scale + 8 bytes low-2-bits + 4 bytes high-1-bit.
 /// 32 weights × 3 bits = 96 bits = 12 bytes payload + 2 byte scale = 14 bytes.
@@ -7186,6 +7554,73 @@ fn dequantize_q3_0(data: &[u8], rows: usize, cols: usize) -> Vec<f32> {
         }
     }
     output
+}
+
+fn dequantize_q4_0(data: &[u8], rows: usize, cols: usize) -> Vec<f32> {
+    assert_eq!(cols % 32, 0);
+    let blocks_per_row = cols / 32;
+    assert_eq!(data.len(), rows * blocks_per_row * 18);
+    let mut output = vec![0.0f32; rows * cols];
+    for row in 0..rows {
+        for block_idx in 0..blocks_per_row {
+            let src = (row * blocks_per_row + block_idx) * 18;
+            let d = f16_to_f32(u16::from_le_bytes([data[src], data[src + 1]]));
+            for i in 0..16 {
+                let packed = data[src + 2 + i];
+                output[row * cols + block_idx * 32 + i] =
+                    d * ((packed & 0x0F) as i32 - 8) as f32;
+                output[row * cols + block_idx * 32 + i + 16] =
+                    d * ((packed >> 4) as i32 - 8) as f32;
+            }
+        }
+    }
+    output
+}
+
+/// Quantization-error comparison on one real model tensor. This is intentionally
+/// separate from the kernel benchmark: fewer bytes are useful only if both
+/// decode speed and reconstruction quality survive.
+pub fn bench_residual_quality(model_path: &str) {
+    let gguf = crate::gguf::Gguf::open(model_path);
+    let tensor_name = ["blk.0.ffn_gate.weight", "blk.0.attn_q.weight"]
+        .into_iter()
+        .find(|name| gguf.has_tensor(name))
+        .expect("model has no representative projection tensor");
+    let info = gguf.tensor(tensor_name).unwrap();
+    let cols = info.ne0();
+    let rows = info.n_rows();
+    let source = gguf.dequant_to_f32(tensor_name);
+
+    let score = |reconstructed: &[f32]| {
+        let signal = source.iter().map(|v| v * v).sum::<f32>();
+        let noise = source
+            .iter()
+            .zip(reconstructed.iter())
+            .map(|(a, b)| (a - b) * (a - b))
+            .sum::<f32>();
+        let max_error = source
+            .iter()
+            .zip(reconstructed.iter())
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+        (noise / signal.max(1e-30), max_error)
+    };
+
+    let q2 = quantize_q2_r32(&source, rows, cols);
+    let q3 = quantize_q3_0(&source, rows, cols);
+    let q4 = quantize_q4_0(&source, rows, cols);
+    let q2_score = score(&dequantize_q2_r32(&q2, rows, cols));
+    let q3_score = score(&dequantize_q3_0(&q3, rows, cols));
+    let q4_score = score(&dequantize_q4_0(&q4, rows, cols));
+
+    println!("\n=== residual/additive quantization quality ===");
+    println!("source: {tensor_name} ({rows} x {cols}, source type {})",
+        crate::gguf::ggml_type_name(info.ggml_type));
+    println!("{:<12} {:>8} {:>14} {:>14}", "format", "bpw", "relative MSE", "max abs error");
+    println!("{:<12} {:>8.2} {:>14.6} {:>14.6}", "Q2_R32", 3.0, q2_score.0, q2_score.1);
+    println!("{:<12} {:>8.2} {:>14.6} {:>14.6}", "Q3_0", 3.5, q3_score.0, q3_score.1);
+    println!("{:<12} {:>8.2} {:>14.6} {:>14.6}", "Q4_0", 4.5, q4_score.0, q4_score.1);
+    println!("Note: a quantized GGUF source measures additional error on top of its existing quantization.");
 }
 
 /// Quantize f32 weights to Q4_0 format.
@@ -7551,6 +7986,80 @@ mod tests {
     fn metal_context_compiles_shaders() {
         // Creating a context compiles every Metal function in llama.metal.
         let _ctx = MetalContext::new();
+    }
+
+    #[test]
+    fn q2_r32_quantize_dequantize_roundtrip() {
+        let mut rng = rand::thread_rng();
+        let rows = 4;
+        let cols = 64;
+        let data: Vec<f32> = (0..rows * cols)
+            .map(|_| rng.gen_range(-1.0..1.0))
+            .collect();
+        let quantized = quantize_q2_r32(&data, rows, cols);
+        assert_eq!(quantized.len(), rows * (cols / 32) * 12);
+        let dequantized = dequantize_q2_r32(&quantized, rows, cols);
+        let signal = data.iter().map(|v| v * v).sum::<f32>();
+        let noise = data
+            .iter()
+            .zip(dequantized.iter())
+            .map(|(a, b)| (a - b) * (a - b))
+            .sum::<f32>();
+        assert!(
+            noise / signal < 0.12,
+            "Q2_R32 relative MSE too high: {:.5}",
+            noise / signal
+        );
+    }
+
+    #[test]
+    fn q2_r32_matvec_matches_cpu_reference() {
+        let ctx = MetalContext::new();
+        let rows = 8u32;
+        let cols = 64u32;
+        let mut rng = rand::thread_rng();
+        let weights: Vec<f32> = (0..rows * cols)
+            .map(|_| rng.gen_range(-0.5..0.5))
+            .collect();
+        let x: Vec<f32> = (0..cols).map(|_| rng.gen_range(-1.0..1.0)).collect();
+        let packed = quantize_q2_r32(&weights, rows as usize, cols as usize);
+        let dequantized = dequantize_q2_r32(&packed, rows as usize, cols as usize);
+        let expected: Vec<f32> = (0..rows as usize)
+            .map(|r| {
+                dequantized[r * cols as usize..(r + 1) * cols as usize]
+                    .iter()
+                    .zip(x.iter())
+                    .map(|(w, x)| w * x)
+                    .sum()
+            })
+            .collect();
+
+        let weight = BufferView::from_buffer(ctx.device.new_buffer_with_data(
+            packed.as_ptr() as *const _,
+            packed.len() as u64,
+            MTLResourceOptions::StorageModeShared,
+        ))
+        .with_format(weight_fmt::Q2_R32);
+        let x_buf = ctx.buffer_from_slice(&x);
+        let y_buf = ctx.buffer_empty(rows as usize);
+        let cmd = ctx.queue.new_command_buffer();
+        let encoder = cmd.new_compute_command_encoder();
+        ctx.encode_matvec_q2_r32_at_view(
+            encoder, &weight, &x_buf, 0, &y_buf, 0, rows, cols, 1,
+        );
+        encoder.end_encoding();
+        cmd.commit();
+        cmd.wait_until_completed();
+
+        let actual = unsafe {
+            std::slice::from_raw_parts(y_buf.contents() as *const f32, rows as usize)
+        };
+        let max_diff = actual
+            .iter()
+            .zip(expected.iter())
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+        assert!(max_diff < 1e-4, "Q2_R32 GPU mismatch: {max_diff}");
     }
 
     #[test]

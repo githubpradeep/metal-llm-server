@@ -40,6 +40,18 @@ fn main() {
         ctx.bench_matvec();
         return;
     }
+    if args.iter().any(|a| a == "--bench-residual-matvec") {
+        let ctx = gpu::MetalContext::new();
+        ctx.bench_residual_matvec();
+        return;
+    }
+    if let Some(i) = args.iter().position(|a| a == "--bench-residual-quality") {
+        let model_path = args
+            .get(i + 1)
+            .expect("--bench-residual-quality requires a GGUF path");
+        gpu::bench_residual_quality(model_path);
+        return;
+    }
     if args.iter().any(|a| a == "--bench-mul-mm") {
         let ctx = gpu::MetalContext::new();
         ctx.bench_mul_mm();

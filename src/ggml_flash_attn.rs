@@ -39,10 +39,35 @@ pub struct GgmlFlashAttnReduceArgs {
     pub nrows: i32,
 }
 
-/// llama.cpp decode default: 32 workgroups partition KV (C=32 tokens each).
-pub const NWG: u64 = 32;
+/// Largest compiled multi-WG variant. The scratch buffer is sized for this,
+/// while each dispatch selects 4/8/16/32 from the active KV length.
+pub const MAX_NWG: u64 = 32;
+pub const MIN_NWG: u64 = 4;
 const NCPSG: u64 = 32;
 const NSG: u64 = 1;
+
+/// Select enough 32-token partitions to cover the active KV range once, rounded
+/// to a compiled power-of-two variant. Also keep at least 128 total main-pass
+/// workgroups in flight; the M1 Pro sweep showed that lower occupancy loses more
+/// than it saves in dispatch/reduction work (eight heads therefore use NWG 16).
+///
+/// `ATTENTION_GGML_NWG=4|8|16|32` forces a variant for controlled benchmarks.
+pub fn flash_attn_nwg(kv_seq: u32, num_heads: u32) -> u64 {
+    if let Some(forced) = std::env::var("ATTENTION_GGML_NWG")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .filter(|v| matches!(v, 4 | 8 | 16 | 32))
+    {
+        return forced;
+    }
+    let chunks = (kv_seq as u64 + 31) / 32;
+    let heads = num_heads.max(1) as u64;
+    let occupancy_floor = ((128 + heads - 1) / heads).next_power_of_two();
+    chunks
+        .next_power_of_two()
+        .max(occupancy_floor)
+        .clamp(MIN_NWG, MAX_NWG)
+}
 
 fn pad_to(x: u64, n: u64) -> u64 {
     ((x + n - 1) / n) * n
@@ -62,7 +87,7 @@ pub fn flash_attn_tmp_bytes(num_heads: u32, head_dim: u32) -> u64 {
     let ne02 = num_heads as u64;
     let ne03 = 1u64;
     let ne20 = head_dim as u64;
-    ne01_max * ne02 * ne03 * NWG * (ne20 + 2) * std::mem::size_of::<f32>() as u64
+    ne01_max * ne02 * ne03 * MAX_NWG * (ne20 + 2) * std::mem::size_of::<f32>() as u64
 }
 
 pub fn flash_attn_args(
@@ -107,13 +132,35 @@ pub fn flash_attn_args(
     }
 }
 
-/// Main kernel dispatch: one threadgroup per head × NWG KV partitions.
-pub fn flash_attn_dispatch(num_heads: u32) -> (u64, u64, u64, u64, u64) {
-    (1, num_heads as u64, NWG, 32, NSG)
+/// Main kernel dispatch: one threadgroup per head × selected KV partitions.
+pub fn flash_attn_dispatch(num_heads: u32, nwg: u64) -> (u64, u64, u64, u64, u64) {
+    debug_assert!(matches!(nwg, 4 | 8 | 16 | 32));
+    (1, num_heads as u64, nwg, 32, NSG)
 }
 
 /// Reduce kernel dispatch after multi-WG main pass.
-pub fn flash_attn_reduce_dispatch(num_heads: u32) -> (u64, u64, u64, u64, u64, u64) {
+pub fn flash_attn_reduce_dispatch(num_heads: u32, nwg: u64) -> (u64, u64, u64, u64, u64, u64) {
+    debug_assert!(matches!(nwg, 4 | 8 | 16 | 32));
     let nrows = num_heads as u64;
-    (nrows, 1, 1, 32 * NWG, 1, 1)
+    (nrows, 1, 1, 32 * nwg, 1, 1)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn adaptive_nwg_tracks_32_token_chunks() {
+        std::env::remove_var("ATTENTION_GGML_NWG");
+        assert_eq!(flash_attn_nwg(1, 32), 4);
+        assert_eq!(flash_attn_nwg(128, 32), 4);
+        assert_eq!(flash_attn_nwg(129, 32), 8);
+        assert_eq!(flash_attn_nwg(256, 32), 8);
+        assert_eq!(flash_attn_nwg(257, 32), 16);
+        assert_eq!(flash_attn_nwg(1, 16), 8);
+        assert_eq!(flash_attn_nwg(1, 8), 16);
+        assert_eq!(flash_attn_nwg(512, 8), 16);
+        assert_eq!(flash_attn_nwg(513, 8), 32);
+        assert_eq!(flash_attn_nwg(32_768, 8), 32);
+    }
 }

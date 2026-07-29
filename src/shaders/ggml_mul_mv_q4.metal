@@ -591,6 +591,214 @@ kernel void matvec_ggml_q3_0_gelu_mul_r2s4(
         tgpig, tiisg, sgitg);
 }
 
+// ─── Q2_R32: two-plane residual/additive binary quantization ─────────────────
+//
+// Each 32-weight block is represented as
+//     w_i ~= d0 * s0_i + d1 * s1_i,  s0_i,s1_i in {-1,+1}
+// where the second binary plane is initialized from the first plane's residual.
+// Layout: 2 x f16 scales + 2 x uint32 sign masks = 12 bytes / 32 weights = 3 bpw.
+
+#define QK2_R32 32
+
+struct block_q2_r32 {
+    half d0;
+    half d1;
+    uint32_t signs0;
+    uint32_t signs1;
+};
+
+inline float2 q2_r32_signed_dot16x2(device const float * y, uint mask0, uint mask1) {
+    float4 sums0 = 0.0f;
+    float4 sums1 = 0.0f;
+    const uint4 bit_lanes = uint4(1u, 2u, 4u, 8u);
+    for (uint j = 0; j < 4; ++j) {
+        const float4 xv = *((device const float4 *)(y + 4*j));
+        const uint nibble0 = (mask0 >> (4*j)) & 0xFu;
+        const uint nibble1 = (mask1 >> (4*j)) & 0xFu;
+        sums0 += select(-xv, xv, (uint4(nibble0) & bit_lanes) != uint4(0u));
+        sums1 += select(-xv, xv, (uint4(nibble1) & bit_lanes) != uint4(0u));
+    }
+    return float2(
+        sums0[0] + sums0[1] + sums0[2] + sums0[3],
+        sums1[0] + sums1[1] + sums1[2] + sums1[3]);
+}
+
+inline float4 q2_r32_signed_dot16x4(
+        device const float * y, uint mask0, uint mask1, uint mask2, uint mask3) {
+    float4 totals = 0.0f;
+    const uint4 bit_lanes = uint4(1u, 2u, 4u, 8u);
+    for (uint j = 0; j < 4; ++j) {
+        const float4 xv = *((device const float4 *)(y + 4*j));
+        const uint shift = 4*j;
+        float4 partial0 = select(-xv, xv,
+            (uint4((mask0 >> shift) & 0xFu) & bit_lanes) != uint4(0u));
+        float4 partial1 = select(-xv, xv,
+            (uint4((mask1 >> shift) & 0xFu) & bit_lanes) != uint4(0u));
+        float4 partial2 = select(-xv, xv,
+            (uint4((mask2 >> shift) & 0xFu) & bit_lanes) != uint4(0u));
+        float4 partial3 = select(-xv, xv,
+            (uint4((mask3 >> shift) & 0xFu) & bit_lanes) != uint4(0u));
+        totals += float4(
+            partial0[0] + partial0[1] + partial0[2] + partial0[3],
+            partial1[0] + partial1[1] + partial1[2] + partial1[3],
+            partial2[0] + partial2[1] + partial2[2] + partial2[3],
+            partial3[0] + partial3[1] + partial3[2] + partial3[3]);
+    }
+    return totals;
+}
+
+template<short NR0, short NSG, short NW>
+void mul_vec_q2_r32_f32_impl(
+        device const void  * src0,
+        device const float * src1,
+        device       float * dst,
+                   int64_t   ne00,
+                   int64_t   ne01,
+                   int64_t   ne02,
+                   int64_t   ne10,
+                   int64_t   ne12,
+                   int64_t   ne0,
+                   int64_t   ne1,
+                   uint      r2,
+                   uint      r3,
+                   uint3 tgpig, uint tiisg, uint sgitg) {
+    const int nb = ne00/QK2_R32;
+    const int r0 = tgpig.x;
+    const int r1 = tgpig.y;
+    const int im = tgpig.z;
+    const int first_row = (r0 * NSG + sgitg) * NR0;
+    const uint i12 = im%ne12;
+    const uint i13 = im/ne12;
+    const uint offset0 = first_row * nb + (i12/r2)*(nb*ne01) + (i13/r3)*(nb*ne01*ne02);
+    device const block_q2_r32 * blocks = (device const block_q2_r32 *)src0 + offset0;
+    device const float * y = src1 + r1*ne10 + im*ne00*ne1;
+
+    float sumf[NR0];
+    for (short row = 0; row < NR0; ++row) sumf[row] = 0.0f;
+
+    // A pair of lanes owns one 32-value block: even lane handles [0,16),
+    // odd lane handles [16,32). Across a simdgroup, 16 blocks are in flight.
+    const uint ib0 = tiisg/2;
+    const uint half_block = (tiisg & 1u)*16u;
+    device const float * yb = y + ib0*QK2_R32 + half_block;
+
+    for (int ib = ib0; ib < nb; ib += NW/2) {
+        for (short row = 0; row < NR0; ++row) {
+            device const block_q2_r32 * qb = blocks + ib + row*nb;
+            const uint mask0 = qb->signs0 >> half_block;
+            const uint mask1 = qb->signs1 >> half_block;
+            const float2 dots = q2_r32_signed_dot16x2(yb, mask0, mask1);
+            sumf[row] += float(qb->d0)*dots[0] + float(qb->d1)*dots[1];
+        }
+        yb += QK2_R32*(NW/2);
+    }
+
+    for (short row = 0; row < NR0; ++row) {
+        const float total = simd_sum(sumf[row]);
+        if (tiisg == 0 && first_row + row < ne01) {
+            dst[im*ne0*ne1 + r1*ne0 + first_row + row] = total;
+        }
+    }
+}
+
+template<short NR0, short NSG, short NW>
+void mul_vec_gelu_q2_r32_f32_impl(
+        device const void  * src0_gate,
+        device const void  * src0_up,
+        device const float * src1,
+        device       float * dst,
+                   int64_t   ne00,
+                   int64_t   ne01,
+                   int64_t   ne02,
+                   int64_t   ne10,
+                   int64_t   ne12,
+                   int64_t   ne0,
+                   int64_t   ne1,
+                   uint      r2,
+                   uint      r3,
+                   uint3 tgpig, uint tiisg, uint sgitg) {
+    const int nb = ne00/QK2_R32;
+    const int r0 = tgpig.x;
+    const int r1 = tgpig.y;
+    const int im = tgpig.z;
+    const int first_row = (r0 * NSG + sgitg) * NR0;
+    const uint i12 = im%ne12;
+    const uint i13 = im/ne12;
+    const uint offset0 = first_row * nb + (i12/r2)*(nb*ne01) + (i13/r3)*(nb*ne01*ne02);
+    device const block_q2_r32 * gate_blocks = (device const block_q2_r32 *)src0_gate + offset0;
+    device const block_q2_r32 * up_blocks = (device const block_q2_r32 *)src0_up + offset0;
+    device const float * y = src1 + r1*ne10 + im*ne00*ne1;
+
+    float gate_sum[NR0];
+    float up_sum[NR0];
+    for (short row = 0; row < NR0; ++row) {
+        gate_sum[row] = 0.0f;
+        up_sum[row] = 0.0f;
+    }
+
+    const uint ib0 = tiisg/2;
+    const uint half_block = (tiisg & 1u)*16u;
+    device const float * yb = y + ib0*QK2_R32 + half_block;
+    for (int ib = ib0; ib < nb; ib += NW/2) {
+        for (short row = 0; row < NR0; ++row) {
+            device const block_q2_r32 * qg = gate_blocks + ib + row*nb;
+            device const block_q2_r32 * qu = up_blocks + ib + row*nb;
+            const uint gmask0 = qg->signs0 >> half_block;
+            const uint gmask1 = qg->signs1 >> half_block;
+            const uint umask0 = qu->signs0 >> half_block;
+            const uint umask1 = qu->signs1 >> half_block;
+            const float4 dots = q2_r32_signed_dot16x4(
+                yb, gmask0, gmask1, umask0, umask1);
+            gate_sum[row] += float(qg->d0)*dots[0] + float(qg->d1)*dots[1];
+            up_sum[row] += float(qu->d0)*dots[2] + float(qu->d1)*dots[3];
+        }
+        yb += QK2_R32*(NW/2);
+    }
+
+    for (short row = 0; row < NR0; ++row) {
+        const int row_idx = first_row + row;
+        const float gate = simd_sum(gate_sum[row]);
+        const float up = simd_sum(up_sum[row]);
+        if (tiisg == 0 && row_idx < ne01) {
+            const uint64_t dst_off = (uint64_t)im*ne0*ne1 + (uint64_t)r1*ne0 + (uint64_t)row_idx;
+            dst[dst_off] = gelu_pytorch_tanh_q4(gate)*up;
+        }
+    }
+}
+
+kernel void matvec_ggml_q2_r32(
+    device const char * W [[buffer(0)]],
+    device const char * x [[buffer(1)]],
+    device char * y [[buffer(2)]],
+    constant ggml_mul_mv_args& args [[buffer(3)]],
+    uint3 tgpig [[threadgroup_position_in_grid]],
+    uint tiisg [[thread_index_in_simdgroup]],
+    uint sgitg [[simdgroup_index_in_threadgroup]]
+) {
+    mul_vec_q2_r32_f32_impl<4, 2, 32>(
+        W, (device const float *)x, (device float *)y,
+        args.ne00, args.ne01, args.ne02,
+        args.ne10, args.ne12, args.ne0, args.ne1,
+        uint(args.r2), uint(args.r3), tgpig, tiisg, sgitg);
+}
+
+kernel void matvec_ggml_q2_r32_gelu_mul(
+    device const char * W_gate [[buffer(0)]],
+    device const char * W_up [[buffer(1)]],
+    device const char * x [[buffer(2)]],
+    device char * y [[buffer(3)]],
+    constant ggml_mul_mv_args& args [[buffer(4)]],
+    uint3 tgpig [[threadgroup_position_in_grid]],
+    uint tiisg [[thread_index_in_simdgroup]],
+    uint sgitg [[simdgroup_index_in_threadgroup]]
+) {
+    mul_vec_gelu_q2_r32_f32_impl<4, 2, 32>(
+        W_gate, W_up, (device const float *)x, (device float *)y,
+        args.ne00, args.ne01, args.ne02,
+        args.ne10, args.ne12, args.ne0, args.ne1,
+        uint(args.r2), uint(args.r3), tgpig, tiisg, sgitg);
+}
+
 // ─── mul_mv_ext (batch matvec) ───────────────────────────────────────────────
 
 template <typename type4>

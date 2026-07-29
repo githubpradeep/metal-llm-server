@@ -445,3 +445,88 @@ Acceptance is the structural limit: at 42% accept and 1.85 tok/forward, even
 free batching caps at ~1.85× per-forward cost. M7 fused gelu was a wash for
 e2e. Next levers: draft head quality (accept ~42% → 60%+), or deeper verify
 phase timing to find where the 1.6× MLP tax actually lives.
+
+---
+
+## E24. Q2_R32 residual/additive weights (2026-07-28) — kernel loses to Q4
+
+**What**: Implemented a true two-stage binary residual/additive format:
+
+`w[i] ≈ d0·sign0[i] + d1·sign1[i]`
+
+The first plane quantizes the weight and the second starts from its residual;
+four Lloyd/least-squares refinement iterations optimize assignments and scales.
+Each 32-weight block stores two f16 scales plus two 32-bit sign planes:
+12 bytes / 32 weights = exactly **3.00 bpw**. Added CPU quant/dequant, Metal
+batch-1/batched matvec, fused gate+up+GeLU, correctness tests, a real-tensor
+quality probe, and `--bench-residual-matvec`.
+
+**Kernel result** (E2B shapes, M1 Pro, lower ms is better):
+
+| Shape | Q2_R32 | Q3_0 | Q4_0 |
+|---|---:|---:|---:|
+| 1536×1536 q/o | 0.047 | 0.032 | **0.023** |
+| 8192×1536 gate/up | 0.077 | 0.095 | **0.063** |
+| 1536×8192 down | 0.073 | 0.092 | **0.059** |
+| 262144×1536 lm_head | 1.900 | 2.483 | **1.471** |
+
+Despite 33% fewer bytes than Q4_0, two binary-plane dot products cost more than
+the highly optimized nibble decoder. Q2_R32 is 22–104% slower than Q4_0 on the
+representative shapes. Vectorized sign decoding and shared activation loads
+improved it over Q3_0 for large matrices but did not beat Q4_0.
+
+**Quality result** (requantizing `blk.0.ffn_gate.weight` from the available
+Q4_K GGUF, so these are additional errors):
+
+| Format | bpw | relative MSE |
+|---|---:|---:|
+| Q2_R32 | 3.00 | 0.118267 |
+| Q3_0 | 3.50 | 0.058685 |
+| Q4_0 | 4.50 | 0.010943 |
+
+**Conclusion**: Do not route the model to Q2_R32. The kernel-level gate fails
+before end-to-end integration, and quality is poor on top of Q4_K. A viable
+sub-4-bit speed path on M1 Pro needs a hardware-friendly vector/codebook lookup
+or integer-dot design that beats the Q4 nibble kernel in isolation, plus
+quantization from BF16/F16 rather than an already quantized GGUF.
+
+---
+
+## E25. Adaptive GGML attention MWG (2026-07-29) — small decode win
+
+**What**: Compiled `flash_attn_ext_vec` main/reduce pairs for NWG
+4/8/16/32 at head dimensions 128/256/512. Dispatch now selects NWG from both
+active KV length and query-head count:
+
+`nwg = clamp_pow2(max(ceil(kv_seq/32), ceil(128/num_heads)), 4, 32)`
+
+The 128-total-workgroup occupancy floor is important on M1 Pro. For Gemma4's
+eight query heads this selects NWG=16 through 512 KV tokens, then NWG=32.
+`ATTENTION_GGML_NWG=4|8|16|32` forces a variant for benchmarking. Scratch
+remains sized for the maximum NWG=32.
+
+**Correctness fix**: llama.cpp's reduce kernel assumed NWG=simd width=32.
+For smaller NWGs, lanes `iwg >= NWG` previously indexed outside the partial
+S/M and output arrays. Inactive lanes now contribute the online-softmax
+identity (`S=0`, `M=-inf`, output=0), allowing the same 32-lane simd reduction
+for all variants.
+
+**Result** (E2B Q4_K_M, Q4_0 KV, M1 Pro):
+
+| Mode | 200-token generation | 400-token generation |
+|---|---:|---:|
+| auto hybrid, forced NWG=32 (old behavior) | 44.5 tok/s | 44.0 tok/s |
+| auto hybrid, NWG=16 (adaptive choice ≤512) | **45.0 tok/s** | **44.4 tok/s** |
+
+In forced-GGML isolation at 200 tokens, NWG 4/8/16/32 measured
+41.8/43.8/**45.8**/43.4 tok/s, confirming that workgroup occupancy matters
+more than merely assigning one 32-token KV chunk per workgroup. Gains in the
+production hybrid are modest (~0.4–0.5 tok/s) because fused attention still
+handles KV <128 and attention is only part of decode time.
+
+**Verification**: all Metal variants compile; the policy unit test passes; a
+436-token adaptive essay remained coherent and completed at 45.60 tok/s.
+
+**Conclusion**: Keep adaptive MWG as the default GGML leg. It removes the
+fixed-NWG=32 oversubscription penalty but does not close the remaining
+llama.cpp gap by itself.

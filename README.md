@@ -64,6 +64,7 @@ Listens on `http://0.0.0.0:8080` by default (`--port N` to change).
 | `LLAMA_CTX_SIZE` | `16384` | KV capacity / context window (max `200000`) |
 | `LLAMA_MAX_PREFILL_SEQ` | engine default | Max tokens per prefill chunk (e.g. `4096`) |
 | `ATTENTION_KERNEL` | `specialized` | Decode attention: `auto` (hybrid), `ggml`, or `specialized` |
+| `ATTENTION_GGML_NWG` | adaptive | Force GGML decode attention NWG to `4`, `8`, `16`, or `32` (benchmark/debug) |
 | `LLAMA_QUEUE_DEPTH` | server default | Admission queue depth |
 | `LLAMA_KV_POOL_SLOTS` | server default | Concurrent KV slots |
 | `LLAMA_REQUEST_TIMEOUT_SECS` | server default | Per-request timeout |
@@ -106,6 +107,19 @@ Ballpark on Apple M1 Pro (E2B Q4_K_M, Q4_0 KV, cool machine): prefill ~580–590
 tok/s @ 4k (matches llama.cpp FA); decode ~45–50 tok/s at short context (falls
 with long context). Numbers move with thermal state — warm up or take the second
 run.
+
+Experimental residual/additive quantization probes:
+
+```bash
+# Kernel latency: Q2_R32 (3.0 bpw) vs Q3_0 and Q4_0.
+./target/release/llama-sinks --bench-residual-matvec
+
+# Reconstruction error on a representative tensor (use F16/BF16 GGUF when available).
+./target/release/llama-sinks --bench-residual-quality /path/to/model.gguf
+```
+
+Q2_R32 is currently research-only and is not routed into model execution: its
+Metal kernel is slower than Q4_0 on M1 Pro. See `AGENTS.md` E24.
 
 ## API example
 
