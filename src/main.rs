@@ -14,6 +14,7 @@ mod gemma4_config;
 mod gemma4_gpu_model;
 mod gemma4_mtp;
 mod decode_fused;
+mod mtp_host;
 mod speculative;
 mod kv_pool;
 mod metrics;
@@ -70,6 +71,25 @@ fn main() {
         .and_then(|i| args.get(i + 1))
         .and_then(|n| n.parse().ok())
         .unwrap_or(256);
+    let bench_verify = args.iter().any(|a| a == "--bench-verify");
+    let bench_verify_ctx: usize = args
+        .iter()
+        .position(|a| a == "--bench-verify-ctx")
+        .and_then(|i| args.get(i + 1))
+        .and_then(|n| n.parse().ok())
+        .unwrap_or(512);
+    let bench_verify_iters: usize = args
+        .iter()
+        .position(|a| a == "--bench-verify-iters")
+        .and_then(|i| args.get(i + 1))
+        .and_then(|n| n.parse().ok())
+        .unwrap_or(24);
+    let bench_verify_batches: Vec<usize> = args
+        .iter()
+        .position(|a| a == "--bench-verify-batches")
+        .and_then(|i| args.get(i + 1))
+        .map(|s| parse_prefill_token_sizes(s))
+        .unwrap_or_else(|| vec![1, 2, 3, 4, 6, 8]);
     let bench_prefill = args.iter().any(|a| a == "--bench-prefill");
     let bench_prefill_tokens: Vec<usize> = args
         .iter()
@@ -230,17 +250,66 @@ fn main() {
                 let y_gpu = unsafe {
                     std::slice::from_raw_parts(y_buf.contents() as *const f32, m * seq_len as usize)
                 };
-                let mut mm_max_rel = 0.0f32;
-                for i in 0..y_ref.len() {
-                    let d = (y_gpu[i] - y_ref[i]).abs();
-                    let denom = y_ref[i].abs().max(1e-3);
-                    mm_max_rel = mm_max_rel.max(d / denom);
-                }
+                // mul_mm casts activations to half, so per-element relative error
+                // explodes on near-zero outputs. Relative L2 is the meaningful
+                // metric for the half-MMA paths (expect ~1e-3).
+                let rel_l2 = relative_l2(y_gpu, &y_ref);
                 println!(
-                    "  mul_mm seq={:<3} max_rel_err={:.3e} {}",
+                    "  mul_mm seq={:<3} rel_l2={:.3e} {}",
                     seq_len,
-                    mm_max_rel,
-                    if mm_max_rel < 1e-3 { "OK" } else { "FAIL" }
+                    rel_l2,
+                    if rel_l2 < 5e-3 { "OK" } else { "FAIL" }
+                );
+            }
+
+            // Narrow-N simdgroup matmul (MTP verify path) at every batch it sees.
+            // Partial N tiles (batch < 8) and partial M tiles are the common case,
+            // so check each batch size rather than just the aligned one.
+            for seq_len in 1u32..=8 {
+                let n = seq_len as usize;
+                let x_batch: Vec<f32> = (0..n)
+                    .flat_map(|s| (0..k).map(move |j| ((j + s * 11) % 23) as f32 * 0.04 - 0.45))
+                    .collect();
+                let mut y_ref = vec![0.0f32; m * n];
+                for s in 0..n {
+                    for r in 0..m {
+                        let mut acc = 0.0f32;
+                        let base_w = r * k;
+                        let base_x = s * k;
+                        for j in 0..k {
+                            acc += w[base_w + j] * x_batch[base_x + j];
+                        }
+                        y_ref[s * m + r] = acc;
+                    }
+                }
+                let x_buf = ctx.buffer_from_slice(&x_batch);
+                // Exactly n rows: a too-wide store past row n would corrupt memory
+                // past the buffer, which is what we want to catch here.
+                let y_buf = ctx.buffer_empty(m * n);
+                let cmd = ctx.queue.new_command_buffer();
+                let enc = cmd.new_compute_command_encoder();
+                ctx.encode_mul_mm_narrow_kquant_at_view(
+                    enc,
+                    &w_view,
+                    &x_buf,
+                    0,
+                    &y_buf,
+                    0,
+                    m as u32,
+                    k as u32,
+                    seq_len,
+                );
+                enc.end_encoding();
+                cmd.commit();
+                cmd.wait_until_completed();
+                let y_gpu =
+                    unsafe { std::slice::from_raw_parts(y_buf.contents() as *const f32, m * n) };
+                let rel_l2 = relative_l2(y_gpu, &y_ref);
+                println!(
+                    "  narrow seq={:<3} rel_l2={:.3e} {}",
+                    seq_len,
+                    rel_l2,
+                    if rel_l2 < 5e-3 { "OK" } else { "FAIL" }
                 );
             }
         }
@@ -319,6 +388,17 @@ fn main() {
                 return;
             }
 
+            if bench_verify {
+                bench_verify_gemma4(
+                    &tokenizer,
+                    &mut gpu_model,
+                    bench_verify_ctx,
+                    bench_verify_iters,
+                    &bench_verify_batches,
+                );
+                return;
+            }
+
             if bench_prefill {
                 bench_prefill_gemma4(
                     &tokenizer,
@@ -368,16 +448,35 @@ fn main() {
                 println!("GEMMA4 E2B GENERATION (Metal GPU, MTP)");
                 println!("{}", "=".repeat(60));
 
+                let prompt_name = args
+                    .iter()
+                    .position(|a| a == "--prompt")
+                    .and_then(|i| args.get(i + 1))
+                    .cloned()
+                    .or_else(|| std::env::var("MTP_PROMPT").ok())
+                    .unwrap_or_else(|| "bubble_sort".to_string());
+                let prompt = mtp_bench_prompt(&prompt_name);
+                let max_tokens: usize = args
+                    .iter()
+                    .position(|a| a == "--max-tokens")
+                    .and_then(|i| args.get(i + 1))
+                    .and_then(|n| n.parse().ok())
+                    .or_else(|| {
+                        std::env::var("MTP_MAX_TOKENS")
+                            .ok()
+                            .and_then(|v| v.parse().ok())
+                    })
+                    .unwrap_or(1000);
+                println!("  Prompt preset: {} (max_tokens={})", prompt_name, max_tokens);
+
                 let gen_start = Instant::now();
                 let mut assistant = gemma4_mtp::Gemma4MtpAssistant::new(&gpu_model.ctx, &draft_path, &gpu_model);
                 generate_gemma4_gpu_mtp(
-                    //"<start_of_turn>user\n Write a short essay about the benefits of exercise. Include an introduction, 3 key points, and a conclusion.<end_of_turn>\n<start_of_turn>model\n",
-                    "<start_of_turn>user\n def bubble_sort<end_of_turn>\n<start_of_turn>model\n",
-
+                    &prompt,
                     &tokenizer,
                     &mut gpu_model,
                     &mut assistant,
-                    1000,
+                    max_tokens,
                 );
                 println!("\nTotal time: {:.2}s", gen_start.elapsed().as_secs_f64());
             } else {
@@ -550,6 +649,126 @@ fn bench_decode_gemma4(
     println!("  (llama.cpp reports the same Prompt/Generation split; no stdout in decode loop)");
 }
 
+/// Deterministic MTP-verify microbenchmark: prefill a fixed context, then time
+/// `forward_verify_batch` at several batch sizes, rewinding the KV after each
+/// call so every sample runs at the same KV length. Isolates verify cost from
+/// draft/accept noise, and pairs with `PROFILE_ABLATE=<bucket>` for a phase
+/// breakdown.
+fn bench_verify_gemma4(
+    tokenizer: &tokenizers::Tokenizer,
+    model: &mut gemma4_gpu_model::Gemma4GpuModel,
+    ctx_target: usize,
+    iters: usize,
+    batches: &[usize],
+) {
+    let filler = "The quick brown fox jumps over the lazy dog. ";
+    let mut text = String::from("<start_of_turn>user\n");
+    while tokenizer
+        .encode(text.as_str(), true)
+        .map(|e| e.get_ids().len())
+        .unwrap_or(0)
+        < ctx_target
+    {
+        text.push_str(filler);
+    }
+    let mut token_ids: Vec<usize> = tokenizer
+        .encode(text.as_str(), true)
+        .expect("Failed to encode bench verify prompt")
+        .get_ids()
+        .iter()
+        .map(|&t| t as usize)
+        .collect();
+    token_ids.truncate(ctx_target.max(1));
+
+    model.reset_legacy_state();
+    model
+        .forward_prefill_parallel_self(&token_ids)
+        .expect("bench verify prefill failed");
+    let base_ctx = model.num_items();
+
+    // Fixed, real vocabulary ids so dequant/softcap work on plausible values.
+    let verify_tokens: Vec<usize> = vec![2364, 1596, 3084, 604, 1105, 2134, 506, 1024];
+
+    println!("\n=== Gemma4 MTP verify benchmark (Metal GPU) ===");
+    println!(
+        "  hidden={} layers={} intermediate={:?}",
+        model.config.hidden_size,
+        model.config.num_hidden_layers,
+        &model.config.intermediate_sizes[..model.config.intermediate_sizes.len().min(4)]
+    );
+    println!(
+        "  ctx={} iters={} PROFILE_ABLATE={} MUL_MM_MIN_SEQ={} PREFILL_GATE_UP_EXT_GELU={}",
+        base_ctx,
+        iters,
+        std::env::var("PROFILE_ABLATE").unwrap_or_else(|_| "-".into()),
+        std::env::var("MUL_MM_MIN_SEQ").unwrap_or_else(|_| "8 (default)".into()),
+        std::env::var("PREFILL_GATE_UP_EXT_GELU").unwrap_or_else(|_| "1 (default)".into())
+    );
+
+    let mut baseline_min = 0.0f64;
+    for &batch in batches {
+        let batch = batch.min(verify_tokens.len());
+        if batch == 0 {
+            continue;
+        }
+        let rows = &verify_tokens[..batch];
+
+        let run = |model: &mut gemma4_gpu_model::Gemma4GpuModel| {
+            model
+                .forward_verify_batch(rows)
+                .expect("bench verify forward failed");
+            model.truncate_kv(batch as u32);
+        };
+
+        for _ in 0..3 {
+            run(model);
+        }
+        let mut samples: Vec<f64> = Vec::with_capacity(iters);
+        for _ in 0..iters {
+            let t0 = Instant::now();
+            run(model);
+            samples.push(t0.elapsed().as_secs_f64() * 1000.0);
+        }
+        samples.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        let min = samples[0];
+        let median = samples[samples.len() / 2];
+        if batch == 1 {
+            baseline_min = min;
+        }
+        let marginal = if batch > 1 && baseline_min > 0.0 {
+            (min - baseline_min) / (batch - 1) as f64
+        } else {
+            0.0
+        };
+        println!(
+            "  batch={:<2} min={:>7.2} ms  median={:>7.2} ms  per-row={:>6.2} ms  marginal-row={:>6.2} ms",
+            batch,
+            min,
+            median,
+            min / batch as f64,
+            marginal
+        );
+    }
+    println!("  (batch=1 uses the fused sequential/decode path; batch>1 uses parallel verify)");
+    println!("  ctx after bench: {} tokens", model.num_items());
+}
+
+/// ‖got − want‖₂ / ‖want‖₂ — the meaningful accuracy metric for half-precision
+/// MMA kernels, where individual near-zero outputs have huge relative error.
+fn relative_l2(got: &[f32], want: &[f32]) -> f32 {
+    let mut num = 0.0f64;
+    let mut den = 0.0f64;
+    for i in 0..want.len() {
+        let d = (got[i] - want[i]) as f64;
+        num += d * d;
+        den += (want[i] as f64) * (want[i] as f64);
+    }
+    if den == 0.0 {
+        return 0.0;
+    }
+    (num.sqrt() / den.sqrt()) as f32
+}
+
 fn parse_prefill_token_sizes(s: &str) -> Vec<usize> {
     s.split(',')
         .filter_map(|p| p.trim().parse::<usize>().ok())
@@ -674,6 +893,29 @@ fn generate_gemma4_gpu(
 }
 
 // ─── MTP Draft/Verify generation helpers ─────────────────────────────────────
+
+/// Named MTP bench prompts. Default is the short code completion used in E27/E28;
+/// other presets exercise lower-accept (essay) and mid-accept (QA / algorithm) regimes.
+fn mtp_bench_prompt(name: &str) -> String {
+    let user = match name {
+        "bubble_sort" | "code" => "def bubble_sort",
+        "fibonacci" => "Write a Python function fibonacci(n) that returns the nth Fibonacci number. Include a short docstring and an iterative implementation.",
+        "essay" => "Write a short essay about the benefits of exercise. Include an introduction, 3 key points, and a conclusion.",
+        "explain" => "Explain how a key-value cache works in transformer inference in 4-6 short paragraphs. Be concrete about what is stored and why it helps.",
+        "qa" => "Name the five largest countries by land area and give one notable geographic fact about each. Keep each country to two short sentences.",
+        "json" => "Return a JSON object with keys name, age, and hobbies (array of 3 strings) for a fictional software engineer. No markdown, JSON only.",
+        other => {
+            eprintln!(
+                "Unknown MTP prompt preset {:?}; known: bubble_sort, fibonacci, essay, explain, qa, json. Using bubble_sort.",
+                other
+            );
+            "def bubble_sort"
+        }
+    };
+    format!(
+        "<start_of_turn>user\n {user}<end_of_turn>\n<start_of_turn>model\n"
+    )
+}
 
 fn parse_mtp_draft_steps() -> usize {
     std::env::var("LLAMA_MTP_DRAFT_STEPS")

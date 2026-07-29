@@ -2945,6 +2945,9 @@ impl Gemma4GpuModel {
             };
             // MTP verify / small-batch: fused gate∥up+GeLU ext matvec shares
             // activation loads and writes gelu directly (skips 2·M·batch scratch).
+            // From 3 rows up the narrow simdgroup matmul on the stacked weight is
+            // faster than the fused kernel's scalar dots by more than the extra
+            // gelu dispatch and intermediate cost, so let that path take over.
             let use_ext_gelu = crate::gpu::prefill_gate_up_ext_gelu_enabled()
                 && !use_f16
                 && !skip_gelu
@@ -2952,6 +2955,7 @@ impl Gemma4GpuModel {
                 && seq_len <= 8
                 && layer.gate_proj.format == crate::gpu::weight_fmt::Q4_K
                 && layer.up_proj.format == crate::gpu::weight_fmt::Q4_K
+                && !self.ctx.use_mul_mm_narrow(&layer.gate_up_stacked, seq_len)
                 && !crate::ggml_gemv::should_use_mul_mm(hidden_size, seq_len);
             if use_ext_gelu {
                 self.ctx.encode_matvec_kq_ext_gelu_mul_at_view(

@@ -414,3 +414,44 @@ pub fn mul_mm_dispatch(m: u32, seq_len: u32) -> (u64, u64, u64, u64, u64) {
     let tg_y = ((m + MUL_MM_NR0 - 1) / MUL_MM_NR0) as u64;
     (tg_x, tg_y, 1, 32, MUL_MM_NSG as u64)
 }
+
+// ─── Narrow-N mul_mm (MTP verify, batch 2..8) ───────────────────────────────
+
+/// Weight rows / batch rows per threadgroup for `mul_mm_narrow_*`.
+pub const MUL_MM_NARROW_NR0: u32 = 32;
+pub const MUL_MM_NARROW_NR1: u32 = 8;
+/// Simdgroups per threadgroup; each takes every 4th K block of the same tile.
+pub const MUL_MM_NARROW_NSG: u32 = 4;
+/// Per simdgroup: sa (4 K-tiles × 4 M-tiles × 64 half) + sb (4 K-tiles × 64 half).
+/// The end-of-kernel partial-sum reduction reuses the same allocation.
+pub const MUL_MM_NARROW_SMEM: u64 = (MUL_MM_NARROW_NSG as u64) * (2048 + 512);
+
+/// Only ceil(m/32) threadgroups are needed, so the 1536-row down/o_proj shapes
+/// still spread across the GPU.
+pub fn mul_mm_narrow_dispatch(m: u32, seq_len: u32) -> (u64, u64, u64, u64, u64) {
+    let tg_x = ((seq_len + MUL_MM_NARROW_NR1 - 1) / MUL_MM_NARROW_NR1) as u64;
+    let tg_y = ((m + MUL_MM_NARROW_NR0 - 1) / MUL_MM_NARROW_NR0) as u64;
+    (tg_x, tg_y, 1, 32, MUL_MM_NARROW_NSG as u64)
+}
+
+/// Route K-quant projections at small batch through the narrow simdgroup-matmul
+/// kernel instead of the scalar-dot ext matvec (`MUL_MM_NARROW=0` to disable).
+pub fn mul_mm_narrow_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("MUL_MM_NARROW").map(|v| v != "0").unwrap_or(true))
+}
+
+/// The narrow kernel stages weights through threadgroup memory for the matrix
+/// units, which costs more than it saves at batch 2 — measured crossover on
+/// M1 Pro is 3 rows. Tunable with `MUL_MM_NARROW_MIN_SEQ` for sweeps.
+pub const MUL_MM_NARROW_MIN_SEQ: u32 = 3;
+
+pub fn mul_mm_narrow_min_seq() -> u32 {
+    static MIN: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *MIN.get_or_init(|| {
+        std::env::var("MUL_MM_NARROW_MIN_SEQ")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(MUL_MM_NARROW_MIN_SEQ)
+    })
+}

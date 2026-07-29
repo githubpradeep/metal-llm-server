@@ -1031,3 +1031,183 @@ kernel void mul_mm_f16_f32(
         }
     }
 }
+
+// ─── Narrow-N K-quant mul_mm for MTP verify (N ≤ 8) ─────────────────────────
+//
+// `matvec_ggml_ext_q4x4` already reads each quantized weight row once per
+// batch, but it evaluates the batch dimension with scalar dot products, so its
+// runtime grows roughly linearly with N: on M1 Pro a batch-4 gate∥up costs
+// ~2.4x a batch-1 matvec even though the weight traffic is identical.
+//
+// This variant keeps the single weight read and moves the batch dimension onto
+// the simdgroup matrix units, which are ~5x more efficient per output column.
+// One 8-wide N tile covers the whole MTP verify batch, so extra draft rows are
+// nearly free and the kernel falls back to being weight-bandwidth bound.
+//
+// Tile: NR0=32 weight rows x NR1=8 batch rows, NK=32 reduction step. Only
+// ceil(M/32) threadgroups are needed, so the narrow 1536-row down/o_proj shapes
+// still get 48 threadgroups (the 64x32 prefill tile above would give just 12).
+//
+// The four simdgroups split the K dimension rather than the M dimension, and
+// each owns a private slice of the staging tiles. That keeps the threadgroup at
+// 128 threads for latency hiding while needing only cheap simdgroup barriers
+// inside the K loop: an earlier version with one simdgroup per threadgroup had
+// to use full threadgroup barriers with no other warp to hide them, and ran at
+// a third of this speed. The per-simdgroup partial sums are summed once at the
+// end through threadgroup memory.
+
+template<typename block_t,
+         void (*deq_t)(device const block_t *, short, thread half4x4 &)>
+void mul_mm_narrow_impl(
+    constant ggml_mul_mm_args & args,
+    device const char * src0,
+    device const char * src1,
+    device char * dst,
+    threadgroup char * shmem,
+    uint3 tgpig,
+    ushort tiitg,
+    ushort tiisg,
+    ushort sgitg) {
+
+    constexpr short NR0 = 32;
+    constexpr short NR1 = 8;
+    constexpr short NK = 32;
+    constexpr short NSG = 4;        // simdgroups, each taking every 4th K block
+    constexpr short NL0 = NK / 16;  // 2 dequant lanes per weight row per K block
+    constexpr short NL1 = NK / 8;   // 4 lanes of 8 activations per batch row
+    constexpr short SA_HALVES = 4 * 4 * 64;  // 4 K-tiles x 4 M-tiles
+    constexpr short SB_HALVES = 4 * 64;      // 4 K-tiles x 1 N-tile
+
+    threadgroup half * sa = (threadgroup half *)(shmem) + sgitg * SA_HALVES;
+    threadgroup half * sb =
+        (threadgroup half *)(shmem + NSG * SA_HALVES * 2) + sgitg * SB_HALVES;
+
+    const int r0 = tgpig.y * NR0;
+    const int r1 = tgpig.x * NR1;
+
+    const short nr0 = (args.ne0 - r0 < NR0) ? short(args.ne0 - r0) : NR0;
+    const short nr1 = (args.ne1 - r1 < NR1) ? short(args.ne1 - r1) : NR1;
+
+    // A tile: 32 lanes cover 16 weight rows per pass, two passes span NR0.
+    const short da = (short)tiisg / NL0;         // dest row 0..15
+    const short db = da + 16;                    // dest row 16..31
+    const short il0 = (short)tiisg % NL0;
+    // Rows past the end re-read a valid row; their results are dropped below.
+    const short arow = da < nr0 ? da : short(nr0 - 1);
+    const short brow = db < nr0 ? db : short(nr0 - 1);
+
+    // B tile: one 8-activation lane per (batch row, K quarter).
+    const short bn = (short)tiisg / NL1;         // dest batch row 0..7
+    const short lr1 = bn < nr1 ? bn : short(nr1 - 1);
+    const short bsx = (short)tiisg % NL1;
+
+    device const block_t * xa_base =
+        (device const block_t *)(src0 + args.nb01 * (r0 + arow));
+    device const block_t * xb_base =
+        (device const block_t *)(src0 + args.nb01 * (r0 + brow));
+    device const float * y_base =
+        (device const float *)(src1 + args.nb11 * (r1 + lr1)) + 8 * bsx;
+
+    simdgroup_half8x8 ma[4];
+    simdgroup_half8x8 mb;
+    simdgroup_float8x8 mc[4];
+    for (short i = 0; i < 4; ++i) {
+        mc[i] = make_filled_simdgroup_matrix<float, 8>(0.f);
+    }
+
+    // Each K block is 32 weights; a Q4_K/Q6_K super-block holds 8 of them.
+    const int nkb = args.ne00 / NK;
+    for (int kb = sgitg; kb < nkb; kb += NSG) {
+        const short il = 2 * (short)(kb % 8) + il0;
+        device const block_t * xa = xa_base + (kb / 8);
+        device const block_t * xb = xb_base + (kb / 8);
+        device const float * y = y_base + (int)kb * NK;
+
+        simdgroup_barrier(mem_flags::mem_threadgroup);
+
+        {
+            half4x4 ta, tb;
+            deq_t(xa, il, ta);
+            deq_t(xb, il, tb);
+            FOR_UNROLL(short i = 0; i < 16; ++i) {
+                const short sx = 2 * il0 + i / 8;   // K tile 0..3
+                const short ly = i % 8;             // K within tile
+                *(sa + 64 * (4 * sx + (da >> 3)) + 8 * ly + (da & 7)) = ta[i / 4][i % 4];
+                *(sa + 64 * (4 * sx + (db >> 3)) + 8 * ly + (db & 7)) = tb[i / 4][i % 4];
+            }
+        }
+
+        *((threadgroup half2x4 *)(sb + 64 * bsx + 8 * bn)) =
+            half2x4(*((device float2x4 *)y));
+
+        simdgroup_barrier(mem_flags::mem_threadgroup);
+
+        threadgroup const half * lsma = sa;
+        threadgroup const half * lsmb = sb;
+
+        FOR_UNROLL(short ik = 0; ik < NK / 8; ++ik) {
+            simdgroup_barrier(mem_flags::mem_none);
+            FOR_UNROLL(short i = 0; i < 4; ++i) {
+                simdgroup_load(ma[i], lsma + 64 * i, 8, 0, false);
+            }
+            simdgroup_barrier(mem_flags::mem_none);
+            simdgroup_load(mb, lsmb, 8, 0, false);
+            simdgroup_barrier(mem_flags::mem_none);
+            FOR_UNROLL(short i = 0; i < 4; ++i) {
+                simdgroup_multiply_accumulate(mc[i], mb, ma[i], mc[i]);
+            }
+            lsma += 4 * 64;
+            lsmb += 64;
+        }
+    }
+
+    // Sum the four K-partial tiles. Reuses the staging tiles, so wait for every
+    // simdgroup to finish reading them first.
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    threadgroup float * red = (threadgroup float *)shmem;
+    FOR_UNROLL(short i = 0; i < 4; ++i) {
+        simdgroup_store(mc[i], red + sgitg * (NR1 * NR0) + 8 * i, NR0, 0, false);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (short idx = (short)tiitg; idx < NR1 * NR0; idx += NSG * 32) {
+        const short n = idx / NR0;
+        const short mo = idx % NR0;
+        if (n >= nr1 || mo >= nr0) {
+            continue;
+        }
+        float s = 0.0f;
+        FOR_UNROLL(short sg = 0; sg < NSG; ++sg) {
+            s += red[sg * (NR1 * NR0) + n * NR0 + mo];
+        }
+        ((device float *)dst)[r0 + mo + (uint64_t)(r1 + n) * args.ne0] = s;
+    }
+}
+
+kernel void mul_mm_narrow_q4_K_f32(
+    constant ggml_mul_mm_args & args [[buffer(0)]],
+    device const char * src0 [[buffer(1)]],
+    device const char * src1 [[buffer(2)]],
+    device char * dst [[buffer(3)]],
+    threadgroup char * shmem [[threadgroup(0)]],
+    uint3 tgpig [[threadgroup_position_in_grid]],
+    ushort tiitg [[thread_index_in_threadgroup]],
+    ushort tiisg [[thread_index_in_simdgroup]],
+    ushort sgitg [[simdgroup_index_in_threadgroup]]) {
+    mul_mm_narrow_impl<block_q4_K, mul_mm_dequantize_q4_K>(
+        args, src0, src1, dst, shmem, tgpig, tiitg, tiisg, sgitg);
+}
+
+kernel void mul_mm_narrow_q6_K_f32(
+    constant ggml_mul_mm_args & args [[buffer(0)]],
+    device const char * src0 [[buffer(1)]],
+    device const char * src1 [[buffer(2)]],
+    device char * dst [[buffer(3)]],
+    threadgroup char * shmem [[threadgroup(0)]],
+    uint3 tgpig [[threadgroup_position_in_grid]],
+    ushort tiitg [[thread_index_in_threadgroup]],
+    ushort tiisg [[thread_index_in_simdgroup]],
+    ushort sgitg [[simdgroup_index_in_threadgroup]]) {
+    mul_mm_narrow_impl<block_q6_K, mul_mm_dequantize_q6_K>(
+        args, src0, src1, dst, shmem, tgpig, tiitg, tiisg, sgitg);
+}

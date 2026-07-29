@@ -1,0 +1,62 @@
+PROMPT       CONFIG                 BEST   ACCEPT   TOK/FWD    FWDS    TOKS   RUNS
+  rep1 bubble_sort  steps=3            55.27 tok/s
+  rep1 bubble_sort  steps=4            64.81 tok/s
+  rep1 bubble_sort  steps=4 adaptive   59.66 tok/s
+  rep2 bubble_sort  steps=3            66.34 tok/s
+  rep2 bubble_sort  steps=4            67.29 tok/s
+  rep2 bubble_sort  steps=4 adaptive   59.07 tok/s
+bubble_sort  steps=3               66.34    62.6%      2.88      57     164   55.27 66.34
+bubble_sort  steps=4               67.29    54.3%      3.15      52     164   64.81 67.29
+bubble_sort  steps=4 adaptive      59.66    69.3%      2.41      68     164   59.66 59.07
+
+  rep1 fibonacci    steps=3            67.09 tok/s
+  rep1 fibonacci    steps=4            69.75 tok/s
+  rep1 fibonacci    steps=4 adaptive   61.03 tok/s
+  rep2 fibonacci    steps=3            69.13 tok/s
+  rep2 fibonacci    steps=4            69.69 tok/s
+  rep2 fibonacci    steps=4 adaptive   61.71 tok/s
+fibonacci    steps=3               69.13    69.6%      3.07      69     212   67.09 69.13
+fibonacci    steps=4               69.75    63.8%      3.53      60     212   69.75 69.69
+fibonacci    steps=4 adaptive      61.71    73.5%      2.65      80     212   61.03 61.71
+
+  rep1 essay        steps=3            40.07 tok/s
+  rep1 essay        steps=4            39.08 tok/s
+  rep1 essay        steps=4 adaptive   43.67 tok/s
+  rep2 essay        steps=3            41.96 tok/s
+  rep2 essay        steps=4            39.09 tok/s
+  rep2 essay        steps=4 adaptive   44.07 tok/s
+essay        steps=3               41.96    31.9%      1.96     204     400   40.07 41.96
+essay        steps=4               39.09    26.4%      2.06     194     400   39.08 39.09
+essay        steps=4 adaptive      44.07    43.9%      1.89     212     400   43.67 44.07
+
+  rep1 explain      steps=3            43.61 tok/s
+  rep1 explain      steps=4            41.30 tok/s
+  rep1 explain      steps=4 adaptive   45.16 tok/s
+  rep2 explain      steps=3            44.39 tok/s
+  rep2 explain      steps=4            42.00 tok/s
+  rep2 explain      steps=4 adaptive   45.51 tok/s
+explain      steps=3               44.39    36.3%      2.09     191     400   43.61 44.39
+explain      steps=4               42.00    29.6%      2.19     183     400   41.30 42.00
+explain      steps=4 adaptive      45.51    46.3%      1.93     207     400   45.16 45.51
+
+  rep1 qa           steps=3            50.40 tok/s
+  rep1 qa           steps=4            50.38 tok/s
+  rep1 qa           steps=4 adaptive   51.23 tok/s
+  rep2 qa           steps=3            51.16 tok/s
+  rep2 qa           steps=4            51.59 tok/s
+  rep2 qa           steps=4 adaptive   52.04 tok/s
+qa           steps=3               51.16    43.1%      2.28      82     187   50.40 51.16
+qa           steps=4               51.59    38.5%      2.53      74     187   50.38 51.59
+qa           steps=4 adaptive      52.04    52.9%      2.12      88     187   51.23 52.04
+
+  rep1 json         steps=3            59.24 tok/s
+  rep1 json         steps=4            56.54 tok/s
+  rep1 json         steps=4 adaptive   48.96 tok/s
+  rep2 json         steps=3            59.89 tok/s
+  rep2 json         steps=4            54.21 tok/s
+  rep2 json         steps=4 adaptive   43.27 tok/s
+json         steps=3               59.89    55.6%      2.67      15      40   59.24 59.89
+json         steps=4               56.54    41.7%      2.67      15      40   56.54 54.21
+json         steps=4 adaptive      48.96    50.0%      2.00      20      40   48.96 43.27
+
+EXIT:0

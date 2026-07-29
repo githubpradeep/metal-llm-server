@@ -530,3 +530,213 @@ handles KV <128 and attention is only part of decode time.
 **Conclusion**: Keep adaptive MWG as the default GGML leg. It removes the
 fixed-NWG=32 oversubscription penalty but does not close the remaining
 llama.cpp gap by itself.
+
+---
+
+## E26. MTP host offload + ANE measurement (`MTP_BACKEND=ane`) (2026-07-29)
+
+**What**: Move the Gemma4 MTP draft trunk off the full-Metal path
+(`MTP_BACKEND=ane|cpu|host`, default `metal`): pre_proj / norms / Q / O / FFN on
+host Accelerate `sgemv` (AMX). The 262k lm_head + post_proj + argmax stay on
+Metal in one command buffer.
+
+**ANE verdict — the Neural Engine is slower here, measured, not assumed.**
+`tools/ane_mtp_probe.py` builds the whole draft step (pre_proj → 4 layers
+*including* attention over the target KV → output_norm → post_proj, i.e. one
+prediction per draft step) and times CoreML fp16:
+
+| kv_len | CPU_AND_NE | CPU_ONLY | ALL (GPU+ANE) |
+|---|---:|---:|---:|
+| 192 | 1.97 ms | **1.22 ms** | 3.56 ms |
+| 512 | 1.97 ms | **1.30 ms** | 3.19 ms |
+| 2048 | 3.23 ms | **2.01 ms** | 4.25 ms |
+
+ANE loses at every context length. The draft is batch-1 with hidden 256 — memory
+bound, far below ANE's arithmetic-intensity sweet spot, and it pays per-inference
+dispatch. So there is no CoreML wiring: it cannot win, and the Metal fused draft
+step is ~2.6 ms *including* lm_head.
+
+**The real regression was GPU syncs, not the trunk math.** The first version
+dispatched Metal attention per layer (write Q → encode → wait → read araw), so a
+draft step went from 1 sync to ~5 → 36.8 tok/s. Fix: the target's KV is frozen
+during a draft chain (only verify appends), so `KvMirror` snapshots the needed
+rows to host f32 **once per chain**, dequantizing only positions appended since
+the last snapshot. Metal buffers are `StorageModeShared`, so this is a
+memcpy+dequant off unified memory — no command buffer, no fence. Attention then
+runs on Accelerate (`K·q`, softmax, `Vᵀ·p`). Rewound rows are dropped and
+re-read. `MTP_HOST_KV_MAX` (default 32768) falls back to Metal attention beyond
+that KV length to bound mirror memory.
+
+**Result** (E2B Q4_K_M + F16 MTP, bubble_sort, 160 tok, all 110/200 accepted =
+55.0%, byte-identical output):
+
+| Config | tok/s |
+|---|---:|
+| metal (default), 3 runs | 49.8 / 52.4 / 51.8 |
+| ane/host + KV mirror, 3 runs | 50.6 / 50.5 / 39.0 |
+| ane/host, `MTP_HOST_KV_MAX=0` (per-layer Metal attn) | 38.3 |
+| ane/host, first version (no mirror) | 36.8 |
+
+The `MTP_HOST_KV_MAX=0` row is the clean A/B: same code, mirror disabled, and
+~12 tok/s evaporates. Draft wall share went 30% → 23%, matching metal.
+
+**Measurement warning**: this machine drifts hard. During this session load
+average was 6.5 with WindowServer at 38% (GPU contention), Cursor, Chrome and an
+EDR agent live; identical metal binaries measured 55.8, then 49–52, then 41–49.
+Single runs are worthless here. `benchmarks/mtp_metal_sweep.sh` interleaves
+configs round-robin and scores best-of-N; use it instead of consecutive blocks.
+
+**Conclusion**: The mirror brings host offload to rough parity with the fused
+Metal draft in good runs, but it is *less stable* (one run at 39.0) because the
+trunk now competes for CPU with the rest of the process, whereas the Metal draft
+rides the GPU. Keep `metal` as default; `ane/host` is a correct opt-in path.
+ANE is closed as a speed lever for MTP draft — the probe, not intuition, settles
+it. Remaining host-side headroom is small: weights are dequantized to F32 for
+`sgemv` (2× the bandwidth of the Metal F16 path), so the trunk floor is
+~0.6–1 ms plus ~1 ms of lm_head + sync.
+
+---
+
+## E27. MTP draft depth 4 → 3 (2026-07-29) — +5 tok/s, one env var
+
+**What**: The default `LLAMA_MTP_DRAFT_STEPS=4` is too deep for this workload.
+Swept depth / adaptive / p_min on the Metal draft path, interleaved best-of-N
+(`benchmarks/mtp_metal_sweep.sh`, E2B Q4_K_M + F16 MTP, bubble_sort 160 tok).
+
+| Config | best tok/s | all runs | tok/fwd | fwds |
+|---|---:|---|---:|---:|
+| steps=4 (default) | 54.67 | 48.1 / 54.7 / 52.0 / 53.8 | 3.20 | 50 |
+| **steps=3** | **59.62** | 56.4 / 57.0 / 59.6 / 58.8 | 2.91 | 55 |
+| steps=2 | 57.96 | 57.2 / 57.2 / 58.0 / 57.6 | 2.42 | 66 |
+| steps=4 + adaptive | 58.99 | 54.5 / 55.9 / 59.0 / 59.0 | 2.42 | 66 |
+
+Fixed depths 5/6/7 were all *worse* than 4 (35–45 tok/s), and `p_min` 0.5/0.75
+landed at/below baseline.
+
+Confirmed twice more. Second interleaved sweep (contended machine, WindowServer
+42%): steps=3 ran 55.0 / 57.2 / 55.2 / 58.5 vs steps=4 at 48.1 / 52.7 / 50.3 /
+51.9 — *every* depth-3 run beat *every* depth-4 run, so the effect survives the
+noise. On a quiet machine with warm page cache, depth 3 reached **61.4 tok/s**
+(53.8 / 55.9 / 61.1 / 61.4 as cache warmed) against the 55.8 previously seen at
+depth 4. Host backend under the same setting stayed below metal (52.9–57.8).
+
+**Why deeper loses**: a rejected draft costs a full draft GPU pass *and* a verify
+row. At ~2.2 accepted/cycle, depth 4 wastes ~45% of its draft passes. Depth 3
+gives up a little tok/forward (2.91 vs 3.20) but cuts wasted draft passes and
+shrinks the verify batch, and 55 cheap forwards beat 50 expensive ones.
+
+`LLAMA_MTP_ADAPTIVE=1` finds nearly the same operating point on its own — its
+heuristic clamps tails to ≤2 once the 12-cycle accept average sits under 3.0,
+which is why steps=4/6/7 adaptive all converge to 2.42 tok/fwd and 66 forwards.
+It is the safer choice when accept rate varies; fixed depth 3 was slightly faster
+and more consistent here.
+
+**Not contradicting M6**: that sweep (2/3/4/6/7 flat at 42–43.8) ran a 399-token
+essay at ~42% accept. This prompt accepts 55%, which moves the optimum. Depth is
+workload-dependent — sweep it per workload rather than trusting the default.
+
+**Conclusion**: Default 4 leaves ~5 tok/s on the table for short code prompts.
+Use `LLAMA_MTP_DRAFT_STEPS=3` (or `LLAMA_MTP_ADAPTIVE=1`). Not yet flipped as the
+built-in default — needs validation across more prompt types first.
+**Superseded by E28**: once extra verify rows became nearly free, depth 4 (the
+existing default) became the optimum again.
+
+---
+
+## E28. Narrow-N simdgroup matmul for MTP verify (2026-07-29) — +18% e2e
+
+**Tooling first**: added `--bench-verify` (prefill a fixed context, then time
+`forward_verify_batch` at each batch size, rewinding the KV after each call so
+every sample runs at the same KV length). Deterministic to ~±1%, and the
+`PROFILE_ABLATE` buckets work on it — this replaced noisy whole-generation A/B
+testing. `--bench-mv-ext` shapes moved from gemma-4-12b to E2B and gained `mm`
+and `narrow` columns. The `mul_mm` accuracy check in `--gguf-kquant-test` was
+reporting FAIL on a correct kernel: per-element relative error with a `1e-3`
+floor is meaningless for half-MMA paths, so it and the new narrow check now use
+relative L2.
+
+**Diagnosis** (E2B Q4_K_M, ctx 512): verify at batch 1/2/3/4/6/8 =
+22.0/34.0/37.9/43.2/59.8/69.7 ms. Ablation at batch 4: MLP 20.6 ms (gate∥up
+11.5, down 9.4), attention 13.5, floor 5.9, PLE/head ~1. About half the ~7 ms
+marginal cost per draft row is MLP, and it matched the kernel microbench exactly
+(gate∥up ext matvec marginal 0.032 ms/row × 35 layers = 1.12 ms/row).
+
+Root cause: `matvec_ggml_ext_q4x4` reads each weight row once per batch but
+evaluates the batch with **scalar dot products**. Measured as GB/s of weight
+traffic (flat = perfect amortization) it falls 56→20 from batch 2 to 8. The
+marginal row runs at ~50% of fp32 FMA peak — near optimal *for scalar code*, so
+the fix had to change the instruction mix, not the memory layout. Note that
+activation traffic is `m·k·r1ptg·4` bytes regardless of `nxpsg`/`nypsg`, so tile
+geometry cannot help; `MV_EXT_NSG` 1/2/4/8 was a wash, ruling out occupancy.
+
+The wide prefill `mul_mm` is perfectly flat in batch but always computes a
+32-column tile, wasting 4–8× the work at N≤8 — which is why `MUL_MM_MIN_SEQ=1`
+was catastrophic in M2. It does show the matrix units are ~5.6× more
+FLOP-efficient per output column than the scalar dots.
+
+**Kernel**: `mul_mm_narrow_{q4_K,q6_K}_f32` — 32 weight rows × 8 batch rows,
+NK=32. The first attempt used one simdgroup per threadgroup (to keep ceil(m/32)
+threadgroups for the 1536-row down/o_proj shapes) and only reached ~30 GB/s:
+with a single simdgroup the `sa` staging barriers have no other warp to hide
+behind. **The fix was to split K rather than M across 4 simdgroups**, each with
+a private slice of the staging tiles, so the K loop needs only
+`simdgroup_barrier` and the four partial tiles are summed once at the end. That
+lifted gate∥up 30→41, down Q4_K 15→33 and lm_head 45→57 GB/s, all flat in batch.
+
+**Routing** (`MUL_MM_NARROW=0` to disable, `MUL_MM_NARROW_MIN_SEQ` default 3):
+Q4_K only, batch 3–8. Q6_K keeps the ext matvec — `mul_vec_q6_K` folds scales in
+at the end instead of fully dequantizing and stays ahead (44 vs 33 GB/s at batch
+4). Batch 2 also keeps the ext matvec (48 vs 42). The fused gate∥up+GeLU ext
+kernel (M7) now yields to narrow + a separate gelu dispatch above the threshold.
+
+**Result** (bubble_sort, E2B Q4_K_M + F16 MTP, best of 2 interleaved runs):
+
+| draft steps | verify batch | narrow off | narrow on |
+|---|---|---:|---:|
+| 3 | 4 | 58.0 | 63.0 |
+| 4 | 5 | 53.9 | **63.7** |
+| 5 | 6 | 45.3 | 60.6 |
+| 6 | 7 | 42.1 | 58.9 |
+
+Verify is now nearly flat from batch 3 to 6 (35.2/36.3/35.2/37.3 ms, was
+33.1/38.3/45.7/54.6), so extra draft rows are close to free and the throughput
+peak moved from steps=3 back to the existing **default steps=4**. Verify fell
+from 83% to 74% of wall time; draft is the next target at 26%.
+
+**Verification**: `--gguf-kquant-test` narrow rel_l2 1.5e-3 (Q4_K) / 2.9e-4
+(Q6_K) at every batch 1–8, matching the existing prefill `mul_mm`, and covering
+partial M tiles (m=256) and partial N tiles. `MTP_VERIFY_CROSSCHECK=1` reports
+all rows matching the fused-sequential reference on every cycle. Generated
+bubble_sort is correct and accept rate is unchanged at 54.3%. Prompt prefill is
+unaffected (480→486 and 653→660 tok/s at 147/537 tokens).
+
+**Conclusion**: The batch dimension belongs on the matrix units; the batch
+*threshold* is just where a kernel stops being worth its threadgroup staging.
+Keep narrow default-on for Q4_K at batch ≥3.
+
+### E28 follow-up — depth across prompt types (2026-07-29)
+
+`--prompt` presets + `benchmarks/mtp_prompt_sweep.sh` (2 interleaved reps,
+narrow on). Best-of-2:
+
+| Prompt | accept@4 | best config | best tok/s | steps=3 | steps=4 |
+|---|---:|---|---:|---:|---:|
+| bubble_sort (code) | 54% | **steps=4** | 67.3 | 66.3 | 67.3 |
+| fibonacci (code) | 64% | **steps=4** | 69.8 | 69.1 | 69.8 |
+| essay (prose) | 26% | **adaptive** | 44.1 | 42.0 | 39.1 |
+| explain (prose) | 30% | **adaptive** | 45.5 | 44.4 | 42.0 |
+| qa (factual) | 39% | **adaptive** | 52.0 | 51.2 | 51.6 |
+| json (structured) | 42% | steps=3† | 59.9 | 59.9 | 56.5 |
+
+† json finishes in ~40 tokens — too short for a clean depth call.
+
+**Pattern**: after E28, fixed depth 4 wins on high-accept code (≥54%). On
+low-accept prose (≤30%) fixed 4 wastes draft passes and loses to both fixed 3
+and adaptive; adaptive is the clear winner because it clamps tails once the
+12-cycle accept average drops. Mid-accept (~39%) is a wash between 3/4/adaptive.
+
+**Recommendation**: keep built-in default `LLAMA_MTP_DRAFT_STEPS=4` (correct for
+code after narrow verify). Prefer `LLAMA_MTP_ADAPTIVE=1` when the workload's
+accept rate is unknown or known-low (essay/chat). Do not flip the global
+default to 3 — that only helps the low-accept regime and costs ~0–1 tok/s on
+code.

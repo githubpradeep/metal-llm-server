@@ -567,6 +567,10 @@ pub struct MetalContext {
     mul_mm_q4k_pipeline: OnceLock<ComputePipelineState>,
     /// Lazy: prefill Q6_K matrix-matrix (llama.cpp `kernel_mul_mm_q6_K_f32`).
     mul_mm_q6k_pipeline: OnceLock<ComputePipelineState>,
+    /// Lazy: narrow-N (batch ≤ 8) Q4_K simdgroup matmul for MTP verify.
+    mul_mm_narrow_q4k_pipeline: OnceLock<ComputePipelineState>,
+    /// Lazy: narrow-N (batch ≤ 8) Q6_K simdgroup matmul for MTP verify.
+    mul_mm_narrow_q6k_pipeline: OnceLock<ComputePipelineState>,
     /// Lazy: Q4_K mul_mm with f16 RHS.
     mul_mm_q4k_f16_pipeline: OnceLock<ComputePipelineState>,
     /// Lazy: Q6_K mul_mm with f16 RHS.
@@ -1162,6 +1166,8 @@ impl MetalContext {
             matvec_ggml_q4k_rmsnorm_gelu_mul_pipeline,
             mul_mm_q4k_pipeline: OnceLock::new(),
             mul_mm_q6k_pipeline: OnceLock::new(),
+            mul_mm_narrow_q4k_pipeline: OnceLock::new(),
+            mul_mm_narrow_q6k_pipeline: OnceLock::new(),
             mul_mm_q4k_f16_pipeline: OnceLock::new(),
             mul_mm_q6k_f16_pipeline: OnceLock::new(),
             mul_mm_q4k_f16_f16_pipeline: OnceLock::new(),
@@ -1351,6 +1357,21 @@ impl MetalContext {
         self.mul_mm_q6k_pipeline.get_or_init(|| {
             println!("  Prefill mul_mm: compiling Q6_K simdgroup matmul pipeline");
             Self::compile_mul_mm_pipeline(&self.device, "mul_mm_q6_K_f32", false, false)
+        })
+    }
+
+    fn mul_mm_narrow_q4k_pipeline(&self) -> &ComputePipelineState {
+        self.mul_mm_narrow_q4k_pipeline.get_or_init(|| {
+            println!("  MTP verify: compiling Q4_K narrow-N simdgroup matmul pipeline");
+            // bc_inp/bc_out unused by the narrow kernel's partial-tile handling.
+            Self::compile_mul_mm_pipeline(&self.device, "mul_mm_narrow_q4_K_f32", false, false)
+        })
+    }
+
+    fn mul_mm_narrow_q6k_pipeline(&self) -> &ComputePipelineState {
+        self.mul_mm_narrow_q6k_pipeline.get_or_init(|| {
+            println!("  MTP verify: compiling Q6_K narrow-N simdgroup matmul pipeline");
+            Self::compile_mul_mm_pipeline(&self.device, "mul_mm_narrow_q6_K_f32", false, false)
         })
     }
 
@@ -1805,13 +1826,15 @@ impl MetalContext {
         use std::time::Instant;
         let reps = 40;
         let packed = 20;
-        // (m_out, k_in, fmt, label) — real gemma-4-12b MLP projection shapes.
+        // (m_out, k_in, fmt, label) — real gemma-4-E2B projection shapes
+        // (hidden=1536, intermediate=6144, q_out=2048, kv_out=256, vocab=262144).
         let shapes: &[(u32, u32, u8, &str)] = &[
-            (15360, 3840, weight_fmt::Q4_K, "gate/up Q4_K 15360x3840"),
-            (3840, 15360, weight_fmt::Q6_K, "down    Q6_K 3840x15360"),
-            (3840, 15360, weight_fmt::Q4_K, "down    Q4_K 3840x15360"),
-            (4096, 3840, weight_fmt::Q4_K, "qkv     Q4_K 4096x3840"),
-            (3840, 4096, weight_fmt::Q4_K, "o_proj  Q4_K 3840x4096"),
+            (12288, 1536, weight_fmt::Q4_K, "gate∥up Q4_K 12288x1536"),
+            (1536, 6144, weight_fmt::Q4_K, "down    Q4_K 1536x6144"),
+            (1536, 6144, weight_fmt::Q6_K, "down    Q6_K 1536x6144"),
+            (2560, 1536, weight_fmt::Q4_K, "qkv     Q4_K 2560x1536"),
+            (1536, 2048, weight_fmt::Q4_K, "o_proj  Q4_K 1536x2048"),
+            (262144, 1536, weight_fmt::Q4_K, "lm_head Q4_K 262144x1536"),
         ];
         let batches: &[u32] = &[1, 2, 3, 4, 5, 6, 8];
 
@@ -1836,24 +1859,27 @@ impl MetalContext {
                     .new_buffer(wbytes, MTLResourceOptions::StorageModeShared),
             )
             .with_format(fmt);
-            let x = self.buffer_empty((8 * k) as usize);
-            let y = self.buffer_empty((8 * m) as usize);
+            // mul_mm writes whole 32-column tiles, so size for a padded batch.
+            let pad_rows = 64u32;
+            let x = self.buffer_empty((pad_rows * k) as usize);
+            let y = self.buffer_empty((pad_rows * m) as usize);
             let mb = wbytes as f64 / 1e6;
 
-            // Two kernels: ext (batch>=2 only) and mul_mv (any batch).
-            for kern in ["ext", "mv"].iter() {
+            // Four kernels: ext (batch>=2), mul_mv (any batch), mul_mm (wide
+            // 64x32 prefill tile), narrow (32x8 tile for MTP verify).
+            for kern in ["ext", "mv", "mm", "narrow"].iter() {
                 print!("{:<26} {:>7}", if *kern == "ext" { label } else { "" }, kern);
                 for &b in batches {
                     if *kern == "ext" && !(2..=8).contains(&b) {
                         print!("  {:>6}", "-");
                         continue;
                     }
-                    let run = |enc: &metal::ComputeCommandEncoderRef| {
-                        if *kern == "ext" {
-                            self.encode_matvec_kq_ext_at_view(enc, &w, &x, 0, &y, 0, m, k, b);
-                        } else {
-                            self.encode_matvec_qk_at_view(enc, &w, &x, 0, &y, 0, m, k, b);
-                        }
+                    let run = |enc: &metal::ComputeCommandEncoderRef| match *kern {
+                        "ext" => self.encode_matvec_kq_ext_at_view(enc, &w, &x, 0, &y, 0, m, k, b),
+                        "mv" => self.encode_matvec_qk_at_view(enc, &w, &x, 0, &y, 0, m, k, b),
+                        "mm" => self.encode_mul_mm_kquant_at_view(enc, &w, &x, &y, m, k, b),
+                        _ => self
+                            .encode_mul_mm_narrow_kquant_at_view(enc, &w, &x, 0, &y, 0, m, k, b),
                     };
                     for _ in 0..3 {
                         let cmd = self.queue.new_command_buffer();
@@ -2400,11 +2426,68 @@ impl MetalContext {
             && matches!(weight.format, weight_fmt::Q4_K | weight_fmt::Q6_K);
         if use_mm {
             self.encode_mul_mm_kquant_at_view(encoder, weight, x_buf, y_buf, m, k, seq_len);
+        } else if self.use_mul_mm_narrow(weight, seq_len) {
+            self.encode_mul_mm_narrow_kquant_at_view(
+                encoder, weight, x_buf, 0, y_buf, 0, m, k, seq_len,
+            );
         } else if seq_len >= 2 && seq_len <= 8 {
             self.encode_matvec_kq_ext_at_view(encoder, weight, x_buf, 0, y_buf, 0, m, k, seq_len);
         } else {
             self.encode_matvec_qk_at_view(encoder, weight, x_buf, 0, y_buf, 0, m, k, seq_len);
         }
+    }
+
+    /// Whether a small-batch K-quant projection should take the narrow
+    /// simdgroup-matmul path. Q6_K stays on the ext matvec: its scale-folded
+    /// decoder avoids a full dequant and stays ahead at every verify batch size,
+    /// whereas Q4_K's dequant-to-half is the narrow kernel's strength.
+    pub fn use_mul_mm_narrow(&self, weight: &BufferView, seq_len: u32) -> bool {
+        crate::ggml_gemv::mul_mm_narrow_enabled()
+            && weight.format == weight_fmt::Q4_K
+            && seq_len >= crate::ggml_gemv::mul_mm_narrow_min_seq()
+            && seq_len <= 8
+    }
+
+    /// Narrow-N (batch 2..8) K-quant simdgroup matmul — the MTP verify path.
+    /// Same weight-once traffic as the ext matvec, but the batch dimension runs
+    /// on the matrix units so extra draft rows are nearly free.
+    pub fn encode_mul_mm_narrow_kquant_at_view(
+        &self,
+        encoder: &metal::ComputeCommandEncoderRef,
+        weight: &BufferView,
+        x_buf: &Buffer,
+        x_offset: u64,
+        y_buf: &Buffer,
+        y_offset: u64,
+        m: u32,
+        k: u32,
+        seq_len: u32,
+    ) {
+        use crate::ggml_gemv::{
+            mul_mm_args_k, mul_mm_narrow_dispatch, Q4_K_BLOCK_BYTES, Q6_K_BLOCK_BYTES,
+            MUL_MM_NARROW_SMEM,
+        };
+        let (pipeline, block_bytes) = match weight.format {
+            weight_fmt::Q4_K => (self.mul_mm_narrow_q4k_pipeline(), Q4_K_BLOCK_BYTES),
+            weight_fmt::Q6_K => (self.mul_mm_narrow_q6k_pipeline(), Q6_K_BLOCK_BYTES),
+            other => panic!("encode_mul_mm_narrow_kquant_at_view: not K-quant ({})", other),
+        };
+        let args = mul_mm_args_k(m, k, seq_len, block_bytes);
+        encoder.set_compute_pipeline_state(pipeline);
+        encoder.set_bytes(
+            0,
+            std::mem::size_of::<crate::ggml_gemv::GgmlMulMmArgs>() as u64,
+            &args as *const _ as *const _,
+        );
+        encoder.set_buffer(1, Some(&weight.buffer), weight.offset);
+        encoder.set_buffer(2, Some(x_buf), x_offset);
+        encoder.set_buffer(3, Some(y_buf), y_offset);
+        encoder.set_threadgroup_memory_length(0, MUL_MM_NARROW_SMEM);
+        let (tg_x, tg_y, tg_z, tw, nsg) = mul_mm_narrow_dispatch(m, seq_len);
+        encoder.dispatch_thread_groups(
+            metal::MTLSize::new(tg_x, tg_y, tg_z),
+            metal::MTLSize::new(tw, nsg, 1),
+        );
     }
 
     /// llama.cpp `kernel_mul_mm_{q4,q6}_K_f32` dispatch for prefill projections.
@@ -4008,6 +4091,21 @@ impl MetalContext {
                 gate_up_stacked,
                 x_buf,
                 gate_up_act_buf,
+                m2,
+                k,
+                seq_len,
+            );
+            if !skip_gelu {
+                self.encode_gelu_mul_stacked_batch(encoder, gate_up_act_buf, gelu_buf, m, seq_len);
+            }
+        } else if self.use_mul_mm_narrow(gate_up_stacked, seq_len) {
+            self.encode_mul_mm_narrow_kquant_at_view(
+                encoder,
+                gate_up_stacked,
+                x_buf,
+                0,
+                gate_up_act_buf,
+                0,
                 m2,
                 k,
                 seq_len,
