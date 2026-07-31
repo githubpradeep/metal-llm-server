@@ -274,6 +274,344 @@ pub fn max_abs_diff(a: &[f32], b: &[f32]) -> f32 {
         .fold(0.0f32, f32::max)
 }
 
+/// Turbo-fieldfare-style fixed slot cache for routed experts (LFU eviction).
+///
+/// Keeps `slot_count` hot copies of (gate∥up, down) expert blobs in private
+/// Metal shared buffers so decode does not thrash the full ~14GB mmap.
+pub struct ExpertSlotCache {
+    slot_count: usize,
+    n_embd: usize,
+    n_ff: usize,
+    down_format: u8,
+    gate_up_stride: usize,
+    down_stride: usize,
+    gate_up_slots: Vec<metal::Buffer>,
+    down_slots: Vec<metal::Buffer>,
+    state: std::sync::Mutex<ExpertCacheState>,
+    hits: std::sync::atomic::AtomicU64,
+    misses: std::sync::atomic::AtomicU64,
+}
+
+/// Process-wide cache counters (per-layer atomics bounce in logs).
+static CACHE_HITS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static CACHE_MISSES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+struct ExpertCacheState {
+    slot_expert: Vec<i32>,
+    slot_last_use: Vec<u64>,
+    expert_use_count: Vec<u32>,
+    use_clock: u64,
+}
+
+/// Default slots/layer (turbo-fieldfare production). Override with `MOE_EXPERT_SLOTS`.
+pub fn expert_cache_slot_count(n_expert_used: usize) -> usize {
+    if std::env::var("MOE_EXPERT_CACHE").as_deref() == Ok("0") {
+        return 0;
+    }
+    let raw = std::env::var("MOE_EXPERT_SLOTS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(16usize);
+    raw.max(n_expert_used).max(1)
+}
+
+/// Result of LFU slot assignment before miss I/O.
+pub struct ExpertCachePlan {
+    pub experts: Vec<usize>,
+    pub assigned_slots: Vec<usize>,
+    pub miss_indices: Vec<usize>,
+}
+
+impl ExpertSlotCache {
+    pub fn new(
+        device: &metal::Device,
+        n_expert: usize,
+        n_embd: usize,
+        n_ff: usize,
+        down_format: u8,
+        slot_count: usize,
+    ) -> Self {
+        use metal::MTLResourceOptions;
+        let gate_up_stride = gate_up_expert_bytes(n_embd, n_ff) as usize;
+        let down_stride = down_expert_bytes(n_ff, n_embd, down_block_bytes(down_format)) as usize;
+        let mut gate_up_slots = Vec::with_capacity(slot_count);
+        let mut down_slots = Vec::with_capacity(slot_count);
+        for _ in 0..slot_count {
+            gate_up_slots.push(device.new_buffer(
+                gate_up_stride as u64,
+                MTLResourceOptions::StorageModeShared,
+            ));
+            down_slots.push(device.new_buffer(
+                down_stride as u64,
+                MTLResourceOptions::StorageModeShared,
+            ));
+        }
+        Self {
+            slot_count,
+            n_embd,
+            n_ff,
+            down_format,
+            gate_up_stride,
+            down_stride,
+            gate_up_slots,
+            down_slots,
+            state: std::sync::Mutex::new(ExpertCacheState {
+                slot_expert: vec![-1; slot_count],
+                slot_last_use: vec![0; slot_count],
+                expert_use_count: vec![0; n_expert.max(1)],
+                use_clock: 0,
+            }),
+            hits: std::sync::atomic::AtomicU64::new(0),
+            misses: std::sync::atomic::AtomicU64::new(0),
+        }
+    }
+
+    pub fn bytes_per_layer(&self) -> u64 {
+        (self.slot_count * (self.gate_up_stride + self.down_stride)) as u64
+    }
+
+    pub fn global_stats() -> (u64, u64) {
+        (
+            CACHE_HITS.load(std::sync::atomic::Ordering::Relaxed),
+            CACHE_MISSES.load(std::sync::atomic::Ordering::Relaxed),
+        )
+    }
+
+    /// Reserve slots (LFU). Miss slots are marked empty until `fill_misses`.
+    pub fn plan(&self, experts: &[usize]) -> ExpertCachePlan {
+        assert!(
+            experts.len() <= self.slot_count,
+            "need ≥{} slots for top-{}, have {}",
+            experts.len(),
+            experts.len(),
+            self.slot_count
+        );
+        let mut st = self.state.lock().unwrap();
+        st.use_clock = st.use_clock.wrapping_add(1);
+        let clock = st.use_clock;
+        let mut assigned = vec![usize::MAX; experts.len()];
+        let mut reserved = vec![false; self.slot_count];
+
+        for (i, &e) in experts.iter().enumerate() {
+            for s in 0..self.slot_count {
+                if !reserved[s] && st.slot_expert[s] == e as i32 {
+                    assigned[i] = s;
+                    reserved[s] = true;
+                    break;
+                }
+            }
+        }
+
+        let miss_indices: Vec<usize> = assigned
+            .iter()
+            .enumerate()
+            .filter_map(|(i, &s)| if s == usize::MAX { Some(i) } else { None })
+            .collect();
+
+        let mut evictable: Vec<usize> = (0..self.slot_count).filter(|&s| !reserved[s]).collect();
+        evictable.sort_by(|&a, &b| {
+            let ae = st.slot_expert[a];
+            let be = st.slot_expert[b];
+            if ae < 0 || be < 0 {
+                return ae.cmp(&be);
+            }
+            let ac = st.expert_use_count.get(ae as usize).copied().unwrap_or(0);
+            let bc = st.expert_use_count.get(be as usize).copied().unwrap_or(0);
+            ac.cmp(&bc)
+                .then_with(|| st.slot_last_use[a].cmp(&st.slot_last_use[b]))
+        });
+        assert!(
+            miss_indices.len() <= evictable.len(),
+            "expert cache cannot place {} misses into {} free slots",
+            miss_indices.len(),
+            evictable.len()
+        );
+
+        for &e in experts {
+            if e < st.expert_use_count.len() {
+                st.expert_use_count[e] = st.expert_use_count[e].wrapping_add(1);
+            }
+        }
+        for &s in &assigned {
+            if s != usize::MAX {
+                st.slot_last_use[s] = clock;
+            }
+        }
+        for (off, &idx) in miss_indices.iter().enumerate() {
+            let slot = evictable[off];
+            assigned[idx] = slot;
+            reserved[slot] = true;
+            st.slot_expert[slot] = -1;
+            st.slot_last_use[slot] = clock;
+        }
+
+        let hits = experts.len() - miss_indices.len();
+        self.hits
+            .fetch_add(hits as u64, std::sync::atomic::Ordering::Relaxed);
+        self.misses.fetch_add(
+            miss_indices.len() as u64,
+            std::sync::atomic::Ordering::Relaxed,
+        );
+        CACHE_HITS.fetch_add(hits as u64, std::sync::atomic::Ordering::Relaxed);
+        CACHE_MISSES.fetch_add(
+            miss_indices.len() as u64,
+            std::sync::atomic::Ordering::Relaxed,
+        );
+
+        if std::env::var("MOE_CACHE_STATS").as_deref() == Ok("1") {
+            static CALLS: std::sync::atomic::AtomicU64 =
+                std::sync::atomic::AtomicU64::new(0);
+            let n = CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if n < 5 || n % 64 == 0 {
+                let (h, m) = Self::global_stats();
+                let total = h + m;
+                let rate = if total > 0 {
+                    100.0 * h as f64 / total as f64
+                } else {
+                    0.0
+                };
+                eprintln!(
+                    "  [moe-cache] call={} hits={} misses={} hit_rate={:.1}% (this: {} hit / {} miss)",
+                    n,
+                    h,
+                    m,
+                    rate,
+                    hits,
+                    miss_indices.len()
+                );
+            }
+        }
+
+        ExpertCachePlan {
+            experts: experts.to_vec(),
+            assigned_slots: assigned,
+            miss_indices,
+        }
+    }
+
+    /// Parallel mmap→slot copies for plan misses (safe: distinct slots).
+    pub fn fill_misses(
+        &self,
+        plan: &ExpertCachePlan,
+        gate_up_src: &BufferView,
+        down_src: &BufferView,
+    ) {
+        self.fill_misses_scoped(plan, gate_up_src, down_src, || {});
+    }
+
+    /// Spawn miss fills, run `between` (e.g. wait shared + encode cache hits),
+    /// then join fills and mark slots occupied.
+    pub fn fill_misses_scoped<R>(
+        &self,
+        plan: &ExpertCachePlan,
+        gate_up_src: &BufferView,
+        down_src: &BufferView,
+        between: impl FnOnce() -> R,
+    ) -> R {
+        if plan.miss_indices.is_empty() {
+            return between();
+        }
+        let result = std::thread::scope(|scope| {
+            for &idx in &plan.miss_indices {
+                let expert = plan.experts[idx];
+                let slot = plan.assigned_slots[idx];
+                scope.spawn(move || {
+                    self.fill_slot(slot, expert, gate_up_src, down_src);
+                });
+            }
+            between()
+        });
+        let mut st = self.state.lock().unwrap();
+        for &idx in &plan.miss_indices {
+            st.slot_expert[plan.assigned_slots[idx]] = plan.experts[idx] as i32;
+        }
+        result
+    }
+
+    /// Indices in `plan.experts` that were cache hits at plan time.
+    pub fn hit_indices(plan: &ExpertCachePlan) -> Vec<usize> {
+        let miss: std::collections::HashSet<usize> =
+            plan.miss_indices.iter().copied().collect();
+        (0..plan.experts.len())
+            .filter(|i| !miss.contains(i))
+            .collect()
+    }
+
+    /// Gate/up/down views for planned slots. `swap_gate_up=false` → gate first.
+    pub fn views(
+        &self,
+        plan: &ExpertCachePlan,
+        swap_gate_up: bool,
+    ) -> Vec<(BufferView, BufferView, BufferView)> {
+        let gate_is_up = swap_gate_up;
+        let half_bytes = self.gate_up_stride / 2;
+        let gate_off = gate_up_half_offset(self.n_embd, self.n_ff, gate_is_up);
+        let up_off = gate_up_half_offset(self.n_embd, self.n_ff, !gate_is_up);
+        plan.assigned_slots
+            .iter()
+            .map(|&slot| {
+                let gate = BufferView {
+                    buffer: self.gate_up_slots[slot].clone(),
+                    offset: gate_off,
+                    length: half_bytes as u64,
+                    format: crate::gpu::weight_fmt::Q4_K,
+                };
+                let up = BufferView {
+                    buffer: self.gate_up_slots[slot].clone(),
+                    offset: up_off,
+                    length: half_bytes as u64,
+                    format: crate::gpu::weight_fmt::Q4_K,
+                };
+                let down = BufferView {
+                    buffer: self.down_slots[slot].clone(),
+                    offset: 0,
+                    length: self.down_stride as u64,
+                    format: self.down_format,
+                };
+                (gate, up, down)
+            })
+            .collect()
+    }
+
+    /// Plan + fill + views (sequential path / tests).
+    pub fn ensure(
+        &self,
+        experts: &[usize],
+        gate_up_src: &BufferView,
+        down_src: &BufferView,
+        swap_gate_up: bool,
+    ) -> Vec<(BufferView, BufferView, BufferView)> {
+        let plan = self.plan(experts);
+        self.fill_misses(&plan, gate_up_src, down_src);
+        self.views(&plan, swap_gate_up)
+    }
+
+    fn fill_slot(
+        &self,
+        slot: usize,
+        expert: usize,
+        gate_up_src: &BufferView,
+        down_src: &BufferView,
+    ) {
+        let g_base = expert * self.gate_up_stride;
+        let d_base = expert * self.down_stride;
+        let g_src = &gate_up_src.as_bytes()[g_base..g_base + self.gate_up_stride];
+        let d_src = &down_src.as_bytes()[d_base..d_base + self.down_stride];
+        unsafe {
+            let g_dst = std::slice::from_raw_parts_mut(
+                self.gate_up_slots[slot].contents() as *mut u8,
+                self.gate_up_stride,
+            );
+            let d_dst = std::slice::from_raw_parts_mut(
+                self.down_slots[slot].contents() as *mut u8,
+                self.down_stride,
+            );
+            g_dst.copy_from_slice(g_src);
+            d_dst.copy_from_slice(d_src);
+        }
+    }
+}
+
 #[allow(dead_code)]
 pub fn assert_q5_1_supported() {
     let _ = ggml_type::Q5_1;
