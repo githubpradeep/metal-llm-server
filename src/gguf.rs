@@ -1,6 +1,6 @@
 //! Minimal GGUF (v2/v3) reader: header, metadata KV table, tensor table, and
 //! CPU dequantizers for the quant types used by Gemma-4 GGUFs
-//! (Q4_0, Q4_1, Q8_0, Q4_K, Q5_K, plus F16/BF16/F32 passthrough).
+//! (Q4_0, Q4_1, Q5_1, Q8_0, Q4_K, Q5_K, Q6_K, plus F16/BF16/F32 passthrough).
 //!
 //! The Q4_0 block layout is byte-identical to `gpu::quantize_q4_0`, so quantized
 //! weights round-trip losslessly through `dequant_to_f32` -> `buffer_from_f32_as_q4`.
@@ -22,6 +22,7 @@ pub mod ggml_type {
     pub const F16: u32 = 1;
     pub const Q4_0: u32 = 2;
     pub const Q4_1: u32 = 3;
+    pub const Q5_1: u32 = 7;
     pub const Q8_0: u32 = 8;
     pub const Q4_K: u32 = 12;
     pub const Q5_K: u32 = 13;
@@ -35,6 +36,7 @@ pub fn ggml_type_name(t: u32) -> &'static str {
         ggml_type::F16 => "F16",
         ggml_type::Q4_0 => "Q4_0",
         ggml_type::Q4_1 => "Q4_1",
+        ggml_type::Q5_1 => "Q5_1",
         ggml_type::Q8_0 => "Q8_0",
         ggml_type::Q4_K => "Q4_K",
         ggml_type::Q5_K => "Q5_K",
@@ -45,13 +47,14 @@ pub fn ggml_type_name(t: u32) -> &'static str {
 }
 
 /// (elements_per_block, bytes_per_block) for a ggml type.
-fn block_spec(t: u32) -> (usize, usize) {
+pub(crate) fn block_spec(t: u32) -> (usize, usize) {
     match t {
         ggml_type::F32 => (1, 4),
         ggml_type::F16 => (1, 2),
         ggml_type::BF16 => (1, 2),
         ggml_type::Q4_0 => (32, 18),
         ggml_type::Q4_1 => (32, 20),
+        ggml_type::Q5_1 => (32, 24),
         ggml_type::Q8_0 => (32, 34),
         ggml_type::Q4_K => (QK_K, 144),
         ggml_type::Q5_K => (QK_K, 176),
@@ -639,6 +642,32 @@ fn dequant_blocks(ggml_type: u32, data: &[u8], total_elems: usize, mut sink: imp
                     let q_hi = (qs[i] >> 4) as f32;
                     out[i] = q_lo * d + m;
                     out[i + 16] = q_hi * d + m;
+                }
+                sink(&out);
+            }
+        }
+        ggml_type::Q5_1 => {
+            // block_q5_1: half d, half m, qh[4], qs[16] = 24 bytes / 32 values
+            let mut out = [0.0f32; 32];
+            let nb = total_elems / 32;
+            for b in 0..nb {
+                let base = b * 24;
+                let d = f16_to_f32(u16::from_le_bytes([data[base], data[base + 1]]));
+                let m = f16_to_f32(u16::from_le_bytes([data[base + 2], data[base + 3]]));
+                let qh = u32::from_le_bytes([
+                    data[base + 4],
+                    data[base + 5],
+                    data[base + 6],
+                    data[base + 7],
+                ]);
+                let qs = &data[base + 8..base + 24];
+                for i in 0..16 {
+                    let xh_0 = (((qh >> (i + 0)) << 4) & 0x10) as f32;
+                    let xh_1 = (((qh >> (i + 12)) ) & 0x10) as f32;
+                    let x0 = ((qs[i] & 0x0F) as f32) + xh_0;
+                    let x1 = ((qs[i] >> 4) as f32) + xh_1;
+                    out[i] = x0 * d + m;
+                    out[i + 16] = x1 * d + m;
                 }
                 sink(&out);
             }

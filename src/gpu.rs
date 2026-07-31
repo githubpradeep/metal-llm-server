@@ -11,6 +11,9 @@ pub mod weight_fmt {
     pub const Q3_0: u8 = 2;
     pub const Q4_K: u8 = 3;
     pub const Q6_K: u8 = 4;
+    // Keep 5 free — WeightFormat::KQuant historically serializes as 5.
+    pub const Q5_1: u8 = 6;
+    pub const Q8_0: u8 = 7;
 }
 
 /// A sub-range view into a Metal buffer (offset applied at kernel bind time).
@@ -548,6 +551,8 @@ pub struct MetalContext {
     pub matvec_qkv_rmsnorm_inv_kquant_pipeline: ComputePipelineState,
     pub ple_matvec_gelu_q4_pipeline: ComputePipelineState,
     pub matvec_ggml_q4_pipeline: ComputePipelineState,
+    pub matvec_ggml_q5_1_pipeline: ComputePipelineState,
+    pub matvec_ggml_q8_0_pipeline: ComputePipelineState,
     pub matvec_ggml_q4_dual_pipeline: ComputePipelineState,
     pub matvec_ggml_q4_gelu_mul_pipeline: ComputePipelineState,
     pub matvec_ggml_q4_gelu_mul_r2s4_pipeline: ComputePipelineState,
@@ -799,6 +804,8 @@ impl MetalContext {
         let matvec_qkv_rmsnorm_inv_kquant_pipeline = get_fn("matvec_qkv_rmsnorm_inv_kquant");
         let ple_matvec_gelu_q4_pipeline = get_fn("ple_matvec_gelu_q4");
         let matvec_ggml_q4_pipeline = get_fn("matvec_ggml_q4_0");
+        let matvec_ggml_q5_1_pipeline = get_fn("matvec_ggml_q5_1");
+        let matvec_ggml_q8_0_pipeline = get_fn("matvec_ggml_q8_0");
         let matvec_ggml_q4_dual_pipeline = get_fn("matvec_ggml_q4_0_dual");
         let matvec_ggml_q4_gelu_mul_pipeline = get_fn("matvec_ggml_q4_0_gelu_mul");
         let matvec_ggml_q4_gelu_mul_r2s4_pipeline = get_fn("matvec_ggml_q4_0_gelu_mul_r2s4");
@@ -1107,6 +1114,8 @@ impl MetalContext {
             matvec_qkv_rmsnorm_inv_kquant_pipeline,
             ple_matvec_gelu_q4_pipeline,
             matvec_ggml_q4_pipeline,
+            matvec_ggml_q5_1_pipeline,
+            matvec_ggml_q8_0_pipeline,
             matvec_ggml_q4_dual_pipeline,
             matvec_ggml_q4_gelu_mul_pipeline,
             matvec_ggml_q4_gelu_mul_r2s4_pipeline,
@@ -2628,6 +2637,93 @@ impl MetalContext {
             metal::MTLSize::new(tg_x, tg_y, tg_z),
             metal::MTLSize::new(tw, nsg, 1),
         );
+    }
+
+    /// Q5_1 weight matvec (llama.cpp `kernel_mul_mv_q5_1_f32`). Used for MoE
+    /// `ffn_down_exps` on Gemma4 26B-A4B UD-Q4_K_M.
+    pub fn encode_matvec_q5_1_at_view(
+        &self,
+        encoder: &metal::ComputeCommandEncoderRef,
+        weight: &BufferView,
+        x_buf: &Buffer,
+        x_offset: u64,
+        y_buf: &Buffer,
+        y_offset: u64,
+        m: u32,
+        k: u32,
+    ) {
+        debug_assert_eq!(weight.format, weight_fmt::Q5_1);
+        use crate::ggml_gemv::{mul_mv_args_q5_1, mul_mv_dispatch};
+        let args = mul_mv_args_q5_1(m, k);
+        encoder.set_compute_pipeline_state(&self.matvec_ggml_q5_1_pipeline);
+        encoder.set_buffer(0, Some(&weight.buffer), weight.offset);
+        encoder.set_buffer(1, Some(x_buf), x_offset);
+        encoder.set_buffer(2, Some(y_buf), y_offset);
+        encoder.set_bytes(
+            3,
+            std::mem::size_of::<crate::ggml_gemv::GgmlMulMvArgs>() as u64,
+            &args as *const _ as *const _,
+        );
+        let (tg_x, tg_y, tg_z, tw, nsg) = mul_mv_dispatch(m, 1);
+        encoder.dispatch_thread_groups(
+            metal::MTLSize::new(tg_x, tg_y, tg_z),
+            metal::MTLSize::new(tw, nsg, 1),
+        );
+    }
+
+    /// Q8_0 weight matvec (llama.cpp `kernel_mul_mv_q8_0_f32`). Used when a
+    /// MoE expert down tensor is stored as Q8_0 (e.g. last layer of UD-Q4_K_M).
+    pub fn encode_matvec_q8_0_at_view(
+        &self,
+        encoder: &metal::ComputeCommandEncoderRef,
+        weight: &BufferView,
+        x_buf: &Buffer,
+        x_offset: u64,
+        y_buf: &Buffer,
+        y_offset: u64,
+        m: u32,
+        k: u32,
+    ) {
+        debug_assert_eq!(weight.format, weight_fmt::Q8_0);
+        use crate::ggml_gemv::{mul_mv_args_q8_0, mul_mv_dispatch};
+        let args = mul_mv_args_q8_0(m, k);
+        encoder.set_compute_pipeline_state(&self.matvec_ggml_q8_0_pipeline);
+        encoder.set_buffer(0, Some(&weight.buffer), weight.offset);
+        encoder.set_buffer(1, Some(x_buf), x_offset);
+        encoder.set_buffer(2, Some(y_buf), y_offset);
+        encoder.set_bytes(
+            3,
+            std::mem::size_of::<crate::ggml_gemv::GgmlMulMvArgs>() as u64,
+            &args as *const _ as *const _,
+        );
+        let (tg_x, tg_y, tg_z, tw, nsg) = mul_mv_dispatch(m, 1);
+        encoder.dispatch_thread_groups(
+            metal::MTLSize::new(tg_x, tg_y, tg_z),
+            metal::MTLSize::new(tw, nsg, 1),
+        );
+    }
+
+    /// Dispatch MoE expert down by per-tensor format (Q5_1 / Q8_0).
+    pub fn encode_matvec_moe_down_at_view(
+        &self,
+        encoder: &metal::ComputeCommandEncoderRef,
+        weight: &BufferView,
+        x_buf: &Buffer,
+        x_offset: u64,
+        y_buf: &Buffer,
+        y_offset: u64,
+        m: u32,
+        k: u32,
+    ) {
+        match weight.format {
+            weight_fmt::Q5_1 => self.encode_matvec_q5_1_at_view(
+                encoder, weight, x_buf, x_offset, y_buf, y_offset, m, k,
+            ),
+            weight_fmt::Q8_0 => self.encode_matvec_q8_0_at_view(
+                encoder, weight, x_buf, x_offset, y_buf, y_offset, m, k,
+            ),
+            other => panic!("unsupported MoE down format {other}"),
+        }
     }
 
     /// K-quant small-batch ext matvec (llama.cpp `kernel_mul_mv_ext_q4x4_f32`).
@@ -7194,7 +7290,7 @@ fn dequantize_q3_0(data: &[u8], rows: usize, cols: usize) -> Vec<f32> {
 ///   - Quantize each value to 4-bit unsigned: q = round(v / scale) + 8, clamped to [0, 15]
 ///   - Pack GGUF layout: byte i = low nibble elem i, high nibble elem i+16
 ///   - Store: [f16 scale][16 bytes packed quants]
-fn quantize_q4_0(data: &[f32], rows: usize, cols: usize) -> Vec<u8> {
+pub(crate) fn quantize_q4_0(data: &[f32], rows: usize, cols: usize) -> Vec<u8> {
     assert_eq!(cols % 32, 0, "cols must be divisible by 32 for Q4_0");
     let num_groups_per_row = cols / 32;
     let bytes_per_row = num_groups_per_row * 18; // 18 bytes per group

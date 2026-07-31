@@ -873,6 +873,9 @@ pub struct Gemma4GpuLayer {
     pub q_norm_weight: BufferView,
     pub k_norm_weight: BufferView,
 
+    /// Present on MoE layers (26B-A4B). Dense E2B/E4B layers leave this `None`.
+    pub moe: Option<Gemma4MoeLayer>,
+
     // Layer properties
     pub is_full_attention: bool,
     pub has_kv: bool,           // false for shared KV layers (layers 24-41)
@@ -882,6 +885,27 @@ pub struct Gemma4GpuLayer {
     pub kv_out_dim: usize,
     pub intermediate_size: usize,
     pub weight_format: WeightFormat,
+}
+
+/// Per-layer MoE weights for Gemma 4 26B-A4B (shared FFN stays in `Gemma4GpuLayer`).
+pub struct Gemma4MoeLayer {
+    /// Router projection, f16 `[n_expert, n_embd]`.
+    pub router_weight: BufferView,
+    /// Prefolded `router.scale * 1/sqrt(n_embd)`, f32 `[n_embd]`.
+    pub router_scale: BufferView,
+    /// Fused gate∥up experts, Q4_K `[n_embd, 2*n_ff_exp, n_expert]` (mmap).
+    pub gate_up_exps: BufferView,
+    /// Down experts, Q5_1 or Q8_0 `[n_ff_exp, n_embd, n_expert]` (mmap).
+    /// UD-Q4_K_M uses Q5_1 for layers 0–28 and Q8_0 for the final layer.
+    pub down_exps: BufferView,
+    /// Per-expert scale on down outputs, f32 `[n_expert]`.
+    pub down_exps_scale: BufferView,
+    pub pre_ffw_norm_2: BufferView,
+    pub post_ffw_norm_1: BufferView,
+    pub post_ffw_norm_2: BufferView,
+    pub n_expert: usize,
+    pub n_expert_used: usize,
+    pub expert_ff: usize,
 }
 
 /// Weight format for a layer's projection matrices.
@@ -1315,6 +1339,7 @@ impl Gemma4GpuModel {
 
                 q_norm_weight: BufferView::from_buffer(ctx.buffer_from_slice(&q_norm_data)),
                 k_norm_weight: BufferView::from_buffer(ctx.buffer_from_slice(&k_norm_data)),
+                moe: None,
 
                 is_full_attention: is_full,
                 has_kv: layer_idx < (num_layers - config.num_kv_shared_layers),
@@ -1675,6 +1700,15 @@ impl Gemma4GpuModel {
             "  Sliding head_dim={}, Full head_dim={}, PLE dim={}, shared_kv_layers={}",
             config.head_dim, config.global_head_dim, ple_dim, config.num_kv_shared_layers
         );
+        if config.is_moe() {
+            println!(
+                "  MoE: experts={}/{} used, expert_ff={}, shared_ff={}",
+                config.num_experts_used,
+                config.num_experts,
+                config.expert_intermediate_size,
+                config.intermediate_size
+            );
+        }
         println!(
             "  RoPE: sliding θ={:.0} (all {} dims), full θ={:.0} p-RoPE factor={:.2} ({} of {} dims)",
             config.sliding_rope_theta(),
@@ -1711,6 +1745,37 @@ impl Gemma4GpuModel {
                     ctx.buffer_from_slice_no_copy(g.tensor_raw("token_embd.weight")),
                 )
                 .with_format(weight_fmt::F16),
+                // A4B UD-Q4_K_M uses Q8_0 embeddings (~783 MB). Stream-requant to
+                // Q4_0 row-by-row so we never materialize vocab×hidden f32 (~3 GB)
+                // on a 16 GB host (that spike corrupted earlier loads).
+                ggml_type::Q8_0 => {
+                    let (epb, bpb) = crate::gguf::block_spec(ggml_type::Q8_0);
+                    assert_eq!(hidden_size % epb, 0);
+                    let row_bytes = (hidden_size / epb) * bpb;
+                    let q4_row = (hidden_size / 32) * 18;
+                    let mut q4 = vec![0u8; vocab_size * q4_row];
+                    let mut f32_row = vec![0.0f32; hidden_size];
+                    println!(
+                        "    lm_head: streaming Q8_0→Q4_0 requant ({} rows × {})...",
+                        vocab_size, hidden_size
+                    );
+                    for row in 0..vocab_size {
+                        let bytes =
+                            g.tensor_row_bytes("token_embd.weight", row, row_bytes);
+                        crate::gguf::dequant_row_to_f32(
+                            ggml_type::Q8_0,
+                            bytes,
+                            hidden_size,
+                            &mut f32_row,
+                        );
+                        let q = crate::gpu::quantize_q4_0(&f32_row, 1, hidden_size);
+                        q4[row * q4_row..(row + 1) * q4_row].copy_from_slice(&q);
+                        if row > 0 && row % 65536 == 0 {
+                            println!("      … {} / {}", row, vocab_size);
+                        }
+                    }
+                    BufferView::from_buffer(ctx.buffer_from_bytes(&q4))
+                }
                 _ => BufferView::from_buffer(ctx.buffer_from_f32_as_q4(
                     &g.dequant_to_f32("token_embd.weight"),
                     vocab_size,
@@ -1844,6 +1909,13 @@ impl Gemma4GpuModel {
                         BufferView::from_buffer(ctx.buffer_from_f32_as_f16(&data))
                             .with_format(weight_fmt::F16)
                     }
+                    // A4B dense attn/FFN are Q8_0 — keep as f16 (not lossy Q4_0 requant).
+                    // Experts stay native Q4_K/Q5_1 via the MoE loader below.
+                    ggml_type::Q8_0 => {
+                        let data = g.dequant_to_f32(&name);
+                        BufferView::from_buffer(ctx.buffer_from_f32_as_f16(&data))
+                            .with_format(weight_fmt::F16)
+                    }
                     _ => {
                         let data = g.dequant_to_f32(&name);
                         BufferView::from_buffer(ctx.buffer_from_f32_as_q4(&data, rows, cols))
@@ -1884,12 +1956,86 @@ impl Gemma4GpuModel {
             // this disables the Q4_0-only fused/mega paths for the layer while
             // each tensor still dispatches by its own `BufferView::format`.
             use crate::gpu::weight_fmt;
-            let any_kquant = [
+            let moe = if g.has_tensor(&p("ffn_gate_inp.weight")) {
+                use crate::gguf::ggml_type;
+                let n_expert = config.num_experts;
+                let n_expert_used = config.num_experts_used;
+                let expert_ff = config.expert_intermediate_size;
+                assert!(n_expert > 0 && n_expert_used > 0 && expert_ff > 0);
+
+                // Router: F32 [n_embd, n_expert] → f16 [n_expert, n_embd] for matvec.
+                let router_f32 = g.dequant_to_f32(&p("ffn_gate_inp.weight"));
+                let router_weight = BufferView::from_buffer(
+                    ctx.buffer_from_f32_as_f16(&router_f32),
+                )
+                .with_format(weight_fmt::F16);
+                drop(router_f32);
+
+                // Prefold router.scale * 1/sqrt(D) into one f32 vector.
+                let mut router_scale = g.dequant_to_f32(&p("ffn_gate_inp.scale"));
+                let inv_sqrt_d = (hidden_size as f32).sqrt().recip();
+                for s in &mut router_scale {
+                    *s *= inv_sqrt_d;
+                }
+                let router_scale = BufferView::from_buffer(ctx.buffer_from_slice(&router_scale));
+
+                let gate_up_exps = BufferView::from_buffer(
+                    ctx.buffer_from_slice_no_copy(g.tensor_raw(&p("ffn_gate_up_exps.weight"))),
+                )
+                .with_format(weight_fmt::Q4_K);
+                let down_name = p("ffn_down_exps.weight");
+                let down_ty = g.tensor_type(&down_name);
+                let down_fmt = match down_ty {
+                    ggml_type::Q5_1 => weight_fmt::Q5_1,
+                    ggml_type::Q8_0 => weight_fmt::Q8_0,
+                    other => panic!(
+                        "unsupported {} type {} (expected Q5_1 or Q8_0)",
+                        down_name,
+                        crate::gguf::ggml_type_name(other)
+                    ),
+                };
+                if down_fmt == weight_fmt::Q8_0 {
+                    eprintln!(
+                        "  MoE L{}: ffn_down_exps is Q8_0 (Metal matvec_ggml_q8_0)",
+                        layer_idx
+                    );
+                }
+                let down_exps = BufferView::from_buffer(
+                    ctx.buffer_from_slice_no_copy(g.tensor_raw(&down_name)),
+                )
+                .with_format(down_fmt);
+                let down_exps_scale =
+                    BufferView::from_buffer(ctx.buffer_from_slice(&g.dequant_to_f32(
+                        &p("ffn_down_exps.scale"),
+                    )));
+
+                Some(Gemma4MoeLayer {
+                    router_weight,
+                    router_scale,
+                    gate_up_exps,
+                    down_exps,
+                    down_exps_scale,
+                    pre_ffw_norm_2: f32buf(p("pre_ffw_norm_2.weight")),
+                    post_ffw_norm_1: f32buf(p("post_ffw_norm_1.weight")),
+                    post_ffw_norm_2: f32buf(p("post_ffw_norm_2.weight")),
+                    n_expert,
+                    n_expert_used,
+                    expert_ff,
+                })
+            } else {
+                None
+            };
+
+            let proj_refs = [
                 &q_proj, &k_proj, &v_proj, &o_proj, &gate_proj, &up_proj, &down_proj,
                 &per_layer_input_gate_weight, &per_layer_projection_weight,
-            ]
-            .iter()
-            .any(|v| matches!(v.format, weight_fmt::Q4_K | weight_fmt::Q6_K));
+            ];
+            let any_kquant = proj_refs
+                .iter()
+                .any(|v| matches!(v.format, weight_fmt::Q4_K | weight_fmt::Q6_K));
+            let any_f16 = proj_refs
+                .iter()
+                .any(|v| v.format == weight_fmt::F16);
 
             let layer = Gemma4GpuLayer {
                 q_proj,
@@ -1916,6 +2062,7 @@ impl Gemma4GpuModel {
 
                 q_norm_weight: f32buf(p("attn_q_norm.weight")),
                 k_norm_weight: f32buf(p("attn_k_norm.weight")),
+                moe,
 
                 is_full_attention: is_full,
                 has_kv: layer_idx < (num_layers - config.num_kv_shared_layers),
@@ -1924,13 +2071,28 @@ impl Gemma4GpuModel {
                 q_out_dim: q_out,
                 kv_out_dim: kv_out,
                 intermediate_size: layer_inter,
+                // Prefer K-quant when mixed; else F16 (A4B Q8_0→f16); else Q4_0.
                 weight_format: if any_kquant {
                     WeightFormat::KQuant
+                } else if any_f16 {
+                    WeightFormat::F16
                 } else {
                     WeightFormat::Q4_0
                 },
             };
             layers.push(layer);
+        }
+
+        if config.is_moe() {
+            let moe_layers = layers.iter().filter(|l| l.moe.is_some()).count();
+            println!(
+                "  MoE: {}/{} layers, experts={}/{} used, expert_ff={}",
+                moe_layers,
+                num_layers,
+                config.num_experts_used,
+                config.num_experts,
+                config.expert_intermediate_size
+            );
         }
 
         let model = Self::assemble(
@@ -2290,6 +2452,7 @@ impl Gemma4GpuModel {
                 layer_scalar,
                 q_norm_weight,
                 k_norm_weight,
+                moe: None,
                 is_full_attention,
                 has_kv,
                 kv_source_layer,
@@ -3067,6 +3230,405 @@ impl Gemma4GpuModel {
         self.encode_matvec_quant_at(encoder, weight, x_buf, 0, y_buf, 0, m, k, wf);
     }
 
+    /// Gemma 4 MoE FFN (shared dense + routed experts). Owns its command
+    /// buffers and completes before returning (caller must start a fresh CB).
+    fn run_moe_mlp_decode(
+        &self,
+        layer_idx: usize,
+        layer: &Gemma4GpuLayer,
+        moe: &Gemma4MoeLayer,
+        hidden_size: usize,
+        eps: f32,
+    ) {
+        static ONCE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        if !ONCE.swap(true, std::sync::atomic::Ordering::Relaxed) {
+            eprintln!(
+                "  MoE decode path active (experts {}/{}, expert_ff={})",
+                moe.n_expert_used, moe.n_expert, moe.expert_ff
+            );
+        }
+        if std::env::var("MOE_LOG").as_deref() == Ok("1") && layer_idx >= 25 {
+            let h = MetalContext::read_buffer(&self.hidden_buf, hidden_size);
+            let nan = h.iter().filter(|v| !v.is_finite()).count();
+            let mx = h
+                .iter()
+                .filter(|v| v.is_finite())
+                .map(|v| v.abs())
+                .fold(0.0f32, f32::max);
+            eprintln!("  [moe] pre-L{} maxabs={:.4} nan={}", layer_idx, mx, nan);
+        }
+        let n_embd = hidden_size as u32;
+        let shared_ff = layer.intermediate_size as u32;
+        let expert_ff = moe.expert_ff as u32;
+
+        let mut cmd = self.ctx.queue.new_command_buffer();
+        let mut encoder = cmd.new_compute_command_encoder();
+
+        // ── Shared expert ──
+        self.ctx.encode_rmsnorm_view(
+            &encoder,
+            &self.hidden_buf,
+            &layer.pre_feedforward_layernorm_weight,
+            &self.normed_buf,
+            n_embd,
+            eps,
+        );
+        self.encode_matvec_quant(
+            &encoder,
+            &layer.gate_proj,
+            &self.normed_buf,
+            &self.gate_buf,
+            shared_ff,
+            n_embd,
+            layer.weight_format,
+        );
+        self.encode_matvec_quant(
+            &encoder,
+            &layer.up_proj,
+            &self.normed_buf,
+            &self.up_buf,
+            shared_ff,
+            n_embd,
+            layer.weight_format,
+        );
+        self.ctx.encode_gelu_mul(
+            &encoder,
+            &self.gate_buf,
+            &self.up_buf,
+            &self.gelu_buf,
+            shared_ff,
+        );
+        self.encode_matvec_quant(
+            &encoder,
+            &layer.down_proj,
+            &self.gelu_buf,
+            &self.down_buf,
+            n_embd,
+            shared_ff,
+            layer.weight_format,
+        );
+        self.ctx.encode_rmsnorm_view(
+            &encoder,
+            &self.down_buf,
+            &moe.post_ffw_norm_1,
+            &self.attn_out_buf,
+            n_embd,
+            eps,
+        );
+
+        // ── Router on attn residual (hidden_buf) ──
+        self.ctx.encode_rmsnorm_noweight_batch(
+            &encoder,
+            &self.hidden_buf,
+            &self.normed_buf,
+            n_embd,
+            eps,
+            1,
+        );
+        self.ctx.encode_vec_mul(
+            &encoder,
+            &self.normed_buf,
+            &moe.router_scale.buffer,
+            &self.normed_buf,
+            n_embd,
+        );
+        self.ctx.encode_matvec_f16_view(
+            &encoder,
+            &moe.router_weight,
+            &self.normed_buf,
+            &self.q_buf,
+            moe.n_expert as u32,
+            n_embd,
+        );
+
+        encoder.end_encoding();
+        cmd.commit();
+        cmd.wait_until_completed();
+
+        let logits = MetalContext::read_buffer(&self.q_buf, moe.n_expert);
+        let (experts, weights) =
+            crate::gemma4_moe::softmax_topk_renorm(&logits, moe.n_expert_used);
+        if std::env::var("MOE_LOG").as_deref() == Ok("1") {
+            static LOGS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+            if LOGS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 3 {
+                eprintln!(
+                    "  [moe] top{} experts={:?} w={:?}",
+                    moe.n_expert_used,
+                    &experts[..experts.len().min(8)],
+                    weights
+                        .iter()
+                        .take(8)
+                        .map(|w| format!("{:.3}", w))
+                        .collect::<Vec<_>>()
+                );
+            }
+        }
+        let scales = MetalContext::read_buffer(&moe.down_exps_scale.buffer, moe.n_expert);
+
+        cmd = self.ctx.queue.new_command_buffer();
+        encoder = cmd.new_compute_command_encoder();
+
+        self.ctx.encode_rmsnorm_view(
+            &encoder,
+            &self.hidden_buf,
+            &moe.pre_ffw_norm_2,
+            &self.normed_buf,
+            n_embd,
+            eps,
+        );
+        encoder.end_encoding();
+        cmd.commit();
+        cmd.wait_until_completed();
+        // Explicit zero — avoid 0*Inf NaN from reusing o_out as attn scratch.
+        MetalContext::write_buffer(&self.o_out_buf, &vec![0.0f32; hidden_size]);
+
+        let shared_only = std::env::var("MOE_SHARED_ONLY").as_deref() == Ok("1");
+        let swap_gate_up = std::env::var("MOE_SWAP_GATE_UP").as_deref() == Ok("1");
+        let crosscheck = std::env::var("MOE_CROSSCHECK").as_deref() == Ok("1");
+        let use_fused_gelu = std::env::var("MOE_NO_FUSED_GELU").as_deref() != Ok("1");
+
+        cmd = self.ctx.queue.new_command_buffer();
+        encoder = cmd.new_compute_command_encoder();
+
+        if !shared_only {
+            // Probe late layers: sync after each expert so we can see which op blows up.
+            let probe_experts = std::env::var("MOE_LOG").as_deref() == Ok("1")
+                && (layer_idx >= 28 || crosscheck);
+            for (ei, &expert) in experts.iter().enumerate() {
+                let w = weights[ei] * scales[expert];
+                let gate_view = crate::gemma4_moe::expert_gate_up_view(
+                    &moe.gate_up_exps,
+                    expert,
+                    hidden_size,
+                    moe.expert_ff,
+                    swap_gate_up, // false → gate first (llama.cpp)
+                );
+                let up_view = crate::gemma4_moe::expert_gate_up_view(
+                    &moe.gate_up_exps,
+                    expert,
+                    hidden_size,
+                    moe.expert_ff,
+                    !swap_gate_up,
+                );
+                let down_view = crate::gemma4_moe::expert_down_view(
+                    &moe.down_exps,
+                    expert,
+                    moe.expert_ff,
+                    hidden_size,
+                );
+                if use_fused_gelu {
+                    self.ctx.encode_matvec_qk_gelu_mul_at_view(
+                        &encoder,
+                        &gate_view,
+                        &up_view,
+                        &self.normed_buf,
+                        0,
+                        &self.gelu_buf,
+                        0,
+                        expert_ff,
+                        n_embd,
+                    );
+                } else {
+                    self.ctx.encode_matvec_qk_at_view(
+                        &encoder,
+                        &gate_view,
+                        &self.normed_buf,
+                        0,
+                        &self.gate_buf,
+                        0,
+                        expert_ff,
+                        n_embd,
+                        1,
+                    );
+                    self.ctx.encode_matvec_qk_at_view(
+                        &encoder,
+                        &up_view,
+                        &self.normed_buf,
+                        0,
+                        &self.up_buf,
+                        0,
+                        expert_ff,
+                        n_embd,
+                        1,
+                    );
+                    self.ctx.encode_gelu_mul(
+                        &encoder,
+                        &self.gate_buf,
+                        &self.up_buf,
+                        &self.gelu_buf,
+                        expert_ff,
+                    );
+                }
+                self.ctx.encode_matvec_moe_down_at_view(
+                    &encoder,
+                    &down_view,
+                    &self.gelu_buf,
+                    0,
+                    &self.down_buf,
+                    0,
+                    n_embd,
+                    expert_ff,
+                );
+
+                if probe_experts {
+                    encoder.end_encoding();
+                    cmd.commit();
+                    cmd.wait_until_completed();
+                    let gpu_gelu = MetalContext::read_buffer(&self.gelu_buf, moe.expert_ff);
+                    let gpu_down = MetalContext::read_buffer(&self.down_buf, hidden_size);
+                    let gelu_nan = gpu_gelu.iter().filter(|v| !v.is_finite()).count();
+                    let down_nan = gpu_down.iter().filter(|v| !v.is_finite()).count();
+                    let gelu_mx = gpu_gelu
+                        .iter()
+                        .filter(|v| v.is_finite())
+                        .map(|v| v.abs())
+                        .fold(0.0f32, f32::max);
+                    let down_mx = gpu_down
+                        .iter()
+                        .filter(|v| v.is_finite())
+                        .map(|v| v.abs())
+                        .fold(0.0f32, f32::max);
+                    if layer_idx >= 28 || gelu_nan > 0 || down_nan > 0 || crosscheck {
+                        eprintln!(
+                            "  [moe] L{} e{}#{} gelu_max={:.4} nan={} down_max={:.4} nan={} w={:.4} scale={:.4}",
+                            layer_idx,
+                            ei,
+                            expert,
+                            gelu_mx,
+                            gelu_nan,
+                            down_mx,
+                            down_nan,
+                            weights[ei],
+                            scales[expert],
+                        );
+                    }
+                    if crosscheck && (layer_idx >= 28 || ei == 0) {
+                        let x = MetalContext::read_buffer(&self.normed_buf, hidden_size);
+                        let (_g, _u, cpu_gelu, cpu_down) = crate::gemma4_moe::expert_ffn_cpu(
+                            &moe.gate_up_exps,
+                            &moe.down_exps,
+                            &x,
+                            expert,
+                            hidden_size,
+                            moe.expert_ff,
+                            1.0,
+                            swap_gate_up,
+                        );
+                        eprintln!(
+                            "  [moe-xcheck] L{} expert={} gelu_l2 gpu={:.4} cpu={:.4} maxΔ={:.4} down_l2 gpu={:.4} cpu={:.4} maxΔ={:.4}",
+                            layer_idx,
+                            expert,
+                            crate::gemma4_moe::l2(&gpu_gelu),
+                            crate::gemma4_moe::l2(&cpu_gelu),
+                            crate::gemma4_moe::max_abs_diff(&gpu_gelu, &cpu_gelu),
+                            crate::gemma4_moe::l2(&gpu_down),
+                            crate::gemma4_moe::l2(&cpu_down),
+                            crate::gemma4_moe::max_abs_diff(&gpu_down, &cpu_down),
+                        );
+                    }
+                    cmd = self.ctx.queue.new_command_buffer();
+                    encoder = cmd.new_compute_command_encoder();
+                }
+
+                self.ctx.encode_vec_add_scaled(
+                    &encoder,
+                    &self.o_out_buf,
+                    &self.down_buf,
+                    &self.o_out_buf,
+                    n_embd,
+                    w,
+                );
+            }
+        } // !shared_only
+
+        if std::env::var("MOE_LOG").as_deref() == Ok("1") {
+            encoder.end_encoding();
+            cmd.commit();
+            cmd.wait_until_completed();
+            let acc = MetalContext::read_buffer(&self.o_out_buf, hidden_size);
+            let acc_n = acc.iter().map(|v| v * v).sum::<f32>().sqrt();
+            let nan = acc.iter().filter(|v| !v.is_finite()).count();
+            let mx = acc
+                .iter()
+                .filter(|v| v.is_finite())
+                .map(|v| v.abs())
+                .fold(0.0f32, f32::max);
+            if layer_idx < 3 || layer_idx >= 25 || nan > 0 {
+                eprintln!(
+                    "  [moe] L{} routed_acc_l2={:.4} maxabs={:.4} nan={} shared_only={}",
+                    layer_idx, acc_n, mx, nan, shared_only
+                );
+            }
+            cmd = self.ctx.queue.new_command_buffer();
+            encoder = cmd.new_compute_command_encoder();
+        }
+
+        self.ctx.encode_rmsnorm_view(
+            &encoder,
+            &self.o_out_buf,
+            &moe.post_ffw_norm_2,
+            &self.down_buf,
+            n_embd,
+            eps,
+        );
+        // Combine into residual_buf — gelu_buf is only max_intermediate (2112)
+        // which is < hidden (2816) on A4B and would overrun.
+        self.ctx.encode_vec_add(
+            &encoder,
+            &self.attn_out_buf,
+            &self.down_buf,
+            &self.residual_buf,
+            n_embd,
+        );
+        if crate::gpu::fused_rmsnorm_acc_enabled() {
+            self.ctx.encode_rmsnorm_acc_view(
+                &encoder,
+                &self.hidden_buf,
+                &self.residual_buf,
+                &layer.post_feedforward_layernorm_weight,
+                n_embd,
+                eps,
+            );
+        } else {
+            self.ctx.encode_rmsnorm_view(
+                &encoder,
+                &self.residual_buf,
+                &layer.post_feedforward_layernorm_weight,
+                &self.normed_buf,
+                n_embd,
+                eps,
+            );
+            self.ctx.encode_vec_add(
+                &encoder,
+                &self.hidden_buf,
+                &self.normed_buf,
+                &self.hidden_buf,
+                n_embd,
+            );
+        }
+
+        encoder.end_encoding();
+        cmd.commit();
+        cmd.wait_until_completed();
+
+        if std::env::var("MOE_LOG").as_deref() == Ok("1") && layer_idx < 30 {
+            let h = MetalContext::read_buffer(&self.hidden_buf, hidden_size);
+            let hn = h.iter().map(|v| v * v).sum::<f32>().sqrt();
+            let nan = h.iter().filter(|v| !v.is_finite()).count();
+            let mx = h
+                .iter()
+                .filter(|v| v.is_finite())
+                .map(|v| v.abs())
+                .fold(0.0f32, f32::max);
+            if nan > 0 || layer_idx < 5 || layer_idx >= 25 || layer_idx % 5 == 4 {
+                eprintln!(
+                    "  [moe] L{} hidden_l2={:.4} maxabs={:.4} nan={}",
+                    layer_idx, hn, mx, nan
+                );
+            }
+        }
+    }
+
     /// Offset-aware variant of `encode_matvec_quant` for the batched decode path,
     /// where activations for each token live at a per-token offset in a shared
     /// scratch buffer.
@@ -3090,9 +3652,15 @@ impl Gemma4GpuModel {
             weight_fmt::Q4_K | weight_fmt::Q6_K => self.ctx.encode_matvec_qk_at_view(
                 encoder, weight, x_buf, x_offset, y_buf, y_offset, m, k, 1,
             ),
+            weight_fmt::F16 => self.ctx.encode_matvec_f16_at(
+                encoder, &weight.buffer, weight.offset, x_buf, x_offset, y_buf, y_offset, m, k,
+            ),
             _ => match wf {
                 WeightFormat::Q3_0 => self.ctx.encode_matvec_q3_at_view(
                     encoder, weight, x_buf, x_offset, y_buf, y_offset, m, k,
+                ),
+                WeightFormat::F16 => self.ctx.encode_matvec_f16_at(
+                    encoder, &weight.buffer, weight.offset, x_buf, x_offset, y_buf, y_offset, m, k,
                 ),
                 _ => self.ctx.encode_matvec_q4_at_view(
                     encoder, weight, x_buf, x_offset, y_buf, y_offset, m, k,
@@ -3386,8 +3954,8 @@ impl Gemma4GpuModel {
         let __t0 = std::time::Instant::now();
         let hidden_size = self.config.hidden_size;
         let num_heads = self.config.num_attention_heads;
-        let num_kv_heads = self.config.num_key_value_heads;
-        let num_kv_groups = (num_heads / num_kv_heads) as u32;
+        // Per-layer KV head counts (A4B: 8 on SWA, 2 on full). Do not use the
+        // config-wide max here — wrong GQA grouping corrupts full-attn layers.
         let intermediate_size = self.config.max_intermediate_size();
         let vocab_size = self.config.vocab_size;
         let eps = self.config.rms_norm_eps as f32;
@@ -3585,6 +4153,19 @@ impl Gemma4GpuModel {
             let q_out = layer.q_out_dim;
             let kv_out = layer.kv_out_dim;
             let is_full = layer.is_full_attention;
+            let num_kv_heads = if head_dim > 0 {
+                kv_out / head_dim
+            } else {
+                self.config.layer_num_kv_heads(layer_idx)
+            };
+            assert!(
+                num_kv_heads > 0 && num_heads % num_kv_heads == 0,
+                "layer {}: invalid GQA heads={} kv_heads={}",
+                layer_idx,
+                num_heads,
+                num_kv_heads
+            );
+            let num_kv_groups = (num_heads / num_kv_heads) as u32;
             // Gemma4 uses attention_scale = 1.0 (QK norm handles scaling)
             let scale = 1.0f32;
 
@@ -4163,6 +4744,27 @@ impl Gemma4GpuModel {
             // until the residual add below, so no save-residual copy is needed.
 
             if !__ablate.skip_mlp() {
+            // MOE_DISABLE=1: run the dense shared-FFN path (ignore experts/router).
+            // Useful to isolate MoE wiring bugs from Q8→Q4 / attention issues on A4B.
+            let moe_disabled = std::env::var("MOE_DISABLE").as_deref() == Ok("1");
+            if let Some(ref moe) = layer.moe {
+                if moe_disabled {
+                    static ONCE: std::sync::atomic::AtomicBool =
+                        std::sync::atomic::AtomicBool::new(false);
+                    if !ONCE.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                        eprintln!("  MOE_DISABLE=1: using dense shared-FFN path (no router/experts)");
+                    }
+                    // fall through to dense MLP below
+                } else {
+                encoder.end_encoding();
+                cmd.commit();
+                cmd.wait_until_completed();
+                self.run_moe_mlp_decode(layer_idx, layer, moe, hidden_size, eps);
+                cmd = self.ctx.queue.new_command_buffer();
+                encoder = cmd.new_compute_command_encoder();
+                }
+            }
+            if layer.moe.is_none() || moe_disabled {
             // MLP: gate_proj, up_proj, GeLU activation, down_proj
             if layer.weight_format == WeightFormat::F16 {
                 self.ctx.encode_rmsnorm_view(
@@ -4472,13 +5074,14 @@ impl Gemma4GpuModel {
                     hidden_size as u32,
                 );
             }
+            } // dense MLP (non-MoE)
             } // !skip_mlp
             if let Some(p) = &mut __gpu_prof {
                 p.mark(&encoder);
             }
 
             // ─── Per-Layer Embedding (PLE) — after MLP, before layer_scalar ───
-            if !__ablate.skip_ple() {
+            if ple_dim > 0 && !__ablate.skip_ple() {
             // hidden_buf is the residual; it is only read (by the input gate
             // matvec) until the residual add below, so no save copy is needed.
             // Gate: ple_gated = per_layer_input_gate(hidden) → [ple_dim]
@@ -4615,6 +5218,41 @@ impl Gemma4GpuModel {
                 if __ablate.skip_head() {
                     MetalContext::write_u32_buffer(&self.sample_out_buf, &[0]);
                 } else {
+                if std::env::var("GGUF_LOGIT_PROBE").as_deref() == Ok("1") {
+                    static PROBED: std::sync::atomic::AtomicBool =
+                        std::sync::atomic::AtomicBool::new(false);
+                    if !PROBED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                        // Softcap then dump top-5 before sampling mutates further.
+                        if cap > 0.0 {
+                            self.ctx.encode_softcap_argmax_rows_f32(
+                                encoder,
+                                &self.logits_buf,
+                                &self.sample_out_buf,
+                                1,
+                                vocab_size as u32,
+                                cap,
+                            );
+                        }
+                        encoder.end_encoding();
+                        cmd.commit();
+                        cmd.wait_until_completed();
+                        let logits =
+                            MetalContext::read_buffer(&self.logits_buf, vocab_size);
+                        let mut idx: Vec<usize> = (0..logits.len()).collect();
+                        idx.sort_by(|&a, &b| {
+                            logits[b]
+                                .partial_cmp(&logits[a])
+                                .unwrap_or(std::cmp::Ordering::Equal)
+                        });
+                        eprint!("  [logit-probe] top5:");
+                        for &i in idx.iter().take(5) {
+                            eprint!(" id={}={:.3}", i, logits[i]);
+                        }
+                        eprintln!();
+                        cmd = self.ctx.queue.new_command_buffer();
+                        encoder = cmd.new_compute_command_encoder();
+                    }
+                }
                 // GPU-side softcap + min-p sampling; read back only the token id.
                 self.ctx.encode_sample(
                     encoder,
@@ -6236,6 +6874,13 @@ impl Gemma4GpuModel {
             return false;
         }
         if start_pos + seq_len > kv_pool.capacity() as usize {
+            return false;
+        }
+        // MoE layers need per-token top-k; parallel prefill still runs dense-only
+        // shared FFN. Force sequential decode MoE until batched MoE lands.
+        if self.layers.iter().any(|l| l.moe.is_some())
+            && std::env::var("MOE_DISABLE").as_deref() != Ok("1")
+        {
             return false;
         }
 
@@ -9133,6 +9778,11 @@ fn gemma4_config_from_gguf(g: &crate::gguf::Gguf) -> Gemma4TextConfig {
         tie_word_embeddings: !g.has_tensor("output.weight"),
         rope_parameters,
         num_key_value_heads_per_layer,
+        num_experts: g.get_u32("gemma4.expert_count").unwrap_or(0) as usize,
+        num_experts_used: g.get_u32("gemma4.expert_used_count").unwrap_or(0) as usize,
+        expert_intermediate_size: g
+            .get_u32("gemma4.expert_feed_forward_length")
+            .unwrap_or(0) as usize,
     }
 }
 

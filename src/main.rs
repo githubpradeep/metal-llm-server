@@ -12,6 +12,7 @@ mod gpu;
 mod gpu_model;
 mod gemma4_config;
 mod gemma4_gpu_model;
+mod gemma4_moe;
 mod gemma4_mtp;
 mod decode_fused;
 mod speculative;
@@ -254,7 +255,11 @@ fn main() {
         let mut next = model.forward_prefill_sample_last(&ids, 0.0, 0.0, 0);
         let eos: &[usize] = &[1, 106];
         let printer = token_printer::TokenPrinter::spawn(&tok);
-        for _ in 0..60 {
+        let max_gen: usize = std::env::var("GGUF_GEN_TOKENS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(60);
+        for _ in 0..max_gen {
             if eos.contains(&next) {
                 break;
             }

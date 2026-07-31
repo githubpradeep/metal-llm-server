@@ -5,6 +5,8 @@
 using namespace metal;
 
 #define QK4_0 32
+#define QK5_0 32
+#define QK5_1 32
 #define N_SIMDWIDTH 32
 
 // Must match GgmlMulMvArgs in ggml_gemv.rs
@@ -59,6 +61,13 @@ struct block_q4_0 {
     uint8_t qs[16];
 };
 
+struct block_q5_1 {
+    half d;
+    half m;
+    uint8_t qh[4];
+    uint8_t qs[16];
+};
+
 inline float block_q_n_dot_y(device const block_q4_0 * qb_curr, float sumy, thread float * yl, int il) {
     float d = qb_curr->d;
 
@@ -73,6 +82,26 @@ inline float block_q_n_dot_y(device const block_q4_0 * qb_curr, float sumy, thre
                 + yl[i + 9] * (qs[i / 2] & 0xF000);
     }
     return d * (sumy * -8.f + acc[0] + acc[1]);
+}
+
+// Ported from llama.cpp ggml-metal.metal — same yl packing as Q4_0.
+inline float block_q_n_dot_y(device const block_q5_1 * qb_curr, float sumy, thread float * yl, int il) {
+    float d = qb_curr->d;
+    float m = qb_curr->m;
+
+    float acc[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
+
+    device const uint16_t * qs = ((device const uint16_t *)qb_curr + 4 + il/2);
+    const uint32_t qh = *((device const uint32_t *)qb_curr->qh);
+
+    for (int i = 0; i < 8; i+=2) {
+        acc[0] += yl[i + 0] * ((qs[i / 2] & 0x000F) | ((qh >> (i+0+il          ) << 4 ) & 0x00010));
+        acc[1] += yl[i + 1] * ((qs[i / 2] & 0x0F00) | ((qh >> (i+1+il          ) << 12) & 0x01000));
+        acc[2] += yl[i + 8] * ((qs[i / 2] & 0x00F0) | ((qh >> (i+0+il+QK5_0/2) << 8 ) & 0x00100));
+        acc[3] += yl[i + 9] * ((qs[i / 2] & 0xF000) | ((qh >> (i+1+il+QK5_0/2) << 16) & 0x10000));
+    }
+
+    return d * (acc[0] + acc[1] + acc[2] + acc[3]) + sumy * m;
 }
 
 template<typename block_q_type, short NR0, short NSG, short NW>
@@ -161,6 +190,78 @@ kernel void matvec_ggml_q4_0(
         args.ne0, args.ne1,
         uint(args.r2), uint(args.r3),
         tgpig, tiisg, sgitg);
+}
+
+kernel void matvec_ggml_q5_1(
+    device const char * W [[buffer(0)]],
+    device const char * x [[buffer(1)]],
+    device char * y [[buffer(2)]],
+    constant ggml_mul_mv_args& args [[buffer(3)]],
+    uint3 tgpig [[threadgroup_position_in_grid]],
+    uint tiisg [[thread_index_in_simdgroup]],
+    uint sgitg [[simdgroup_index_in_threadgroup]]
+) {
+    // Same tiling as Q4_0 (N_R0=4, N_SG=2); QK5_1 == QK4_0 == 32 so the
+    // shared mul_vec_q_n_f32_impl block loop is correct.
+    mul_vec_q_n_f32_impl<block_q5_1, 4, 2, 32>(
+        W, (device const float *)x, (device float *)y,
+        args.ne00, args.ne01, args.ne02,
+        args.ne10, args.ne12,
+        args.ne0, args.ne1,
+        uint(args.r2), uint(args.r3),
+        tgpig, tiisg, sgitg);
+}
+
+// Q8_0 weight matvec (UD-Q4_K_M keeps last-layer MoE down as Q8_0).
+// Tiling matches Q4_0/Q5_1: NR0=4 rows × NSG=2 simdgroups per TG.
+constant uint QK8_0 = 32;
+struct block_q8_0 {
+    half d;
+    char qs[32];
+};
+
+kernel void matvec_ggml_q8_0(
+    device const char * W [[buffer(0)]],
+    device const char * x [[buffer(1)]],
+    device char * y [[buffer(2)]],
+    constant ggml_mul_mv_args& args [[buffer(3)]],
+    uint3 tgpig [[threadgroup_position_in_grid]],
+    uint tiisg [[thread_index_in_simdgroup]],
+    uint sgitg [[simdgroup_index_in_threadgroup]]
+) {
+    constexpr short NR0 = 4;
+    constexpr short NSG = 2;
+    constexpr short NW = 32;
+
+    const int nb = args.ne00 / int(QK8_0);
+    const int first_row = (int(tgpig.x) * NSG + int(sgitg)) * NR0;
+    device const block_q8_0 * xw =
+        (device const block_q8_0 *)W + first_row * nb;
+    device const float * yv = (device const float *)x;
+    device float * dst = (device float *)y;
+
+    float sumf[NR0];
+    for (short row = 0; row < NR0; ++row) sumf[row] = 0.f;
+
+    // One thread owns each block (stride NW); dequant+dot the full QK8_0.
+    for (int ib = int(tiisg); ib < nb; ib += NW) {
+        device const float * yb = yv + ib * int(QK8_0);
+        for (short row = 0; row < NR0; ++row) {
+            device const block_q8_0 & blk = xw[ib + row * nb];
+            float acc = 0.f;
+            for (uint i = 0; i < QK8_0; ++i) {
+                acc += float(blk.qs[i]) * yb[i];
+            }
+            sumf[row] += acc * float(blk.d);
+        }
+    }
+
+    for (short row = 0; row < NR0; ++row) {
+        const float tot = simd_sum(sumf[row]);
+        if (tiisg == 0 && first_row + row < args.ne01) {
+            dst[first_row + row] = tot;
+        }
+    }
 }
 
 template<typename block_q_type, short NR0, short NSG, short NW>
