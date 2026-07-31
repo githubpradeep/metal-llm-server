@@ -364,8 +364,8 @@ fn main() {
                 let gen_start = Instant::now();
                 let mut assistant = gemma4_mtp::Gemma4MtpAssistant::new(&gpu_model.ctx, &draft_path, &gpu_model);
                 generate_gemma4_gpu_mtp(
-                    //"<start_of_turn>user\n Write a short essay about the benefits of exercise. Include an introduction, 3 key points, and a conclusion.<end_of_turn>\n<start_of_turn>model\n",
-                    "<start_of_turn>user\n def bubble_sort<end_of_turn>\n<start_of_turn>model\n",
+                    // Gemma 4 control tokens are <|turn>/<turn|> (not Gemma-2 start_of_turn).
+                    "<|turn>user\ndef bubble_sort<turn|>\n<|turn>model\n",
 
                     &tokenizer,
                     &mut gpu_model,
@@ -380,7 +380,9 @@ fn main() {
 
                 let gen_start = Instant::now();
                 generate_gemma4_gpu(
-                    "<start_of_turn>user\n Write a short essay about the benefits of exercise. Include an introduction, 3 key points, and a conclusion.<end_of_turn>\n<start_of_turn>model\n",
+                    // Gemma 4 A4B chat template uses <|turn>/<turn|> (GGUF tokens 105/106).
+                    // <start_of_turn>/<end_of_turn> are the wrong markers and produce garbage.
+                    "<|turn>user\nWrite a short essay about the benefits of exercise. Include an introduction, 3 key points, and a conclusion.<turn|>\n<|turn>model\n",
                     &tokenizer,
                     &mut gpu_model,
                     1000,
@@ -490,11 +492,12 @@ fn bench_decode_gemma4(
     model: &mut gemma4_gpu_model::Gemma4GpuModel,
     gen_tokens: usize,
 ) {
-    // Plain prompt for token count; wrap in Gemma chat template so greedy decode
-    // does not immediately sample <end_of_turn> (happens without <start_of_turn>model).
-    let plain = "Write a short essay about the benefits of exercise. Include an introduction, 3 key points, and a conclusion.";
+    // Short chat-framed prompt (~TF 6/32 yardstick). Prefill is brief; 16 untimed
+    // decode tokens warm the expert LFU before the measured window.
+    // Gemma 4 markers: <|turn>/<turn|> (not Gemma-2 start_of_turn).
+    let plain = "Hello";
     let prompt = format!(
-        "<start_of_turn>user\n{plain}<end_of_turn>\n<start_of_turn>model\n"
+        "<|turn>user\n{plain}<turn|>\n<|turn>model\n"
     );
     let encoding = tokenizer.encode(prompt.as_str(), true).expect("Failed to encode");
     let token_ids: Vec<usize> = encoding.get_ids().iter().map(|&t| t as usize).collect();
@@ -513,10 +516,19 @@ fn bench_decode_gemma4(
         0.0
     };
 
-    // Decode — no print/flush/tokenizer in the timed section
+    // Decode — no print/flush/tokenizer in the timed section.
+    // Untimed warmup settles expert LFU / UBC before the measured 32-token window.
+    let eos_tokens: &[usize] = &[1, 106];
+    let warmup = 16usize;
+    for _ in 0..warmup {
+        if eos_tokens.contains(&next_token) {
+            break;
+        }
+        let seed: u32 = rng.gen();
+        next_token = model.forward_single_token_sample(next_token, 0.0, 0.0, seed);
+    }
     let decode_start = Instant::now();
     let mut generated = 0usize;
-    let eos_tokens: &[usize] = &[1, 106];
     for _ in 0..gen_tokens {
         if eos_tokens.contains(&next_token) {
             break;
@@ -570,7 +582,7 @@ fn bench_prefill_gemma4(
 
     for &target in sizes {
         model.reset_legacy_state();
-        let mut text = String::from("<start_of_turn>user\n");
+        let mut text = String::from("<|turn>user\n");
         while tokenizer
             .encode(text.as_str(), true)
             .map(|e| e.get_ids().len())
@@ -579,7 +591,7 @@ fn bench_prefill_gemma4(
         {
             text.push_str(filler);
         }
-        text.push_str("<end_of_turn>\n<start_of_turn>model\n");
+        text.push_str("<turn|>\n<|turn>model\n");
         let mut token_ids: Vec<usize> = tokenizer
             .encode(text.as_str(), true)
             .expect("Failed to encode bench prefill prompt")
@@ -638,7 +650,7 @@ fn generate_gemma4_gpu(
     let start_time = Instant::now();
     let mut tokens_generated = 0;
 
-    // Gemma4 stop tokens: <eos> (1), <end_of_turn> (106)
+    // Gemma4 stop tokens: <eos> (1), <turn|> (106)
     let eos_tokens: &[usize] = &[1, 106];
 
     let printer = token_printer::TokenPrinter::spawn(tokenizer);

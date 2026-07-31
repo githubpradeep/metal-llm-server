@@ -274,10 +274,18 @@ pub fn max_abs_diff(a: &[f32], b: &[f32]) -> f32 {
         .fold(0.0f32, f32::max)
 }
 
+/// Optional on-disk source for expert miss fills (`pread` + macOS `F_RDADVISE`).
+pub struct ExpertIoSource {
+    /// One fd per parallel fill worker (avoids contention on a single file table).
+    pub files: Vec<std::sync::Arc<std::fs::File>>,
+    pub gate_up_file_off: u64,
+    pub down_file_off: u64,
+}
+
 /// Turbo-fieldfare-style fixed slot cache for routed experts (LFU eviction).
 ///
-/// Keeps `slot_count` hot copies of (gate∥up, down) expert blobs in private
-/// Metal shared buffers so decode does not thrash the full ~14GB mmap.
+/// Keeps `slot_count` hot copies of (gate∥up, down) expert blobs in Metal shared
+/// buffers so decode does not thrash the full ~14GB mmap.
 pub struct ExpertSlotCache {
     slot_count: usize,
     n_embd: usize,
@@ -287,6 +295,7 @@ pub struct ExpertSlotCache {
     down_stride: usize,
     gate_up_slots: Vec<metal::Buffer>,
     down_slots: Vec<metal::Buffer>,
+    io: Option<ExpertIoSource>,
     state: std::sync::Mutex<ExpertCacheState>,
     hits: std::sync::atomic::AtomicU64,
     misses: std::sync::atomic::AtomicU64,
@@ -303,7 +312,7 @@ struct ExpertCacheState {
     use_clock: u64,
 }
 
-/// Default slots/layer (turbo-fieldfare production). Override with `MOE_EXPERT_SLOTS`.
+/// Default slots/layer for 16 GB hosts (~3.3 GB @ 32). Override with `MOE_EXPERT_SLOTS`.
 pub fn expert_cache_slot_count(n_expert_used: usize) -> usize {
     if std::env::var("MOE_EXPERT_CACHE").as_deref() == Ok("0") {
         return 0;
@@ -311,7 +320,7 @@ pub fn expert_cache_slot_count(n_expert_used: usize) -> usize {
     let raw = std::env::var("MOE_EXPERT_SLOTS")
         .ok()
         .and_then(|s| s.parse().ok())
-        .unwrap_or(16usize);
+        .unwrap_or(32usize);
     raw.max(n_expert_used).max(1)
 }
 
@@ -322,6 +331,82 @@ pub struct ExpertCachePlan {
     pub miss_indices: Vec<usize>,
 }
 
+/// Cheap wall-clock MoE phase timers (`MOE_PROFILE=1`).
+pub struct MoeProfile {
+    pub router_read_ms: f64,
+    pub plan_ms: f64,
+    pub fill_ms: f64,
+    pub shared_wait_ms: f64,
+    pub expert_gpu_ms: f64,
+    pub calls: u64,
+    pub miss_experts: u64,
+    pub hit_experts: u64,
+    pub fill_bytes: u64,
+}
+
+impl MoeProfile {
+    pub fn enabled() -> bool {
+        std::env::var("MOE_PROFILE").as_deref() == Ok("1")
+    }
+
+    fn global() -> &'static std::sync::Mutex<MoeProfile> {
+        static P: std::sync::OnceLock<std::sync::Mutex<MoeProfile>> = std::sync::OnceLock::new();
+        P.get_or_init(|| {
+            std::sync::Mutex::new(MoeProfile {
+                router_read_ms: 0.0,
+                plan_ms: 0.0,
+                fill_ms: 0.0,
+                shared_wait_ms: 0.0,
+                expert_gpu_ms: 0.0,
+                calls: 0,
+                miss_experts: 0,
+                hit_experts: 0,
+                fill_bytes: 0,
+            })
+        })
+    }
+
+    pub fn add(
+        router_read_ms: f64,
+        plan_ms: f64,
+        fill_ms: f64,
+        shared_wait_ms: f64,
+        expert_gpu_ms: f64,
+        hits: u64,
+        misses: u64,
+        fill_bytes: u64,
+    ) {
+        if !Self::enabled() {
+            return;
+        }
+        let mut p = Self::global().lock().unwrap();
+        p.router_read_ms += router_read_ms;
+        p.plan_ms += plan_ms;
+        p.fill_ms += fill_ms;
+        p.shared_wait_ms += shared_wait_ms;
+        p.expert_gpu_ms += expert_gpu_ms;
+        p.calls += 1;
+        p.hit_experts += hits;
+        p.miss_experts += misses;
+        p.fill_bytes += fill_bytes;
+        if p.calls == 1 || p.calls % 64 == 0 {
+            let n = p.calls as f64;
+            eprintln!(
+                "  [moe-prof] n={} avg_ms router={:.2} plan={:.2} fill={:.2} shared_wait={:.2} expert={:.2} hit/miss={}/{} fill_MB/call={:.2}",
+                p.calls,
+                p.router_read_ms / n,
+                p.plan_ms / n,
+                p.fill_ms / n,
+                p.shared_wait_ms / n,
+                p.expert_gpu_ms / n,
+                p.hit_experts,
+                p.miss_experts,
+                (p.fill_bytes as f64 / n) / (1024.0 * 1024.0),
+            );
+        }
+    }
+}
+
 impl ExpertSlotCache {
     pub fn new(
         device: &metal::Device,
@@ -330,6 +415,7 @@ impl ExpertSlotCache {
         n_ff: usize,
         down_format: u8,
         slot_count: usize,
+        io: Option<ExpertIoSource>,
     ) -> Self {
         use metal::MTLResourceOptions;
         let gate_up_stride = gate_up_expert_bytes(n_embd, n_ff) as usize;
@@ -355,6 +441,7 @@ impl ExpertSlotCache {
             down_stride,
             gate_up_slots,
             down_slots,
+            io,
             state: std::sync::Mutex::new(ExpertCacheState {
                 slot_expert: vec![-1; slot_count],
                 slot_last_use: vec![0; slot_count],
@@ -368,6 +455,14 @@ impl ExpertSlotCache {
 
     pub fn bytes_per_layer(&self) -> u64 {
         (self.slot_count * (self.gate_up_stride + self.down_stride)) as u64
+    }
+
+    pub fn bytes_per_expert(&self) -> u64 {
+        (self.gate_up_stride + self.down_stride) as u64
+    }
+
+    pub fn slot_count(&self) -> usize {
+        self.slot_count
     }
 
     pub fn global_stats() -> (u64, u64) {
@@ -499,8 +594,8 @@ impl ExpertSlotCache {
         self.fill_misses_scoped(plan, gate_up_src, down_src, || {});
     }
 
-    /// Spawn miss fills, run `between` (e.g. wait shared + encode cache hits),
-    /// then join fills and mark slots occupied.
+    /// Spawn miss fills, run `between` (e.g. encode cache hits), then join fills
+    /// and mark slots occupied. Issues a batch `F_RDADVISE` for all misses first.
     pub fn fill_misses_scoped<R>(
         &self,
         plan: &ExpertCachePlan,
@@ -510,6 +605,26 @@ impl ExpertSlotCache {
     ) -> R {
         if plan.miss_indices.is_empty() {
             return between();
+        }
+        #[cfg(target_os = "macos")]
+        if let Some(io) = &self.io {
+            use std::os::fd::AsRawFd;
+            let fd = io.files[0].as_raw_fd();
+            for &idx in &plan.miss_indices {
+                let expert = plan.experts[idx];
+                let g_off = io.gate_up_file_off + (expert * self.gate_up_stride) as u64;
+                let d_off = io.down_file_off + (expert * self.down_stride) as u64;
+                let mut ra_g = libc::radvisory {
+                    ra_offset: g_off as i64,
+                    ra_count: self.gate_up_stride as i32,
+                };
+                let mut ra_d = libc::radvisory {
+                    ra_offset: d_off as i64,
+                    ra_count: self.down_stride as i32,
+                };
+                let _ = unsafe { libc::fcntl(fd, libc::F_RDADVISE, &mut ra_g) };
+                let _ = unsafe { libc::fcntl(fd, libc::F_RDADVISE, &mut ra_d) };
+            }
         }
         let result = std::thread::scope(|scope| {
             for &idx in &plan.miss_indices {
@@ -595,8 +710,6 @@ impl ExpertSlotCache {
     ) {
         let g_base = expert * self.gate_up_stride;
         let d_base = expert * self.down_stride;
-        let g_src = &gate_up_src.as_bytes()[g_base..g_base + self.gate_up_stride];
-        let d_src = &down_src.as_bytes()[d_base..d_base + self.down_stride];
         unsafe {
             let g_dst = std::slice::from_raw_parts_mut(
                 self.gate_up_slots[slot].contents() as *mut u8,
@@ -606,8 +719,21 @@ impl ExpertSlotCache {
                 self.down_slots[slot].contents() as *mut u8,
                 self.down_stride,
             );
-            g_dst.copy_from_slice(g_src);
-            d_dst.copy_from_slice(d_src);
+            if let Some(io) = &self.io {
+                use std::os::unix::fs::FileExt;
+                let file = &io.files[slot % io.files.len()];
+                let g_off = io.gate_up_file_off + g_base as u64;
+                let d_off = io.down_file_off + d_base as u64;
+                file.read_exact_at(g_dst, g_off)
+                    .unwrap_or_else(|e| panic!("expert gate_up pread: {e}"));
+                file.read_exact_at(d_dst, d_off)
+                    .unwrap_or_else(|e| panic!("expert down pread: {e}"));
+            } else {
+                let g_src = &gate_up_src.as_bytes()[g_base..g_base + self.gate_up_stride];
+                let d_src = &down_src.as_bytes()[d_base..d_base + self.down_stride];
+                g_dst.copy_from_slice(g_src);
+                d_dst.copy_from_slice(d_src);
+            }
         }
     }
 }

@@ -286,6 +286,13 @@ impl Gguf {
         &self.mmap[start..start + row_stride]
     }
 
+pub fn tensor_file_offset(&self, name: &str) -> u64 {
+        let info = self
+            .tensor(name)
+            .unwrap_or_else(|| panic!("tensor not found: {}", name));
+        (self.data_offset + info.offset as usize) as u64
+    }
+
     /// ggml type id of a tensor (see `ggml_type`).
     pub fn tensor_type(&self, name: &str) -> u32 {
         self.tensor(name)

@@ -289,6 +289,16 @@ pub struct Gemma4GpuModel {
     weights_mmap_offset: Option<usize>,
     embed_decode_scratch: Vec<f32>,
     ple_decode_scratch: Vec<f32>,
+    /// Scratch for MoE experts on `ctx.moe_queue` (overlaps shared MLP).
+    moe_expert_scratch: std::sync::OnceLock<MoeExpertScratch>,
+}
+
+struct MoeExpertScratch {
+    normed_buf: Buffer,
+    gate_buf: Buffer,
+    up_buf: Buffer,
+    gelu_buf: Buffer,
+    down_buf: Buffer,
 }
 
 pub struct PrefillScratch {
@@ -920,6 +930,8 @@ pub enum WeightFormat {
     /// layer as "not pure Q4_0/F16" so the Q4_0-only fused/mega paths are
     /// skipped; the actual kernel is chosen per tensor from `BufferView::format`.
     KQuant,
+    /// Dense projections kept as native ggml Q8_0 (A4B UD-Q4_K_M attn/shared FFN).
+    Q8_0,
 }
 
 impl WeightFormat {
@@ -929,6 +941,7 @@ impl WeightFormat {
             WeightFormat::Q4_0 => 1,
             WeightFormat::Q3_0 => 2,
             WeightFormat::KQuant => 5,
+            WeightFormat::Q8_0 => 7,
         }
     }
 
@@ -937,6 +950,7 @@ impl WeightFormat {
             0 => WeightFormat::F16,
             2 => WeightFormat::Q3_0,
             5 => WeightFormat::KQuant,
+            7 => WeightFormat::Q8_0,
             _ => WeightFormat::Q4_0,
         }
     }
@@ -954,6 +968,10 @@ impl WeightFormat {
 
     pub fn is_kquant(self) -> bool {
         matches!(self, WeightFormat::KQuant)
+    }
+
+    pub fn is_q8(self) -> bool {
+        matches!(self, WeightFormat::Q8_0)
     }
 }
 
@@ -1657,6 +1675,7 @@ impl Gemma4GpuModel {
             weights_mmap_offset: None,
             embed_decode_scratch: vec![0.0f32; hidden_size],
             ple_decode_scratch: vec![0.0f32; (num_layers * ple_dim).max(1)],
+            moe_expert_scratch: std::sync::OnceLock::new(),
         };
 
         crate::decode_fused::log_fused_decode_status(&model);
@@ -1868,6 +1887,20 @@ impl Gemma4GpuModel {
             "  Loading {} layers from GGUF (native Q4_K/Q6_K kept; other types -> Q4_0)...",
             num_layers
         );
+        let moe_io_files: Option<Vec<std::sync::Arc<std::fs::File>>> = if config.is_moe() {
+            // One fd per top-k expert so parallel miss fills do not serialize on one file.
+            let n = config.num_experts_used.max(1);
+            let mut files = Vec::with_capacity(n);
+            for _ in 0..n {
+                files.push(std::sync::Arc::new(
+                    std::fs::File::open(gguf_path)
+                        .expect("failed to reopen GGUF for MoE expert pread"),
+                ));
+            }
+            Some(files)
+        } else {
+            None
+        };
         let mut layers = Vec::with_capacity(num_layers);
         for layer_idx in 0..num_layers {
             let is_full = config.is_full_attention(layer_idx);
@@ -1911,13 +1944,12 @@ impl Gemma4GpuModel {
                         BufferView::from_buffer(ctx.buffer_from_f32_as_f16(&data))
                             .with_format(weight_fmt::F16)
                     }
-                    // A4B dense attn/FFN are Q8_0 — keep as f16 (not lossy Q4_0 requant).
-                    // Experts stay native Q4_K/Q5_1 via the MoE loader below.
-                    ggml_type::Q8_0 => {
-                        let data = g.dequant_to_f32(&name);
-                        BufferView::from_buffer(ctx.buffer_from_f32_as_f16(&data))
-                            .with_format(weight_fmt::F16)
-                    }
+                    // A4B dense attn/FFN are Q8_0 — keep native (Metal matvec_ggml_q8_0).
+                    // Expanding to f16 doubles bandwidth and RAM; experts stay Q4_K/Q5_1.
+                    ggml_type::Q8_0 => BufferView::from_buffer(
+                        ctx.buffer_from_slice_no_copy(g.tensor_raw(&name)),
+                    )
+                    .with_format(weight_fmt::Q8_0),
                     _ => {
                         let data = g.dequant_to_f32(&name);
                         BufferView::from_buffer(ctx.buffer_from_f32_as_q4(&data, rows, cols))
@@ -2010,6 +2042,11 @@ impl Gemma4GpuModel {
 
                 let slot_count = crate::gemma4_moe::expert_cache_slot_count(n_expert_used);
                 let expert_cache = if slot_count > 0 {
+                    let io = moe_io_files.as_ref().map(|files| crate::gemma4_moe::ExpertIoSource {
+                        files: files.clone(),
+                        gate_up_file_off: g.tensor_file_offset(&p("ffn_gate_up_exps.weight")),
+                        down_file_off: g.tensor_file_offset(&down_name),
+                    });
                     Some(crate::gemma4_moe::ExpertSlotCache::new(
                         &ctx.device,
                         n_expert,
@@ -2017,6 +2054,7 @@ impl Gemma4GpuModel {
                         expert_ff,
                         down_fmt,
                         slot_count,
+                        io,
                     ))
                 } else {
                     None
@@ -2050,6 +2088,9 @@ impl Gemma4GpuModel {
             let any_f16 = proj_refs
                 .iter()
                 .any(|v| v.format == weight_fmt::F16);
+            let any_q8 = proj_refs
+                .iter()
+                .any(|v| v.format == weight_fmt::Q8_0);
 
             let layer = Gemma4GpuLayer {
                 q_proj,
@@ -2085,9 +2126,11 @@ impl Gemma4GpuModel {
                 q_out_dim: q_out,
                 kv_out_dim: kv_out,
                 intermediate_size: layer_inter,
-                // Prefer K-quant when mixed; else F16 (A4B Q8_0→f16); else Q4_0.
+                // Prefer K-quant when mixed; else native Q8_0 (A4B); else F16; else Q4_0.
                 weight_format: if any_kquant {
                     WeightFormat::KQuant
+                } else if any_q8 {
+                    WeightFormat::Q8_0
                 } else if any_f16 {
                     WeightFormat::F16
                 } else {
@@ -2810,7 +2853,28 @@ impl Gemma4GpuModel {
             per_layer_ple_bufs.push(ctx.buffer_empty(ple_dim.max(1)));
         }
 
-        if layers.iter().any(|l| l.weight_format == WeightFormat::F16) {
+        let n_f16 = layers
+            .iter()
+            .filter(|l| l.weight_format == WeightFormat::F16)
+            .count();
+        let n_q8 = layers
+            .iter()
+            .filter(|l| l.weight_format == WeightFormat::Q8_0)
+            .count();
+        let n_kq = layers
+            .iter()
+            .filter(|l| l.weight_format.is_kquant())
+            .count();
+        let n_q3 = layers
+            .iter()
+            .filter(|l| l.weight_format.is_q3())
+            .count();
+        let n_q4 = layers.len().saturating_sub(n_f16 + n_q8 + n_kq + n_q3);
+        println!(
+            "  Weights: {} layers Q4_0, {} Q8_0, {} K-quant (Q4_K/Q6_K native), {} f16, {} Q3_0",
+            n_q4, n_q8, n_kq, n_f16, n_q3
+        );
+        if n_f16 > 0 {
             eprintln!(
                 "  Warning: weights cache has f16 layers; delete model.q4cache for all-Q4"
             );
@@ -2908,6 +2972,7 @@ impl Gemma4GpuModel {
             weights_mmap_offset,
             embed_decode_scratch: vec![0.0f32; hidden_size],
             ple_decode_scratch: vec![0.0f32; (num_layers * ple_dim).max(1)],
+            moe_expert_scratch: std::sync::OnceLock::new(),
         };
         crate::decode_fused::log_fused_decode_status(&model);
         model
@@ -3033,6 +3098,45 @@ impl Gemma4GpuModel {
                     hidden_size,
                     seq_len,
                 );
+            }
+        } else if layer.weight_format == WeightFormat::Q8_0 {
+            // Native Q8_0: one matvec per token (no Q8 batch kernel yet).
+            for s in 0..seq_len {
+                let x_off = (s * hidden_size * 4) as u64;
+                let q_off = (s * q_out * 4) as u64;
+                self.ctx.encode_matvec_q8_0_at_view(
+                    encoder,
+                    &layer.q_proj,
+                    &self.prefill_scratch.normed_buf,
+                    x_off,
+                    &self.prefill_scratch.q_buf,
+                    q_off,
+                    q_out,
+                    hidden_size,
+                );
+                if layer.has_kv {
+                    let kv_off = (s * kv_out * 4) as u64;
+                    self.ctx.encode_matvec_q8_0_at_view(
+                        encoder,
+                        &layer.k_proj,
+                        &self.prefill_scratch.normed_buf,
+                        x_off,
+                        &self.prefill_scratch.k_buf,
+                        kv_off,
+                        kv_out,
+                        hidden_size,
+                    );
+                    self.ctx.encode_matvec_q8_0_at_view(
+                        encoder,
+                        &layer.v_proj,
+                        &self.prefill_scratch.normed_buf,
+                        x_off,
+                        &self.prefill_scratch.v_buf,
+                        kv_off,
+                        kv_out,
+                        hidden_size,
+                    );
+                }
             }
         } else if Self::use_prefill_qkv_stacked(layer) {
             self.ctx.encode_prefill_qkv_kquant_stacked(
@@ -3295,7 +3399,9 @@ impl Gemma4GpuModel {
     }
 
     /// Shared dense FFN ∥ routed experts. Expects router already encoded into
-    /// `q_buf` (see `encode_moe_router`) and the prior CB waited.
+    /// `q_buf` (see `encode_moe_router`). If `attn_cb` is `Some`, it is waited
+    /// before reading router logits (shared MLP is committed first so it can
+    /// run as soon as attention finishes on the same queue).
     /// Leaves `hidden_buf` updated; caller must wait before the next layer.
     fn run_moe_mlp_decode(
         &self,
@@ -3304,6 +3410,7 @@ impl Gemma4GpuModel {
         moe: &Gemma4MoeLayer,
         hidden_size: usize,
         eps: f32,
+        attn_cb: Option<&metal::CommandBufferRef>,
     ) {
         static ONCE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
         if !ONCE.swap(true, std::sync::atomic::Ordering::Relaxed) {
@@ -3332,10 +3439,20 @@ impl Gemma4GpuModel {
         let probe_experts = std::env::var("MOE_LOG").as_deref() == Ok("1")
             && (layer_idx >= 28 || crosscheck);
 
-        // Router already ran on the attention CB; read logits for CPU top-k.
+        // Wait for attn+router before planning experts (logits must be ready).
+        let profile = crate::gemma4_moe::MoeProfile::enabled();
+        let t_router0 = std::time::Instant::now();
+        if let Some(cb) = attn_cb {
+            cb.wait_until_completed();
+        }
         let logits = MetalContext::read_buffer(&self.q_buf, moe.n_expert);
         let (experts, weights) =
             crate::gemma4_moe::softmax_topk_renorm(&logits, moe.n_expert_used);
+        let router_read_ms = if profile {
+            t_router0.elapsed().as_secs_f64() * 1e3
+        } else {
+            0.0
+        };
         if std::env::var("MOE_LOG").as_deref() == Ok("1") {
             static LOGS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
             if LOGS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 3 {
@@ -3353,8 +3470,31 @@ impl Gemma4GpuModel {
         }
         let scales = &moe.down_exps_scale;
 
-        // ── 2. Plan expert slots, then overlap miss I/O with shared MLP GPU ──
+        // Plan expert slots, then overlap miss I/O with shared MLP GPU.
+        let t_plan0 = std::time::Instant::now();
         let cache_plan = moe.expert_cache.as_ref().map(|c| c.plan(&experts));
+        let plan_ms = if profile {
+            t_plan0.elapsed().as_secs_f64() * 1e3
+        } else {
+            0.0
+        };
+        let (plan_hits, plan_misses) = cache_plan
+            .as_ref()
+            .map(|p| {
+                (
+                    (p.experts.len() - p.miss_indices.len()) as u64,
+                    p.miss_indices.len() as u64,
+                )
+            })
+            .unwrap_or((0, experts.len() as u64));
+        let fill_bytes = cache_plan
+            .as_ref()
+            .and_then(|p| {
+                moe.expert_cache
+                    .as_ref()
+                    .map(|c| p.miss_indices.len() as u64 * c.bytes_per_expert())
+            })
+            .unwrap_or(0);
 
         let shared_cmd = self.ctx.queue.new_command_buffer();
         {
@@ -3467,6 +3607,7 @@ impl Gemma4GpuModel {
 
         // ── 3. Expert path: miss fill ∥ shared wait, then hit GPU ∥ remaining fills ──
         let mut routed_init = false;
+        let mut prof_fill_ms = 0.0f64;
         let mut cmd = self.ctx.queue.new_command_buffer();
         let mut encoder = cmd.new_compute_command_encoder();
         self.ctx.encode_rmsnorm_view(
@@ -3661,12 +3802,300 @@ impl Gemma4GpuModel {
         {
             let hit_idxs = crate::gemma4_moe::ExpertSlotCache::hit_indices(plan);
             let miss_idxs = plan.miss_indices.clone();
+            let parallel = std::env::var("MOE_PARALLEL_QUEUE").as_deref() == Ok("1");
+            let t_fill0 = std::time::Instant::now();
+
+            if parallel {
+                // Abandon the unused main-queue encoder opened above.
+                encoder.end_encoding();
+                // Hits on moe_queue (own scratch) overlap shared MLP; miss I/O overlaps both.
+                let scratch = self.moe_expert_scratch.get_or_init(|| MoeExpertScratch {
+                    normed_buf: self.ctx.buffer_empty(hidden_size),
+                    gate_buf: self.ctx.buffer_empty(moe.expert_ff.max(1)),
+                    up_buf: self.ctx.buffer_empty(moe.expert_ff.max(1)),
+                    gelu_buf: self.ctx.buffer_empty(moe.expert_ff.max(1)),
+                    down_buf: self.ctx.buffer_empty(hidden_size),
+                });
+                let views = cache.views(plan, swap_gate_up);
+                let hit_cmd = if !hit_idxs.is_empty() {
+                    let hit_cmd = self.ctx.moe_queue.new_command_buffer().to_owned();
+                    {
+                        let enc = hit_cmd.new_compute_command_encoder();
+                        self.ctx.encode_rmsnorm_view(
+                            &enc,
+                            &self.hidden_buf,
+                            &moe.pre_ffw_norm_2,
+                            &scratch.normed_buf,
+                            n_embd,
+                            eps,
+                        );
+                        let mut first = true;
+                        for &ei in &hit_idxs {
+                            let expert = experts[ei];
+                            let w = weights[ei] * scales[expert];
+                            if use_fused_gelu {
+                                self.ctx.encode_matvec_qk_gelu_mul_at_view(
+                                    &enc,
+                                    &views[ei].0,
+                                    &views[ei].1,
+                                    &scratch.normed_buf,
+                                    0,
+                                    &scratch.gelu_buf,
+                                    0,
+                                    expert_ff,
+                                    n_embd,
+                                );
+                            } else {
+                                self.ctx.encode_matvec_qk_at_view(
+                                    &enc,
+                                    &views[ei].0,
+                                    &scratch.normed_buf,
+                                    0,
+                                    &scratch.gate_buf,
+                                    0,
+                                    expert_ff,
+                                    n_embd,
+                                    1,
+                                );
+                                self.ctx.encode_matvec_qk_at_view(
+                                    &enc,
+                                    &views[ei].1,
+                                    &scratch.normed_buf,
+                                    0,
+                                    &scratch.up_buf,
+                                    0,
+                                    expert_ff,
+                                    n_embd,
+                                    1,
+                                );
+                                self.ctx.encode_gelu_mul(
+                                    &enc,
+                                    &scratch.gate_buf,
+                                    &scratch.up_buf,
+                                    &scratch.gelu_buf,
+                                    expert_ff,
+                                );
+                            }
+                            self.ctx.encode_matvec_moe_down_at_view(
+                                &enc,
+                                &views[ei].2,
+                                &scratch.gelu_buf,
+                                0,
+                                &scratch.down_buf,
+                                0,
+                                n_embd,
+                                expert_ff,
+                            );
+                            if first {
+                                self.ctx.encode_vec_scale(
+                                    &enc,
+                                    &scratch.down_buf,
+                                    &self.o_out_buf,
+                                    n_embd,
+                                    w,
+                                );
+                                first = false;
+                            } else {
+                                self.ctx.encode_vec_add_scaled(
+                                    &enc,
+                                    &self.o_out_buf,
+                                    &scratch.down_buf,
+                                    &self.o_out_buf,
+                                    n_embd,
+                                    w,
+                                );
+                            }
+                        }
+                        enc.end_encoding();
+                    }
+                    Some(hit_cmd)
+                } else {
+                    None
+                };
+                // Fill misses while hit GPU + shared GPU run.
+                cache.fill_misses_scoped(plan, &moe.gate_up_exps, &moe.down_exps, || {
+                    if let Some(ref c) = hit_cmd {
+                        c.commit();
+                    }
+                });
+                if profile {
+                    prof_fill_ms = t_fill0.elapsed().as_secs_f64() * 1e3;
+                }
+                if !miss_idxs.is_empty() {
+                    let miss_cmd = self.ctx.moe_queue.new_command_buffer().to_owned();
+                    {
+                        let enc = miss_cmd.new_compute_command_encoder();
+                        if hit_idxs.is_empty() {
+                            self.ctx.encode_rmsnorm_view(
+                                &enc,
+                                &self.hidden_buf,
+                                &moe.pre_ffw_norm_2,
+                                &scratch.normed_buf,
+                                n_embd,
+                                eps,
+                            );
+                        }
+                        let mut first = hit_idxs.is_empty();
+                        for &ei in &miss_idxs {
+                            let expert = experts[ei];
+                            let w = weights[ei] * scales[expert];
+                            if use_fused_gelu {
+                                self.ctx.encode_matvec_qk_gelu_mul_at_view(
+                                    &enc,
+                                    &views[ei].0,
+                                    &views[ei].1,
+                                    &scratch.normed_buf,
+                                    0,
+                                    &scratch.gelu_buf,
+                                    0,
+                                    expert_ff,
+                                    n_embd,
+                                );
+                            } else {
+                                self.ctx.encode_matvec_qk_at_view(
+                                    &enc,
+                                    &views[ei].0,
+                                    &scratch.normed_buf,
+                                    0,
+                                    &scratch.gate_buf,
+                                    0,
+                                    expert_ff,
+                                    n_embd,
+                                    1,
+                                );
+                                self.ctx.encode_matvec_qk_at_view(
+                                    &enc,
+                                    &views[ei].1,
+                                    &scratch.normed_buf,
+                                    0,
+                                    &scratch.up_buf,
+                                    0,
+                                    expert_ff,
+                                    n_embd,
+                                    1,
+                                );
+                                self.ctx.encode_gelu_mul(
+                                    &enc,
+                                    &scratch.gate_buf,
+                                    &scratch.up_buf,
+                                    &scratch.gelu_buf,
+                                    expert_ff,
+                                );
+                            }
+                            self.ctx.encode_matvec_moe_down_at_view(
+                                &enc,
+                                &views[ei].2,
+                                &scratch.gelu_buf,
+                                0,
+                                &scratch.down_buf,
+                                0,
+                                n_embd,
+                                expert_ff,
+                            );
+                            if first {
+                                self.ctx.encode_vec_scale(
+                                    &enc,
+                                    &scratch.down_buf,
+                                    &self.o_out_buf,
+                                    n_embd,
+                                    w,
+                                );
+                                first = false;
+                            } else {
+                                self.ctx.encode_vec_add_scaled(
+                                    &enc,
+                                    &self.o_out_buf,
+                                    &scratch.down_buf,
+                                    &self.o_out_buf,
+                                    n_embd,
+                                    w,
+                                );
+                            }
+                        }
+                        enc.end_encoding();
+                    }
+                    miss_cmd.commit();
+                    shared_cmd.wait_until_completed();
+                    if let Some(ref c) = hit_cmd {
+                        c.wait_until_completed();
+                    }
+                    miss_cmd.wait_until_completed();
+                } else {
+                    shared_cmd.wait_until_completed();
+                    if let Some(ref c) = hit_cmd {
+                        c.wait_until_completed();
+                    }
+                }
+                routed_init = !experts.is_empty();
+                if !routed_init {
+                    MetalContext::write_buffer(&self.o_out_buf, &vec![0.0f32; hidden_size]);
+                }
+                let mut cmd = self.ctx.queue.new_command_buffer();
+                let encoder = cmd.new_compute_command_encoder();
+                self.ctx.encode_rmsnorm_view(
+                    &encoder,
+                    &self.o_out_buf,
+                    &moe.post_ffw_norm_2,
+                    &self.down_buf,
+                    n_embd,
+                    eps,
+                );
+                self.ctx.encode_vec_add(
+                    &encoder,
+                    &self.attn_out_buf,
+                    &self.down_buf,
+                    &self.residual_buf,
+                    n_embd,
+                );
+                if crate::gpu::fused_rmsnorm_acc_enabled() {
+                    self.ctx.encode_rmsnorm_acc_view(
+                        &encoder,
+                        &self.hidden_buf,
+                        &self.residual_buf,
+                        &layer.post_feedforward_layernorm_weight,
+                        n_embd,
+                        eps,
+                    );
+                } else {
+                    self.ctx.encode_rmsnorm_view(
+                        &encoder,
+                        &self.residual_buf,
+                        &layer.post_feedforward_layernorm_weight,
+                        &self.normed_buf,
+                        n_embd,
+                        eps,
+                    );
+                    self.ctx.encode_vec_add(
+                        &encoder,
+                        &self.hidden_buf,
+                        &self.normed_buf,
+                        &self.hidden_buf,
+                        n_embd,
+                    );
+                }
+                encoder.end_encoding();
+                cmd.commit();
+                if profile {
+                    crate::gemma4_moe::MoeProfile::add(
+                        router_read_ms,
+                        plan_ms,
+                        prof_fill_ms,
+                        0.0,
+                        0.0,
+                        plan_hits,
+                        plan_misses,
+                        fill_bytes,
+                    );
+                }
+                return;
+            }
+
             let hit_committed = cache.fill_misses_scoped(
                 plan,
                 &moe.gate_up_exps,
                 &moe.down_exps,
                 || {
-                    shared_cmd.wait_until_completed();
+                    // Do not CPU-wait on shared: same queue orders hit CB after it.
                     let views = cache.views(plan, swap_gate_up);
                     for &ei in &hit_idxs {
                         let expert = experts[ei];
@@ -3683,13 +4112,16 @@ impl Gemma4GpuModel {
                     }
                     if !hit_idxs.is_empty() {
                         encoder.end_encoding();
-                        cmd.commit(); // hit GPU overlaps remaining miss I/O
+                        cmd.commit();
                         true
                     } else {
                         false
                     }
                 },
             );
+            if profile {
+                prof_fill_ms = t_fill0.elapsed().as_secs_f64() * 1e3;
+            }
             if hit_committed {
                 cmd = self.ctx.queue.new_command_buffer();
                 encoder = cmd.new_compute_command_encoder();
@@ -3810,8 +4242,27 @@ impl Gemma4GpuModel {
 
         encoder.end_encoding();
         cmd.commit();
-        // No wait — next layer's CB on the same queue is ordered after this one.
-        // Token boundary waits when reading logits / writing the next embed.
+        let expert_gpu_ms = if profile {
+            let t = std::time::Instant::now();
+            cmd.wait_until_completed();
+            t.elapsed().as_secs_f64() * 1e3
+        } else {
+            // No wait — next layer's CB on the same queue is ordered after this one.
+            // Token boundary waits when reading logits / writing the next embed.
+            0.0
+        };
+        if profile {
+            crate::gemma4_moe::MoeProfile::add(
+                router_read_ms,
+                plan_ms,
+                prof_fill_ms,
+                0.0,
+                expert_gpu_ms,
+                plan_hits,
+                plan_misses,
+                fill_bytes,
+            );
+        }
     }
 
     /// Offset-aware variant of `encode_matvec_quant` for the batched decode path,
@@ -3837,6 +4288,9 @@ impl Gemma4GpuModel {
             weight_fmt::Q4_K | weight_fmt::Q6_K => self.ctx.encode_matvec_qk_at_view(
                 encoder, weight, x_buf, x_offset, y_buf, y_offset, m, k, 1,
             ),
+            weight_fmt::Q8_0 => self.ctx.encode_matvec_q8_0_at_view(
+                encoder, weight, x_buf, x_offset, y_buf, y_offset, m, k,
+            ),
             weight_fmt::F16 => self.ctx.encode_matvec_f16_at(
                 encoder, &weight.buffer, weight.offset, x_buf, x_offset, y_buf, y_offset, m, k,
             ),
@@ -3846,6 +4300,9 @@ impl Gemma4GpuModel {
                 ),
                 WeightFormat::F16 => self.ctx.encode_matvec_f16_at(
                     encoder, &weight.buffer, weight.offset, x_buf, x_offset, y_buf, y_offset, m, k,
+                ),
+                WeightFormat::Q8_0 => self.ctx.encode_matvec_q8_0_at_view(
+                    encoder, weight, x_buf, x_offset, y_buf, y_offset, m, k,
                 ),
                 _ => self.ctx.encode_matvec_q4_at_view(
                     encoder, weight, x_buf, x_offset, y_buf, y_offset, m, k,
@@ -4941,12 +5398,12 @@ impl Gemma4GpuModel {
                     }
                     // fall through to dense MLP below
                 } else {
-                // Fold router onto the attention CB so one wait serves both.
+                // Fold router onto the attention CB; commit shared before waiting
+                // so shared MLP runs as soon as attention finishes.
                 self.encode_moe_router(&encoder, moe, hidden_size as u32, eps);
                 encoder.end_encoding();
                 cmd.commit();
-                cmd.wait_until_completed();
-                self.run_moe_mlp_decode(layer_idx, layer, moe, hidden_size, eps);
+                self.run_moe_mlp_decode(layer_idx, layer, moe, hidden_size, eps, Some(&cmd));
                 cmd = self.ctx.queue.new_command_buffer();
                 encoder = cmd.new_compute_command_encoder();
                 }
@@ -7063,15 +7520,62 @@ impl Gemma4GpuModel {
         if start_pos + seq_len > kv_pool.capacity() as usize {
             return false;
         }
-        // MoE layers need per-token top-k; parallel prefill still runs dense-only
-        // shared FFN. Force sequential decode MoE until batched MoE lands.
+        // MoE: allow parallel prefill (batched attn + per-row MoE MLP) unless opted out.
+        // Prefill was sequential-only and cold-missed every prompt token.
         if self.layers.iter().any(|l| l.moe.is_some())
             && std::env::var("MOE_DISABLE").as_deref() != Ok("1")
+            && std::env::var("MOE_PARALLEL_PREFILL").as_deref() == Ok("0")
         {
             return false;
         }
 
         true
+    }
+
+    /// Per-token MoE FFN over a parallel-prefill activation batch in
+    /// `prefill_scratch.hidden_buf` (post-attention residuals).
+    fn run_moe_mlp_prefill_rows(
+        &self,
+        layer_idx: usize,
+        layer: &Gemma4GpuLayer,
+        moe: &Gemma4MoeLayer,
+        seq_len: usize,
+        hidden_size: usize,
+        eps: f32,
+    ) {
+        let row_bytes = hidden_size * 4;
+        for t in 0..seq_len {
+            unsafe {
+                let src = (self.prefill_scratch.hidden_buf.contents() as *const u8)
+                    .add(t * row_bytes);
+                let dst = self.hidden_buf.contents() as *mut u8;
+                std::ptr::copy_nonoverlapping(src, dst, row_bytes);
+            }
+            let cmd = self.ctx.queue.new_command_buffer();
+            let enc = cmd.new_compute_command_encoder();
+            self.encode_moe_router(&enc, moe, hidden_size as u32, eps);
+            enc.end_encoding();
+            cmd.commit();
+            self.run_moe_mlp_decode(layer_idx, layer, moe, hidden_size, eps, Some(&cmd));
+            // MoE decode may leave its CB unwaited; blit orders behind it.
+            let cmd = self.ctx.queue.new_command_buffer();
+            let enc = cmd.new_compute_command_encoder();
+            self.ctx.encode_copy(
+                &enc,
+                &self.hidden_buf,
+                &self.prefill_scratch.residual_buf,
+                hidden_size as u32,
+            );
+            enc.end_encoding();
+            cmd.commit();
+            cmd.wait_until_completed();
+            unsafe {
+                let src = self.prefill_scratch.residual_buf.contents() as *const u8;
+                let dst = (self.prefill_scratch.hidden_buf.contents() as *mut u8)
+                    .add(t * row_bytes);
+                std::ptr::copy_nonoverlapping(src, dst, row_bytes);
+            }
+        }
     }
 
     fn encode_parallel_prefill_layer(
@@ -7333,6 +7837,88 @@ impl Gemma4GpuModel {
             total_hidden,
         );
 
+        // MoE: batched attention done; run shared∥experts per token (top-k differs).
+        if let Some(ref moe) = layer.moe {
+            if std::env::var("MOE_DISABLE").as_deref() != Ok("1") {
+                encoder.end_encoding();
+                cmd.commit();
+                cmd.wait_until_completed();
+                self.run_moe_mlp_prefill_rows(layer_idx, layer, moe, seq_len, hidden_size, eps);
+                let cmd = self.ctx.queue.new_command_buffer();
+                let encoder = cmd.new_compute_command_encoder();
+                // PLE is absent on A4B (ple_dim=0); still apply layer scalar.
+                if ple_dim > 0 {
+                    self.ctx.encode_copy(
+                        encoder,
+                        &self.prefill_scratch.hidden_buf,
+                        &self.prefill_scratch.residual_buf,
+                        total_hidden,
+                    );
+                    self.ctx.encode_prefill_projection_auto_batch_view(
+                        encoder,
+                        &layer.per_layer_input_gate_weight,
+                        &self.prefill_scratch.hidden_buf,
+                        &self.prefill_scratch.gate_buf,
+                        ple_dim as u32,
+                        hidden_size as u32,
+                        seq_len as u32,
+                    );
+                    self.ctx.encode_ple_gelu_mul_batch(
+                        encoder,
+                        &self.prefill_scratch.gate_buf,
+                        &self.prefill_scratch.ple_context_proj_buf,
+                        &self.prefill_scratch.up_buf,
+                        layer_idx as u32,
+                        self.config.num_hidden_layers as u32,
+                        ple_dim as u32,
+                        seq_len as u32,
+                    );
+                    self.ctx.encode_prefill_projection_auto_batch_view(
+                        encoder,
+                        &layer.per_layer_projection_weight,
+                        &self.prefill_scratch.up_buf,
+                        &self.prefill_scratch.o_out_buf,
+                        hidden_size as u32,
+                        ple_dim as u32,
+                        seq_len as u32,
+                    );
+                    self.ctx.encode_rmsnorm_batch_view(
+                        encoder,
+                        &self.prefill_scratch.o_out_buf,
+                        &layer.post_per_layer_input_norm_weight,
+                        &self.prefill_scratch.normed_buf,
+                        hidden_size as u32,
+                        eps,
+                        seq_len as u32,
+                    );
+                    self.ctx.encode_vec_add_batch(
+                        encoder,
+                        &self.prefill_scratch.residual_buf,
+                        &self.prefill_scratch.normed_buf,
+                        &self.prefill_scratch.hidden_buf,
+                        total_hidden,
+                    );
+                }
+                self.ctx.encode_vec_scale(
+                    encoder,
+                    &self.prefill_scratch.hidden_buf,
+                    &self.prefill_scratch.residual_buf,
+                    total_hidden,
+                    layer.layer_scalar,
+                );
+                self.ctx.encode_copy(
+                    encoder,
+                    &self.prefill_scratch.residual_buf,
+                    &self.prefill_scratch.hidden_buf,
+                    total_hidden,
+                );
+                encoder.end_encoding();
+                cmd.commit();
+                cmd.wait_until_completed();
+                return Ok(());
+            }
+        }
+
         self.ctx.encode_copy(
             encoder,
             &self.prefill_scratch.hidden_buf,
@@ -7366,6 +7952,21 @@ impl Gemma4GpuModel {
                 intermediate_size as u32,
                 seq_len as u32,
             );
+        } else if layer.weight_format == WeightFormat::Q8_0 {
+            for s in 0..seq_len {
+                let x_off = (s * intermediate_size * 4) as u64;
+                let y_off = (s * hidden_size * 4) as u64;
+                self.ctx.encode_matvec_q8_0_at_view(
+                    encoder,
+                    &layer.down_proj,
+                    &self.prefill_scratch.gelu_buf,
+                    x_off,
+                    &self.prefill_scratch.down_buf,
+                    y_off,
+                    hidden_size as u32,
+                    intermediate_size as u32,
+                );
+            }
         } else {
             self.ctx.encode_prefill_projection_q4_batch_view(
                 encoder,

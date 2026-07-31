@@ -529,6 +529,8 @@ fn attention_threadgroup_size(flash: bool) -> MTLSize {
 pub struct MetalContext {
     pub device: Device,
     pub queue: CommandQueue,
+    /// Second queue for MoE routed-expert work overlapping shared MLP.
+    pub moe_queue: CommandQueue,
     pub matvec_pipeline: ComputePipelineState,
     pub matvec_f16_pipeline: ComputePipelineState,
     pub matvec_q4_pipeline: ComputePipelineState,
@@ -707,6 +709,7 @@ impl MetalContext {
         let device = Device::system_default().expect("No Metal GPU found");
         println!("  Metal GPU: {}", device.name());
         let queue = device.new_command_queue();
+        let moe_queue = device.new_command_queue();
 
         let shader_path = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/shaders/llama.metal");
         let mega_path = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/shaders/decode_mega.metal");
@@ -1092,6 +1095,7 @@ impl MetalContext {
         MetalContext {
             device,
             queue,
+            moe_queue,
             matvec_pipeline,
             matvec_f16_pipeline,
             matvec_q4_pipeline,
@@ -2100,6 +2104,8 @@ impl MetalContext {
     ) {
         if matches!(weight.format, weight_fmt::Q4_K | weight_fmt::Q6_K) {
             self.encode_matvec_qk_at_view(encoder, weight, x_buf, 0, y_buf, 0, m, k, 1);
+        } else if weight.format == weight_fmt::Q8_0 {
+            self.encode_matvec_q8_0_at_view(encoder, weight, x_buf, 0, y_buf, 0, m, k);
         } else if weight_buf_is_q3(weight, m, k) {
             self.encode_matvec_q3_at_view(encoder, weight, x_buf, 0, y_buf, 0, m, k);
         } else if weight_buf_is_q4(weight, m, k) {
@@ -2123,6 +2129,10 @@ impl MetalContext {
         if matches!(weight.format, weight_fmt::Q4_K | weight_fmt::Q6_K) {
             self.encode_matvec_qk_at_view(
                 encoder, weight, x_buf, x_offset, y_buf, y_offset, m, k, 1,
+            );
+        } else if weight.format == weight_fmt::Q8_0 {
+            self.encode_matvec_q8_0_at_view(
+                encoder, weight, x_buf, x_offset, y_buf, y_offset, m, k,
             );
         } else if weight_buf_is_q3(weight, m, k) {
             self.encode_matvec_q3_at_view(
@@ -2151,6 +2161,14 @@ impl MetalContext {
     ) {
         if matches!(weight.format, weight_fmt::Q4_K | weight_fmt::Q6_K) {
             self.encode_matvec_qk_at_view(encoder, weight, x_buf, 0, y_buf, 0, m, k, seq_len);
+        } else if weight.format == weight_fmt::Q8_0 {
+            for s in 0..seq_len {
+                let x_off = (s * k * 4) as u64;
+                let y_off = (s * m * 4) as u64;
+                self.encode_matvec_q8_0_at_view(
+                    encoder, weight, x_buf, x_off, y_buf, y_off, m, k,
+                );
+            }
         } else if weight_buf_is_q4(weight, m, k) {
             self.encode_projection_q4_batch_view(encoder, weight, x_buf, y_buf, m, k, seq_len);
         } else {
@@ -2172,6 +2190,14 @@ impl MetalContext {
     ) {
         if matches!(weight.format, weight_fmt::Q4_K | weight_fmt::Q6_K) {
             self.encode_prefill_kquant_projection(encoder, weight, x_buf, y_buf, m, k, seq_len);
+        } else if weight.format == weight_fmt::Q8_0 {
+            for s in 0..seq_len {
+                let x_off = (s * k * 4) as u64;
+                let y_off = (s * m * 4) as u64;
+                self.encode_matvec_q8_0_at_view(
+                    encoder, weight, x_buf, x_off, y_buf, y_off, m, k,
+                );
+            }
         } else if weight.format == weight_fmt::F16
             || (!weight_buf_is_q4(weight, m, k) && !weight_buf_is_q3(weight, m, k))
         {
