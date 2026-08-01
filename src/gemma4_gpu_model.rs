@@ -291,6 +291,8 @@ pub struct Gemma4GpuModel {
     ple_decode_scratch: Vec<f32>,
     /// Scratch for MoE experts on `ctx.moe_queue` (overlaps shared MLP).
     moe_expert_scratch: std::sync::OnceLock<MoeExpertScratch>,
+    /// Per-expert GeLU mids for slots8/sum8 fused MoE (`n_expert_used * expert_ff`).
+    moe_slots_mid: std::sync::OnceLock<Buffer>,
 }
 
 struct MoeExpertScratch {
@@ -1676,6 +1678,7 @@ impl Gemma4GpuModel {
             embed_decode_scratch: vec![0.0f32; hidden_size],
             ple_decode_scratch: vec![0.0f32; (num_layers * ple_dim).max(1)],
             moe_expert_scratch: std::sync::OnceLock::new(),
+            moe_slots_mid: std::sync::OnceLock::new(),
         };
 
         crate::decode_fused::log_fused_decode_status(&model);
@@ -2984,6 +2987,7 @@ impl Gemma4GpuModel {
             embed_decode_scratch: vec![0.0f32; hidden_size],
             ple_decode_scratch: vec![0.0f32; (num_layers * ple_dim).max(1)],
             moe_expert_scratch: std::sync::OnceLock::new(),
+            moe_slots_mid: std::sync::OnceLock::new(),
         };
         crate::decode_fused::log_fused_decode_status(&model);
         model
@@ -4121,6 +4125,105 @@ impl Gemma4GpuModel {
                 return;
             }
 
+            let use_fused_slots = std::env::var("MOE_FUSED_SLOTS").as_deref() == Ok("1")
+                && use_fused_gelu
+                && (1..=8).contains(&experts.len());
+            if use_fused_slots {
+                static FUSED_ONCE: std::sync::atomic::AtomicBool =
+                    std::sync::atomic::AtomicBool::new(false);
+                if !FUSED_ONCE.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                    eprintln!(
+                        "  MoE slots8/sum8 fused experts enabled (MOE_FUSED_SLOTS=1)"
+                    );
+                }
+                let mid = self.moe_slots_mid.get_or_init(|| {
+                    self.ctx
+                        .buffer_empty((moe.n_expert_used.max(1) * moe.expert_ff.max(1)).max(8))
+                });
+                // Hit-first: shared + hit slots8 ∥ miss preads; then miss slots8; then sum8.
+                // Only commit the hit CB early when there are misses to overlap; all-hit
+                // keeps slots8+sum8+combine on one CB (avoids per-layer commit tax).
+                let early_hit_commit = !miss_idxs.is_empty() && !hit_idxs.is_empty();
+                cache.fill_misses_scoped(plan, &moe.gate_up_exps, &moe.down_exps, || {
+                    let _shared = commit_shared_mlp();
+                    encode_expert_norm(&encoder);
+                    expert_norm_encoded = true;
+                    let views = cache.views(plan, swap_gate_up);
+                    if !hit_idxs.is_empty() {
+                        let gates: Vec<&BufferView> =
+                            hit_idxs.iter().map(|&ei| &views[ei].0).collect();
+                        let ups: Vec<&BufferView> =
+                            hit_idxs.iter().map(|&ei| &views[ei].1).collect();
+                        let ws: Vec<f32> = hit_idxs
+                            .iter()
+                            .map(|&ei| weights[ei] * scales[experts[ei]])
+                            .collect();
+                        let mids: Vec<u32> = hit_idxs.iter().map(|&ei| ei as u32).collect();
+                        self.ctx.encode_moe_slots8_q4k_gelu(
+                            &encoder,
+                            &gates,
+                            &ups,
+                            &self.normed_buf,
+                            0,
+                            mid,
+                            &ws,
+                            &mids,
+                            expert_ff,
+                            n_embd,
+                        );
+                    }
+                    if early_hit_commit {
+                        encoder.end_encoding();
+                        cmd.commit();
+                    }
+                });
+                if profile {
+                    prof_fill_ms = t_fill0.elapsed().as_secs_f64() * 1e3;
+                }
+                if early_hit_commit {
+                    cmd = self.ctx.queue.new_command_buffer();
+                    encoder = cmd.new_compute_command_encoder();
+                    expert_norm_encoded = false;
+                }
+                let views = cache.views(plan, swap_gate_up);
+                if !miss_idxs.is_empty() {
+                    if !expert_norm_encoded {
+                        encode_expert_norm(&encoder);
+                        expert_norm_encoded = true;
+                    }
+                    let gates: Vec<&BufferView> =
+                        miss_idxs.iter().map(|&ei| &views[ei].0).collect();
+                    let ups: Vec<&BufferView> =
+                        miss_idxs.iter().map(|&ei| &views[ei].1).collect();
+                    let ws: Vec<f32> = miss_idxs
+                        .iter()
+                        .map(|&ei| weights[ei] * scales[experts[ei]])
+                        .collect();
+                    let mids: Vec<u32> = miss_idxs.iter().map(|&ei| ei as u32).collect();
+                    self.ctx.encode_moe_slots8_q4k_gelu(
+                        &encoder,
+                        &gates,
+                        &ups,
+                        &self.normed_buf,
+                        0,
+                        mid,
+                        &ws,
+                        &mids,
+                        expert_ff,
+                        n_embd,
+                    );
+                }
+                let downs: Vec<&BufferView> = views.iter().map(|v| &v.2).collect();
+                self.ctx.encode_moe_sum8_down(
+                    &encoder,
+                    &downs,
+                    mid,
+                    &self.o_out_buf,
+                    n_embd,
+                    expert_ff,
+                );
+                routed_init = true;
+            } else {
             let hit_committed = cache.fill_misses_scoped(
                 plan,
                 &moe.gate_up_exps,
@@ -4184,6 +4287,7 @@ impl Gemma4GpuModel {
                     routed_init = true;
                 }
             }
+            } // !use_fused_slots
         } else {
             let shared_cmd = commit_shared_mlp();
             shared_cmd.wait_until_completed();

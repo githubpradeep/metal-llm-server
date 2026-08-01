@@ -2210,3 +2210,192 @@ kernel void matvec_qkv_rmsnorm_inv_kquant(
             uint3(tgpig.x - q_tgs - kv_tgs, 0, 0), tiisg, sgitg);
     }
 }
+
+// ─── MoE slots8 / sum8 (TurboFieldfare / ds4-style multi-expert decode) ───────
+// One dispatch covers all selected experts (tgpig.z = expert slot). Gate∥up+GeLU
+// writes weighted mids; sum8 fused down accumulates into the residual without
+// serializing on a shared gelu_buf.
+
+static inline device const char *moe_pick8(
+    uint e,
+    device const char *p0, device const char *p1, device const char *p2, device const char *p3,
+    device const char *p4, device const char *p5, device const char *p6, device const char *p7
+) {
+    switch (e) {
+    case 1: return p1;
+    case 2: return p2;
+    case 3: return p3;
+    case 4: return p4;
+    case 5: return p5;
+    case 6: return p6;
+    case 7: return p7;
+    default: return p0;
+    }
+}
+
+kernel void matvec_ggml_q4_K_gelu_mul_slots8(
+    device const char * G0 [[buffer(0)]],
+    device const char * G1 [[buffer(1)]],
+    device const char * G2 [[buffer(2)]],
+    device const char * G3 [[buffer(3)]],
+    device const char * G4 [[buffer(4)]],
+    device const char * G5 [[buffer(5)]],
+    device const char * G6 [[buffer(6)]],
+    device const char * G7 [[buffer(7)]],
+    device const char * U0 [[buffer(8)]],
+    device const char * U1 [[buffer(9)]],
+    device const char * U2 [[buffer(10)]],
+    device const char * U3 [[buffer(11)]],
+    device const char * U4 [[buffer(12)]],
+    device const char * U5 [[buffer(13)]],
+    device const char * U6 [[buffer(14)]],
+    device const char * U7 [[buffer(15)]],
+    device const char * x  [[buffer(16)]],
+    device float      * mid [[buffer(17)]],
+    constant float    * weights [[buffer(18)]],
+    constant uint     * mid_ids [[buffer(19)]],
+    constant uint     & n_slots [[buffer(20)]],
+    constant ggml_mul_mv_args& args [[buffer(21)]],
+    uint3 tgpig [[threadgroup_position_in_grid]],
+    uint tiisg  [[thread_index_in_simdgroup]],
+    uint sgitg  [[simdgroup_index_in_threadgroup]]
+) {
+    const uint e = tgpig.z;
+    if (e >= n_slots) {
+        return;
+    }
+    device const char * Wg = moe_pick8(e, G0, G1, G2, G3, G4, G5, G6, G7);
+    device const char * Wu = moe_pick8(e, U0, U1, U2, U3, U4, U5, U6, U7);
+    const uint mid_i = mid_ids[e];
+    device float * dst = mid + (ulong)mid_i * (ulong)args.ne0;
+    uint3 tg = uint3(tgpig.x, tgpig.y, 0);
+    mul_vec_q4_K_gelu_f32_impl<KQ_NR0>(
+        args, Wg, Wu, x, (device char *)dst, tg, tiisg, sgitg);
+
+    const float w = weights[e];
+    const short NSG = KQ_NSG;
+    const int first_row = (int(tgpig.x) * NSG + int(sgitg)) * KQ_NR0;
+    if (tiisg == 0 && w != 1.f) {
+        for (int row = 0; row < KQ_NR0 && first_row + row < args.ne0; ++row) {
+            dst[first_row + row] *= w;
+        }
+    }
+}
+
+kernel void matvec_ggml_q8_0_sum8(
+    device const char * W0 [[buffer(0)]],
+    device const char * W1 [[buffer(1)]],
+    device const char * W2 [[buffer(2)]],
+    device const char * W3 [[buffer(3)]],
+    device const char * W4 [[buffer(4)]],
+    device const char * W5 [[buffer(5)]],
+    device const char * W6 [[buffer(6)]],
+    device const char * W7 [[buffer(7)]],
+    device const float * mid [[buffer(8)]],
+    device float       * dst [[buffer(9)]],
+    constant uint      & n_slots [[buffer(10)]],
+    constant ggml_mul_mv_args& args [[buffer(11)]],
+    uint3 tgpig [[threadgroup_position_in_grid]],
+    uint tiisg  [[thread_index_in_simdgroup]],
+    uint sgitg  [[simdgroup_index_in_threadgroup]]
+) {
+    constexpr short NR0 = 4;
+    constexpr short NSG = 2;
+    constexpr short NW = 32;
+
+    const int nb = args.ne00 / int(QK8_0);
+    const int first_row = (int(tgpig.x) * NSG + int(sgitg)) * NR0;
+    float sumf[NR0];
+    for (short row = 0; row < NR0; ++row) sumf[row] = 0.f;
+
+    for (uint e = 0; e < n_slots; ++e) {
+        device const char * W = moe_pick8(e, W0, W1, W2, W3, W4, W5, W6, W7);
+        device const block_q8_0 * xw =
+            (device const block_q8_0 *)W + first_row * nb;
+        device const float * yv = mid + (ulong)e * (ulong)args.ne00;
+
+        for (int ib = int(tiisg); ib < nb; ib += NW) {
+            device const float * yb = yv + ib * int(QK8_0);
+            for (short row = 0; row < NR0; ++row) {
+                if (first_row + row >= args.ne01) continue;
+                device const block_q8_0 & blk = xw[ib + row * nb];
+                float acc = 0.f;
+                for (uint i = 0; i < QK8_0; ++i) {
+                    acc += float(blk.qs[i]) * yb[i];
+                }
+                sumf[row] += acc * float(blk.d);
+            }
+        }
+    }
+
+    for (short row = 0; row < NR0; ++row) {
+        const float tot = simd_sum(sumf[row]);
+        if (tiisg == 0 && first_row + row < args.ne01) {
+            dst[first_row + row] = tot;
+        }
+    }
+}
+
+kernel void matvec_ggml_q5_1_sum8(
+    device const char * W0 [[buffer(0)]],
+    device const char * W1 [[buffer(1)]],
+    device const char * W2 [[buffer(2)]],
+    device const char * W3 [[buffer(3)]],
+    device const char * W4 [[buffer(4)]],
+    device const char * W5 [[buffer(5)]],
+    device const char * W6 [[buffer(6)]],
+    device const char * W7 [[buffer(7)]],
+    device const float * mid [[buffer(8)]],
+    device float       * dst [[buffer(9)]],
+    constant uint      & n_slots [[buffer(10)]],
+    constant ggml_mul_mv_args& args [[buffer(11)]],
+    uint3 tgpig [[threadgroup_position_in_grid]],
+    uint tiisg  [[thread_index_in_simdgroup]],
+    uint sgitg  [[simdgroup_index_in_threadgroup]]
+) {
+    constexpr short NR0 = 4;
+    constexpr short NSG = 2;
+    constexpr short NW = 32;
+
+    const int nb = args.ne00 / QK5_1;
+    const int first_row = (int(tgpig.x) * NSG + int(sgitg)) * NR0;
+    float sumf[NR0];
+    for (short row = 0; row < NR0; ++row) sumf[row] = 0.f;
+
+    const int ix = int(tiisg) / 2;
+    const int il = (int(tiisg) % 2) * 8;
+
+    for (uint e = 0; e < n_slots; ++e) {
+        device const char * W = moe_pick8(e, W0, W1, W2, W3, W4, W5, W6, W7);
+        device const block_q5_1 * x =
+            (device const block_q5_1 *)W + first_row * nb;
+        device const float * y = mid + (ulong)e * (ulong)args.ne00;
+        device const float * yb = y + ix * QK5_1 + il;
+
+        float yl[16];
+        for (int ib = ix; ib < nb; ib += NW / 2) {
+            float sumy = 0;
+            for (int i = 0; i < 8; i += 2) {
+                sumy += yb[i] + yb[i + 1];
+                yl[i + 0] = yb[i + 0];
+                yl[i + 1] = yb[i + 1] / 256.f;
+                sumy += yb[i + 16] + yb[i + 17];
+                yl[i + 8] = yb[i + 16] / 16.f;
+                yl[i + 9] = yb[i + 17] / 4096.f;
+            }
+            for (int row = 0; row < NR0; row++) {
+                if (first_row + row < args.ne01) {
+                    sumf[row] += block_q_n_dot_y(x + ib + row * nb, sumy, yl, il);
+                }
+            }
+            yb += QK5_1 * 16;
+        }
+    }
+
+    for (int row = 0; row < NR0; ++row) {
+        const float tot = simd_sum(sumf[row]);
+        if (tiisg == 0 && first_row + row < args.ne01) {
+            dst[first_row + row] = tot;
+        }
+    }
+}
