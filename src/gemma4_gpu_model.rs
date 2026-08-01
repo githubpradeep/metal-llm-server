@@ -1596,11 +1596,15 @@ impl Gemma4GpuModel {
                 .iter()
                 .filter(|l| l.weight_format == WeightFormat::F16)
                 .count();
+            let q8 = layers
+                .iter()
+                .filter(|l| l.weight_format == WeightFormat::Q8_0)
+                .count();
             let q3 = layers.iter().filter(|l| l.weight_format.is_q3()).count();
-            let q4 = num_layers - kq - f16 - q3;
+            let q4 = num_layers.saturating_sub(kq + f16 + q8 + q3);
             println!(
-                "  Weights: {} layers Q4_0, {} K-quant (Q4_K/Q6_K native), {} f16, {} Q3_0",
-                q4, kq, f16, q3
+                "  Weights: {} layers Q4_0, {} Q8_0, {} K-quant (Q4_K/Q6_K native), {} f16, {} Q3_0",
+                q4, q8, kq, f16, q3
             );
         }
 
@@ -3206,12 +3210,17 @@ impl Gemma4GpuModel {
         hidden_size: u32,
         skip_gelu: bool,
     ) {
+        use crate::gpu::weight_fmt;
         let total_intermediate = seq_len * intermediate_size;
-        // f16 activations only feed the mul_mm path; the small-seq matvec
-        // fallback reads x as f32, so casting there corrupts the MLP.
+        // f16 activations only feed the K-quant mul_mm path; Q8_0/Q4_0 must not enter it.
+        let gate_is_kquant = matches!(
+            layer.gate_proj.format,
+            weight_fmt::Q4_K | weight_fmt::Q6_K
+        );
         let use_f16 = crate::gpu::prefill_mlp_f16_enabled()
             && !crate::gpu::ProfileAblate::from_env().skip_cast()
             && layer.weight_format != WeightFormat::F16
+            && gate_is_kquant
             && crate::gpu::prefill_mul_mm_enabled()
             && crate::ggml_gemv::should_use_mul_mm(hidden_size, seq_len);
         // residual_buf unused during MLP after fused residual path; holds f16 normed.
@@ -3227,6 +3236,37 @@ impl Gemma4GpuModel {
                 seq_len,
             );
             self.ctx.encode_projection_f16_batch_view(
+                encoder,
+                &layer.up_proj,
+                &self.prefill_scratch.normed_buf,
+                &self.prefill_scratch.up_buf,
+                intermediate_size,
+                hidden_size,
+                seq_len,
+            );
+            if !skip_gelu {
+                self.ctx.encode_gelu_mul(
+                    encoder,
+                    &self.prefill_scratch.gate_buf,
+                    &self.prefill_scratch.up_buf,
+                    &self.prefill_scratch.gelu_buf,
+                    total_intermediate,
+                );
+            }
+        } else if layer.gate_proj.format == weight_fmt::Q8_0
+            || layer.weight_format == WeightFormat::Q8_0
+        {
+            // A4B shared FFN is native Q8_0 — no K-quant mul_mm / Q4 batch path.
+            self.ctx.encode_prefill_projection_auto_batch_view(
+                encoder,
+                &layer.gate_proj,
+                &self.prefill_scratch.normed_buf,
+                &self.prefill_scratch.gate_buf,
+                intermediate_size,
+                hidden_size,
+                seq_len,
+            );
+            self.ctx.encode_prefill_projection_auto_batch_view(
                 encoder,
                 &layer.up_proj,
                 &self.prefill_scratch.normed_buf,
@@ -3303,7 +3343,7 @@ impl Gemma4GpuModel {
             } else {
                 &self.prefill_scratch.normed_buf
             };
-            if use_f16 {
+            if use_f16 && gate_is_kquant {
                 self.ctx.encode_mul_mm_kquant_f16_at_view(
                     encoder,
                     &layer.gate_proj,
@@ -3323,7 +3363,7 @@ impl Gemma4GpuModel {
                     seq_len,
                 );
             } else {
-                self.ctx.encode_prefill_projection_q4_batch_view(
+                self.ctx.encode_prefill_projection_auto_batch_view(
                     encoder,
                     &layer.gate_proj,
                     x_buf,
@@ -3332,7 +3372,7 @@ impl Gemma4GpuModel {
                     hidden_size,
                     seq_len,
                 );
-                self.ctx.encode_prefill_projection_q4_batch_view(
+                self.ctx.encode_prefill_projection_auto_batch_view(
                     encoder,
                     &layer.up_proj,
                     x_buf,
@@ -7671,11 +7711,12 @@ impl Gemma4GpuModel {
         if start_pos + seq_len > kv_pool.capacity() as usize {
             return false;
         }
-        // MoE: allow parallel prefill (batched attn + per-row MoE MLP) unless opted out.
-        // Prefill was sequential-only and cold-missed every prompt token.
+        // MoE parallel prefill (batched attn + per-row MoE MLP) is opt-in.
+        // Default path stays sequential: A4B Q8 shared-FFN + expert rows still
+        // produce garbage under the batched path (MOE_PARALLEL_PREFILL=1 to try).
         if self.layers.iter().any(|l| l.moe.is_some())
             && std::env::var("MOE_DISABLE").as_deref() != Ok("1")
-            && std::env::var("MOE_PARALLEL_PREFILL").as_deref() == Ok("0")
+            && std::env::var("MOE_PARALLEL_PREFILL").as_deref() != Ok("1")
         {
             return false;
         }
@@ -8103,23 +8144,8 @@ impl Gemma4GpuModel {
                 intermediate_size as u32,
                 seq_len as u32,
             );
-        } else if layer.weight_format == WeightFormat::Q8_0 {
-            for s in 0..seq_len {
-                let x_off = (s * intermediate_size * 4) as u64;
-                let y_off = (s * hidden_size * 4) as u64;
-                self.ctx.encode_matvec_q8_0_at_view(
-                    encoder,
-                    &layer.down_proj,
-                    &self.prefill_scratch.gelu_buf,
-                    x_off,
-                    &self.prefill_scratch.down_buf,
-                    y_off,
-                    hidden_size as u32,
-                    intermediate_size as u32,
-                );
-            }
         } else {
-            self.ctx.encode_prefill_projection_q4_batch_view(
+            self.ctx.encode_prefill_projection_auto_batch_view(
                 encoder,
                 &layer.down_proj,
                 &self.prefill_scratch.gelu_buf,
@@ -8478,7 +8504,7 @@ impl Gemma4GpuModel {
                 total_seq_len as u32,
             );
         } else {
-            self.ctx.encode_prefill_projection_q4_batch_view(
+            self.ctx.encode_prefill_projection_auto_batch_view(
                 encoder,
                 &layer.down_proj,
                 &self.prefill_scratch.gelu_buf,
@@ -8934,7 +8960,10 @@ impl Gemma4GpuModel {
                     intermediate_size as u32,
                     seq_len as u32,
                 );
-            } else if crate::gpu::prefill_mlp_f16_enabled()
+            } else if matches!(
+                layer.down_proj.format,
+                crate::gpu::weight_fmt::Q4_K | crate::gpu::weight_fmt::Q6_K
+            ) && crate::gpu::prefill_mlp_f16_enabled()
                 && !ablate.skip_cast()
                 && crate::gpu::prefill_mul_mm_enabled()
                 && crate::ggml_gemv::should_use_mul_mm(
@@ -8964,7 +8993,7 @@ impl Gemma4GpuModel {
                     seq_len as u32,
                 );
             } else {
-                self.ctx.encode_prefill_projection_q4_batch_view(
+                self.ctx.encode_prefill_projection_auto_batch_view(
                     encoder,
                     &layer.down_proj,
                     &self.prefill_scratch.gelu_buf,
