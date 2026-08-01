@@ -1901,6 +1901,12 @@ impl Gemma4GpuModel {
         } else {
             None
         };
+        // Pick slot count once (before allocating 30 layer caches) from free RAM.
+        let moe_slot_count = if config.is_moe() {
+            crate::gemma4_moe::expert_cache_slot_count(config.num_experts_used)
+        } else {
+            0
+        };
         let mut layers = Vec::with_capacity(num_layers);
         for layer_idx in 0..num_layers {
             let is_full = config.is_full_attention(layer_idx);
@@ -2040,7 +2046,7 @@ impl Gemma4GpuModel {
                 .with_format(down_fmt);
                 let down_exps_scale = g.dequant_to_f32(&p("ffn_down_exps.scale"));
 
-                let slot_count = crate::gemma4_moe::expert_cache_slot_count(n_expert_used);
+                let slot_count = moe_slot_count;
                 let expert_cache = if slot_count > 0 {
                     let io = moe_io_files.as_ref().map(|files| crate::gemma4_moe::ExpertIoSource {
                         files: files.clone(),
@@ -2157,7 +2163,12 @@ impl Gemma4GpuModel {
                 .map(|c| c.bytes_per_layer())
                 .sum();
             if cache_bytes > 0 {
-                let slots = crate::gemma4_moe::expert_cache_slot_count(config.num_experts_used);
+                let slots = layers
+                    .iter()
+                    .find_map(|l| l.moe.as_ref())
+                    .and_then(|m| m.expert_cache.as_ref())
+                    .map(|c| c.slot_count())
+                    .unwrap_or(moe_slot_count);
                 println!(
                     "  MoE expert LFU cache: {} slots/layer × {} layers = {:.2} GB (MOE_EXPERT_CACHE=0 to disable, MOE_EXPERT_SLOTS=N to size)",
                     slots,
@@ -3496,64 +3507,71 @@ impl Gemma4GpuModel {
             })
             .unwrap_or(0);
 
-        let shared_cmd = self.ctx.queue.new_command_buffer();
-        {
-            let enc = shared_cmd.new_compute_command_encoder();
-            self.ctx.encode_rmsnorm_view(
-                &enc,
-                &self.hidden_buf,
-                &layer.pre_feedforward_layernorm_weight,
-                &self.normed_buf,
-                n_embd,
-                eps,
-            );
-            self.encode_matvec_quant(
-                &enc,
-                &layer.gate_proj,
-                &self.normed_buf,
-                &self.gate_buf,
-                shared_ff,
-                n_embd,
-                layer.weight_format,
-            );
-            self.encode_matvec_quant(
-                &enc,
-                &layer.up_proj,
-                &self.normed_buf,
-                &self.up_buf,
-                shared_ff,
-                n_embd,
-                layer.weight_format,
-            );
-            self.ctx.encode_gelu_mul(
-                &enc,
-                &self.gate_buf,
-                &self.up_buf,
-                &self.gelu_buf,
-                shared_ff,
-            );
-            self.encode_matvec_quant(
-                &enc,
-                &layer.down_proj,
-                &self.gelu_buf,
-                &self.down_buf,
-                n_embd,
-                shared_ff,
-                layer.weight_format,
-            );
-            self.ctx.encode_rmsnorm_view(
-                &enc,
-                &self.down_buf,
-                &moe.post_ffw_norm_1,
-                &self.attn_out_buf,
-                n_embd,
-                eps,
-            );
-            enc.end_encoding();
-        }
-        shared_cmd.commit(); // no wait — overlaps expert miss fills
+        // Shared dense MLP: commit without waiting so miss `pread` can overlap.
+        // Cache paths call this *inside* `fill_misses_scoped` so I/O threads start
+        // before we spend CPU time encoding the shared CB (ds4 early-load).
+        let commit_shared_mlp = || -> metal::CommandBuffer {
+            let shared_cmd = self.ctx.queue.new_command_buffer().to_owned();
+            {
+                let enc = shared_cmd.new_compute_command_encoder();
+                self.ctx.encode_rmsnorm_view(
+                    &enc,
+                    &self.hidden_buf,
+                    &layer.pre_feedforward_layernorm_weight,
+                    &self.normed_buf,
+                    n_embd,
+                    eps,
+                );
+                self.encode_matvec_quant(
+                    &enc,
+                    &layer.gate_proj,
+                    &self.normed_buf,
+                    &self.gate_buf,
+                    shared_ff,
+                    n_embd,
+                    layer.weight_format,
+                );
+                self.encode_matvec_quant(
+                    &enc,
+                    &layer.up_proj,
+                    &self.normed_buf,
+                    &self.up_buf,
+                    shared_ff,
+                    n_embd,
+                    layer.weight_format,
+                );
+                self.ctx.encode_gelu_mul(
+                    &enc,
+                    &self.gate_buf,
+                    &self.up_buf,
+                    &self.gelu_buf,
+                    shared_ff,
+                );
+                self.encode_matvec_quant(
+                    &enc,
+                    &layer.down_proj,
+                    &self.gelu_buf,
+                    &self.down_buf,
+                    n_embd,
+                    shared_ff,
+                    layer.weight_format,
+                );
+                self.ctx.encode_rmsnorm_view(
+                    &enc,
+                    &self.down_buf,
+                    &moe.post_ffw_norm_1,
+                    &self.attn_out_buf,
+                    n_embd,
+                    eps,
+                );
+                enc.end_encoding();
+            }
+            shared_cmd.commit();
+            shared_cmd
+        };
 
         if shared_only {
+            let shared_cmd = commit_shared_mlp();
             shared_cmd.wait_until_completed();
             MetalContext::write_buffer(&self.o_out_buf, &vec![0.0f32; hidden_size]);
             let mut cmd = self.ctx.queue.new_command_buffer();
@@ -3605,19 +3623,24 @@ impl Gemma4GpuModel {
             return;
         }
 
-        // ── 3. Expert path: miss fill ∥ shared wait, then hit GPU ∥ remaining fills ──
+        // ── 3. Expert path: miss fill ∥ shared+hit GPU, then miss GPU ──
         let mut routed_init = false;
         let mut prof_fill_ms = 0.0f64;
+        // Encoder opened lazily inside each branch so I/O-first paths can spawn
+        // fills before any shared/expert CPU encode work.
         let mut cmd = self.ctx.queue.new_command_buffer();
         let mut encoder = cmd.new_compute_command_encoder();
-        self.ctx.encode_rmsnorm_view(
-            &encoder,
-            &self.hidden_buf,
-            &moe.pre_ffw_norm_2,
-            &self.normed_buf,
-            n_embd,
-            eps,
-        );
+        let mut expert_norm_encoded = false;
+        let mut encode_expert_norm = |encoder: &metal::ComputeCommandEncoderRef| {
+            self.ctx.encode_rmsnorm_view(
+                encoder,
+                &self.hidden_buf,
+                &moe.pre_ffw_norm_2,
+                &self.normed_buf,
+                n_embd,
+                eps,
+            );
+        };
 
         let mut encode_one =
             |encoder: &metal::ComputeCommandEncoderRef,
@@ -3696,10 +3719,13 @@ impl Gemma4GpuModel {
 
         if probe_experts {
             // Debug path: fill then probe each expert with syncs.
+            let shared_cmd = commit_shared_mlp();
             if let (Some(cache), Some(plan)) = (moe.expert_cache.as_ref(), cache_plan.as_ref()) {
                 cache.fill_misses(plan, &moe.gate_up_exps, &moe.down_exps);
             }
             shared_cmd.wait_until_completed();
+            encode_expert_norm(&encoder);
+            expert_norm_encoded = true;
             let cached_views: Option<Vec<(BufferView, BufferView, BufferView)>> =
                 match (moe.expert_cache.as_ref(), cache_plan.as_ref()) {
                     (Some(cache), Some(plan)) => Some(cache.views(plan, swap_gate_up)),
@@ -3809,6 +3835,7 @@ impl Gemma4GpuModel {
                 // Abandon the unused main-queue encoder opened above.
                 encoder.end_encoding();
                 // Hits on moe_queue (own scratch) overlap shared MLP; miss I/O overlaps both.
+                // I/O-first: spawn fills, then commit shared + hits while preads run.
                 let scratch = self.moe_expert_scratch.get_or_init(|| MoeExpertScratch {
                     normed_buf: self.ctx.buffer_empty(hidden_size),
                     gate_buf: self.ctx.buffer_empty(moe.expert_ff.max(1)),
@@ -3817,107 +3844,111 @@ impl Gemma4GpuModel {
                     down_buf: self.ctx.buffer_empty(hidden_size),
                 });
                 let views = cache.views(plan, swap_gate_up);
-                let hit_cmd = if !hit_idxs.is_empty() {
-                    let hit_cmd = self.ctx.moe_queue.new_command_buffer().to_owned();
-                    {
-                        let enc = hit_cmd.new_compute_command_encoder();
-                        self.ctx.encode_rmsnorm_view(
-                            &enc,
-                            &self.hidden_buf,
-                            &moe.pre_ffw_norm_2,
-                            &scratch.normed_buf,
-                            n_embd,
-                            eps,
-                        );
-                        let mut first = true;
-                        for &ei in &hit_idxs {
-                            let expert = experts[ei];
-                            let w = weights[ei] * scales[expert];
-                            if use_fused_gelu {
-                                self.ctx.encode_matvec_qk_gelu_mul_at_view(
+                let (shared_cmd, hit_cmd) = cache.fill_misses_scoped(
+                    plan,
+                    &moe.gate_up_exps,
+                    &moe.down_exps,
+                    || {
+                        let shared_cmd = commit_shared_mlp();
+                        let hit_cmd = if !hit_idxs.is_empty() {
+                            let hit_cmd = self.ctx.moe_queue.new_command_buffer().to_owned();
+                            {
+                                let enc = hit_cmd.new_compute_command_encoder();
+                                self.ctx.encode_rmsnorm_view(
                                     &enc,
-                                    &views[ei].0,
-                                    &views[ei].1,
+                                    &self.hidden_buf,
+                                    &moe.pre_ffw_norm_2,
                                     &scratch.normed_buf,
-                                    0,
-                                    &scratch.gelu_buf,
-                                    0,
-                                    expert_ff,
                                     n_embd,
+                                    eps,
                                 );
-                            } else {
-                                self.ctx.encode_matvec_qk_at_view(
-                                    &enc,
-                                    &views[ei].0,
-                                    &scratch.normed_buf,
-                                    0,
-                                    &scratch.gate_buf,
-                                    0,
-                                    expert_ff,
-                                    n_embd,
-                                    1,
-                                );
-                                self.ctx.encode_matvec_qk_at_view(
-                                    &enc,
-                                    &views[ei].1,
-                                    &scratch.normed_buf,
-                                    0,
-                                    &scratch.up_buf,
-                                    0,
-                                    expert_ff,
-                                    n_embd,
-                                    1,
-                                );
-                                self.ctx.encode_gelu_mul(
-                                    &enc,
-                                    &scratch.gate_buf,
-                                    &scratch.up_buf,
-                                    &scratch.gelu_buf,
-                                    expert_ff,
-                                );
+                                let mut first = true;
+                                for &ei in &hit_idxs {
+                                    let expert = experts[ei];
+                                    let w = weights[ei] * scales[expert];
+                                    if use_fused_gelu {
+                                        self.ctx.encode_matvec_qk_gelu_mul_at_view(
+                                            &enc,
+                                            &views[ei].0,
+                                            &views[ei].1,
+                                            &scratch.normed_buf,
+                                            0,
+                                            &scratch.gelu_buf,
+                                            0,
+                                            expert_ff,
+                                            n_embd,
+                                        );
+                                    } else {
+                                        self.ctx.encode_matvec_qk_at_view(
+                                            &enc,
+                                            &views[ei].0,
+                                            &scratch.normed_buf,
+                                            0,
+                                            &scratch.gate_buf,
+                                            0,
+                                            expert_ff,
+                                            n_embd,
+                                            1,
+                                        );
+                                        self.ctx.encode_matvec_qk_at_view(
+                                            &enc,
+                                            &views[ei].1,
+                                            &scratch.normed_buf,
+                                            0,
+                                            &scratch.up_buf,
+                                            0,
+                                            expert_ff,
+                                            n_embd,
+                                            1,
+                                        );
+                                        self.ctx.encode_gelu_mul(
+                                            &enc,
+                                            &scratch.gate_buf,
+                                            &scratch.up_buf,
+                                            &scratch.gelu_buf,
+                                            expert_ff,
+                                        );
+                                    }
+                                    self.ctx.encode_matvec_moe_down_at_view(
+                                        &enc,
+                                        &views[ei].2,
+                                        &scratch.gelu_buf,
+                                        0,
+                                        &scratch.down_buf,
+                                        0,
+                                        n_embd,
+                                        expert_ff,
+                                    );
+                                    if first {
+                                        self.ctx.encode_vec_scale(
+                                            &enc,
+                                            &scratch.down_buf,
+                                            &self.o_out_buf,
+                                            n_embd,
+                                            w,
+                                        );
+                                        first = false;
+                                    } else {
+                                        self.ctx.encode_vec_add_scaled(
+                                            &enc,
+                                            &self.o_out_buf,
+                                            &scratch.down_buf,
+                                            &self.o_out_buf,
+                                            n_embd,
+                                            w,
+                                        );
+                                    }
+                                }
+                                enc.end_encoding();
                             }
-                            self.ctx.encode_matvec_moe_down_at_view(
-                                &enc,
-                                &views[ei].2,
-                                &scratch.gelu_buf,
-                                0,
-                                &scratch.down_buf,
-                                0,
-                                n_embd,
-                                expert_ff,
-                            );
-                            if first {
-                                self.ctx.encode_vec_scale(
-                                    &enc,
-                                    &scratch.down_buf,
-                                    &self.o_out_buf,
-                                    n_embd,
-                                    w,
-                                );
-                                first = false;
-                            } else {
-                                self.ctx.encode_vec_add_scaled(
-                                    &enc,
-                                    &self.o_out_buf,
-                                    &scratch.down_buf,
-                                    &self.o_out_buf,
-                                    n_embd,
-                                    w,
-                                );
-                            }
-                        }
-                        enc.end_encoding();
-                    }
-                    Some(hit_cmd)
-                } else {
-                    None
-                };
-                // Fill misses while hit GPU + shared GPU run.
-                cache.fill_misses_scoped(plan, &moe.gate_up_exps, &moe.down_exps, || {
-                    if let Some(ref c) = hit_cmd {
-                        c.commit();
-                    }
-                });
+                            hit_cmd.commit();
+                            Some(hit_cmd)
+                        } else {
+                            None
+                        };
+                        (shared_cmd, hit_cmd)
+                    },
+                );
                 if profile {
                     prof_fill_ms = t_fill0.elapsed().as_secs_f64() * 1e3;
                 }
@@ -4095,7 +4126,13 @@ impl Gemma4GpuModel {
                 &moe.gate_up_exps,
                 &moe.down_exps,
                 || {
-                    // Do not CPU-wait on shared: same queue orders hit CB after it.
+                    // I/O threads already running — encode shared then hits on the
+                    // main queue (same-queue orders hits after shared; no CPU wait).
+                    let _shared_cmd = commit_shared_mlp();
+                    if !expert_norm_encoded {
+                        encode_expert_norm(&encoder);
+                        expert_norm_encoded = true;
+                    }
                     let views = cache.views(plan, swap_gate_up);
                     for &ei in &hit_idxs {
                         let expert = experts[ei];
@@ -4125,23 +4162,33 @@ impl Gemma4GpuModel {
             if hit_committed {
                 cmd = self.ctx.queue.new_command_buffer();
                 encoder = cmd.new_compute_command_encoder();
+                expert_norm_encoded = false;
             }
-            let views = cache.views(plan, swap_gate_up);
-            for &ei in &miss_idxs {
-                let expert = experts[ei];
-                let w = weights[ei] * scales[expert];
-                encode_one(
-                    &encoder,
-                    &views[ei].0,
-                    &views[ei].1,
-                    &views[ei].2,
-                    w,
-                    !routed_init,
-                );
-                routed_init = true;
+            if !miss_idxs.is_empty() {
+                if !expert_norm_encoded {
+                    encode_expert_norm(&encoder);
+                    expert_norm_encoded = true;
+                }
+                let views = cache.views(plan, swap_gate_up);
+                for &ei in &miss_idxs {
+                    let expert = experts[ei];
+                    let w = weights[ei] * scales[expert];
+                    encode_one(
+                        &encoder,
+                        &views[ei].0,
+                        &views[ei].1,
+                        &views[ei].2,
+                        w,
+                        !routed_init,
+                    );
+                    routed_init = true;
+                }
             }
         } else {
+            let shared_cmd = commit_shared_mlp();
             shared_cmd.wait_until_completed();
+            encode_expert_norm(&encoder);
+            expert_norm_encoded = true;
             for (ei, &expert) in experts.iter().enumerate() {
                 let w = weights[ei] * scales[expert];
                 let gate_view = crate::gemma4_moe::expert_gate_up_view(

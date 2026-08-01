@@ -518,21 +518,16 @@ fn bench_decode_gemma4(
 
     // Decode — no print/flush/tokenizer in the timed section.
     // Untimed warmup settles expert LFU / UBC before the measured 32-token window.
-    let eos_tokens: &[usize] = &[1, 106];
+    // Do not stop on EOS: short greedy replies end early and zero the Generation
+    // yardstick (TF-style sustained decode).
     let warmup = 16usize;
     for _ in 0..warmup {
-        if eos_tokens.contains(&next_token) {
-            break;
-        }
         let seed: u32 = rng.gen();
         next_token = model.forward_single_token_sample(next_token, 0.0, 0.0, seed);
     }
     let decode_start = Instant::now();
     let mut generated = 0usize;
     for _ in 0..gen_tokens {
-        if eos_tokens.contains(&next_token) {
-            break;
-        }
         generated += 1;
         let seed: u32 = rng.gen();
         next_token = model.forward_single_token_sample(next_token, 0.0, 0.0, seed);

@@ -312,16 +312,101 @@ struct ExpertCacheState {
     use_clock: u64,
 }
 
-/// Default slots/layer for 16 GB hosts (~3.3 GB @ 32). Override with `MOE_EXPERT_SLOTS`.
+/// Approx reclaimable RAM (free + purgeable pages). Conservative fallback 4 GiB.
+fn approx_available_ram_bytes() -> u64 {
+    #[cfg(target_os = "macos")]
+    {
+        let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) }.max(1) as u64;
+        let read_sysctl_u64 = |name: &std::ffi::CStr| -> Option<u64> {
+            let mut val: u64 = 0;
+            let mut len = std::mem::size_of::<u64>();
+            let rc = unsafe {
+                libc::sysctlbyname(
+                    name.as_ptr(),
+                    &mut val as *mut _ as *mut libc::c_void,
+                    &mut len,
+                    std::ptr::null_mut(),
+                    0,
+                )
+            };
+            if rc == 0 {
+                Some(val)
+            } else {
+                None
+            }
+        };
+        // vm.page_free_count is uint32 on some Darwin versions — try both widths.
+        let free_pages = read_sysctl_u64(c"vm.page_free_count").or_else(|| {
+            let mut val: u32 = 0;
+            let mut len = std::mem::size_of::<u32>();
+            let rc = unsafe {
+                libc::sysctlbyname(
+                    c"vm.page_free_count".as_ptr(),
+                    &mut val as *mut _ as *mut libc::c_void,
+                    &mut len,
+                    std::ptr::null_mut(),
+                    0,
+                )
+            };
+            if rc == 0 {
+                Some(val as u64)
+            } else {
+                None
+            }
+        });
+        let purge_pages = read_sysctl_u64(c"vm.page_purgeable_count").or_else(|| {
+            let mut val: u32 = 0;
+            let mut len = std::mem::size_of::<u32>();
+            let rc = unsafe {
+                libc::sysctlbyname(
+                    c"vm.page_purgeable_count".as_ptr(),
+                    &mut val as *mut _ as *mut libc::c_void,
+                    &mut len,
+                    std::ptr::null_mut(),
+                    0,
+                )
+            };
+            if rc == 0 {
+                Some(val as u64)
+            } else {
+                None
+            }
+        });
+        if let Some(free) = free_pages {
+            return (free + purge_pages.unwrap_or(0)) * page_size;
+        }
+    }
+    4u64 << 30
+}
+
+/// Default slots/layer from free RAM (ds4-style budget). Override with `MOE_EXPERT_SLOTS`.
+///
+/// A4B: ~110 MB/slot across 30 layers. On a busy 16 GB M1 Pro, 32 slots (~3.3 GB)
+/// thrash; 16 matches TurboFieldfare and sustains higher tok/s.
 pub fn expert_cache_slot_count(n_expert_used: usize) -> usize {
     if std::env::var("MOE_EXPERT_CACHE").as_deref() == Ok("0") {
         return 0;
     }
-    let raw = std::env::var("MOE_EXPERT_SLOTS")
+    if let Some(raw) = std::env::var("MOE_EXPERT_SLOTS")
         .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(32usize);
-    raw.max(n_expert_used).max(1)
+        .and_then(|s| s.parse::<usize>().ok())
+    {
+        return raw.max(n_expert_used).max(1);
+    }
+    const BYTES_PER_SLOT: u64 = 110 * 1024 * 1024;
+    const HEADROOM: u64 = 2500 * 1024 * 1024;
+    let avail = approx_available_ram_bytes();
+    let budget = avail.saturating_sub(HEADROOM);
+    let by_budget = (budget / BYTES_PER_SLOT).clamp(8, 32) as usize;
+    // Snap to TF/ds4-friendly sizes so we do not oscillate mid-band.
+    let snapped = if by_budget >= 28 {
+        32
+    } else if by_budget >= 20 {
+        24
+    } else {
+        16
+    };
+    snapped.max(n_expert_used).max(1)
 }
 
 /// Result of LFU slot assignment before miss I/O.
@@ -484,6 +569,12 @@ impl ExpertSlotCache {
         let mut st = self.state.lock().unwrap();
         st.use_clock = st.use_clock.wrapping_add(1);
         let clock = st.use_clock;
+        // ds4-style decay: keep LFU from pinning early-prompt experts forever.
+        if clock % 16 == 0 {
+            for c in st.expert_use_count.iter_mut() {
+                *c >>= 1;
+            }
+        }
         let mut assigned = vec![usize::MAX; experts.len()];
         let mut reserved = vec![false; self.slot_count];
 
