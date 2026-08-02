@@ -11,6 +11,9 @@ pub mod weight_fmt {
     pub const Q3_0: u8 = 2;
     pub const Q4_K: u8 = 3;
     pub const Q6_K: u8 = 4;
+    // Keep 5 free — WeightFormat::KQuant historically serializes as 5.
+    pub const Q5_1: u8 = 6;
+    pub const Q8_0: u8 = 7;
 }
 
 /// A sub-range view into a Metal buffer (offset applied at kernel bind time).
@@ -526,6 +529,8 @@ fn attention_threadgroup_size(flash: bool) -> MTLSize {
 pub struct MetalContext {
     pub device: Device,
     pub queue: CommandQueue,
+    /// Second queue for MoE routed-expert work overlapping shared MLP.
+    pub moe_queue: CommandQueue,
     pub matvec_pipeline: ComputePipelineState,
     pub matvec_f16_pipeline: ComputePipelineState,
     pub matvec_q4_pipeline: ComputePipelineState,
@@ -548,6 +553,8 @@ pub struct MetalContext {
     pub matvec_qkv_rmsnorm_inv_kquant_pipeline: ComputePipelineState,
     pub ple_matvec_gelu_q4_pipeline: ComputePipelineState,
     pub matvec_ggml_q4_pipeline: ComputePipelineState,
+    pub matvec_ggml_q5_1_pipeline: ComputePipelineState,
+    pub matvec_ggml_q8_0_pipeline: ComputePipelineState,
     pub matvec_ggml_q4_dual_pipeline: ComputePipelineState,
     pub matvec_ggml_q4_gelu_mul_pipeline: ComputePipelineState,
     pub matvec_ggml_q4_gelu_mul_r2s4_pipeline: ComputePipelineState,
@@ -555,6 +562,11 @@ pub struct MetalContext {
     pub matvec_ggml_q4k_pipeline: ComputePipelineState,
     pub matvec_ggml_q6k_pipeline: ComputePipelineState,
     pub matvec_ggml_q4k_gelu_mul_pipeline: ComputePipelineState,
+    /// MoE: one dispatch, tgpig.z = expert slot (≤8), weighted mid write.
+    pub matvec_ggml_q4k_gelu_mul_slots8_pipeline: ComputePipelineState,
+    /// MoE: fused down across ≤8 expert mids (Q8_0 / Q5_1).
+    pub matvec_ggml_q8_0_sum8_pipeline: ComputePipelineState,
+    pub matvec_ggml_q5_1_sum8_pipeline: ComputePipelineState,
     pub matvec_ggml_q4k_rmsnorm_gelu_mul_pipeline: ComputePipelineState,
     /// Lazy: prefill Q4_K matrix-matrix (llama.cpp `kernel_mul_mm_q4_K_f32`).
     mul_mm_q4k_pipeline: OnceLock<ComputePipelineState>,
@@ -702,6 +714,7 @@ impl MetalContext {
         let device = Device::system_default().expect("No Metal GPU found");
         println!("  Metal GPU: {}", device.name());
         let queue = device.new_command_queue();
+        let moe_queue = device.new_command_queue();
 
         let shader_path = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/shaders/llama.metal");
         let mega_path = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/shaders/decode_mega.metal");
@@ -799,12 +812,18 @@ impl MetalContext {
         let matvec_qkv_rmsnorm_inv_kquant_pipeline = get_fn("matvec_qkv_rmsnorm_inv_kquant");
         let ple_matvec_gelu_q4_pipeline = get_fn("ple_matvec_gelu_q4");
         let matvec_ggml_q4_pipeline = get_fn("matvec_ggml_q4_0");
+        let matvec_ggml_q5_1_pipeline = get_fn("matvec_ggml_q5_1");
+        let matvec_ggml_q8_0_pipeline = get_fn("matvec_ggml_q8_0");
         let matvec_ggml_q4_dual_pipeline = get_fn("matvec_ggml_q4_0_dual");
         let matvec_ggml_q4_gelu_mul_pipeline = get_fn("matvec_ggml_q4_0_gelu_mul");
         let matvec_ggml_q4_gelu_mul_r2s4_pipeline = get_fn("matvec_ggml_q4_0_gelu_mul_r2s4");
         let matvec_ggml_q4k_pipeline = get_fn("matvec_ggml_q4_K");
         let matvec_ggml_q6k_pipeline = get_fn("matvec_ggml_q6_K");
         let matvec_ggml_q4k_gelu_mul_pipeline = get_fn("matvec_ggml_q4_K_gelu_mul");
+        let matvec_ggml_q4k_gelu_mul_slots8_pipeline =
+            get_fn("matvec_ggml_q4_K_gelu_mul_slots8");
+        let matvec_ggml_q8_0_sum8_pipeline = get_fn("matvec_ggml_q8_0_sum8");
+        let matvec_ggml_q5_1_sum8_pipeline = get_fn("matvec_ggml_q5_1_sum8");
         let matvec_ggml_q4k_rmsnorm_gelu_mul_pipeline = get_fn("matvec_ggml_q4_K_rmsnorm_gelu_mul");
         let matvec_ggml_q3_pipeline = get_fn("matvec_ggml_q3_0");
         let matvec_ggml_q3_dual_pipeline = get_fn("matvec_ggml_q3_0_dual");
@@ -1085,6 +1104,7 @@ impl MetalContext {
         MetalContext {
             device,
             queue,
+            moe_queue,
             matvec_pipeline,
             matvec_f16_pipeline,
             matvec_q4_pipeline,
@@ -1107,12 +1127,17 @@ impl MetalContext {
             matvec_qkv_rmsnorm_inv_kquant_pipeline,
             ple_matvec_gelu_q4_pipeline,
             matvec_ggml_q4_pipeline,
+            matvec_ggml_q5_1_pipeline,
+            matvec_ggml_q8_0_pipeline,
             matvec_ggml_q4_dual_pipeline,
             matvec_ggml_q4_gelu_mul_pipeline,
             matvec_ggml_q4_gelu_mul_r2s4_pipeline,
             matvec_ggml_q4k_pipeline,
             matvec_ggml_q6k_pipeline,
             matvec_ggml_q4k_gelu_mul_pipeline,
+            matvec_ggml_q4k_gelu_mul_slots8_pipeline,
+            matvec_ggml_q8_0_sum8_pipeline,
+            matvec_ggml_q5_1_sum8_pipeline,
             matvec_ggml_q4k_rmsnorm_gelu_mul_pipeline,
             mul_mm_q4k_pipeline: OnceLock::new(),
             mul_mm_q6k_pipeline: OnceLock::new(),
@@ -2091,6 +2116,8 @@ impl MetalContext {
     ) {
         if matches!(weight.format, weight_fmt::Q4_K | weight_fmt::Q6_K) {
             self.encode_matvec_qk_at_view(encoder, weight, x_buf, 0, y_buf, 0, m, k, 1);
+        } else if weight.format == weight_fmt::Q8_0 {
+            self.encode_matvec_q8_0_at_view(encoder, weight, x_buf, 0, y_buf, 0, m, k);
         } else if weight_buf_is_q3(weight, m, k) {
             self.encode_matvec_q3_at_view(encoder, weight, x_buf, 0, y_buf, 0, m, k);
         } else if weight_buf_is_q4(weight, m, k) {
@@ -2114,6 +2141,10 @@ impl MetalContext {
         if matches!(weight.format, weight_fmt::Q4_K | weight_fmt::Q6_K) {
             self.encode_matvec_qk_at_view(
                 encoder, weight, x_buf, x_offset, y_buf, y_offset, m, k, 1,
+            );
+        } else if weight.format == weight_fmt::Q8_0 {
+            self.encode_matvec_q8_0_at_view(
+                encoder, weight, x_buf, x_offset, y_buf, y_offset, m, k,
             );
         } else if weight_buf_is_q3(weight, m, k) {
             self.encode_matvec_q3_at_view(
@@ -2142,6 +2173,14 @@ impl MetalContext {
     ) {
         if matches!(weight.format, weight_fmt::Q4_K | weight_fmt::Q6_K) {
             self.encode_matvec_qk_at_view(encoder, weight, x_buf, 0, y_buf, 0, m, k, seq_len);
+        } else if weight.format == weight_fmt::Q8_0 {
+            for s in 0..seq_len {
+                let x_off = (s * k * 4) as u64;
+                let y_off = (s * m * 4) as u64;
+                self.encode_matvec_q8_0_at_view(
+                    encoder, weight, x_buf, x_off, y_buf, y_off, m, k,
+                );
+            }
         } else if weight_buf_is_q4(weight, m, k) {
             self.encode_projection_q4_batch_view(encoder, weight, x_buf, y_buf, m, k, seq_len);
         } else {
@@ -2163,6 +2202,14 @@ impl MetalContext {
     ) {
         if matches!(weight.format, weight_fmt::Q4_K | weight_fmt::Q6_K) {
             self.encode_prefill_kquant_projection(encoder, weight, x_buf, y_buf, m, k, seq_len);
+        } else if weight.format == weight_fmt::Q8_0 {
+            for s in 0..seq_len {
+                let x_off = (s * k * 4) as u64;
+                let y_off = (s * m * 4) as u64;
+                self.encode_matvec_q8_0_at_view(
+                    encoder, weight, x_buf, x_off, y_buf, y_off, m, k,
+                );
+            }
         } else if weight.format == weight_fmt::F16
             || (!weight_buf_is_q4(weight, m, k) && !weight_buf_is_q3(weight, m, k))
         {
@@ -2630,6 +2677,93 @@ impl MetalContext {
         );
     }
 
+    /// Q5_1 weight matvec (llama.cpp `kernel_mul_mv_q5_1_f32`). Used for MoE
+    /// `ffn_down_exps` on Gemma4 26B-A4B UD-Q4_K_M.
+    pub fn encode_matvec_q5_1_at_view(
+        &self,
+        encoder: &metal::ComputeCommandEncoderRef,
+        weight: &BufferView,
+        x_buf: &Buffer,
+        x_offset: u64,
+        y_buf: &Buffer,
+        y_offset: u64,
+        m: u32,
+        k: u32,
+    ) {
+        debug_assert_eq!(weight.format, weight_fmt::Q5_1);
+        use crate::ggml_gemv::{mul_mv_args_q5_1, mul_mv_dispatch};
+        let args = mul_mv_args_q5_1(m, k);
+        encoder.set_compute_pipeline_state(&self.matvec_ggml_q5_1_pipeline);
+        encoder.set_buffer(0, Some(&weight.buffer), weight.offset);
+        encoder.set_buffer(1, Some(x_buf), x_offset);
+        encoder.set_buffer(2, Some(y_buf), y_offset);
+        encoder.set_bytes(
+            3,
+            std::mem::size_of::<crate::ggml_gemv::GgmlMulMvArgs>() as u64,
+            &args as *const _ as *const _,
+        );
+        let (tg_x, tg_y, tg_z, tw, nsg) = mul_mv_dispatch(m, 1);
+        encoder.dispatch_thread_groups(
+            metal::MTLSize::new(tg_x, tg_y, tg_z),
+            metal::MTLSize::new(tw, nsg, 1),
+        );
+    }
+
+    /// Q8_0 weight matvec (llama.cpp `kernel_mul_mv_q8_0_f32`). Used when a
+    /// MoE expert down tensor is stored as Q8_0 (e.g. last layer of UD-Q4_K_M).
+    pub fn encode_matvec_q8_0_at_view(
+        &self,
+        encoder: &metal::ComputeCommandEncoderRef,
+        weight: &BufferView,
+        x_buf: &Buffer,
+        x_offset: u64,
+        y_buf: &Buffer,
+        y_offset: u64,
+        m: u32,
+        k: u32,
+    ) {
+        debug_assert_eq!(weight.format, weight_fmt::Q8_0);
+        use crate::ggml_gemv::{mul_mv_args_q8_0, mul_mv_dispatch};
+        let args = mul_mv_args_q8_0(m, k);
+        encoder.set_compute_pipeline_state(&self.matvec_ggml_q8_0_pipeline);
+        encoder.set_buffer(0, Some(&weight.buffer), weight.offset);
+        encoder.set_buffer(1, Some(x_buf), x_offset);
+        encoder.set_buffer(2, Some(y_buf), y_offset);
+        encoder.set_bytes(
+            3,
+            std::mem::size_of::<crate::ggml_gemv::GgmlMulMvArgs>() as u64,
+            &args as *const _ as *const _,
+        );
+        let (tg_x, tg_y, tg_z, tw, nsg) = mul_mv_dispatch(m, 1);
+        encoder.dispatch_thread_groups(
+            metal::MTLSize::new(tg_x, tg_y, tg_z),
+            metal::MTLSize::new(tw, nsg, 1),
+        );
+    }
+
+    /// Dispatch MoE expert down by per-tensor format (Q5_1 / Q8_0).
+    pub fn encode_matvec_moe_down_at_view(
+        &self,
+        encoder: &metal::ComputeCommandEncoderRef,
+        weight: &BufferView,
+        x_buf: &Buffer,
+        x_offset: u64,
+        y_buf: &Buffer,
+        y_offset: u64,
+        m: u32,
+        k: u32,
+    ) {
+        match weight.format {
+            weight_fmt::Q5_1 => self.encode_matvec_q5_1_at_view(
+                encoder, weight, x_buf, x_offset, y_buf, y_offset, m, k,
+            ),
+            weight_fmt::Q8_0 => self.encode_matvec_q8_0_at_view(
+                encoder, weight, x_buf, x_offset, y_buf, y_offset, m, k,
+            ),
+            other => panic!("unsupported MoE down format {other}"),
+        }
+    }
+
     /// K-quant small-batch ext matvec (llama.cpp `kernel_mul_mv_ext_q4x4_f32`).
     /// Dequantizes each weight row once and dots against r1ptg src1 rows.
     pub fn encode_matvec_kq_ext_at_view(
@@ -2746,6 +2880,116 @@ impl MetalContext {
             &args as *const _ as *const _,
         );
         let (tg_x, tg_y, tg_z, tw, nsg) = mul_mv_k_dispatch(m, 1);
+        encoder.dispatch_thread_groups(
+            metal::MTLSize::new(tg_x, tg_y, tg_z),
+            metal::MTLSize::new(tw, nsg, 1),
+        );
+    }
+
+    /// Fused MoE gate∥up+GeLU for ≤8 resident experts in one dispatch (`tgpig.z`).
+    /// Writes `weights[e] * GeLU(gate_e·x)*(up_e·x)` into `mid[mid_ids[e] * m ..]`.
+    pub fn encode_moe_slots8_q4k_gelu(
+        &self,
+        encoder: &metal::ComputeCommandEncoderRef,
+        gates: &[&BufferView],
+        ups: &[&BufferView],
+        x_buf: &Buffer,
+        x_offset: u64,
+        mid: &Buffer,
+        weights: &[f32],
+        mid_ids: &[u32],
+        m: u32,
+        k: u32,
+    ) {
+        let n = gates.len();
+        assert!(n >= 1 && n <= 8);
+        assert_eq!(ups.len(), n);
+        assert_eq!(weights.len(), n);
+        assert_eq!(mid_ids.len(), n);
+        for g in gates {
+            debug_assert_eq!(g.format, weight_fmt::Q4_K);
+        }
+        for u in ups {
+            debug_assert_eq!(u.format, weight_fmt::Q4_K);
+        }
+        use crate::ggml_gemv::{mul_mv_args_k, mul_mv_k_dispatch, Q4_K_BLOCK_BYTES};
+        let args = mul_mv_args_k(m, k, 1, Q4_K_BLOCK_BYTES);
+        let n_slots = n as u32;
+        let mut wpad = [0.0f32; 8];
+        wpad[..n].copy_from_slice(weights);
+        let mut idpad = [0u32; 8];
+        idpad[..n].copy_from_slice(mid_ids);
+
+        encoder.set_compute_pipeline_state(&self.matvec_ggml_q4k_gelu_mul_slots8_pipeline);
+        let pad_gate = gates[0];
+        let pad_up = ups[0];
+        for i in 0..8 {
+            let g = if i < n { gates[i] } else { pad_gate };
+            let u = if i < n { ups[i] } else { pad_up };
+            encoder.set_buffer(i as u64, Some(&g.buffer), g.offset);
+            encoder.set_buffer(8 + i as u64, Some(&u.buffer), u.offset);
+        }
+        encoder.set_buffer(16, Some(x_buf), x_offset);
+        encoder.set_buffer(17, Some(mid), 0);
+        encoder.set_bytes(18, (8 * 4) as u64, wpad.as_ptr() as *const _);
+        encoder.set_bytes(19, (8 * 4) as u64, idpad.as_ptr() as *const _);
+        encoder.set_bytes(20, 4, &n_slots as *const u32 as *const _);
+        encoder.set_bytes(
+            21,
+            std::mem::size_of::<crate::ggml_gemv::GgmlMulMvArgs>() as u64,
+            &args as *const _ as *const _,
+        );
+        let (tg_x, _tg_y, _tg_z, tw, nsg) = mul_mv_k_dispatch(m, 1);
+        encoder.dispatch_thread_groups(
+            metal::MTLSize::new(tg_x, 1, n_slots as u64),
+            metal::MTLSize::new(tw, nsg, 1),
+        );
+    }
+
+    /// Fused MoE down across ≤8 weighted mids → `dst` (Q5_1 or Q8_0 downs).
+    pub fn encode_moe_sum8_down(
+        &self,
+        encoder: &metal::ComputeCommandEncoderRef,
+        downs: &[&BufferView],
+        mid: &Buffer,
+        dst: &Buffer,
+        m: u32,
+        k: u32,
+    ) {
+        let n = downs.len();
+        assert!(n >= 1 && n <= 8);
+        let fmt = downs[0].format;
+        for d in downs {
+            debug_assert_eq!(d.format, fmt);
+        }
+        use crate::ggml_gemv::{mul_mv_args_q5_1, mul_mv_args_q8_0, mul_mv_dispatch};
+        let (pipeline, args) = match fmt {
+            weight_fmt::Q8_0 => (
+                &self.matvec_ggml_q8_0_sum8_pipeline,
+                mul_mv_args_q8_0(m, k),
+            ),
+            weight_fmt::Q5_1 => (
+                &self.matvec_ggml_q5_1_sum8_pipeline,
+                mul_mv_args_q5_1(m, k),
+            ),
+            other => panic!("encode_moe_sum8_down: unsupported format {other}"),
+        };
+        let n_slots = n as u32;
+        encoder.set_compute_pipeline_state(pipeline);
+        let pad = downs[0];
+        for i in 0..8 {
+            let d = if i < n { downs[i] } else { pad };
+            encoder.set_buffer(i as u64, Some(&d.buffer), d.offset);
+        }
+        encoder.set_buffer(8, Some(mid), 0);
+        encoder.set_buffer(9, Some(dst), 0);
+        encoder.set_bytes(10, 4, &n_slots as *const u32 as *const _);
+        encoder.set_bytes(
+            11,
+            std::mem::size_of::<crate::ggml_gemv::GgmlMulMvArgs>() as u64,
+            &args as *const _ as *const _,
+        );
+        let (tg_x, tg_y, tg_z, tw, nsg) = mul_mv_dispatch(m, 1);
         encoder.dispatch_thread_groups(
             metal::MTLSize::new(tg_x, tg_y, tg_z),
             metal::MTLSize::new(tw, nsg, 1),
@@ -7194,7 +7438,7 @@ fn dequantize_q3_0(data: &[u8], rows: usize, cols: usize) -> Vec<f32> {
 ///   - Quantize each value to 4-bit unsigned: q = round(v / scale) + 8, clamped to [0, 15]
 ///   - Pack GGUF layout: byte i = low nibble elem i, high nibble elem i+16
 ///   - Store: [f16 scale][16 bytes packed quants]
-fn quantize_q4_0(data: &[f32], rows: usize, cols: usize) -> Vec<u8> {
+pub(crate) fn quantize_q4_0(data: &[f32], rows: usize, cols: usize) -> Vec<u8> {
     assert_eq!(cols % 32, 0, "cols must be divisible by 32 for Q4_0");
     let num_groups_per_row = cols / 32;
     let bytes_per_row = num_groups_per_row * 18; // 18 bytes per group

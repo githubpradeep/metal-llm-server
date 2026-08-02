@@ -55,6 +55,10 @@ pub fn log_fused_decode_status(model: &Gemma4GpuModel) {
         println!("  Fused decode executor skipped (F16 weight layers present)");
         return;
     }
+    if model.layers.iter().any(|l| l.moe.is_some()) {
+        println!("  Fused decode executor skipped (MoE layers present)");
+        return;
+    }
     let kq = model
         .layers
         .iter()
@@ -109,7 +113,8 @@ impl Gemma4GpuModel {
             return false;
         }
         self.layers.iter().all(|l| {
-            l.weight_format == WeightFormat::Q4_0 || l.weight_format.is_kquant()
+            l.moe.is_none()
+                && (l.weight_format == WeightFormat::Q4_0 || l.weight_format.is_kquant())
         })
     }
 

@@ -100,6 +100,17 @@ fn row_bytes(k: u32) -> u64 {
     (k as u64 / 32) * 18
 }
 
+pub const Q5_1_BLOCK_BYTES: u64 = 24;
+pub const Q8_0_BLOCK_BYTES: u64 = 34;
+
+fn row_bytes_q5_1(k: u32) -> u64 {
+    (k as u64 / 32) * Q5_1_BLOCK_BYTES
+}
+
+fn row_bytes_q8_0(k: u32) -> u64 {
+    (k as u64 / 32) * Q8_0_BLOCK_BYTES
+}
+
 pub fn mul_mv_args(m: u32, k: u32) -> GgmlMulMvArgs {
     let rb = row_bytes(k);
     GgmlMulMvArgs {
@@ -107,6 +118,58 @@ pub fn mul_mv_args(m: u32, k: u32) -> GgmlMulMvArgs {
         ne01: m as i32,
         ne02: 1,
         nb00: 18,
+        nb01: rb,
+        nb02: rb * m as u64,
+        nb03: 0,
+        ne10: k as i32,
+        ne11: 1,
+        ne12: 1,
+        nb10: 4,
+        nb11: (k as u64) * 4,
+        nb12: 0,
+        nb13: 0,
+        ne0: m as i32,
+        ne1: 1,
+        nr0: GGML_NR0_Q4_0 as i32,
+        r2: 1,
+        r3: 1,
+    }
+}
+
+/// Args for Q5_1 matvec (`matvec_ggml_q5_1`). Same tiling as Q4_0 (NR0=4, NSG=2).
+pub fn mul_mv_args_q5_1(m: u32, k: u32) -> GgmlMulMvArgs {
+    let rb = row_bytes_q5_1(k);
+    GgmlMulMvArgs {
+        ne00: k as i32,
+        ne01: m as i32,
+        ne02: 1,
+        nb00: Q5_1_BLOCK_BYTES,
+        nb01: rb,
+        nb02: rb * m as u64,
+        nb03: 0,
+        ne10: k as i32,
+        ne11: 1,
+        ne12: 1,
+        nb10: 4,
+        nb11: (k as u64) * 4,
+        nb12: 0,
+        nb13: 0,
+        ne0: m as i32,
+        ne1: 1,
+        nr0: GGML_NR0_Q4_0 as i32,
+        r2: 1,
+        r3: 1,
+    }
+}
+
+/// Args for Q8_0 matvec (`matvec_ggml_q8_0`). Same tiling as Q4_0 (NR0=4, NSG=2).
+pub fn mul_mv_args_q8_0(m: u32, k: u32) -> GgmlMulMvArgs {
+    let rb = row_bytes_q8_0(k);
+    GgmlMulMvArgs {
+        ne00: k as i32,
+        ne01: m as i32,
+        ne02: 1,
+        nb00: Q8_0_BLOCK_BYTES,
         nb01: rb,
         nb02: rb * m as u64,
         nb03: 0,

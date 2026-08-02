@@ -38,6 +38,15 @@ pub struct Gemma4TextConfig {
     /// Per-layer KV head counts. Empty = uniform (use num_key_value_heads).
     #[serde(default)]
     pub num_key_value_heads_per_layer: Vec<usize>,
+    /// MoE: total routed experts per layer (0 = dense MLP only).
+    #[serde(default)]
+    pub num_experts: usize,
+    /// MoE: experts used per token (top-k).
+    #[serde(default)]
+    pub num_experts_used: usize,
+    /// MoE: intermediate size of each routed expert.
+    #[serde(default)]
+    pub expert_intermediate_size: usize,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -175,5 +184,9 @@ impl Gemma4TextConfig {
         self.rope_parameters.as_ref()
             .and_then(|r| r.sliding_attention.as_ref())
             .map_or(1.0, |c| c.factor)
+    }
+
+    pub fn is_moe(&self) -> bool {
+        self.num_experts > 0 && self.num_experts_used > 0
     }
 }
