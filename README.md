@@ -390,6 +390,6 @@ Client  →  axum OpenAI API  →  scheduler / KV pool
 
 ## License / models
 
-Engine code: see repository license. Model weights are Google Gemma 4 (check
-each Hugging Face card for terms). Unsloth GGUFs are redistributions of those
-weights in quantized form.
+Engine code: [MIT](LICENSE). Model weights are Google Gemma 4 (check each Hugging
+Face card for terms). Unsloth GGUFs are redistributions of those weights in
+quantized form.
