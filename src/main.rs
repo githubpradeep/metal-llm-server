@@ -14,6 +14,8 @@ mod gemma4_config;
 mod gemma4_gpu_model;
 mod gemma4_moe;
 mod gemma4_mtp;
+mod deepseek4;
+mod model_api;
 mod decode_fused;
 mod speculative;
 mod kv_pool;
@@ -68,7 +70,7 @@ fn main() {
         .unwrap_or_else(|| vec![128, 256, 512]);
 
     let model_dir = args.iter()
-        .filter(|a| !a.starts_with("--") && *a != &args[0])
+        .filter(|a| !a.starts_with('-') && *a != &args[0])
         .next()
         .cloned()
         .unwrap_or_else(|| {
@@ -76,8 +78,103 @@ fn main() {
             format!("{}/Downloads/hub/models--meta-llama--Llama-3.2-1B/snapshots/4e20de362430cd3b72f300e6b0f18e50e7166e08", home)
         });
 
+    // DeepSeek-V4 flags must run before the generic --gpu Gemma path.
+    if args.iter().any(|a| a == "--dsv4-inspect") {
+        let _cfg = deepseek4::Dsv4GpuModel::inspect_only(&model_dir);
+        let metal = deepseek4::metal_ctx::Dsv4Metal::new();
+        println!("dsv4 Metal library OK (device {})", metal.device.name());
+        return;
+    }
+    if args.iter().any(|a| a == "--dsv4-gen") {
+        let ssd = true;
+        let cache_mib = args
+            .iter()
+            .position(|a| a == "--ssd-streaming-cache-experts")
+            .and_then(|i| args.get(i + 1))
+            .and_then(|s| {
+                let t = s.trim_end_matches("GB").trim_end_matches("GiB");
+                t.parse::<usize>().ok()
+            })
+            .map(|g| g * 1024);
+        let nothink = args.iter().any(|a| a == "--nothink");
+        let n_new: usize = args
+            .iter()
+            .position(|a| a == "-n")
+            .and_then(|i| args.get(i + 1))
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(32);
+        let prompt = args
+            .iter()
+            .position(|a| a == "-p")
+            .and_then(|i| args.get(i + 1))
+            .cloned()
+            .unwrap_or_else(|| "Say hello in one short sentence.".to_string());
+
+        let mut model = deepseek4::Dsv4GpuModel::load_from_gguf(&model_dir, ssd, cache_mib);
+        model.nothink = nothink;
+        let tok = gguf::build_tokenizer_from_gguf(&model_dir);
+        let encoded = deepseek4::encode_chat_user(&prompt, nothink, Some(deepseek4::DSV4_DEFAULT_SYSTEM));
+        println!("Prompt text: {:?}", encoded);
+        let ids = deepseek4::encode_chat_user_ids(
+            &tok,
+            &prompt,
+            nothink,
+            Some(deepseek4::DSV4_DEFAULT_SYSTEM),
+        );
+        println!("Prompt tokens ({}): {:?}", ids.len(), ids);
+        let t0 = Instant::now();
+        model.reset();
+        let logits = model.forward_prefill(&ids);
+        let first = deepseek4::Dsv4GpuModel::sample_greedy(&logits);
+        let first_logit = logits.get(first).copied().unwrap_or(f32::NAN);
+        let first_txt = tok
+            .decode(&[first as u32], true)
+            .unwrap_or_else(|_| format!("id={first}"));
+        println!(
+            "First-token argmax: id={} logit={:.4} text={:?}",
+            first, first_logit, first_txt
+        );
+        // Compare to ds4 dump if present (Hello=19923 @ ~31.68 for -p Hi --nothink).
+        if let Some(&ref_l) = logits.get(19923) {
+            println!("logit[Hello/19923]={:.4} (ds4≈31.68)", ref_l);
+        }
+        let mut out_ids = vec![first];
+        let mut logits = logits;
+        for _ in 1..n_new {
+            logits = model.forward_token_logits(out_ids[out_ids.len() - 1]);
+            out_ids.push(deepseek4::Dsv4GpuModel::sample_greedy(&logits));
+        }
+        let dt = t0.elapsed().as_secs_f64();
+        let text = tok
+            .decode(
+                &out_ids.iter().map(|&x| x as u32).collect::<Vec<_>>(),
+                true,
+            )
+            .unwrap_or_default();
+        println!(
+            "=== dsv4 gen ({:.2}s, {:.2} tok/s) ===\n{}",
+            dt,
+            out_ids.len() as f64 / dt.max(1e-9),
+            text
+        );
+        println!(
+            "SSD cache hits={} misses={}",
+            model.ssd.hits, model.ssd.misses
+        );
+        return;
+    }
+
     // Dev helper: build the embedded GGUF tokenizer and sanity-check encode/decode.
     if args.iter().any(|a| a == "--gguf-tok-test") {
+        let g = gguf::Gguf::open(&model_dir);
+        println!(
+            "tokenizer.ggml.model={:?}",
+            g.get_str("tokenizer.ggml.model")
+        );
+        println!(
+            "tokenizer.ggml.pre={:?}",
+            g.get_str("tokenizer.ggml.pre")
+        );
         let tok = gguf::build_tokenizer_from_gguf(&model_dir);
         // Control-token atomicity: each should encode to exactly one id.
         for ctrl in ["<|turn>", "<turn|>"] {
@@ -284,6 +381,33 @@ fn main() {
                 .expect("Failed to read config.json");
             config_str.contains("\"gemma4\"") || config_str.contains("text_config")
         };
+
+        let is_deepseek4 = is_gguf && {
+            let g = gguf::Gguf::open(&model_dir);
+            g.get_str("general.architecture") == Some("deepseek4")
+        };
+
+        if is_deepseek4 {
+            let start = Instant::now();
+            println!("Loading DeepSeek-V4-Flash (GGUF) from: {}", model_dir);
+            let ssd = args.iter().any(|a| a == "--ssd-streaming") || true;
+            let mut model = deepseek4::Dsv4GpuModel::load_from_gguf(&model_dir, ssd, None);
+            let tokenizer = gguf::build_tokenizer_from_gguf(&model_dir);
+            println!("Model loaded in {:.2}s", start.elapsed().as_secs_f64());
+            let prompt = "Say hello in one short sentence.";
+            let ids = deepseek4::encode_chat_user_ids(
+                &tokenizer,
+                prompt,
+                true,
+                Some(deepseek4::DSV4_DEFAULT_SYSTEM),
+            );
+            let out = model.generate(&ids, 32);
+            let text = tokenizer
+                .decode(&out.iter().map(|&x| x as u32).collect::<Vec<_>>(), true)
+                .unwrap_or_default();
+            println!("=== DeepSeek-V4 ===\n{}", text);
+            return;
+        }
 
         if is_gemma4 {
             let start = Instant::now();

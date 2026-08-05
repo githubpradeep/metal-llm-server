@@ -24,9 +24,12 @@ pub mod ggml_type {
     pub const Q4_1: u32 = 3;
     pub const Q5_1: u32 = 7;
     pub const Q8_0: u32 = 8;
+    pub const Q2_K: u32 = 10;
     pub const Q4_K: u32 = 12;
     pub const Q5_K: u32 = 13;
     pub const Q6_K: u32 = 14;
+    pub const IQ2_XXS: u32 = 16;
+    pub const I32: u32 = 26;
     pub const BF16: u32 = 30;
 }
 
@@ -38,9 +41,12 @@ pub fn ggml_type_name(t: u32) -> &'static str {
         ggml_type::Q4_1 => "Q4_1",
         ggml_type::Q5_1 => "Q5_1",
         ggml_type::Q8_0 => "Q8_0",
+        ggml_type::Q2_K => "Q2_K",
         ggml_type::Q4_K => "Q4_K",
         ggml_type::Q5_K => "Q5_K",
         ggml_type::Q6_K => "Q6_K",
+        ggml_type::IQ2_XXS => "IQ2_XXS",
+        ggml_type::I32 => "I32",
         ggml_type::BF16 => "BF16",
         _ => "UNKNOWN",
     }
@@ -52,13 +58,16 @@ pub(crate) fn block_spec(t: u32) -> (usize, usize) {
         ggml_type::F32 => (1, 4),
         ggml_type::F16 => (1, 2),
         ggml_type::BF16 => (1, 2),
+        ggml_type::I32 => (1, 4),
         ggml_type::Q4_0 => (32, 18),
         ggml_type::Q4_1 => (32, 20),
         ggml_type::Q5_1 => (32, 24),
         ggml_type::Q8_0 => (32, 34),
+        ggml_type::Q2_K => (QK_K, 84),
         ggml_type::Q4_K => (QK_K, 144),
         ggml_type::Q5_K => (QK_K, 176),
         ggml_type::Q6_K => (QK_K, 210),
+        ggml_type::IQ2_XXS => (QK_K, 66),
         _ => panic!("unsupported ggml type id {}", t),
     }
 }
@@ -286,7 +295,7 @@ impl Gguf {
         &self.mmap[start..start + row_stride]
     }
 
-pub fn tensor_file_offset(&self, name: &str) -> u64 {
+    pub fn tensor_file_offset(&self, name: &str) -> u64 {
         let info = self
             .tensor(name)
             .unwrap_or_else(|| panic!("tensor not found: {}", name));
@@ -472,7 +481,14 @@ pub fn build_tokenizer_from_gguf(path: &str) -> tokenizers::Tokenizer {
 
     let model = g.get_str("tokenizer.ggml.model").unwrap_or("");
     assert!(
-        model == "gemma4" || model == "llama" || model == "gemma" || model == "gemma3",
+        model == "gemma4"
+            || model == "llama"
+            || model == "gemma"
+            || model == "gemma3"
+            || model == "deepseek"
+            || model == "deepseek4"
+            || model == "gpt2"
+            || model == "bpe",
         "unexpected tokenizer.ggml.model '{}'",
         model
     );
@@ -497,30 +513,54 @@ pub fn build_tokenizer_from_gguf(path: &str) -> tokenizers::Tokenizer {
         .filter_map(|m| m.split_once(' ').map(|(a, b)| (a.to_string(), b.to_string())))
         .collect();
 
+    let is_gpt2_bpe = model == "gpt2" || model == "bpe" || model == "deepseek" || model == "deepseek4";
+
     let unk_token = g
         .get_u32("tokenizer.ggml.unknown_token_id")
         .and_then(|id| tokens.get(id as usize).cloned())
-        .unwrap_or_else(|| "<unk>".to_string());
+        .unwrap_or_else(|| {
+            if is_gpt2_bpe {
+                String::new()
+            } else {
+                "<unk>".to_string()
+            }
+        });
 
-    let bpe = BPE::builder()
-        .vocab_and_merges(vocab, merges_vec)
-        .unk_token(unk_token)
-        .byte_fallback(true)
-        .fuse_unk(true)
+    let mut bpe_builder = BPE::builder().vocab_and_merges(vocab, merges_vec);
+    if is_gpt2_bpe {
+        // GPT-2 style: byte-level BPE, no UNK.
+        if !unk_token.is_empty() {
+            bpe_builder = bpe_builder.unk_token(unk_token);
+        }
+        bpe_builder = bpe_builder.byte_fallback(false).fuse_unk(false);
+    } else {
+        bpe_builder = bpe_builder
+            .unk_token(unk_token)
+            .byte_fallback(true)
+            .fuse_unk(true);
+    }
+    let bpe = bpe_builder
         .build()
         .expect("failed to build BPE model from GGUF");
 
     let mut tok = Tokenizer::new(bpe);
 
-    // SentencePiece-style whitespace handling: spaces <-> U+2581 ("▁").
-    // GGUF `add_space_prefix` controls whether a leading space is prepended.
-    let prepend = if g.get_bool("tokenizer.ggml.add_space_prefix").unwrap_or(false) {
-        PrependScheme::First
+    if is_gpt2_bpe {
+        use tokenizers::decoders::byte_level::ByteLevel as ByteLevelDecoder;
+        use tokenizers::pre_tokenizers::byte_level::ByteLevel;
+        // add_prefix_space=false matches typical DeepSeek/GPT-2 GGUF exports.
+        tok.with_pre_tokenizer(Some(ByteLevel::new(false, true, false)));
+        tok.with_decoder(Some(ByteLevelDecoder::new(true, false, false)));
     } else {
-        PrependScheme::Never
-    };
-    tok.with_pre_tokenizer(Some(Metaspace::new('\u{2581}', prepend, true)));
-    tok.with_decoder(Some(Metaspace::new('\u{2581}', prepend, true)));
+        // SentencePiece-style whitespace handling: spaces <-> U+2581 ("▁").
+        let prepend = if g.get_bool("tokenizer.ggml.add_space_prefix").unwrap_or(false) {
+            PrependScheme::First
+        } else {
+            PrependScheme::Never
+        };
+        tok.with_pre_tokenizer(Some(Metaspace::new('\u{2581}', prepend, true)));
+        tok.with_decoder(Some(Metaspace::new('\u{2581}', prepend, true)));
+    }
 
     // Register control / user-defined tokens as special so they tokenize atomically.
     if let Some(types) = token_types {
@@ -538,8 +578,9 @@ pub fn build_tokenizer_from_gguf(path: &str) -> tokenizers::Tokenizer {
         tok.add_special_tokens(&specials);
     }
 
-    // BOS post-processor (encode(text, true) prepends <bos>), matching add_bos_token.
-    if g.get_bool("tokenizer.ggml.add_bos_token").unwrap_or(true) {
+    // BOS post-processor (encode(text, true) prepends BOS) when requested.
+    let add_bos = g.get_bool("tokenizer.ggml.add_bos_token").unwrap_or(!is_gpt2_bpe);
+    if add_bos {
         if let Some(bos_id) = g.get_u32("tokenizer.ggml.bos_token_id") {
             if let Some(bos_tok) = tokens.get(bos_id as usize) {
                 let post = TemplateProcessing::builder()
@@ -794,6 +835,159 @@ fn dequant_blocks(ggml_type: u32, data: &[u8], total_elems: usize, mut sink: imp
                 sink(&out);
             }
         }
+        ggml_type::Q2_K => {
+            let nb = total_elems / QK_K;
+            let mut out = [0.0f32; QK_K];
+            for b in 0..nb {
+                let base = b * 84;
+                dequant_q2_k_block_into(&data[base..base + 84], &mut out);
+                sink(&out);
+            }
+        }
+        ggml_type::IQ2_XXS => {
+            let nb = total_elems / QK_K;
+            let mut out = [0.0f32; QK_K];
+            for b in 0..nb {
+                let base = b * 66;
+                dequant_iq2_xxs_block_into(&data[base..base + 66], &mut out);
+                sink(&out);
+            }
+        }
+        ggml_type::I32 => {
+            let mut buf = [0.0f32; 256];
+            let mut i = 0;
+            while i < total_elems {
+                let n = (total_elems - i).min(256);
+                for k in 0..n {
+                    let o = (i + k) * 4;
+                    let v = i32::from_le_bytes([data[o], data[o + 1], data[o + 2], data[o + 3]]);
+                    buf[k] = v as f32;
+                }
+                sink(&buf[..n]);
+                i += n;
+            }
+        }
         other => panic!("dequant: unsupported ggml type {}", other),
+    }
+}
+
+fn dequant_q2_k_block_into(block: &[u8], out: &mut [f32]) {
+    let scales = &block[0..16];
+    let qs = &block[16..80];
+    let d = f16_to_f32(u16::from_le_bytes([block[80], block[81]]));
+    let dmin = f16_to_f32(u16::from_le_bytes([block[82], block[83]]));
+    for idx in 0..QK_K {
+        let group = idx / 16;
+        let l = idx % 16;
+        let q_base = 32 * (group / 8) + 16 * (group & 1);
+        let shift = ((group / 2) & 3) * 2;
+        let q = ((qs[q_base + l] as u32) >> shift) & 0x03;
+        let sc = scales[group];
+        out[idx] = d * ((sc & 0x0f) as f32) * (q as f32) - dmin * ((sc >> 4) as f32);
+    }
+}
+
+// ggml IQ2_XXS format tables (public quant constants).
+static IQ2XXS_GRID: [u64; 256] = [
+    0x0808080808080808, 0x080808080808082b, 0x0808080808081919, 0x0808080808082b08,
+    0x0808080808082b2b, 0x0808080808190819, 0x0808080808191908, 0x08080808082b0808,
+    0x08080808082b082b, 0x08080808082b2b08, 0x08080808082b2b2b, 0x0808080819080819,
+    0x0808080819081908, 0x0808080819190808, 0x0808080819192b08, 0x08080808192b0819,
+    0x08080808192b1908, 0x080808082b080808, 0x080808082b08082b, 0x080808082b082b2b,
+    0x080808082b2b082b, 0x0808081908080819, 0x0808081908081908, 0x0808081908190808,
+    0x0808081908191919, 0x0808081919080808, 0x080808192b081908, 0x080808192b192b08,
+    0x0808082b08080808, 0x0808082b0808082b, 0x0808082b082b082b, 0x0808082b2b08082b,
+    0x0808190808080819, 0x0808190808081908, 0x0808190808190808, 0x08081908082b0819,
+    0x08081908082b1908, 0x0808190819080808, 0x080819081908082b, 0x0808190819082b08,
+    0x08081908192b0808, 0x080819082b080819, 0x080819082b081908, 0x080819082b190808,
+    0x080819082b2b1908, 0x0808191908080808, 0x080819190808082b, 0x0808191908082b08,
+    0x08081919082b0808, 0x080819191908192b, 0x08081919192b2b19, 0x080819192b080808,
+    0x080819192b190819, 0x0808192b08082b19, 0x0808192b08190808, 0x0808192b19080808,
+    0x0808192b2b081908, 0x0808192b2b2b1908, 0x08082b0808080808, 0x08082b0808081919,
+    0x08082b0808082b08, 0x08082b0808191908, 0x08082b08082b2b08, 0x08082b0819080819,
+    0x08082b0819081908, 0x08082b0819190808, 0x08082b081919082b, 0x08082b082b082b08,
+    0x08082b1908081908, 0x08082b1919080808, 0x08082b2b0808082b, 0x08082b2b08191908,
+    0x0819080808080819, 0x0819080808081908, 0x0819080808190808, 0x08190808082b0819,
+    0x0819080819080808, 0x08190808192b0808, 0x081908082b081908, 0x081908082b190808,
+    0x081908082b191919, 0x0819081908080808, 0x0819081908082b08, 0x08190819082b0808,
+    0x0819081919190808, 0x0819081919192b2b, 0x081908192b080808, 0x0819082b082b1908,
+    0x0819082b19081919, 0x0819190808080808, 0x0819190808082b08, 0x08191908082b0808,
+    0x08191908082b1919, 0x0819190819082b19, 0x081919082b080808, 0x0819191908192b08,
+    0x08191919192b082b, 0x0819192b08080808, 0x0819192b0819192b, 0x08192b0808080819,
+    0x08192b0808081908, 0x08192b0808190808, 0x08192b0819080808, 0x08192b082b080819,
+    0x08192b1908080808, 0x08192b1908081919, 0x08192b192b2b0808, 0x08192b2b19190819,
+    0x082b080808080808, 0x082b08080808082b, 0x082b080808082b2b, 0x082b080819081908,
+    0x082b0808192b0819, 0x082b08082b080808, 0x082b08082b08082b, 0x082b0819082b2b19,
+    0x082b081919082b08, 0x082b082b08080808, 0x082b082b0808082b, 0x082b190808080819,
+    0x082b190808081908, 0x082b190808190808, 0x082b190819080808, 0x082b19081919192b,
+    0x082b191908080808, 0x082b191919080819, 0x082b1919192b1908, 0x082b192b2b190808,
+    0x082b2b0808082b08, 0x082b2b08082b0808, 0x082b2b082b191908, 0x082b2b2b19081908,
+    0x1908080808080819, 0x1908080808081908, 0x1908080808190808, 0x1908080808192b08,
+    0x19080808082b0819, 0x19080808082b1908, 0x1908080819080808, 0x1908080819082b08,
+    0x190808081919192b, 0x19080808192b0808, 0x190808082b080819, 0x190808082b081908,
+    0x190808082b190808, 0x1908081908080808, 0x19080819082b0808, 0x19080819192b0819,
+    0x190808192b080808, 0x190808192b081919, 0x1908082b08080819, 0x1908082b08190808,
+    0x1908082b19082b08, 0x1908082b1919192b, 0x1908082b192b2b08, 0x1908190808080808,
+    0x1908190808082b08, 0x19081908082b0808, 0x190819082b080808, 0x190819082b192b19,
+    0x190819190819082b, 0x19081919082b1908, 0x1908192b08080808, 0x19082b0808080819,
+    0x19082b0808081908, 0x19082b0808190808, 0x19082b0819080808, 0x19082b0819081919,
+    0x19082b1908080808, 0x19082b1919192b08, 0x19082b19192b0819, 0x19082b192b08082b,
+    0x19082b2b19081919, 0x19082b2b2b190808, 0x1919080808080808, 0x1919080808082b08,
+    0x1919080808190819, 0x1919080808192b19, 0x19190808082b0808, 0x191908082b080808,
+    0x191908082b082b08, 0x1919081908081908, 0x191908191908082b, 0x191908192b2b1908,
+    0x1919082b2b190819, 0x191919082b190808, 0x191919082b19082b, 0x1919191908082b2b,
+    0x1919192b08080819, 0x1919192b19191908, 0x19192b0808080808, 0x19192b0808190819,
+    0x19192b0808192b19, 0x19192b08192b1908, 0x19192b1919080808, 0x19192b2b08082b08,
+    0x192b080808081908, 0x192b080808190808, 0x192b080819080808, 0x192b0808192b2b08,
+    0x192b081908080808, 0x192b081919191919, 0x192b082b08192b08, 0x192b082b192b0808,
+    0x192b190808080808, 0x192b190808081919, 0x192b191908190808, 0x192b19190819082b,
+    0x192b19192b081908, 0x192b2b081908082b, 0x2b08080808080808, 0x2b0808080808082b,
+    0x2b08080808082b2b, 0x2b08080819080819, 0x2b0808082b08082b, 0x2b08081908081908,
+    0x2b08081908192b08, 0x2b08081919080808, 0x2b08082b08190819, 0x2b08190808080819,
+    0x2b08190808081908, 0x2b08190808190808, 0x2b08190808191919, 0x2b08190819080808,
+    0x2b081908192b0808, 0x2b08191908080808, 0x2b0819191908192b, 0x2b0819192b191908,
+    0x2b08192b08082b19, 0x2b08192b19080808, 0x2b08192b192b0808, 0x2b082b080808082b,
+    0x2b082b1908081908, 0x2b082b2b08190819, 0x2b19080808081908, 0x2b19080808190808,
+    0x2b190808082b1908, 0x2b19080819080808, 0x2b1908082b2b0819, 0x2b1908190819192b,
+    0x2b1908192b080808, 0x2b19082b19081919, 0x2b19190808080808, 0x2b191908082b082b,
+    0x2b19190819081908, 0x2b19191919190819, 0x2b192b082b080819, 0x2b192b19082b0808,
+    0x2b2b08080808082b, 0x2b2b080819190808, 0x2b2b08082b081919, 0x2b2b081908082b19,
+    0x2b2b082b08080808, 0x2b2b190808192b08, 0x2b2b2b0819190808, 0x2b2b2b1908081908,
+];
+
+static KSIGNS_IQ2XS: [u8; 128] = [
+    0, 129, 130, 3, 132, 5, 6, 135, 136, 9, 10, 139, 12, 141, 142, 15, 144, 17, 18, 147, 20, 149,
+    150, 23, 24, 153, 154, 27, 156, 29, 30, 159, 160, 33, 34, 163, 36, 165, 166, 39, 40, 169, 170,
+    43, 172, 45, 46, 175, 48, 177, 178, 51, 180, 53, 54, 183, 184, 57, 58, 187, 60, 189, 190, 63,
+    192, 65, 66, 195, 68, 197, 198, 71, 72, 201, 202, 75, 204, 77, 78, 207, 80, 209, 210, 83, 212,
+    85, 86, 215, 216, 89, 90, 219, 92, 221, 222, 95, 96, 225, 226, 99, 228, 101, 102, 231, 232,
+    105, 106, 235, 108, 237, 238, 111, 240, 113, 114, 243, 116, 245, 246, 119, 120, 249, 250, 123,
+    252, 125, 126, 255,
+];
+
+static KMASK_IQ2XS: [u8; 8] = [1, 2, 4, 8, 16, 32, 64, 128];
+
+fn dequant_iq2_xxs_block_into(block: &[u8], out: &mut [f32]) {
+    let d = f16_to_f32(u16::from_le_bytes([block[0], block[1]]));
+    let qs = &block[2..66];
+    for ib32 in 0..8 {
+        let q2 = &qs[ib32 * 8..ib32 * 8 + 8];
+        let aux32_g = u32::from_le_bytes([q2[0], q2[1], q2[2], q2[3]]);
+        let aux32_s = u32::from_le_bytes([q2[4], q2[5], q2[6], q2[7]]);
+        let aux8 = aux32_g.to_le_bytes();
+        let scale = 0.125 * d * (2.0 * ((aux32_s >> 28) as f32) + 1.0);
+        let base = ib32 * 32;
+        for l in 0..4 {
+            let g = IQ2XXS_GRID[aux8[l] as usize].to_le_bytes();
+            let signs = KSIGNS_IQ2XS[((aux32_s >> (7 * l)) & 127) as usize];
+            for j in 0..8 {
+                let sign = if signs & KMASK_IQ2XS[j] != 0 {
+                    -1.0
+                } else {
+                    1.0
+                };
+                out[base + l * 8 + j] = scale * (g[j] as f32) * sign;
+            }
+        }
     }
 }
