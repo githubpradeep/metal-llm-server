@@ -7,12 +7,14 @@ use crate::gguf::{ggml_type, Gguf};
 
 use super::config::{dsv4_config_from_gguf, Dsv4Config};
 use super::dense_matvec::{bytes_to_f16_vec, matvec_f16_weights, matvec_q8_0};
+use super::forward_metal::LayerGpu;
 use super::gguf_validate::{print_inspect, validate_dsv4_gguf};
 use super::compressor::CompressorState;
 use super::kv::{LayerKvConfig, LayerKvState};
-use super::metal_ctx::Dsv4Metal;
+use super::metal_ctx::{Dsv4Metal, GpuWeight, MetalScratch};
 use super::quant::{IQ2_XXS_BLOCK_BYTES, Q2_K_BLOCK_BYTES, QK_K};
 use super::ssd::{estimate_expert_bytes, ExpertBlobLayout, ExpertKey, ExpertSsdCache};
+use metal::Buffer;
 
 #[derive(Debug, Clone)]
 pub enum DenseW {
@@ -223,6 +225,13 @@ pub struct Dsv4GpuModel {
     pub gate_row_bytes: usize,
     pub up_row_bytes: usize,
     pub down_row_bytes: usize,
+    /// When true, prefer Metal matvecs / FFN / lm_head (default; `DSV4_METAL=0` disables).
+    pub use_metal: bool,
+    pub gpu_layers: Option<Vec<LayerGpu>>,
+    pub gpu_output: Option<GpuWeight>,
+    pub gpu_output_hc_fn: Option<GpuWeight>,
+    pub gpu_output_norm: Option<Buffer>,
+    pub scratch: Option<MetalScratch>,
 }
 
 fn load_f32(g: &Gguf, name: &str) -> Vec<f32> {
@@ -398,7 +407,8 @@ impl Dsv4GpuModel {
 
         println!("  DeepSeek-V4-Flash ready (ssd_streaming={ssd_streaming})");
         let hc_elems = cfg.hc_state_elems();
-        Self {
+        let use_metal = crate::deepseek4::forward_metal::metal_enabled();
+        let mut model = Self {
             path,
             cfg,
             metal,
@@ -422,7 +432,17 @@ impl Dsv4GpuModel {
             gate_row_bytes,
             up_row_bytes,
             down_row_bytes,
+            use_metal,
+            gpu_layers: None,
+            gpu_output: None,
+            gpu_output_hc_fn: None,
+            gpu_output_norm: None,
+            scratch: None,
+        };
+        if use_metal {
+            model.ensure_gpu_weights();
         }
+        model
     }
 
     pub fn reset(&mut self) {

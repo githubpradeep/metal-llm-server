@@ -122,9 +122,15 @@ fn main() {
             Some(deepseek4::DSV4_DEFAULT_SYSTEM),
         );
         println!("Prompt tokens ({}): {:?}", ids.len(), ids);
+        println!(
+            "Metal path: {} (DSV4_METAL)",
+            if model.use_metal { "on" } else { "off" }
+        );
         let t0 = Instant::now();
         model.reset();
+        let prefill_t0 = Instant::now();
         let logits = model.forward_prefill(&ids);
+        let prefill_dt = prefill_t0.elapsed().as_secs_f64();
         let first = deepseek4::Dsv4GpuModel::sample_greedy(&logits);
         let first_logit = logits.get(first).copied().unwrap_or(f32::NAN);
         let first_txt = tok
@@ -134,16 +140,24 @@ fn main() {
             "First-token argmax: id={} logit={:.4} text={:?}",
             first, first_logit, first_txt
         );
-        // Compare to ds4 dump if present (Hello=19923 @ ~31.68 for -p Hi --nothink).
         if let Some(&ref_l) = logits.get(19923) {
             println!("logit[Hello/19923]={:.4} (ds4≈31.68)", ref_l);
         }
+        print!("{}", first_txt);
+        let _ = std::io::Write::flush(&mut std::io::stdout());
         let mut out_ids = vec![first];
         let mut logits = logits;
+        let gen_t0 = Instant::now();
         for _ in 1..n_new {
             logits = model.forward_token_logits(out_ids[out_ids.len() - 1]);
-            out_ids.push(deepseek4::Dsv4GpuModel::sample_greedy(&logits));
+            let next = deepseek4::Dsv4GpuModel::sample_greedy(&logits);
+            out_ids.push(next);
+            let piece = tok.decode(&[next as u32], true).unwrap_or_default();
+            print!("{piece}");
+            let _ = std::io::Write::flush(&mut std::io::stdout());
         }
+        println!();
+        let gen_dt = gen_t0.elapsed().as_secs_f64();
         let dt = t0.elapsed().as_secs_f64();
         let text = tok
             .decode(
@@ -152,9 +166,11 @@ fn main() {
             )
             .unwrap_or_default();
         println!(
-            "=== dsv4 gen ({:.2}s, {:.2} tok/s) ===\n{}",
+            "=== dsv4 gen ({:.2}s wall, prefill {:.2}s / {:.2} tok/s, gen {:.2} tok/s) ===\n{}",
             dt,
-            out_ids.len() as f64 / dt.max(1e-9),
+            prefill_dt,
+            ids.len() as f64 / prefill_dt.max(1e-9),
+            (out_ids.len().saturating_sub(1)) as f64 / gen_dt.max(1e-9),
             text
         );
         println!(
@@ -394,6 +410,19 @@ fn main() {
             let mut model = deepseek4::Dsv4GpuModel::load_from_gguf(&model_dir, ssd, None);
             let tokenizer = gguf::build_tokenizer_from_gguf(&model_dir);
             println!("Model loaded in {:.2}s", start.elapsed().as_secs_f64());
+
+            if args.iter().any(|a| a == "--serve") {
+                let port: u16 = args
+                    .iter()
+                    .position(|a| a == "--port")
+                    .and_then(|i| args.get(i + 1))
+                    .and_then(|p| p.parse().ok())
+                    .unwrap_or(8080);
+                let rt = tokio::runtime::Runtime::new().unwrap();
+                rt.block_on(deepseek4::serve::run_dsv4_server(model, tokenizer, port));
+                return;
+            }
+
             let prompt = "Say hello in one short sentence.";
             let ids = deepseek4::encode_chat_user_ids(
                 &tokenizer,
@@ -401,11 +430,14 @@ fn main() {
                 true,
                 Some(deepseek4::DSV4_DEFAULT_SYSTEM),
             );
-            let out = model.generate(&ids, 32);
-            let text = tokenizer
-                .decode(&out.iter().map(|&x| x as u32).collect::<Vec<_>>(), true)
-                .unwrap_or_default();
-            println!("=== DeepSeek-V4 ===\n{}", text);
+            print!("=== DeepSeek-V4 ===\n");
+            let out = model.generate_with_callback(&ids, 32, |tid| {
+                let piece = tokenizer.decode(&[tid as u32], true).unwrap_or_default();
+                print!("{piece}");
+                let _ = std::io::Write::flush(&mut std::io::stdout());
+            });
+            println!();
+            let _ = out;
             return;
         }
 

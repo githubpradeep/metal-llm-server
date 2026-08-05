@@ -170,6 +170,19 @@ impl ExpertSsdCache {
 /// Shared handle for concurrent prefetch helpers.
 pub type SharedExpertCache = Arc<Mutex<ExpertSsdCache>>;
 
+use std::thread;
+
+/// Prefetch experts on a background thread (caller joins before reading slots).
+pub fn prefetch_experts_async(
+    cache: SharedExpertCache,
+    keys: Vec<ExpertKey>,
+) -> thread::JoinHandle<std::io::Result<Vec<usize>>> {
+    thread::spawn(move || {
+        let mut c = cache.lock().unwrap();
+        c.pin(&keys)
+    })
+}
+
 /// Estimate one Flash IQ2 expert footprint (gate IQ2 + up IQ2 + down Q2_K).
 pub fn estimate_expert_bytes(n_embd: usize, n_ff: usize) -> usize {
     use super::quant::{IQ2_XXS_BLOCK_BYTES, Q2_K_BLOCK_BYTES, QK_K};

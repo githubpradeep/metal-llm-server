@@ -21,10 +21,10 @@ kernel void dsv4_attn_swa_mqa(
     int h = (int)gid;
     if (h >= n_head) return;
     device const float *qh = q + (ulong)h * head_dim;
-    // scores over n_kv (+1 sink)
-    int n_scores = n_kv + (has_sinks ? 1 : 0);
+    // Sink is denom-only bias (CPU attn_swa_mqa): init max from sink, never write sink value.
     thread float scores[512];
-    float max_s = -1.0e30f;
+    float sink = (has_sinks != 0) ? sinks[h] : -1.0e30f;
+    float max_s = sink;
     for (int t = 0; t < n_kv; ++t) {
         device const float *kt = k + (ulong)t * head_dim;
         float dot = 0.0f;
@@ -32,16 +32,12 @@ kernel void dsv4_attn_swa_mqa(
         scores[t] = dot * scale;
         max_s = max(max_s, scores[t]);
     }
-    if (has_sinks != 0) {
-        scores[n_kv] = sinks[h];
-        max_s = max(max_s, scores[n_kv]);
-    }
-    float sum = 0.0f;
-    for (int t = 0; t < n_scores; ++t) {
+    float denom = exp(sink - max_s);
+    for (int t = 0; t < n_kv; ++t) {
         scores[t] = exp(scores[t] - max_s);
-        sum += scores[t];
+        denom += scores[t];
     }
-    float inv = 1.0f / sum;
+    float inv = 1.0f / denom;
     device float *oh = out + (ulong)h * head_dim;
     for (int d = 0; d < head_dim; ++d) oh[d] = 0.0f;
     for (int t = 0; t < n_kv; ++t) {
@@ -49,7 +45,6 @@ kernel void dsv4_attn_swa_mqa(
         device const float *vt = v + (ulong)t * head_dim;
         for (int d = 0; d < head_dim; ++d) oh[d] += w * vt[d];
     }
-    // sink contributes 0 value (learned bias on logits only)
 }
 
 // Mixed attention: raw KV then selected compressed rows (indices in idx buffer).
@@ -73,10 +68,10 @@ kernel void dsv4_attn_mixed_mqa(
     int h = (int)gid;
     if (h >= n_head) return;
     device const float *qh = q + (ulong)h * head_dim;
-    int n_scores = n_raw + n_comp_sel + (has_sinks ? 1 : 0);
     // Cap thread-local scores; Flash indexer top-k <= 512 + swa 128.
     thread float scores[768];
-    float max_s = -1.0e30f;
+    float sink = (has_sinks != 0) ? sinks[h] : -1.0e30f;
+    float max_s = sink;
     int t = 0;
     for (int i = 0; i < n_raw; ++i, ++t) {
         device const float *kt = k_raw + (ulong)i * head_dim;
@@ -93,17 +88,12 @@ kernel void dsv4_attn_mixed_mqa(
         scores[t] = dot * scale;
         max_s = max(max_s, scores[t]);
     }
-    if (has_sinks != 0) {
-        scores[t] = sinks[h];
-        max_s = max(max_s, scores[t]);
-        ++t;
-    }
-    float sum = 0.0f;
-    for (int i = 0; i < n_scores; ++i) {
+    float denom = exp(sink - max_s);
+    for (int i = 0; i < t; ++i) {
         scores[i] = exp(scores[i] - max_s);
-        sum += scores[i];
+        denom += scores[i];
     }
-    float inv = 1.0f / sum;
+    float inv = 1.0f / denom;
     device float *oh = out + (ulong)h * head_dim;
     for (int d = 0; d < head_dim; ++d) oh[d] = 0.0f;
     t = 0;

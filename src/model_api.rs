@@ -31,9 +31,7 @@ pub enum GpuModel {
 impl GpuModel {
     pub fn load_gguf(path: &str, ssd_streaming: bool) -> Self {
         match detect_arch(path) {
-            ModelArch::Gemma4 => {
-                GpuModel::Gemma4(Gemma4GpuModel::load_from_gguf(path))
-            }
+            ModelArch::Gemma4 => GpuModel::Gemma4(Gemma4GpuModel::load_from_gguf(path)),
             ModelArch::DeepSeek4 => {
                 GpuModel::DeepSeek4(Dsv4GpuModel::load_from_gguf(path, ssd_streaming, None))
             }
@@ -44,6 +42,30 @@ impl GpuModel {
         match self {
             GpuModel::Gemma4(_) => ModelArch::Gemma4,
             GpuModel::DeepSeek4(_) => ModelArch::DeepSeek4,
+        }
+    }
+
+    pub fn reset(&mut self) {
+        match self {
+            GpuModel::Gemma4(m) => {
+                // Gemma session reset is request-scoped in the server; no-op here.
+                let _ = m;
+            }
+            GpuModel::DeepSeek4(m) => m.reset(),
+        }
+    }
+
+    pub fn prefill_dsv4(&mut self, tokens: &[usize]) -> Option<Vec<f32>> {
+        match self {
+            GpuModel::DeepSeek4(m) => Some(m.forward_prefill(tokens)),
+            GpuModel::Gemma4(_) => None,
+        }
+    }
+
+    pub fn decode_one_dsv4(&mut self, token: usize) -> Option<Vec<f32>> {
+        match self {
+            GpuModel::DeepSeek4(m) => Some(m.forward_token_logits(token)),
+            GpuModel::Gemma4(_) => None,
         }
     }
 }

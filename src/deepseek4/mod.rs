@@ -5,6 +5,7 @@ pub mod compressor;
 pub mod config;
 pub mod dense_matvec;
 pub mod forward;
+pub mod forward_metal;
 pub mod gguf_validate;
 pub mod hc;
 pub mod kv;
@@ -12,6 +13,7 @@ pub mod metal_ctx;
 pub mod model;
 pub mod moe;
 pub mod quant;
+pub mod serve;
 pub mod ssd;
 
 pub use config::{dsv4_config_from_gguf, Dsv4Config};

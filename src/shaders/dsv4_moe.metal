@@ -104,47 +104,43 @@ kernel void dsv4_matvec_iq2_xxs(
     device float *out [[buffer(2)]],
     constant int &n_out [[buffer(3)]],
     constant int &n_in [[buffer(4)]],
-    uint gid [[thread_position_in_grid]])
+    uint tgid [[threadgroup_position_in_grid]],
+    uint tid [[thread_index_in_threadgroup]])
 {
-    int row = (int)gid;
+    int row = (int)tgid;
     if (row >= n_out) return;
     int nblocks = n_in / 256;
     int row_bytes = nblocks * 66;
     device const uchar *wrow = weight + (ulong)row * row_bytes;
     float acc = 0.0f;
-    for (int b = 0; b < nblocks; ++b) {
+    for (int b = (int)tid; b < nblocks; b += 32) {
         device const block_iq2_xxs *blk = (device const block_iq2_xxs *)(wrow + b * 66);
         float d = (float)blk->d;
         device const ushort *qs = blk->qs;
         for (int ib32 = 0; ib32 < 8; ++ib32) {
             uint aux32_g = (uint)qs[ib32 * 4 + 0] | ((uint)qs[ib32 * 4 + 1] << 16);
             uint aux32_s = (uint)qs[ib32 * 4 + 2] | ((uint)qs[ib32 * 4 + 3] << 16);
-            uchar aux8[4];
-            aux8[0] = (uchar)(aux32_g & 255u);
-            aux8[1] = (uchar)((aux32_g >> 8) & 255u);
-            aux8[2] = (uchar)((aux32_g >> 16) & 255u);
-            aux8[3] = (uchar)((aux32_g >> 24) & 255u);
-            for (int il = 0; il < 2; ++il) {
-                float dl = d * (0.5f + (float)(aux32_s >> 28)) * 0.25f;
-                ulong g0 = IQ2XXS_GRID[aux8[2 * il]];
-                uchar s0 = KSIGNS_IQ2XS[(aux32_s >> (14 * il)) & 127u];
-                int base = b * 256 + ib32 * 32 + il * 16;
-                for (int i = 0; i < 8; ++i) {
-                    float gv = (float)((g0 >> (8 * i)) & 0xfful);
-                    float sign = (s0 & KMASK_IQ2XS[i]) ? -1.0f : 1.0f;
-                    acc += x[base + i] * dl * gv * sign;
-                }
-                ulong g1 = IQ2XXS_GRID[aux8[2 * il + 1]];
-                uchar s1 = KSIGNS_IQ2XS[(aux32_s >> (14 * il + 7)) & 127u];
-                for (int i = 0; i < 8; ++i) {
-                    float gv = (float)((g1 >> (8 * i)) & 0xfful);
-                    float sign = (s1 & KMASK_IQ2XS[i]) ? -1.0f : 1.0f;
-                    acc += x[base + 8 + i] * dl * gv * sign;
+            uchar aux8[4] = {
+                (uchar)(aux32_g & 255u),
+                (uchar)((aux32_g >> 8) & 255u),
+                (uchar)((aux32_g >> 16) & 255u),
+                (uchar)((aux32_g >> 24) & 255u),
+            };
+            float scale = 0.125f * d * (2.0f * (float)(aux32_s >> 28) + 1.0f);
+            int base = b * 256 + ib32 * 32;
+            for (int l = 0; l < 4; ++l) {
+                ulong g = IQ2XXS_GRID[aux8[l]];
+                uchar signs = KSIGNS_IQ2XS[(aux32_s >> (7 * l)) & 127u];
+                for (int j = 0; j < 8; ++j) {
+                    float gv = (float)((g >> (8 * j)) & 0xfful);
+                    float sign = (signs & KMASK_IQ2XS[j]) ? -1.0f : 1.0f;
+                    acc += x[base + l * 8 + j] * scale * gv * sign;
                 }
             }
         }
     }
-    out[row] = acc;
+    acc = simd_sum(acc);
+    if (tid == 0) out[row] = acc;
 }
 
 kernel void dsv4_matvec_q2_k(
@@ -153,30 +149,32 @@ kernel void dsv4_matvec_q2_k(
     device float *out [[buffer(2)]],
     constant int &n_out [[buffer(3)]],
     constant int &n_in [[buffer(4)]],
-    uint gid [[thread_position_in_grid]])
+    uint tgid [[threadgroup_position_in_grid]],
+    uint tid [[thread_index_in_threadgroup]])
 {
-    int row = (int)gid;
+    int row = (int)tgid;
     if (row >= n_out) return;
     int nblocks = n_in / 256;
     int row_bytes = nblocks * 84;
     device const uchar *wrow = weight + (ulong)row * row_bytes;
     float acc = 0.0f;
-    for (int b = 0; b < nblocks; ++b) {
+    for (int b = (int)tid; b < nblocks; b += 32) {
         device const block_q2_k *blk = (device const block_q2_k *)(wrow + b * 84);
         float d = (float)blk->d;
         float dmin = (float)blk->dmin;
-        for (int i = 0; i < 256; ++i) {
-            uchar q_byte = blk->qs[i / 4];
-            int shift = (i % 4) * 2;
-            int q = (q_byte >> shift) & 3;
-            uchar sc = blk->scales[i / 16];
-            float d_scale = (float)(sc & 0x0F);
-            float m_scale = (float)(sc >> 4);
-            float w = d * d_scale * (float)q - dmin * m_scale;
-            acc += w * x[b * 256 + i];
+        for (int idx = 0; idx < 256; ++idx) {
+            int group = idx / 16;
+            int l = idx % 16;
+            int q_base = 32 * (group / 8) + 16 * (group & 1);
+            int shift = ((group / 2) & 3) * 2;
+            int q = (blk->qs[q_base + l] >> shift) & 3;
+            uchar sc = blk->scales[group];
+            float w = d * (float)(sc & 0x0F) * (float)q - dmin * (float)(sc >> 4);
+            acc += w * x[b * 256 + idx];
         }
     }
-    out[row] = acc;
+    acc = simd_sum(acc);
+    if (tid == 0) out[row] = acc;
 }
 
 kernel void dsv4_swiglu(

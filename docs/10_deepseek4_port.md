@@ -63,9 +63,19 @@ cargo run --release -- --dsv4-gen ~/models/dsv4-0731/….gguf --nothink -n 8 -p 
 
 - Indexer FP4 QAT + full CSA mask still simplified (top-k on compressed K dots)
 - YaRN extras on compressed-layer RoPE not fully ported
-- Dense path is CPU matvec (Metal IQ2/Q2_K/HC compile; full graph encode TBD)
-- Expect slow tok/s until Metal graph encode matches ds4 overlap policy
-- Next correctness gate: `--dump-logits` from ds4 vs our first-token logits MAE
+- Metal decode path is default (`DSV4_METAL=0` for CPU); SSD pin overlaps shared-expert CB
+- Stretch goal: closer to ds4 resident tok/s on large unified memory
+
+## Metal + product (current)
+
+- Dense F16/Q8 + IQ2/Q2_K Metal matvecs; GPU-resident non-expert weights
+- MoE/lm_head/attn projections/HC on Metal; SWA sink-corrected Metal kernel for ratio-0
+- SSD pin overlapped with shared-expert CB; `prefetch_experts_async` helper; `DSV4_PREFILL_CHUNK`
+- CLI streaming print on `--dsv4-gen`; `--gpu <dsv4.gguf> --serve` thin OpenAI server
+- Chat encode matches ds4 CLI (BOS + default system + specials by id)
+- Smoke: `-p Hi --nothink` → `Hello! How can I help you today` (logit≈31.6 vs ds4≈31.68)
+- Throughput today ~0.3–0.4 tok/s SSD on M4 (sync-heavy host tape); further CB fusion needed for ≥5 tok/s
+- `DSV4_METAL=0` CPU fallback; `DSV4_METAL_MOE_ONLY=1` MoE+lm_head only (slower)
 
 ## Correctness fixes landed this slice
 
