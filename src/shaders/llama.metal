@@ -7226,3 +7226,42 @@ kernel void attention_flash_causal_q4_0_gqa_h##HD( \
 
 FLASH_CAUSAL_GQA_Q4_0_KERNEL(256, 4)
 FLASH_CAUSAL_GQA_Q4_0_KERNEL(512, 2)
+
+// ─── LFM2 short-conv decode step (causal ssm_conv + gate) ───────────────────
+// bcx layout: [B | C | X], each n_embd floats.
+// state layout: [n_embd][d_state] with d_state = l_cache - 1 (time contiguous).
+// conv_w layout: [n_embd][l_cache] (matches GGUF {l_cache, n_embd}).
+// y[i] = C[i] * dot(window, conv_w[i]); window = [state | B*X]; state shifts.
+kernel void lfm2_shortconv_decode(
+    device const float* bcx [[buffer(0)]],
+    device float* state [[buffer(1)]],
+    device const float* conv_w [[buffer(2)]],
+    device float* y [[buffer(3)]],
+    constant uint& n_embd [[buffer(4)]],
+    constant uint& l_cache [[buffer(5)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    if (gid >= n_embd) return;
+    const uint d_state = l_cache - 1;
+    const float B = bcx[gid];
+    const float C = bcx[n_embd + gid];
+    const float X = bcx[2 * n_embd + gid];
+    const float bx = B * X;
+
+    device float* st = state + gid * d_state;
+    device const float* w = conv_w + gid * l_cache;
+
+    float sum = 0.0f;
+    for (uint i = 0; i < d_state; ++i) {
+        sum += st[i] * w[i];
+    }
+    sum += bx * w[d_state];
+    y[gid] = C * sum;
+
+    for (uint i = 0; i + 1 < d_state; ++i) {
+        st[i] = st[i + 1];
+    }
+    if (d_state > 0) {
+        st[d_state - 1] = bx;
+    }
+}

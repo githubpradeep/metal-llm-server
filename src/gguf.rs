@@ -464,6 +464,7 @@ mod token_type {
 /// metadata (BPE vocab + merges + special tokens + BOS post-processor).
 pub fn build_tokenizer_from_gguf(path: &str) -> tokenizers::Tokenizer {
     use tokenizers::models::bpe::BPE;
+    use tokenizers::pre_tokenizers::byte_level::ByteLevel;
     use tokenizers::pre_tokenizers::metaspace::{Metaspace, PrependScheme};
     use tokenizers::processors::template::TemplateProcessing;
     use tokenizers::{AddedToken, Tokenizer};
@@ -472,10 +473,15 @@ pub fn build_tokenizer_from_gguf(path: &str) -> tokenizers::Tokenizer {
 
     let model = g.get_str("tokenizer.ggml.model").unwrap_or("");
     assert!(
-        model == "gemma4" || model == "llama" || model == "gemma" || model == "gemma3",
+        model == "gemma4"
+            || model == "llama"
+            || model == "gemma"
+            || model == "gemma3"
+            || model == "gpt2",
         "unexpected tokenizer.ggml.model '{}'",
         model
     );
+    let is_gpt2 = model == "gpt2";
 
     let tokens = g
         .get_arr_str("tokenizer.ggml.tokens")
@@ -500,27 +506,42 @@ pub fn build_tokenizer_from_gguf(path: &str) -> tokenizers::Tokenizer {
     let unk_token = g
         .get_u32("tokenizer.ggml.unknown_token_id")
         .and_then(|id| tokens.get(id as usize).cloned())
-        .unwrap_or_else(|| "<unk>".to_string());
+        .unwrap_or_else(|| {
+            if is_gpt2 {
+                tokens.first().cloned().unwrap_or_else(|| "<unk>".to_string())
+            } else {
+                "<unk>".to_string()
+            }
+        });
 
-    let bpe = BPE::builder()
+    let mut bpe_builder = BPE::builder()
         .vocab_and_merges(vocab, merges_vec)
-        .unk_token(unk_token)
-        .byte_fallback(true)
-        .fuse_unk(true)
-        .build()
-        .expect("failed to build BPE model from GGUF");
+        .unk_token(unk_token);
+    if !is_gpt2 {
+        bpe_builder = bpe_builder.byte_fallback(true).fuse_unk(true);
+    }
+    let bpe = bpe_builder.build().expect("failed to build BPE model from GGUF");
 
     let mut tok = Tokenizer::new(bpe);
 
-    // SentencePiece-style whitespace handling: spaces <-> U+2581 ("▁").
-    // GGUF `add_space_prefix` controls whether a leading space is prepended.
-    let prepend = if g.get_bool("tokenizer.ggml.add_space_prefix").unwrap_or(false) {
-        PrependScheme::First
+    if is_gpt2 {
+        // GPT-2 / LFM2 byte-level BPE (pre=lfm2 uses the same ByteLevel path).
+        let add_prefix = g
+            .get_bool("tokenizer.ggml.add_space_prefix")
+            .unwrap_or(false);
+        let bl = ByteLevel::new(add_prefix, false, true);
+        tok.with_pre_tokenizer(Some(bl.clone()));
+        tok.with_decoder(Some(bl));
     } else {
-        PrependScheme::Never
-    };
-    tok.with_pre_tokenizer(Some(Metaspace::new('\u{2581}', prepend, true)));
-    tok.with_decoder(Some(Metaspace::new('\u{2581}', prepend, true)));
+        // SentencePiece-style whitespace handling: spaces <-> U+2581 ("▁").
+        let prepend = if g.get_bool("tokenizer.ggml.add_space_prefix").unwrap_or(false) {
+            PrependScheme::First
+        } else {
+            PrependScheme::Never
+        };
+        tok.with_pre_tokenizer(Some(Metaspace::new('\u{2581}', prepend, true)));
+        tok.with_decoder(Some(Metaspace::new('\u{2581}', prepend, true)));
+    }
 
     // Register control / user-defined tokens as special so they tokenize atomically.
     if let Some(types) = token_types {
@@ -539,7 +560,8 @@ pub fn build_tokenizer_from_gguf(path: &str) -> tokenizers::Tokenizer {
     }
 
     // BOS post-processor (encode(text, true) prepends <bos>), matching add_bos_token.
-    if g.get_bool("tokenizer.ggml.add_bos_token").unwrap_or(true) {
+    let default_add_bos = !is_gpt2;
+    if g.get_bool("tokenizer.ggml.add_bos_token").unwrap_or(default_add_bos) {
         if let Some(bos_id) = g.get_u32("tokenizer.ggml.bos_token_id") {
             if let Some(bos_tok) = tokens.get(bos_id as usize) {
                 let post = TemplateProcessing::builder()

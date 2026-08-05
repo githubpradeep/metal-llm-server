@@ -14,6 +14,8 @@ mod gemma4_config;
 mod gemma4_gpu_model;
 mod gemma4_moe;
 mod gemma4_mtp;
+mod lfm2_config;
+mod lfm2_gpu_model;
 mod decode_fused;
 mod speculative;
 mod kv_pool;
@@ -241,8 +243,48 @@ fn main() {
 
     // Dev helper: load a GGUF model on GPU and greedy-decode a short prompt.
     if args.iter().any(|a| a == "--gguf-gen") {
-        let mut model = gemma4_gpu_model::Gemma4GpuModel::load_from_gguf(&model_dir);
+        let arch = {
+            let g = gguf::Gguf::open(&model_dir);
+            g.get_str("general.architecture")
+                .unwrap_or("")
+                .to_string()
+        };
         let tok = gguf::build_tokenizer_from_gguf(&model_dir);
+        let max_gen: usize = std::env::var("GGUF_GEN_TOKENS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(60);
+
+        if arch == "lfm2" {
+            let mut model = lfm2_gpu_model::Lfm2GpuModel::load_from_gguf(&model_dir);
+            // Minimal LFM2.5 chat turn (matches Liquid instruct style).
+            let prompt = std::env::var("GGUF_GEN_PROMPT").unwrap_or_else(|_| {
+                "<|startoftext|><|im_start|>user\nWhat is the capital of France? Answer in one sentence.<|im_end|>\n<|im_start|>assistant\n".to_string()
+            });
+            let ids: Vec<usize> = tok
+                .encode(prompt.as_str(), false)
+                .expect("encode")
+                .get_ids()
+                .iter()
+                .map(|&t| t as usize)
+                .collect();
+            println!("Prompt ids ({}): {:?}", ids.len(), &ids[..ids.len().min(32)]);
+            let mut next = model.forward_prefill_sample_last(&ids, 0.0, 0.0, 0);
+            let eos = model.eos_token_id();
+            let printer = token_printer::TokenPrinter::spawn(&tok);
+            for _ in 0..max_gen {
+                if next == eos {
+                    break;
+                }
+                printer.send(next as u32);
+                next = model.forward_single_token_sample(next, 0.0, 0.0, 0);
+            }
+            let out = printer.finish();
+            println!("\n=== GGUF greedy generation (lfm2) ===\n{}", out);
+            return;
+        }
+
+        let mut model = gemma4_gpu_model::Gemma4GpuModel::load_from_gguf(&model_dir);
         let prompt = "<|turn>user\nWhat is the capital of France? Answer in one sentence.<turn|>\n<|turn>model\n";
         let ids: Vec<usize> = tok
             .encode(prompt, true)
@@ -255,10 +297,6 @@ fn main() {
         let mut next = model.forward_prefill_sample_last(&ids, 0.0, 0.0, 0);
         let eos: &[usize] = &[1, 106];
         let printer = token_printer::TokenPrinter::spawn(&tok);
-        let max_gen: usize = std::env::var("GGUF_GEN_TOKENS")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(60);
         for _ in 0..max_gen {
             if eos.contains(&next) {
                 break;
@@ -277,12 +315,82 @@ fn main() {
     if use_gpu {
         // A `.gguf` path is loaded directly (weights + embedded tokenizer).
         let is_gguf = model_dir.ends_with(".gguf");
+        let gguf_arch = if is_gguf {
+            let g = gguf::Gguf::open(&model_dir);
+            Some(
+                g.get_str("general.architecture")
+                    .unwrap_or("")
+                    .to_string(),
+            )
+        } else {
+            None
+        };
+
+        if gguf_arch.as_deref() == Some("lfm2") {
+            if args.iter().any(|a| a == "--serve") {
+                eprintln!(
+                    "LFM2 --serve is not supported yet; use --gpu (CLI gen) or --gguf-gen"
+                );
+                std::process::exit(1);
+            }
+            if bench_decode || bench_prefill {
+                eprintln!("LFM2 --bench-decode / --bench-prefill are not wired yet");
+                std::process::exit(1);
+            }
+
+            let start = Instant::now();
+            println!("Loading LFM2 model (GGUF) from: {}", model_dir);
+            let mut gpu_model = lfm2_gpu_model::Lfm2GpuModel::load_from_gguf(&model_dir);
+            let tokenizer = gguf::build_tokenizer_from_gguf(&model_dir);
+            println!("Model loaded in {:.2}s", start.elapsed().as_secs_f64());
+
+            println!("{}", "=".repeat(60));
+            println!("LFM2 GENERATION (Metal GPU)");
+            println!("{}", "=".repeat(60));
+
+            // Prompt precedence: LFM2_PROMPT env → first non-flag arg after the
+            // model path → default instruct turn.
+            let prompt = if let Ok(p) = std::env::var("LFM2_PROMPT") {
+                p
+            } else {
+                let extra: Vec<&String> = args
+                    .iter()
+                    .skip(1)
+                    .filter(|a| !a.starts_with("--") && *a != &model_dir)
+                    .collect();
+                if let Some(user_text) = extra.first() {
+                    format!(
+                        "<|startoftext|><|im_start|>user\n{}<|im_end|>\n<|im_start|>assistant\n",
+                        user_text
+                    )
+                } else {
+                    "<|startoftext|><|im_start|>user\nWrite a short essay about the benefits of exercise. Include an introduction, 3 key points, and a conclusion.<|im_end|>\n<|im_start|>assistant\n".to_string()
+                }
+            };
+            let max_tokens: usize = std::env::var("LFM2_MAX_TOKENS")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(1000);
+
+            let gen_start = Instant::now();
+            generate_lfm2_gpu(&prompt, &tokenizer, &mut gpu_model, max_tokens);
+            println!("\nTotal time: {:.2}s", gen_start.elapsed().as_secs_f64());
+            return;
+        }
+
         // Otherwise, detect a Gemma4 HF model dir by checking config.json.
-        let is_gemma4 = is_gguf || {
-            let config_path = std::path::Path::new(&model_dir).join("config.json");
-            let config_str = std::fs::read_to_string(&config_path)
-                .expect("Failed to read config.json");
-            config_str.contains("\"gemma4\"") || config_str.contains("text_config")
+        let is_gemma4 = match gguf_arch.as_deref() {
+            Some("gemma4") => true,
+            Some(other) => {
+                eprintln!("Unsupported GGUF architecture '{}'", other);
+                std::process::exit(1);
+            }
+            None => {
+                let config_path = std::path::Path::new(&model_dir).join("config.json");
+                let config_str =
+                    std::fs::read_to_string(&config_path).expect("Failed to read config.json");
+                config_str.contains("\"gemma4\"") || config_str.contains("text_config")
+            }
         };
 
         if is_gemma4 {
@@ -620,6 +728,52 @@ fn bench_prefill_gemma4(
             secs * 1000.0
         );
     }
+}
+
+fn generate_lfm2_gpu(
+    prompt: &str,
+    tokenizer: &tokenizers::Tokenizer,
+    model: &mut lfm2_gpu_model::Lfm2GpuModel,
+    max_tokens: usize,
+) {
+    let encoding = tokenizer.encode(prompt, false).expect("Failed to encode");
+    let input_ids: Vec<u32> = encoding.get_ids().to_vec();
+
+    print!("{}", prompt);
+    io::stdout().flush().unwrap();
+
+    let token_ids: Vec<usize> = input_ids.iter().map(|&t| t as usize).collect();
+    let mut next_token = model.forward_prefill_sample_last(&token_ids, 0.0, 0.0, 0);
+
+    let start_time = Instant::now();
+    let mut tokens_generated = 0;
+    let eos = model.eos_token_id();
+    // Also stop on <|endoftext|> when present in this vocab.
+    let stop = [eos, 124895usize];
+    let printer = token_printer::TokenPrinter::spawn(tokenizer);
+
+    for _ in 0..max_tokens {
+        if stop.contains(&next_token) {
+            break;
+        }
+        printer.send(next_token as u32);
+        tokens_generated += 1;
+        next_token = model.forward_single_token_sample(next_token, 0.0, 0.0, 0);
+    }
+
+    printer.finish();
+    let elapsed = start_time.elapsed().as_secs_f64();
+    let tps = if elapsed > 0.0 {
+        tokens_generated as f64 / elapsed
+    } else {
+        0.0
+    };
+
+    println!("\n\n[LFM2 Generation - Metal GPU]");
+    println!("  Tokens: {}", tokens_generated);
+    println!("  Throughput: {:.2} tok/s", tps);
+    println!("  Context length: {} tokens", model.seq_len);
+    println!("  Elapsed: {:.2}s", elapsed);
 }
 
 fn generate_gemma4_gpu(

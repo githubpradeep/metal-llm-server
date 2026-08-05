@@ -612,6 +612,7 @@ pub struct MetalContext {
     pub rmsnorm_noweight_batch_pipeline: ComputePipelineState,
     pub silu_mul_pipeline: ComputePipelineState,
     pub silu_mul_batch_pipeline: ComputePipelineState,
+    pub lfm2_shortconv_decode_pipeline: ComputePipelineState,
     pub attention_pipeline: ComputePipelineState,
     pub attention_causal_pipeline: ComputePipelineState,
     pub rotary_pipeline: ComputePipelineState,
@@ -884,6 +885,7 @@ impl MetalContext {
         let rmsnorm_noweight_batch_pipeline = get_fn("rmsnorm_noweight_batch");
         let silu_mul_pipeline = get_fn("silu_mul");
         let silu_mul_batch_pipeline = get_fn("silu_mul_batch");
+        let lfm2_shortconv_decode_pipeline = get_fn("lfm2_shortconv_decode");
         let attention_pipeline = get_fn("attention_single_token");
         let attention_causal_pipeline = get_fn("attention_causal");
         let rotary_pipeline = get_fn("apply_rotary");
@@ -1172,6 +1174,7 @@ impl MetalContext {
             rmsnorm_noweight_batch_pipeline,
             silu_mul_pipeline,
             silu_mul_batch_pipeline,
+            lfm2_shortconv_decode_pipeline,
             attention_pipeline,
             attention_causal_pipeline,
             rotary_pipeline,
@@ -4982,6 +4985,30 @@ impl MetalContext {
         encoder.set_bytes(10, 4, &scale as *const f32 as *const _);
         let tg_size = MTLSize::new(64, 1, 1);
         encoder.dispatch_thread_groups(MTLSize::new(num_heads as u64, 1, 1), tg_size);
+    }
+
+    /// LFM2 causal short-conv decode: B*X window + ssm_conv + C gate; updates state in-place.
+    pub fn encode_lfm2_shortconv_decode(
+        &self,
+        encoder: &metal::ComputeCommandEncoderRef,
+        bcx_buf: &Buffer,
+        state_buf: &Buffer,
+        conv_w: &BufferView,
+        y_buf: &Buffer,
+        n_embd: u32,
+        l_cache: u32,
+    ) {
+        encoder.set_compute_pipeline_state(&self.lfm2_shortconv_decode_pipeline);
+        encoder.set_buffer(0, Some(bcx_buf), 0);
+        encoder.set_buffer(1, Some(state_buf), 0);
+        encoder.set_buffer(2, Some(&conv_w.buffer), conv_w.offset);
+        encoder.set_buffer(3, Some(y_buf), 0);
+        encoder.set_bytes(4, 4, &n_embd as *const u32 as *const _);
+        encoder.set_bytes(5, 4, &l_cache as *const u32 as *const _);
+        encoder.dispatch_threads(
+            MTLSize::new(n_embd as u64, 1, 1),
+            MTLSize::new(256.min(n_embd as u64), 1, 1),
+        );
     }
 
     pub fn encode_silu_mul(
