@@ -318,6 +318,32 @@ def chat_once(client, args, messages, stream: bool):
     return "content", content.strip()
 
 
+def read_paste() -> str:
+    """Read multi-line input until a line that is only /end, or EOF (Ctrl+D)."""
+    console.print(
+        "[dim]Paste multi-line text. Finish with a line containing only "
+        "[bold]/end[/bold] (or Ctrl+D).[/]"
+    )
+    lines: list[str] = []
+    while True:
+        try:
+            line = sys.stdin.readline()
+        except KeyboardInterrupt:
+            raise
+        if line == "":
+            # EOF (Ctrl+D on an empty buffer)
+            console.print()
+            break
+        if line.endswith("\n"):
+            line = line[:-1]
+        if line.endswith("\r"):
+            line = line[:-1]
+        if line.strip() == "/end":
+            break
+        lines.append(line)
+    return "\n".join(lines).rstrip()
+
+
 def main():
     args = parse_args()
     base_url = f"http://{args.host}:{args.port}/v1"
@@ -333,7 +359,8 @@ def main():
             f"Model:  [yellow]{args.model}[/yellow]\n"
             f"Stream: [{'green' if use_stream else 'red'}]{'on' if use_stream else 'off'}[/]\n"
             f"Type [bold]exit[/] or [bold]Ctrl+C[/] to quit.\n"
-            f"Type [bold]/clear[/] to clear history."
+            f"Type [bold]/clear[/] to clear history.\n"
+            f"Type [bold]/paste[/] for multi-line input (end with [bold]/end[/])."
         )
     )
 
@@ -353,6 +380,16 @@ def main():
             messages = [messages[0]]
             console.print("[dim]History cleared.[/]")
             continue
+        if prompt.strip() == "/paste":
+            try:
+                prompt = read_paste()
+            except KeyboardInterrupt:
+                console.print("\n[dim]Paste cancelled.[/]")
+                continue
+            if not prompt:
+                console.print("[dim]Empty paste; ignored.[/]")
+                continue
+            console.print(f"[dim]Pasted {len(prompt.splitlines())} line(s).[/]")
 
         messages.append({"role": "user", "content": prompt})
 
