@@ -10823,3 +10823,58 @@ fn half_to_f32(bits: u16) -> f32 {
 fn bf16_to_f32(bits: u16) -> f32 {
     f32::from_bits((bits as u32) << 16)
 }
+
+impl crate::serve_model::ServeGpuModel for Gemma4GpuModel {
+    fn kv_capacity(&self) -> u32 {
+        self.kv_capacity
+    }
+
+    fn create_kv_pool(&self, num_slots: usize, max_seq_len: u32) -> crate::kv_pool::KvCachePool {
+        Gemma4GpuModel::create_kv_pool(self, num_slots, max_seq_len)
+    }
+
+    fn max_parallel_prefill_seq(&self) -> usize {
+        Gemma4GpuModel::max_parallel_prefill_seq(self)
+    }
+
+    fn max_decode_batch_size(&self) -> usize {
+        Gemma4GpuModel::max_decode_batch_size(self)
+    }
+
+    fn forward_prefill_chunk_with_kv_slot(
+        &mut self,
+        token_ids: &[usize],
+        kv_pool: &mut crate::kv_pool::KvCachePool,
+        slot: crate::kv_pool::KvSlot,
+        want_logits: bool,
+    ) -> Result<Vec<f32>, String> {
+        Gemma4GpuModel::forward_prefill_chunk_with_kv_slot(
+            self, token_ids, kv_pool, slot, want_logits,
+        )
+    }
+
+    fn forward_prefill_batch_with_kv_slots(
+        &mut self,
+        inputs: &[(crate::kv_pool::KvSlot, &[usize])],
+        kv_pool: &mut crate::kv_pool::KvCachePool,
+    ) -> Vec<Result<Vec<f32>, String>> {
+        Gemma4GpuModel::forward_prefill_batch_with_kv_slots(self, inputs, kv_pool)
+    }
+
+    fn forward_single_token_with_kv_slot(
+        &mut self,
+        token_id: usize,
+        kv_pool: &mut crate::kv_pool::KvCachePool,
+        slot: crate::kv_pool::KvSlot,
+    ) -> Result<Vec<f32>, crate::kv_pool::KvPoolError> {
+        Gemma4GpuModel::forward_single_token_with_kv_slot(self, token_id, kv_pool, slot)
+    }
+
+    fn forward_decode_batch_with_kv_slots(
+        &mut self,
+        inputs: &[(crate::kv_pool::KvSlot, usize)],
+        kv_pool: &mut crate::kv_pool::KvCachePool,
+    ) -> Vec<Result<Vec<f32>, String>> {
+        Gemma4GpuModel::forward_decode_batch_with_kv_slots(self, inputs, kv_pool)
+    }
+}

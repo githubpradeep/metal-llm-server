@@ -8,9 +8,9 @@ use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 
 use crate::batch_engine::{BatchEngine, DecodeInput, PrefillInput};
-use crate::gemma4_gpu_model::Gemma4GpuModel;
 use crate::metrics::Metrics;
 use crate::sampling::{self, SamplingParams};
+use crate::serve_model::ServeGpuModel;
 
 pub const CANCEL_NONE: u8 = 0;
 pub const CANCEL_CLIENT: u8 = 1;
@@ -27,6 +27,8 @@ pub struct GenerationParams {
     pub eos_token_ids: Vec<usize>,
     pub min_decode_tokens: usize,
     pub request_timeout: Duration,
+    /// Gemma-only: remask leading control tokens (eos/channel/turn). Off for LFM2.
+    pub block_leading_control_tokens: bool,
 }
 
 pub struct InferenceRequest {
@@ -44,8 +46,8 @@ pub enum StreamEvent {
     Error { message: String },
 }
 
-pub struct Scheduler {
-    engine: BatchEngine,
+pub struct Scheduler<M: ServeGpuModel> {
+    engine: BatchEngine<M>,
     metrics: Arc<Metrics>,
     config: SchedulerConfig,
     next_prefill_index: usize,
@@ -56,13 +58,13 @@ pub struct SchedulerConfig {
     pub max_prefill_tokens_per_tick: Option<usize>,
 }
 
-impl Scheduler {
-    pub fn new(model: Gemma4GpuModel, kv_pool_slots: usize, metrics: Arc<Metrics>) -> Self {
+impl<M: ServeGpuModel> Scheduler<M> {
+    pub fn new(model: M, kv_pool_slots: usize, metrics: Arc<Metrics>) -> Self {
         Self::new_with_config(model, kv_pool_slots, metrics, SchedulerConfig::default())
     }
 
     pub fn new_with_config(
-        model: Gemma4GpuModel,
+        model: M,
         kv_pool_slots: usize,
         metrics: Arc<Metrics>,
         config: SchedulerConfig,
@@ -624,7 +626,7 @@ fn prepare_decode_token(active: &mut ActiveRequest) -> DecodePreparation {
     let mut next_token =
         sampling::sample_with_params(&active.logits, &sampling_params, &active.generated_tokens);
 
-    // Control tokens that should not lead an answer turn.
+    // Control tokens that should not lead an answer turn (Gemma vocab ids).
     // 1=<eos>, 100=<|channel>, 101=<channel|>, 105=<|turn>, 106=<turn|>, 107='\n'
     const FIRST_TOKEN_BLOCKLIST: &[usize] = &[1, 100, 101, 105, 106, 107];
 
@@ -632,8 +634,9 @@ fn prepare_decode_token(active: &mut ActiveRequest) -> DecodePreparation {
     loop {
         let block_eos = active.completion_tokens < active.request.params.min_decode_tokens
             && active.request.params.eos_token_ids.contains(&next_token);
-        let block_first =
-            active.completion_tokens == 0 && FIRST_TOKEN_BLOCKLIST.contains(&next_token);
+        let block_first = active.request.params.block_leading_control_tokens
+            && active.completion_tokens == 0
+            && FIRST_TOKEN_BLOCKLIST.contains(&next_token);
         if (!block_eos && !block_first) || guard >= 64 {
             break;
         }
@@ -755,8 +758,8 @@ impl RequestFinish {
     }
 }
 
-pub fn spawn_scheduler(
-    model: Gemma4GpuModel,
+pub fn spawn_scheduler<M: ServeGpuModel>(
+    model: M,
     queue_depth: usize,
     kv_pool_slots: usize,
     metrics: Arc<Metrics>,
@@ -770,8 +773,8 @@ pub fn spawn_scheduler(
     )
 }
 
-pub fn spawn_scheduler_with_config(
-    model: Gemma4GpuModel,
+pub fn spawn_scheduler_with_config<M: ServeGpuModel>(
+    model: M,
     queue_depth: usize,
     kv_pool_slots: usize,
     metrics: Arc<Metrics>,

@@ -6,7 +6,9 @@ use std::time::Instant;
 
 use crate::gguf::{self, Gguf};
 use crate::gpu::{weight_buf_is_kquant, weight_fmt, BufferView, MetalContext};
+use crate::kv_pool::{KvCachePool, KvPoolError, KvSlot};
 use crate::lfm2_config::{lfm2_config_from_gguf, Lfm2Config};
+use crate::serve_model::ServeGpuModel;
 
 /// GPU RoPE params for one layer (must match `RopeLayerParams` in llama.metal).
 #[repr(C)]
@@ -166,9 +168,93 @@ pub struct Lfm2GpuModel {
     k_caches: Vec<Buffer>,
     v_caches: Vec<Buffer>,
     conv_states: Vec<Buffer>,
-    kv_capacity: u32,
+    pub kv_capacity: u32,
     /// Shared sequence length (attn KV + position).
     pub seq_len: u32,
+    prefill_scratch: Lfm2PrefillScratch,
+}
+
+struct Lfm2PrefillScratch {
+    max_seq_len: usize,
+    hidden_buf: Buffer,
+    residual_buf: Buffer,
+    normed_buf: Buffer,
+    q_buf: Buffer,
+    k_buf: Buffer,
+    v_buf: Buffer,
+    attn_out_buf: Buffer,
+    q_tmp: Buffer,
+    k_tmp: Buffer,
+    v_tmp: Buffer,
+    o_out_buf: Buffer,
+    gate_buf: Buffer,
+    up_buf: Buffer,
+    silu_buf: Buffer,
+    down_buf: Buffer,
+    bcx_buf: Buffer,
+    shortconv_y_buf: Buffer,
+    cos_buf: Buffer,
+    sin_buf: Buffer,
+    logits_buf: Buffer,
+    embed_rows: Vec<f32>,
+    fa_ext_scratch: Buffer,
+    fa_ext_layout: crate::ggml_flash_attn_ext::ScratchLayout,
+}
+
+impl Lfm2PrefillScratch {
+    fn new(
+        ctx: &MetalContext,
+        max_seq_len: usize,
+        hidden: usize,
+        n_heads: usize,
+        max_kv_out: usize,
+        inter: usize,
+        vocab: usize,
+        head_dim: usize,
+        kv_capacity: u32,
+        num_kv_heads: u32,
+        row_bytes: u64,
+    ) -> Self {
+        let fa_ext_layout = crate::ggml_flash_attn_ext::scratch_layout(
+            max_seq_len as u32,
+            kv_capacity,
+            num_kv_heads,
+            row_bytes,
+        );
+        let fa_ext_elems = ((fa_ext_layout.total + 3) / 4) as usize;
+        println!(
+            "  fa_ext scratch: {:.1} MB (mask_kv≤{}, max_q={})",
+            fa_ext_layout.total as f64 / (1024.0 * 1024.0),
+            fa_ext_layout.mask_kv_capacity,
+            max_seq_len
+        );
+        Self {
+            max_seq_len,
+            hidden_buf: ctx.buffer_empty(max_seq_len * hidden),
+            residual_buf: ctx.buffer_empty(max_seq_len * hidden),
+            normed_buf: ctx.buffer_empty(max_seq_len * hidden),
+            q_buf: ctx.buffer_empty(max_seq_len * n_heads * head_dim),
+            k_buf: ctx.buffer_empty(max_seq_len * max_kv_out),
+            v_buf: ctx.buffer_empty(max_seq_len * max_kv_out),
+            attn_out_buf: ctx.buffer_empty(max_seq_len * n_heads * head_dim),
+            q_tmp: ctx.buffer_empty(max_seq_len * n_heads * head_dim),
+            k_tmp: ctx.buffer_empty(max_seq_len * max_kv_out),
+            v_tmp: ctx.buffer_empty(max_seq_len * max_kv_out),
+            o_out_buf: ctx.buffer_empty(max_seq_len * hidden),
+            gate_buf: ctx.buffer_empty(max_seq_len * inter),
+            up_buf: ctx.buffer_empty(max_seq_len * inter),
+            silu_buf: ctx.buffer_empty(max_seq_len * inter),
+            down_buf: ctx.buffer_empty(max_seq_len * hidden),
+            bcx_buf: ctx.buffer_empty(max_seq_len * 3 * hidden),
+            shortconv_y_buf: ctx.buffer_empty(max_seq_len * hidden),
+            cos_buf: ctx.buffer_empty(max_seq_len * head_dim),
+            sin_buf: ctx.buffer_empty(max_seq_len * head_dim),
+            logits_buf: ctx.buffer_empty(vocab),
+            embed_rows: vec![0.0; max_seq_len * hidden],
+            fa_ext_scratch: ctx.buffer_empty(fa_ext_elems),
+            fa_ext_layout,
+        }
+    }
 }
 
 impl Lfm2GpuModel {
@@ -352,6 +438,38 @@ impl Lfm2GpuModel {
         };
         let rope_layer_params_buf = ctx.buffer_from_bytes(rope_bytes);
         let embed_scratch = vec![0.0; hidden];
+        let max_prefill_seq = std::env::var("LLAMA_MAX_PREFILL_SEQ")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|&v| v > 0)
+            .unwrap_or(1024)
+            .min(kv_capacity as usize);
+        let max_kv_heads = config
+            .num_key_value_heads
+            .iter()
+            .copied()
+            .max()
+            .unwrap_or(1)
+            .max(1) as u32;
+        let prefill_scratch = Lfm2PrefillScratch::new(
+            &ctx,
+            max_prefill_seq,
+            hidden,
+            n_heads,
+            max_kv_out,
+            inter,
+            vocab,
+            head_dim,
+            kv_capacity,
+            max_kv_heads,
+            row_bytes as u64,
+        );
+        println!(
+            "  Prefill scratch: max_seq={} (~{:.0} MB activations)",
+            max_prefill_seq,
+            (max_prefill_seq * (hidden * 8 + inter * 3 + n_heads * head_dim * 2) * 4) as f64
+                / (1024.0 * 1024.0)
+        );
 
         println!(
             "  LFM2 loaded in {:.2}s (KV capacity={}, attn caches={}, conv states={})",
@@ -393,6 +511,7 @@ impl Lfm2GpuModel {
             conv_states,
             kv_capacity,
             seq_len: 0,
+            prefill_scratch,
         }
     }
 
@@ -431,8 +550,17 @@ impl Lfm2GpuModel {
         MetalContext::write_buffer(&self.residual_buf, &self.embed_scratch);
 
         let cur_seq = self.seq_len;
-        let cmd = self.ctx.queue.new_command_buffer();
-        let encoder = cmd.new_compute_command_encoder();
+        let metal_n_cb = crate::gpu::metal_n_cb();
+        let cb_layer_splits: Vec<usize> = if metal_n_cb >= 2 {
+            (1..metal_n_cb as usize)
+                .map(|i| n_layers * i / metal_n_cb as usize)
+                .collect()
+        } else {
+            Vec::new()
+        };
+        let mut cb_split_idx = 0usize;
+        let mut cmd = self.ctx.queue.new_command_buffer();
+        let mut encoder = cmd.new_compute_command_encoder();
 
         self.ctx.encode_rope_fill_decode(
             encoder,
@@ -456,6 +584,14 @@ impl Lfm2GpuModel {
         }
 
         for layer_idx in 0..n_layers {
+            if cb_split_idx < cb_layer_splits.len() && layer_idx == cb_layer_splits[cb_split_idx]
+            {
+                encoder.end_encoding();
+                cmd.commit();
+                cmd = self.ctx.queue.new_command_buffer();
+                encoder = cmd.new_compute_command_encoder();
+                cb_split_idx += 1;
+            }
             let layer = &self.layers[layer_idx];
 
             match &layer.kind {
@@ -553,58 +689,92 @@ impl Lfm2GpuModel {
                         );
                     }
 
-                    self.ctx.encode_rmsnorm_per_head_at_view(
-                        encoder,
-                        &self.q_buf,
-                        0,
-                        q_norm,
-                        &self.q_buf,
-                        0,
-                        n_heads as u32,
-                        head_dim as u32,
-                        eps,
-                    );
-                    self.ctx.encode_rmsnorm_per_head_at_view(
-                        encoder,
-                        &self.k_buf,
-                        0,
-                        k_norm,
-                        &self.k_buf,
-                        0,
-                        n_kv,
-                        head_dim as u32,
-                        eps,
-                    );
+                    let use_qk_fuse_nov = head_dim == 64
+                        && crate::gpu::fused_q_attn_enabled()
+                        && crate::gpu::fused_kv_attention_enabled();
+                    if use_qk_fuse_nov {
+                        let kv_seq = cur_seq + 1;
+                        self.ctx.encode_attention_qk_fused_nov_q4_0(
+                            encoder,
+                            &self.q_buf,
+                            q_norm,
+                            &self.cos_buf,
+                            0,
+                            &self.sin_buf,
+                            0,
+                            &self.k_buf,
+                            k_norm,
+                            &self.v_buf,
+                            &self.attn_out_buf,
+                            &self.k_caches[*kv_idx],
+                            &self.v_caches[*kv_idx],
+                            n_heads as u32,
+                            n_kv,
+                            n_groups,
+                            head_dim as u32,
+                            kv_seq,
+                            self.kv_capacity,
+                            scale,
+                            0,
+                            cur_seq,
+                            groups_per_row,
+                            row_bytes,
+                            eps,
+                        );
+                    } else {
+                        self.ctx.encode_rmsnorm_per_head_at_view(
+                            encoder,
+                            &self.q_buf,
+                            0,
+                            q_norm,
+                            &self.q_buf,
+                            0,
+                            n_heads as u32,
+                            head_dim as u32,
+                            eps,
+                        );
+                        self.ctx.encode_rmsnorm_per_head_at_view(
+                            encoder,
+                            &self.k_buf,
+                            0,
+                            k_norm,
+                            &self.k_buf,
+                            0,
+                            n_kv,
+                            head_dim as u32,
+                            eps,
+                        );
 
-                    self.ctx.encode_rotary(
-                        encoder,
-                        &self.q_buf,
-                        &self.k_buf,
-                        &self.cos_buf,
-                        &self.sin_buf,
-                        n_heads as u32,
-                        n_kv,
-                        head_dim as u32,
-                    );
+                        self.ctx.encode_rotary(
+                            encoder,
+                            &self.q_buf,
+                            &self.k_buf,
+                            &self.cos_buf,
+                            &self.sin_buf,
+                            n_heads as u32,
+                            n_kv,
+                            head_dim as u32,
+                        );
 
-                    self.ctx.encode_kv_append_attention_q4_0(
-                        encoder,
-                        &self.q_buf,
-                        &self.k_buf,
-                        &self.v_buf,
-                        &self.attn_out_buf,
-                        &self.k_caches[*kv_idx],
-                        &self.v_caches[*kv_idx],
-                        n_heads as u32,
-                        n_kv,
-                        n_groups,
-                        head_dim as u32,
-                        self.kv_capacity,
-                        cur_seq,
-                        scale,
-                        groups_per_row,
-                        row_bytes,
-                    );
+                        self.ctx.encode_kv_append_attention_q4_0(
+                            encoder,
+                            &self.q_buf,
+                            &self.k_buf,
+                            &self.v_buf,
+                            &self.attn_out_buf,
+                            &self.k_caches[*kv_idx],
+                            &self.v_caches[*kv_idx],
+                            n_heads as u32,
+                            n_kv,
+                            n_groups,
+                            head_dim as u32,
+                            self.kv_capacity,
+                            cur_seq,
+                            scale,
+                            groups_per_row,
+                            row_bytes,
+                        );
+                    }
 
                     self.ctx.encode_matvec_auto_view(
                         encoder,
@@ -763,9 +933,662 @@ impl Lfm2GpuModel {
         seed: u32,
     ) -> usize {
         assert!(!token_ids.is_empty());
-        for &tid in &token_ids[..token_ids.len() - 1] {
-            let _ = self.forward_one(tid, false);
+        if token_ids.len() == 1 {
+            return self.forward_single_token_sample(token_ids[0], temperature, min_p, seed);
         }
-        self.forward_single_token_sample(*token_ids.last().unwrap(), temperature, min_p, seed)
+        let mut conv = std::mem::take(&mut self.conv_states);
+        let (mut pool, slot) = KvCachePool::from_existing(
+            &self.k_caches,
+            &self.v_caches,
+            self.seq_len,
+            self.seq_len as usize,
+            self.kv_capacity,
+            crate::gemma4_config::KvCacheType::Q4_0,
+        );
+        pool.with_slot_mut(slot, |s| {
+            s.conv_states = std::mem::take(&mut conv);
+        })
+        .expect("lfm2 pool slot");
+        let logits = self
+            .forward_prefill_chunked_with_kv_slot(token_ids, &mut pool, slot)
+            .expect("lfm2 prefill");
+        let (seq, returned_conv) = pool
+            .with_slot_mut(slot, |s| {
+                (s.seq_len, std::mem::take(&mut s.conv_states))
+            })
+            .expect("lfm2 pool slot");
+        self.seq_len = seq;
+        self.conv_states = returned_conv;
+        let mut best = 0usize;
+        let mut best_v = f32::NEG_INFINITY;
+        for (i, &v) in logits.iter().enumerate() {
+            if v > best_v {
+                best_v = v;
+                best = i;
+            }
+        }
+        let _ = (temperature, min_p, seed);
+        best
+    }
+
+    pub fn forward_prefill_chunked_with_kv_slot(
+        &mut self,
+        token_ids: &[usize],
+        kv_pool: &mut KvCachePool,
+        slot: KvSlot,
+    ) -> Result<Vec<f32>, String> {
+        if token_ids.is_empty() {
+            return Err("prefill token_ids must not be empty".into());
+        }
+        let chunk_size = self.max_parallel_prefill_seq().max(1);
+        let mut logits = Vec::new();
+        let chunks: Vec<&[usize]> = token_ids.chunks(chunk_size).collect();
+        for (idx, chunk) in chunks.iter().enumerate() {
+            let is_last = idx + 1 == chunks.len();
+            logits =
+                self.forward_prefill_chunk_with_kv_slot(chunk, kv_pool, slot, is_last)?;
+        }
+        Ok(logits)
+    }
+
+    fn prepare_prefill_embeds(&mut self, token_ids: &[usize]) -> Result<(), String> {
+        let seq = token_ids.len();
+        if seq > self.prefill_scratch.max_seq_len {
+            return Err(format!(
+                "prefill chunk {} > max {}",
+                seq, self.prefill_scratch.max_seq_len
+            ));
+        }
+        let hidden = self.config.hidden_size;
+        for (i, &tid) in token_ids.iter().enumerate() {
+            self.embed.decode_into(
+                tid,
+                &mut self.prefill_scratch.embed_rows[i * hidden..(i + 1) * hidden],
+            );
+        }
+        MetalContext::write_buffer(
+            &self.prefill_scratch.hidden_buf,
+            &self.prefill_scratch.embed_rows[..seq * hidden],
+        );
+        Ok(())
+    }
+
+    fn forward_prefill_chunk_parallel(
+        &mut self,
+        token_ids: &[usize],
+        kv_pool: &mut KvCachePool,
+        slot: KvSlot,
+        start_pos: usize,
+        compute_logits: bool,
+    ) -> Result<Vec<f32>, String> {
+        let seq_len = token_ids.len();
+        let hidden = self.config.hidden_size;
+        let inter = self.config.intermediate_size;
+        let n_heads = self.config.num_attention_heads;
+        let head_dim = self.config.head_dim();
+        let eps = self.config.rms_norm_eps as f32;
+        let scale = 1.0 / (head_dim as f32).sqrt();
+        let l_cache = self.config.shortconv_l_cache as u32;
+        let vocab = self.config.vocab_size;
+        let groups_per_row = (head_dim / 32) as u32;
+        let row_bytes = groups_per_row * 18;
+        let total_hidden = (seq_len * hidden) as u32;
+        let scratch = &self.prefill_scratch;
+
+        let cmd = self.ctx.queue.new_command_buffer();
+        let encoder = cmd.new_compute_command_encoder();
+        let mut ext_mask_cache = crate::ggml_flash_attn_ext::PrefillExtMaskCache::default();
+
+        self.ctx.encode_rope_fill_prefill_batch(
+            encoder,
+            &scratch.cos_buf,
+            &scratch.sin_buf,
+            &self.rope_layer_params_buf,
+            0,
+            start_pos as u32,
+            seq_len as u32,
+            head_dim as u32,
+        );
+
+        // residual = hidden; first operator norm
+        self.ctx.encode_copy(
+            encoder,
+            &scratch.hidden_buf,
+            &scratch.residual_buf,
+            total_hidden,
+        );
+        self.ctx.encode_rmsnorm_batch_view(
+            encoder,
+            &scratch.residual_buf,
+            &self.layers[0].operator_norm,
+            &scratch.normed_buf,
+            hidden as u32,
+            eps,
+            seq_len as u32,
+        );
+
+        for layer_idx in 0..self.layers.len() {
+            let layer = &self.layers[layer_idx];
+            match &layer.kind {
+                Lfm2LayerKind::ShortConv {
+                    in_proj,
+                    conv,
+                    out_proj,
+                    state_idx,
+                } => {
+                    let state = kv_pool
+                        .with_slot_mut(slot, |s| s.conv_states[*state_idx].clone())
+                        .map_err(|e| e.to_string())?;
+                    self.ctx.encode_prefill_projection_auto_batch_view(
+                        encoder,
+                        in_proj,
+                        &scratch.normed_buf,
+                        &scratch.bcx_buf,
+                        (3 * hidden) as u32,
+                        hidden as u32,
+                        seq_len as u32,
+                    );
+                    self.ctx.encode_lfm2_shortconv_prefill(
+                        encoder,
+                        &scratch.bcx_buf,
+                        &state,
+                        conv,
+                        &scratch.shortconv_y_buf,
+                        hidden as u32,
+                        l_cache,
+                        seq_len as u32,
+                    );
+                    self.ctx.encode_prefill_projection_auto_batch_view(
+                        encoder,
+                        out_proj,
+                        &scratch.shortconv_y_buf,
+                        &scratch.o_out_buf,
+                        hidden as u32,
+                        hidden as u32,
+                        seq_len as u32,
+                    );
+                }
+                Lfm2LayerKind::Attention {
+                    q_proj,
+                    k_proj,
+                    v_proj,
+                    o_proj,
+                    q_norm,
+                    k_norm,
+                    kv_idx,
+                    num_kv_heads,
+                } => {
+                    let n_kv = *num_kv_heads as u32;
+                    let n_groups = (n_heads as u32) / n_kv;
+                    let q_out = (n_heads * head_dim) as u32;
+                    let kv_out = (*num_kv_heads * head_dim) as u32;
+                    self.ctx.encode_prefill_projection_auto_batch_view(
+                        encoder,
+                        q_proj,
+                        &scratch.normed_buf,
+                        &scratch.q_buf,
+                        q_out,
+                        hidden as u32,
+                        seq_len as u32,
+                    );
+                    self.ctx.encode_prefill_projection_auto_batch_view(
+                        encoder,
+                        k_proj,
+                        &scratch.normed_buf,
+                        &scratch.k_buf,
+                        kv_out,
+                        hidden as u32,
+                        seq_len as u32,
+                    );
+                    self.ctx.encode_prefill_projection_auto_batch_view(
+                        encoder,
+                        v_proj,
+                        &scratch.normed_buf,
+                        &scratch.v_buf,
+                        kv_out,
+                        hidden as u32,
+                        seq_len as u32,
+                    );
+                    // SHD → HSD for rotary / KV append / causal attn
+                    self.ctx.encode_rmsnorm_per_head_at_view(
+                        encoder,
+                        &scratch.q_buf,
+                        0,
+                        q_norm,
+                        &scratch.q_buf,
+                        0,
+                        (n_heads * seq_len) as u32,
+                        head_dim as u32,
+                        eps,
+                    );
+                    self.ctx.encode_rmsnorm_per_head_at_view(
+                        encoder,
+                        &scratch.k_buf,
+                        0,
+                        k_norm,
+                        &scratch.k_buf,
+                        0,
+                        (n_kv as usize * seq_len) as u32,
+                        head_dim as u32,
+                        eps,
+                    );
+                    self.ctx.encode_transpose_shd(
+                        encoder,
+                        &scratch.q_buf,
+                        &scratch.q_tmp,
+                        seq_len as u32,
+                        n_heads as u32,
+                        head_dim as u32,
+                    );
+                    self.ctx.encode_transpose_shd(
+                        encoder,
+                        &scratch.k_buf,
+                        &scratch.k_tmp,
+                        seq_len as u32,
+                        n_kv,
+                        head_dim as u32,
+                    );
+                    self.ctx.encode_transpose_shd(
+                        encoder,
+                        &scratch.v_buf,
+                        &scratch.v_tmp,
+                        seq_len as u32,
+                        n_kv,
+                        head_dim as u32,
+                    );
+                    self.ctx.encode_copy(
+                        encoder,
+                        &scratch.q_tmp,
+                        &scratch.q_buf,
+                        (seq_len * n_heads * head_dim) as u32,
+                    );
+                    self.ctx.encode_copy(
+                        encoder,
+                        &scratch.k_tmp,
+                        &scratch.k_buf,
+                        (seq_len * *num_kv_heads * head_dim) as u32,
+                    );
+                    self.ctx.encode_copy(
+                        encoder,
+                        &scratch.v_tmp,
+                        &scratch.v_buf,
+                        (seq_len * *num_kv_heads * head_dim) as u32,
+                    );
+                    self.ctx.encode_rotary_batch(
+                        encoder,
+                        &scratch.q_buf,
+                        &scratch.k_buf,
+                        &scratch.cos_buf,
+                        &scratch.sin_buf,
+                        n_heads as u32,
+                        n_kv,
+                        head_dim as u32,
+                        seq_len as u32,
+                    );
+                    let k_cache = kv_pool
+                        .layer_k_cache(slot, *kv_idx)
+                        .map_err(|e| e.to_string())?
+                        .clone();
+                    let v_cache = kv_pool
+                        .layer_v_cache(slot, *kv_idx)
+                        .map_err(|e| e.to_string())?
+                        .clone();
+                    self.ctx.encode_kv_batch_append_q4_0(
+                        encoder,
+                        &scratch.k_buf,
+                        &k_cache,
+                        n_kv,
+                        head_dim as u32,
+                        kv_pool.capacity(),
+                        start_pos as u32,
+                        seq_len as u32,
+                    );
+                    self.ctx.encode_kv_batch_append_q4_0(
+                        encoder,
+                        &scratch.v_buf,
+                        &v_cache,
+                        n_kv,
+                        head_dim as u32,
+                        kv_pool.capacity(),
+                        start_pos as u32,
+                        seq_len as u32,
+                    );
+                    let kv_seq = (start_pos + seq_len) as u32;
+                    let use_ext_attn = crate::gpu::prefill_flash_attn_ext_enabled()
+                        && crate::gpu::prefill_use_flash_attn_ext_tiled(
+                            seq_len as u32,
+                            head_dim as u32,
+                        );
+                    // flash_attn_ext writes SHD ([seq][head][dim]); legacy causal writes HSD.
+                    let attn_out = if use_ext_attn {
+                        &scratch.q_tmp
+                    } else {
+                        &scratch.attn_out_buf
+                    };
+                    // q_f16 arg is unused (kernel loads f32 Q); any buffer satisfies the Option gate.
+                    self.ctx.encode_prefill_attention_causal_q4_0(
+                        encoder,
+                        &scratch.q_buf,
+                        &k_cache,
+                        &v_cache,
+                        attn_out,
+                        Some(&scratch.attn_out_buf),
+                        n_heads as u32,
+                        n_kv,
+                        n_groups,
+                        head_dim as u32,
+                        kv_seq,
+                        kv_pool.capacity(),
+                        scale,
+                        seq_len as u32,
+                        start_pos as u32,
+                        0,
+                        groups_per_row,
+                        row_bytes,
+                        if use_ext_attn {
+                            Some(&scratch.fa_ext_scratch)
+                        } else {
+                            None
+                        },
+                        if use_ext_attn {
+                            Some(&scratch.fa_ext_layout)
+                        } else {
+                            None
+                        },
+                        if use_ext_attn {
+                            Some(&mut ext_mask_cache)
+                        } else {
+                            None
+                        },
+                    );
+                    if !use_ext_attn {
+                        // HSD → SHD for o_proj
+                        self.ctx.encode_transpose_hsd(
+                            encoder,
+                            &scratch.attn_out_buf,
+                            &scratch.q_tmp,
+                            seq_len as u32,
+                            n_heads as u32,
+                            head_dim as u32,
+                        );
+                    }
+                    self.ctx.encode_prefill_projection_auto_batch_view(
+                        encoder,
+                        o_proj,
+                        &scratch.q_tmp,
+                        &scratch.o_out_buf,
+                        hidden as u32,
+                        q_out,
+                        seq_len as u32,
+                    );
+                }
+            }
+
+            self.ctx.encode_vec_add_batch(
+                encoder,
+                &scratch.residual_buf,
+                &scratch.o_out_buf,
+                &scratch.residual_buf,
+                total_hidden,
+            );
+
+            // FFN
+            self.ctx.encode_rmsnorm_batch_view(
+                encoder,
+                &scratch.residual_buf,
+                &layer.ffn_norm,
+                &scratch.normed_buf,
+                hidden as u32,
+                eps,
+                seq_len as u32,
+            );
+            self.ctx.encode_prefill_projection_auto_batch_view(
+                encoder,
+                &layer.gate_proj,
+                &scratch.normed_buf,
+                &scratch.gate_buf,
+                inter as u32,
+                hidden as u32,
+                seq_len as u32,
+            );
+            self.ctx.encode_prefill_projection_auto_batch_view(
+                encoder,
+                &layer.up_proj,
+                &scratch.normed_buf,
+                &scratch.up_buf,
+                inter as u32,
+                hidden as u32,
+                seq_len as u32,
+            );
+            self.ctx.encode_silu_mul_batch(
+                encoder,
+                &scratch.gate_buf,
+                &scratch.up_buf,
+                &scratch.silu_buf,
+                (seq_len * inter) as u32,
+            );
+            self.ctx.encode_prefill_projection_auto_batch_view(
+                encoder,
+                &layer.down_proj,
+                &scratch.silu_buf,
+                &scratch.down_buf,
+                hidden as u32,
+                inter as u32,
+                seq_len as u32,
+            );
+            self.ctx.encode_vec_add_batch(
+                encoder,
+                &scratch.residual_buf,
+                &scratch.down_buf,
+                &scratch.residual_buf,
+                total_hidden,
+            );
+
+            if layer_idx + 1 < self.layers.len() {
+                let next = &self.layers[layer_idx + 1];
+                self.ctx.encode_rmsnorm_batch_view(
+                    encoder,
+                    &scratch.residual_buf,
+                    &next.operator_norm,
+                    &scratch.normed_buf,
+                    hidden as u32,
+                    eps,
+                    seq_len as u32,
+                );
+            }
+        }
+
+        encoder.end_encoding();
+        cmd.commit();
+        cmd.wait_until_completed();
+
+        kv_pool
+            .with_slot_mut(slot, |s| {
+                s.seq_len = (start_pos + seq_len) as u32;
+                s.total_tokens = start_pos + seq_len;
+            })
+            .map_err(|e| e.to_string())?;
+
+        if !compute_logits {
+            return Ok(Vec::new());
+        }
+
+        let last_row = (seq_len - 1) * hidden;
+        let all = MetalContext::read_buffer(
+            &self.prefill_scratch.residual_buf,
+            seq_len * hidden,
+        );
+        MetalContext::write_buffer(&self.residual_buf, &all[last_row..last_row + hidden]);
+        let cmd2 = self.ctx.queue.new_command_buffer();
+        let enc2 = cmd2.new_compute_command_encoder();
+        self.ctx.encode_rmsnorm_view(
+            enc2,
+            &self.residual_buf,
+            &self.final_norm,
+            &self.normed_buf,
+            hidden as u32,
+            eps,
+        );
+        self.ctx.encode_matvec_auto_view(
+            enc2,
+            &self.lm_head,
+            &self.normed_buf,
+            &self.prefill_scratch.logits_buf,
+            vocab as u32,
+            hidden as u32,
+        );
+        enc2.end_encoding();
+        cmd2.commit();
+        cmd2.wait_until_completed();
+        Ok(MetalContext::read_buffer(
+            &self.prefill_scratch.logits_buf,
+            vocab,
+        ))
+    }
+
+    pub fn forward_prefill_chunk_with_kv_slot(
+        &mut self,
+        token_ids: &[usize],
+        kv_pool: &mut KvCachePool,
+        slot: KvSlot,
+        want_logits: bool,
+    ) -> Result<Vec<f32>, String> {
+        if token_ids.is_empty() {
+            return Err("prefill token_ids must not be empty".into());
+        }
+        let start_pos = kv_pool.total_tokens(slot).map_err(|e| e.to_string())?;
+        if token_ids.len() == 1 {
+            let logits = self
+                .forward_single_token_with_kv_slot(token_ids[0], kv_pool, slot)
+                .map_err(|e| e.to_string())?;
+            return Ok(if want_logits { logits } else { Vec::new() });
+        }
+        self.prepare_prefill_embeds(token_ids)?;
+        self.forward_prefill_chunk_parallel(token_ids, kv_pool, slot, start_pos, want_logits)
+    }
+
+    pub fn create_kv_pool(&self, num_slots: usize, max_seq_len: u32) -> KvCachePool {
+        let max_seq_len = max_seq_len.min(self.kv_capacity);
+        KvCachePool::new_lfm2(&self.ctx, &self.config, num_slots, max_seq_len)
+    }
+
+    pub fn max_parallel_prefill_seq(&self) -> usize {
+        self.prefill_scratch.max_seq_len
+    }
+
+    pub fn max_decode_batch_size(&self) -> usize {
+        1
+    }
+
+    pub fn forward_single_token_with_kv_slot(
+        &mut self,
+        token_id: usize,
+        kv_pool: &mut KvCachePool,
+        slot: KvSlot,
+    ) -> Result<Vec<f32>, KvPoolError> {
+        let pool_cap = kv_pool.capacity();
+        kv_pool.with_slot_mut(slot, |slot_state| {
+            std::mem::swap(&mut self.k_caches, &mut slot_state.k_cache);
+            std::mem::swap(&mut self.v_caches, &mut slot_state.v_cache);
+            std::mem::swap(&mut self.conv_states, &mut slot_state.conv_states);
+            let legacy_seq = self.seq_len;
+            let legacy_cap = self.kv_capacity;
+            self.seq_len = slot_state.seq_len;
+            self.kv_capacity = pool_cap;
+
+            let _ = self.forward_one(token_id, true);
+            let logits = MetalContext::read_buffer(&self.logits_buf, self.config.vocab_size);
+
+            slot_state.seq_len = self.seq_len;
+            slot_state.total_tokens = self.seq_len as usize;
+            self.seq_len = legacy_seq;
+            self.kv_capacity = legacy_cap;
+            std::mem::swap(&mut self.conv_states, &mut slot_state.conv_states);
+            std::mem::swap(&mut self.v_caches, &mut slot_state.v_cache);
+            std::mem::swap(&mut self.k_caches, &mut slot_state.k_cache);
+            logits
+        })
+    }
+
+    pub fn forward_decode_batch_with_kv_slots(
+        &mut self,
+        inputs: &[(KvSlot, usize)],
+        kv_pool: &mut KvCachePool,
+    ) -> Vec<Result<Vec<f32>, String>> {
+        inputs
+            .iter()
+            .map(|&(slot, token_id)| {
+                self.forward_single_token_with_kv_slot(token_id, kv_pool, slot)
+                    .map_err(|e| e.to_string())
+            })
+            .collect()
+    }
+
+    pub fn forward_prefill_batch_with_kv_slots(
+        &mut self,
+        inputs: &[(KvSlot, &[usize])],
+        kv_pool: &mut KvCachePool,
+    ) -> Vec<Result<Vec<f32>, String>> {
+        inputs
+            .iter()
+            .map(|&(slot, tokens)| {
+                self.forward_prefill_chunk_with_kv_slot(tokens, kv_pool, slot, true)
+            })
+            .collect()
+    }
+}
+
+impl ServeGpuModel for Lfm2GpuModel {
+    fn kv_capacity(&self) -> u32 {
+        self.kv_capacity
+    }
+
+    fn create_kv_pool(&self, num_slots: usize, max_seq_len: u32) -> KvCachePool {
+        Lfm2GpuModel::create_kv_pool(self, num_slots, max_seq_len)
+    }
+
+    fn max_parallel_prefill_seq(&self) -> usize {
+        Lfm2GpuModel::max_parallel_prefill_seq(self)
+    }
+
+    fn max_decode_batch_size(&self) -> usize {
+        Lfm2GpuModel::max_decode_batch_size(self)
+    }
+
+    fn forward_prefill_chunk_with_kv_slot(
+        &mut self,
+        token_ids: &[usize],
+        kv_pool: &mut KvCachePool,
+        slot: KvSlot,
+        want_logits: bool,
+    ) -> Result<Vec<f32>, String> {
+        Lfm2GpuModel::forward_prefill_chunk_with_kv_slot(
+            self, token_ids, kv_pool, slot, want_logits,
+        )
+    }
+
+    fn forward_prefill_batch_with_kv_slots(
+        &mut self,
+        inputs: &[(KvSlot, &[usize])],
+        kv_pool: &mut KvCachePool,
+    ) -> Vec<Result<Vec<f32>, String>> {
+        Lfm2GpuModel::forward_prefill_batch_with_kv_slots(self, inputs, kv_pool)
+    }
+
+    fn forward_single_token_with_kv_slot(
+        &mut self,
+        token_id: usize,
+        kv_pool: &mut KvCachePool,
+        slot: KvSlot,
+    ) -> Result<Vec<f32>, KvPoolError> {
+        Lfm2GpuModel::forward_single_token_with_kv_slot(self, token_id, kv_pool, slot)
+    }
+
+    fn forward_decode_batch_with_kv_slots(
+        &mut self,
+        inputs: &[(KvSlot, usize)],
+        kv_pool: &mut KvCachePool,
+    ) -> Vec<Result<Vec<f32>, String>> {
+        Lfm2GpuModel::forward_decode_batch_with_kv_slots(self, inputs, kv_pool)
     }
 }

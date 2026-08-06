@@ -25,6 +25,7 @@ mod mtp_serve;
 mod quantize;
 mod sampling;
 mod scheduler;
+mod serve_model;
 mod weights;
 mod generation;
 mod server;
@@ -327,22 +328,35 @@ fn main() {
         };
 
         if gguf_arch.as_deref() == Some("lfm2") {
-            if args.iter().any(|a| a == "--serve") {
-                eprintln!(
-                    "LFM2 --serve is not supported yet; use --gpu (CLI gen) or --gguf-gen"
-                );
-                std::process::exit(1);
-            }
-            if bench_decode || bench_prefill {
-                eprintln!("LFM2 --bench-decode / --bench-prefill are not wired yet");
-                std::process::exit(1);
-            }
-
             let start = Instant::now();
             println!("Loading LFM2 model (GGUF) from: {}", model_dir);
             let mut gpu_model = lfm2_gpu_model::Lfm2GpuModel::load_from_gguf(&model_dir);
             let tokenizer = gguf::build_tokenizer_from_gguf(&model_dir);
             println!("Model loaded in {:.2}s", start.elapsed().as_secs_f64());
+
+            if bench_prefill {
+                bench_prefill_lfm2(&tokenizer, &mut gpu_model, &bench_prefill_tokens);
+                return;
+            }
+            if bench_decode {
+                eprintln!("LFM2 --bench-decode: use CLI generation timing for now");
+                return;
+            }
+            if args.iter().any(|a| a == "--serve") {
+                let port: u16 = args
+                    .iter()
+                    .position(|a| a == "--port")
+                    .and_then(|i| args.get(i + 1))
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or(8080);
+                println!("Starting LFM2 server on port {}...", port);
+                let eos = gpu_model.eos_token_id();
+                let rt = tokio::runtime::Runtime::new().unwrap();
+                rt.block_on(async {
+                    server::run_server_lfm2(gpu_model, tokenizer, port, eos).await;
+                });
+                return;
+            }
 
             println!("{}", "=".repeat(60));
             println!("LFM2 GENERATION (Metal GPU)");
@@ -663,6 +677,61 @@ fn parse_prefill_token_sizes(s: &str) -> Vec<usize> {
         .filter_map(|p| p.trim().parse::<usize>().ok())
         .filter(|&n| n > 0)
         .collect()
+}
+
+/// Timed parallel prefill via KV-pool path (same as server), no decode.
+fn bench_prefill_lfm2(
+    tokenizer: &tokenizers::Tokenizer,
+    model: &mut lfm2_gpu_model::Lfm2GpuModel,
+    sizes: &[usize],
+) {
+    let filler = "The quick brown fox jumps over the lazy dog. ";
+    println!("\n=== LFM2 parallel prefill benchmark (Metal GPU) ===");
+    println!(
+        "  max_parallel_prefill_seq={}",
+        model.max_parallel_prefill_seq()
+    );
+    let sizes = if sizes.is_empty() {
+        vec![128, 512, 1024]
+    } else {
+        sizes.to_vec()
+    };
+    for &target in &sizes {
+        model.reset();
+        let mut text = String::from("<|startoftext|><|im_start|>user\n");
+        while tokenizer
+            .encode(text.as_str(), true)
+            .map(|e| e.get_ids().len())
+            .unwrap_or(0)
+            < target
+        {
+            text.push_str(filler);
+        }
+        text.push_str("<|im_end|>\n<|im_start|>assistant\n");
+        let token_ids: Vec<usize> = tokenizer
+            .encode(text.as_str(), true)
+            .expect("encode")
+            .get_ids()
+            .iter()
+            .map(|&t| t as usize)
+            .collect();
+        let mut kv_pool = model.create_kv_pool(1, model.kv_capacity);
+        let slot = kv_pool.allocate().expect("slot");
+        let t0 = Instant::now();
+        let _logits = model
+            .forward_prefill_chunked_with_kv_slot(&token_ids, &mut kv_pool, slot)
+            .expect("prefill");
+        let ms = t0.elapsed().as_secs_f64() * 1e3;
+        let n = token_ids.len();
+        println!(
+            "  target={:<4} actual={:<4} prefill={:.1} tok/s  ({:.2} ms)",
+            target,
+            n,
+            n as f64 / (ms / 1e3),
+            ms
+        );
+        let _ = kv_pool.release(slot);
+    }
 }
 
 /// Timed parallel prefill via KV-pool path (same as server), no decode.

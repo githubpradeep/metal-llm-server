@@ -1550,6 +1550,24 @@ kernel void flash_attn_ext_prefill_mask_fill(
     mask[qi * args.kv_seq + kj] = allowed ? half(0.0h) : half(-INFINITY);
 }
 
+kernel void flash_attn_ext_prefill_q4_0_h64(
+    constant ggml_metal_kargs_flash_attn_ext & args [[buffer(0)]],
+    device const char * q [[buffer(1)]],
+    device const char * k [[buffer(2)]],
+    device const char * v [[buffer(3)]],
+    device const char * mask [[buffer(4)]],
+    device const char * pad [[buffer(5)]],
+    device const char * blk [[buffer(6)]],
+    device char * dst [[buffer(7)]],
+    threadgroup half * shmem_f16 [[threadgroup(0)]],
+    uint3 tgpig [[threadgroup_position_in_grid]],
+    ushort tiisg [[thread_index_in_simdgroup]],
+    ushort sgitg [[simdgroup_index_in_threadgroup]]) {
+    // LFM2 / small-head models: DK=DV=64, NSG=8 (~15 KB smem).
+    kernel_flash_attn_ext_impl<FA_TYPES, block_q4_0, 2, dequantize_q4_0, block_q4_0, 2, dequantize_q4_0, 64, 64, 8, 64, 8>(
+        args, q, k, v, mask, (device const char *)nullptr, pad, blk, dst, shmem_f16, tgpig, tiisg, sgitg);
+}
+
 kernel void flash_attn_ext_prefill_q4_0_h256(
     constant ggml_metal_kargs_flash_attn_ext & args [[buffer(0)]],
     device const char * q [[buffer(1)]],

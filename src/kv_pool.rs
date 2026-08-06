@@ -3,6 +3,7 @@ use std::fmt;
 
 use crate::gemma4_config::{Gemma4TextConfig, KvCacheType};
 use crate::gpu::MetalContext;
+use crate::lfm2_config::Lfm2Config;
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct KvSlot(usize);
@@ -45,6 +46,8 @@ pub struct KvCachePool {
 pub struct KvCacheSlot {
     pub k_cache: Vec<Buffer>,
     pub v_cache: Vec<Buffer>,
+    /// LFM2 short-conv recurrent state (empty for Gemma).
+    pub conv_states: Vec<Buffer>,
     pub seq_len: u32,
     pub total_tokens: usize,
     in_use: bool,
@@ -79,6 +82,7 @@ impl KvCachePool {
                 slots: vec![KvCacheSlot {
                     k_cache: k_cache.to_vec(),
                     v_cache: v_cache.to_vec(),
+                    conv_states: Vec::new(),
                     seq_len,
                     total_tokens,
                     in_use: true,
@@ -125,6 +129,7 @@ impl KvCachePool {
             slots.push(KvCacheSlot {
                 k_cache,
                 v_cache,
+                conv_states: Vec::new(),
                 seq_len: 0,
                 total_tokens: 0,
                 in_use: false,
@@ -139,6 +144,66 @@ impl KvCachePool {
             max_seq_len,
             num_layers,
             kv_cache_type,
+        }
+    }
+
+    /// LFM2: one K/V buffer per attention layer + conv state per short-conv layer.
+    pub fn new_lfm2(
+        ctx: &MetalContext,
+        config: &Lfm2Config,
+        num_slots: usize,
+        max_seq_len: u32,
+    ) -> Self {
+        let head_dim = config.head_dim();
+        assert!(head_dim % 32 == 0);
+        let row_bytes = (head_dim / 32) * 18;
+        let n_attn = config
+            .num_key_value_heads
+            .iter()
+            .filter(|&&h| h > 0)
+            .count();
+        let n_sc = config.num_hidden_layers - n_attn;
+        let state_elems = config.conv_state_elems();
+
+        let mut slots = Vec::with_capacity(num_slots);
+        for _ in 0..num_slots {
+            let mut k_cache = Vec::with_capacity(n_attn);
+            let mut v_cache = Vec::with_capacity(n_attn);
+            for &n_kv in &config.num_key_value_heads {
+                if n_kv == 0 {
+                    continue;
+                }
+                let byte_len = (n_kv * max_seq_len as usize * row_bytes) as u64;
+                k_cache.push(
+                    ctx.device
+                        .new_buffer(byte_len, MTLResourceOptions::StorageModeShared),
+                );
+                v_cache.push(
+                    ctx.device
+                        .new_buffer(byte_len, MTLResourceOptions::StorageModeShared),
+                );
+            }
+            let mut conv_states = Vec::with_capacity(n_sc);
+            for _ in 0..n_sc {
+                conv_states.push(ctx.buffer_empty(state_elems));
+            }
+            slots.push(KvCacheSlot {
+                k_cache,
+                v_cache,
+                conv_states,
+                seq_len: 0,
+                total_tokens: 0,
+                in_use: false,
+            });
+        }
+
+        let free_slots = (0..num_slots).rev().collect();
+        Self {
+            slots,
+            free_slots,
+            max_seq_len,
+            num_layers: n_attn,
+            kv_cache_type: KvCacheType::Q4_0,
         }
     }
 

@@ -22,6 +22,7 @@ use crate::mtp_serve;
 use crate::scheduler::{
     self, GenerationParams, InferenceRequest, StreamEvent, CANCEL_CLIENT, CANCEL_NONE, CANCEL_STOP,
 };
+use crate::serve_model::ServeGpuModel;
 
 // ─── OpenAI-compatible types ─────────────────────────────────────────────────
 
@@ -150,7 +151,43 @@ fn strip_native_tool_calls(text: &mut String) {
             None => break,
         }
     }
+    while let Some(start) = text.find(LFM2_TOOL_CALL_START) {
+        let suffix_start = text[start..].find(LFM2_TOOL_CALL_END);
+        match suffix_start {
+            Some(end) => {
+                text.replace_range(start..start + end + LFM2_TOOL_CALL_END.len(), "");
+            }
+            None => break,
+        }
+    }
     *text = text.trim().to_string();
+}
+
+fn has_lfm2_think(text: &str) -> bool {
+    text.contains(LFM2_THINK_OPEN) || text.contains(LFM2_THINK_CLOSE)
+}
+
+/// Split LFM2 `<think>...</think>` (prompt may already open `<think>`).
+fn split_lfm2_think(text: &str) -> (String, String) {
+    let mut raw = text.to_string();
+    trim_stop_sequences(&mut raw, None);
+    if let Some(end) = raw.find(LFM2_THINK_CLOSE) {
+        let after = raw[end + LFM2_THINK_CLOSE.len()..].trim_start().to_string();
+        let before = &raw[..end];
+        let reasoning = before
+            .strip_prefix(LFM2_THINK_OPEN)
+            .unwrap_or(before)
+            .trim()
+            .to_string();
+        return (reasoning, after);
+    }
+    if let Some(start) = raw.find(LFM2_THINK_OPEN) {
+        return (
+            raw[start + LFM2_THINK_OPEN.len()..].trim().to_string(),
+            String::new(),
+        );
+    }
+    (String::new(), raw)
 }
 
 fn default_max_tokens() -> usize {
@@ -459,6 +496,9 @@ fn split_reasoning_and_content_with_mode(
     text: &str,
     mode: ChannelSplitMode,
 ) -> (String, String) {
+    if has_lfm2_think(text) {
+        return split_lfm2_think(text);
+    }
     if !has_channel_markup(text) {
         let mut plain = text.to_string();
         trim_stop_sequences(&mut plain, None);
@@ -478,6 +518,16 @@ fn split_reasoning_and_content(text: &str) -> (String, String) {
 /// When tools are enabled, model output before a tool call is reasoning (even if the
 /// prompt already closed an empty `<|channel>thought` block).
 fn split_tool_generation_output(text: &str) -> (String, String) {
+    if let Some(idx) = text.find(LFM2_TOOL_CALL_START) {
+        let mut reasoning = text[..idx].to_string();
+        if has_lfm2_think(&reasoning) {
+            let (r, _) = split_lfm2_think(&reasoning);
+            reasoning = r;
+        } else {
+            trim_stop_sequences(&mut reasoning, None);
+        }
+        return (reasoning, String::new());
+    }
     if let Some(idx) = text.find(NATIVE_TOOL_CALL_TRIGGER) {
         let mut reasoning = text[..idx].to_string();
         trim_stop_sequences(&mut reasoning, None);
@@ -1724,12 +1774,20 @@ impl IntoResponse for ApiError {
 
 // ─── Server state ────────────────────────────────────────────────────────────
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ChatFamily {
+    Gemma4,
+    Lfm2,
+}
+
 pub struct AppState {
     pub request_tx: SyncSender<InferenceRequest>,
     pub metrics: Arc<Metrics>,
     pub tokenizer: tokenizers::Tokenizer,
     pub max_context_len: usize,
     pub runtime_config: ServerRuntimeConfig,
+    pub chat_family: ChatFamily,
+    pub eos_token_ids: Vec<usize>,
 }
 
 impl AppState {
@@ -1849,6 +1907,15 @@ fn generation_priming_suffix(
     ""
 }
 
+const LFM2_IM_START: &str = "<|im_start|>";
+const LFM2_IM_END: &str = "<|im_end|>";
+const LFM2_END_OF_TEXT: &str = "<|endoftext|>";
+const LFM2_START_OF_TEXT: &str = "<|startoftext|>";
+const LFM2_TOOL_CALL_START: &str = "<|tool_call_start|>";
+const LFM2_TOOL_CALL_END: &str = "<|tool_call_end|>";
+const LFM2_THINK_OPEN: &str = "<think>";
+const LFM2_THINK_CLOSE: &str = "</think>";
+
 const BUILT_IN_OUTPUT_TRIM_SEQUENCES: &[&str] = &[
     TURN_END,
     TURN_START,
@@ -1857,6 +1924,11 @@ const BUILT_IN_OUTPUT_TRIM_SEQUENCES: &[&str] = &[
     "<eos>",
     "<start_of_turn>",
     "</start_of_turn>",
+    // LFM2 / ChatML
+    LFM2_IM_END,
+    LFM2_IM_START,
+    LFM2_END_OF_TEXT,
+    LFM2_TOOL_CALL_END,
 ];
 
 /// Strips channel markup from text so the visible content flows correctly in
@@ -1903,9 +1975,35 @@ fn strip_channel_blocks(text: &str) -> String {
 
 // Only these end the underlying sampler loop. Channel / tool markup tokens are
 // normal model output and must not cancel generation mid-turn.
-const BUILT_IN_GENERATION_STOP_SEQUENCES: &[&str] = &[TURN_END, TURN_START];
+const BUILT_IN_GENERATION_STOP_SEQUENCES: &[&str] = &[
+    TURN_END,
+    TURN_START,
+    LFM2_IM_END,
+    LFM2_END_OF_TEXT,
+];
 
-const TURN_STOP_PREFIXES: &[&str] = &["<", "<|", "<|t", "<|tu", "<|tur", "<|turn"];
+const TURN_STOP_PREFIXES: &[&str] = &[
+    "<",
+    "<|",
+    "<|t",
+    "<|tu",
+    "<|tur",
+    "<|turn",
+    "<|i",
+    "<|im",
+    "<|im_",
+    "<|im_e",
+    "<|im_en",
+    "<|im_end",
+    "<|im_end|",
+    "<|e",
+    "<|en",
+    "<|end",
+    "<|endo",
+    "<|endof",
+    "<|endoftext",
+    "<|endoftext|",
+];
 const OTHER_OUTPUT_TRIM_PREFIXES: &[&str] = &[
     "<e",
     "<en",
@@ -1975,6 +2073,142 @@ Only call tools from this list.\n\n",
 }
 
 fn apply_chat_template(
+    messages: &[Message],
+    tools: Option<&[Tool]>,
+    tool_choice: Option<&serde_json::Value>,
+) -> String {
+    apply_chat_template_for(ChatFamily::Gemma4, messages, tools, tool_choice)
+}
+
+fn apply_chat_template_for(
+    family: ChatFamily,
+    messages: &[Message],
+    tools: Option<&[Tool]>,
+    tool_choice: Option<&serde_json::Value>,
+) -> String {
+    match family {
+        ChatFamily::Gemma4 => apply_gemma4_chat_template(messages, tools, tool_choice),
+        ChatFamily::Lfm2 => apply_lfm2_chat_template(messages, tools, tool_choice),
+    }
+}
+
+fn apply_lfm2_chat_template(
+    messages: &[Message],
+    tools: Option<&[Tool]>,
+    _tool_choice: Option<&serde_json::Value>,
+) -> String {
+    let mut prompt = String::from(LFM2_START_OF_TEXT);
+
+    let mut system_parts = Vec::new();
+    let mut body: Vec<&Message> = Vec::new();
+    for msg in messages {
+        if msg.role == "system" {
+            if let Some(content) = &msg.content {
+                if !content.is_empty() {
+                    system_parts.push(content.as_str());
+                }
+            }
+        } else {
+            body.push(msg);
+        }
+    }
+
+    let mut system_prompt = system_parts.join("\n\n");
+    if let Some(tools) = tools {
+        if !tools.is_empty() {
+            let tool_jsons: Vec<String> = tools
+                .iter()
+                .map(|t| {
+                    serde_json::json!({
+                        "name": t.function.name,
+                        "description": t.function.description,
+                        "parameters": t.function.parameters,
+                    })
+                    .to_string()
+                })
+                .collect();
+            if !system_prompt.is_empty() {
+                system_prompt.push('\n');
+            }
+            system_prompt.push_str("List of tools: [");
+            system_prompt.push_str(&tool_jsons.join(", "));
+            system_prompt.push(']');
+        }
+    }
+
+    if !system_prompt.is_empty() {
+        prompt.push_str(LFM2_IM_START);
+        prompt.push_str("system\n");
+        prompt.push_str(&system_prompt);
+        prompt.push_str(LFM2_IM_END);
+        prompt.push('\n');
+    }
+
+    for msg in body {
+        let role = match msg.role.as_str() {
+            "assistant" => "assistant",
+            "tool" => "tool",
+            _ => "user",
+        };
+        prompt.push_str(LFM2_IM_START);
+        prompt.push_str(role);
+        prompt.push('\n');
+        if let Some(content) = &msg.content {
+            prompt.push_str(content);
+        }
+        if let Some(tool_calls) = &msg.tool_calls {
+            if !tool_calls.is_empty() {
+                prompt.push_str(&render_lfm2_tool_calls(tool_calls));
+            }
+        }
+        prompt.push_str(LFM2_IM_END);
+        prompt.push('\n');
+    }
+
+    // Match CLI / Liquid instruct: open assistant turn without forcing <think>.
+    // (GGUF template primes <think>, but that made short answers empty after
+    // </think>+eos and hurt stop behavior with our sampler defaults.)
+    prompt.push_str(LFM2_IM_START);
+    prompt.push_str("assistant\n");
+    prompt
+}
+
+fn render_lfm2_tool_calls(tool_calls: &[ToolCall]) -> String {
+    let mut parts = Vec::with_capacity(tool_calls.len());
+    for tc in tool_calls {
+        let args: serde_json::Value =
+            serde_json::from_str(&tc.function.arguments).unwrap_or(serde_json::json!({}));
+        let mut arg_parts = Vec::new();
+        if let Some(obj) = args.as_object() {
+            for (k, v) in obj {
+                arg_parts.push(format!("{}={}", k, format_lfm2_arg_value(v)));
+            }
+        }
+        parts.push(format!("{}({})", tc.function.name, arg_parts.join(", ")));
+    }
+    format!(
+        "{}[{}]{}",
+        LFM2_TOOL_CALL_START,
+        parts.join(", "),
+        LFM2_TOOL_CALL_END
+    )
+}
+
+fn format_lfm2_arg_value(value: &serde_json::Value) -> String {
+    match value {
+        serde_json::Value::String(s) => {
+            let escaped = s
+                .replace('\\', "\\\\")
+                .replace('\'', "\\'")
+                .replace('\n', "\\n")
+                .replace('\r', "\\r");
+            format!("'{escaped}'")
+        }
+        other => other.to_string(),
+    }
+}
+
+fn apply_gemma4_chat_template(
     messages: &[Message],
     tools: Option<&[Tool]>,
     tool_choice: Option<&serde_json::Value>,
@@ -2122,6 +2356,11 @@ fn parse_tool_calls(
         }
     }
 
+    parse_lfm2_tool_calls(text, &mut calls);
+    if !calls.is_empty() {
+        return finish_parse_tool_calls(calls, allowed_names.as_deref());
+    }
+
     // Gemma4 native: <|tool_call>call:read{path:<|"|>a<|"|>}<tool_call|>
     let mut rest = text;
     while let Some(start) = rest.find(NATIVE_TOOL_CALL_TRIGGER) {
@@ -2237,6 +2476,196 @@ fn finish_parse_tool_calls(calls: Vec<ToolCall>, allowed_names: Option<&[String]
     match allowed_names {
         Some(names) if !names.is_empty() => normalize_tool_calls(calls, names),
         _ => calls,
+    }
+}
+
+/// Parse LFM2 `<|tool_call_start|>[name(arg='v'), ...]<|tool_call_end|>`.
+fn parse_lfm2_tool_calls(text: &str, calls: &mut Vec<ToolCall>) {
+    let mut rest = text;
+    while let Some(start) = rest.find(LFM2_TOOL_CALL_START) {
+        let after = &rest[start + LFM2_TOOL_CALL_START.len()..];
+        let body = if let Some(end) = after.find(LFM2_TOOL_CALL_END) {
+            &after[..end]
+        } else {
+            after
+        };
+        let body = body.trim().trim_start_matches('[').trim_end_matches(']');
+        parse_lfm2_call_list(body, calls);
+        let advance = if let Some(end) = after.find(LFM2_TOOL_CALL_END) {
+            start + LFM2_TOOL_CALL_START.len() + end + LFM2_TOOL_CALL_END.len()
+        } else {
+            rest.len()
+        };
+        if advance <= start {
+            break;
+        }
+        rest = &rest[advance..];
+    }
+}
+
+fn parse_lfm2_call_list(body: &str, calls: &mut Vec<ToolCall>) {
+    let mut i = 0;
+    let bytes = body.as_bytes();
+    while i < bytes.len() {
+        while i < bytes.len() && ((bytes[i] as char).is_whitespace() || bytes[i] == b',') {
+            i += 1;
+        }
+        if i >= bytes.len() {
+            break;
+        }
+        let name_start = i;
+        while i < bytes.len()
+            && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_' || bytes[i] == b'-')
+        {
+            i += 1;
+        }
+        if i == name_start || bytes.get(i) != Some(&b'(') {
+            i += 1;
+            continue;
+        }
+        let name = &body[name_start..i];
+        i += 1; // '('
+        let args_start = i;
+        let mut depth = 1usize;
+        let mut in_str: Option<char> = None;
+        let mut escape = false;
+        while i < bytes.len() {
+            let c = bytes[i] as char;
+            if let Some(q) = in_str {
+                if escape {
+                    escape = false;
+                } else if c == '\\' {
+                    escape = true;
+                } else if c == q {
+                    in_str = None;
+                }
+            } else if c == '\'' || c == '"' {
+                in_str = Some(c);
+            } else if c == '(' {
+                depth += 1;
+            } else if c == ')' {
+                depth -= 1;
+                if depth == 0 {
+                    break;
+                }
+            }
+            i += 1;
+        }
+        let args_str = &body[args_start..i.min(body.len())];
+        if depth == 0 {
+            i += 1; // ')'
+        }
+        let args_val = parse_lfm2_kwargs(args_str);
+        push_unique_call(
+            calls,
+            ToolCall {
+                id: format!("call_{}", uuid::Uuid::new_v4()),
+                call_type: "function".to_string(),
+                function: FunctionCall {
+                    name: name.to_string(),
+                    arguments: serde_json::to_string(&args_val).unwrap_or_else(|_| "{}".to_string()),
+                },
+            },
+        );
+    }
+}
+
+fn parse_lfm2_kwargs(args: &str) -> serde_json::Value {
+    let mut map = serde_json::Map::new();
+    let mut i = 0;
+    let bytes = args.as_bytes();
+    while i < bytes.len() {
+        while i < bytes.len() && ((bytes[i] as char).is_whitespace() || bytes[i] == b',') {
+            i += 1;
+        }
+        if i >= bytes.len() {
+            break;
+        }
+        let key_start = i;
+        while i < bytes.len()
+            && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_' || bytes[i] == b'-')
+        {
+            i += 1;
+        }
+        if i == key_start || bytes.get(i) != Some(&b'=') {
+            break;
+        }
+        let key = args[key_start..i].to_string();
+        i += 1; // '='
+        while i < bytes.len() && (bytes[i] as char).is_whitespace() {
+            i += 1;
+        }
+        if i >= bytes.len() {
+            break;
+        }
+        let (value, next) = parse_lfm2_value(args, i);
+        map.insert(key, value);
+        i = next;
+    }
+    serde_json::Value::Object(map)
+}
+
+fn parse_lfm2_value(s: &str, start: usize) -> (serde_json::Value, usize) {
+    let bytes = s.as_bytes();
+    if start >= bytes.len() {
+        return (serde_json::Value::Null, start);
+    }
+    let c = bytes[start] as char;
+    if c == '\'' || c == '"' {
+        let quote = c;
+        let mut i = start + 1;
+        let mut out = String::new();
+        let mut escape = false;
+        while i < bytes.len() {
+            let ch = bytes[i] as char;
+            if escape {
+                match ch {
+                    'n' => out.push('\n'),
+                    'r' => out.push('\r'),
+                    't' => out.push('\t'),
+                    other => out.push(other),
+                }
+                escape = false;
+            } else if ch == '\\' {
+                escape = true;
+            } else if ch == quote {
+                return (serde_json::Value::String(out), i + 1);
+            } else {
+                out.push(ch);
+            }
+            i += 1;
+        }
+        return (serde_json::Value::String(out), i);
+    }
+    // Unquoted: take until comma at top level, or end.
+    let mut i = start;
+    let mut depth = 0i32;
+    while i < bytes.len() {
+        let ch = bytes[i] as char;
+        if ch == '{' || ch == '[' {
+            depth += 1;
+        } else if ch == '}' || ch == ']' {
+            depth -= 1;
+        } else if ch == ',' && depth == 0 {
+            break;
+        }
+        i += 1;
+    }
+    let raw = s[start..i].trim();
+    if let Ok(v) = serde_json::from_str::<serde_json::Value>(raw) {
+        (v, i)
+    } else if let Ok(n) = raw.parse::<i64>() {
+        (serde_json::json!(n), i)
+    } else if let Ok(n) = raw.parse::<f64>() {
+        (serde_json::json!(n), i)
+    } else if raw == "true" {
+        (serde_json::Value::Bool(true), i)
+    } else if raw == "false" {
+        (serde_json::Value::Bool(false), i)
+    } else if raw == "null" {
+        (serde_json::Value::Null, i)
+    } else {
+        (serde_json::Value::String(raw.to_string()), i)
     }
 }
 
@@ -2451,6 +2880,12 @@ fn find_generation_stop_position(text: &str, request_stop: Option<&[String]>) ->
             None => tool_end,
         });
     }
+    if let Some(tool_end) = text.find(LFM2_TOOL_CALL_END) {
+        earliest = Some(match earliest {
+            Some(pos) => pos.min(tool_end + LFM2_TOOL_CALL_END.len()),
+            None => tool_end + LFM2_TOOL_CALL_END.len(),
+        });
+    }
 
     if let Some(request_stop) = request_stop {
         let request_earliest = request_stop
@@ -2573,6 +3008,8 @@ fn enqueue_request(
 fn generation_params_from_request(
     req: &ChatCompletionRequest,
     request_timeout: Duration,
+    eos_token_ids: &[usize],
+    chat_family: ChatFamily,
 ) -> Result<GenerationParams, ApiError> {
     validate_request(req)?;
 
@@ -2583,13 +3020,14 @@ fn generation_params_from_request(
         top_k: req.top_k,
         repetition_penalty: req.repetition_penalty,
         frequency_penalty: req.frequency_penalty,
-        eos_token_ids: vec![1, 106],
+        eos_token_ids: eos_token_ids.to_vec(),
         min_decode_tokens: min_decode_tokens_for_request(
             &req.messages,
             req.tools.as_deref(),
             req.tool_choice.as_ref(),
         ),
         request_timeout,
+        block_leading_control_tokens: matches!(chat_family, ChatFamily::Gemma4),
     })
 }
 
@@ -2687,9 +3125,11 @@ fn count_prompt_tokens(
     messages: &[Message],
     tools: Option<&[Tool]>,
     tool_choice: Option<&serde_json::Value>,
+    chat_family: ChatFamily,
 ) -> Result<usize, ApiError> {
-    let prompt = apply_chat_template(messages, tools, tool_choice);
-    let encoding = tokenizer.encode(prompt.as_str(), true).map_err(|err| {
+    let prompt = apply_chat_template_for(chat_family, messages, tools, tool_choice);
+    let add_special = matches!(chat_family, ChatFamily::Gemma4);
+    let encoding = tokenizer.encode(prompt.as_str(), add_special).map_err(|err| {
         ApiError::bad_request(
             "tokenizer_error",
             format!("failed to tokenize prompt: {}", err),
@@ -2705,14 +3145,15 @@ fn fit_messages_to_context(
     tool_choice: Option<&serde_json::Value>,
     tokenizer: &tokenizers::Tokenizer,
     max_prompt_tokens: usize,
+    chat_family: ChatFamily,
 ) -> Result<Vec<Message>, ApiError> {
     let mut fitted = messages.to_vec();
-    if count_prompt_tokens(tokenizer, &fitted, tools, tool_choice)? <= max_prompt_tokens {
+    if count_prompt_tokens(tokenizer, &fitted, tools, tool_choice, chat_family)? <= max_prompt_tokens {
         return Ok(fitted);
     }
 
     for _ in 0..48 {
-        let current = count_prompt_tokens(tokenizer, &fitted, tools, tool_choice)?;
+        let current = count_prompt_tokens(tokenizer, &fitted, tools, tool_choice, chat_family)?;
         if current <= max_prompt_tokens {
             return Ok(fitted);
         }
@@ -2747,7 +3188,7 @@ fn fit_messages_to_context(
         truncate_content_to_budget(content, target_len);
     }
 
-    let final_count = count_prompt_tokens(tokenizer, &fitted, tools, tool_choice)?;
+    let final_count = count_prompt_tokens(tokenizer, &fitted, tools, tool_choice, chat_family)?;
     if final_count > max_prompt_tokens {
         return Err(ApiError::bad_request(
             "context_length_exceeded",
@@ -2800,6 +3241,39 @@ fn clamp_max_tokens_to_context(
     Ok(requested_max_tokens.min(remaining).max(1))
 }
 
+fn decode_completion_text(tokenizer: &tokenizers::Tokenizer, ids: &[u32], family: ChatFamily) -> String {
+    match family {
+        ChatFamily::Gemma4 => tokenizer.decode(ids, false).unwrap_or_default(),
+        ChatFamily::Lfm2 => decode_preserving_specials(tokenizer, ids),
+    }
+}
+
+/// `tokenizers` can drop LFM2 control / think tokens even with
+/// `skip_special_tokens=false`. Rebuild from vocab so `<think>` / `<|im_end|>`
+/// survive stop trim and reasoning split.
+fn decode_preserving_specials(tokenizer: &tokenizers::Tokenizer, ids: &[u32]) -> String {
+    let mut out = String::new();
+    for &id in ids {
+        let piece = tokenizer.decode(&[id], false).unwrap_or_default();
+        if !piece.is_empty() {
+            out.push_str(&piece);
+            continue;
+        }
+        let Some(tok) = tokenizer.id_to_token(id) else {
+            continue;
+        };
+        if let Some(rest) = tok.strip_prefix('\u{2581}') {
+            if !out.is_empty() && !out.ends_with(char::is_whitespace) {
+                out.push(' ');
+            }
+            out.push_str(rest);
+        } else {
+            out.push_str(&tok);
+        }
+    }
+    out
+}
+
 fn encode_prompt(
     state: &AppState,
     messages: &[Message],
@@ -2814,11 +3288,13 @@ fn encode_prompt(
         tool_choice,
         &state.tokenizer,
         max_prompt_tokens,
+        state.chat_family,
     )?;
-    let prompt = apply_chat_template(&fitted, tools, tool_choice);
+    let prompt = apply_chat_template_for(state.chat_family, &fitted, tools, tool_choice);
+    let add_special = matches!(state.chat_family, ChatFamily::Gemma4);
     let encoding = state
         .tokenizer
-        .encode(prompt.as_str(), true)
+        .encode(prompt.as_str(), add_special)
         .map_err(|err| {
             ApiError::bad_request(
                 "tokenizer_error",
@@ -2880,7 +3356,12 @@ async fn chat_completions_sync(
     state: Arc<AppState>,
     req: ChatCompletionRequest,
 ) -> Result<Json<ChatCompletionResponse>, ApiError> {
-    let mut generation_params = generation_params_from_request(&req, state.request_timeout())?;
+    let mut generation_params = generation_params_from_request(
+        &req,
+        state.request_timeout(),
+        &state.eos_token_ids,
+        state.chat_family,
+    )?;
     let input_ids = encode_prompt(
         &state,
         &req.messages,
@@ -2903,7 +3384,7 @@ async fn chat_completions_sync(
     let model_name = response_model(&req).to_string();
     let request_stop = req.stop.map(StopSequences::into_vec);
 
-    let inferred_tool_calls = if has_tools {
+    let inferred_tool_calls = if has_tools && matches!(state.chat_family, ChatFamily::Gemma4) {
         infer_tool_calls_without_generation(
             &req.messages,
             req.tools.as_deref(),
@@ -2944,10 +3425,8 @@ async fn chat_completions_sync(
         match event {
             StreamEvent::Token { token_id } => {
                 output_tokens.push(token_id as u32);
-                let decoded_text = state
-                    .tokenizer
-                    .decode(&output_tokens.iter().map(|&t| t).collect::<Vec<u32>>(), false)
-                    .unwrap_or_default();
+                let decoded_text =
+                    decode_completion_text(&state.tokenizer, &output_tokens, state.chat_family);
                 if find_generation_stop_position(&decoded_text, request_stop.as_deref()).is_some() {
                     cancel.store(CANCEL_STOP, Ordering::Relaxed);
                     break;
@@ -2964,10 +3443,8 @@ async fn chat_completions_sync(
     }
 
     let text = {
-        let mut raw = state
-            .tokenizer
-            .decode(&output_tokens.iter().map(|&t| t).collect::<Vec<u32>>(), true)
-            .unwrap_or_default();
+        let mut raw =
+            decode_completion_text(&state.tokenizer, &output_tokens, state.chat_family);
         trim_stop_sequences(&mut raw, request_stop.as_deref());
         raw
     };
@@ -3024,7 +3501,12 @@ async fn chat_completions_stream(
 
     let chat_id = format!("chatcmpl-{}", uuid::Uuid::new_v4());
     let created = chrono::Utc::now().timestamp();
-    let mut generation_params = generation_params_from_request(&req, state.request_timeout())?;
+    let mut generation_params = generation_params_from_request(
+        &req,
+        state.request_timeout(),
+        &state.eos_token_ids,
+        state.chat_family,
+    )?;
     let input_ids = encode_prompt(
         &state,
         &req.messages,
@@ -3056,7 +3538,7 @@ async fn chat_completions_stream(
     let tools_for_resolve = req.tools.clone();
     let tool_choice_for_resolve = req.tool_choice.clone();
 
-    let inferred_tool_calls = if has_tools {
+    let inferred_tool_calls = if has_tools && matches!(state.chat_family, ChatFamily::Gemma4) {
         infer_tool_calls_without_generation(
             &req.messages,
             req.tools.as_deref(),
@@ -3160,10 +3642,11 @@ async fn chat_completions_stream(
                         first_token_at = Some(Instant::now());
                     }
 
-                    let tok_str = state
-                        .tokenizer
-                        .decode(&[token_id as u32], false)
-                        .unwrap_or_default();
+                    let tok_str = decode_completion_text(
+                        &state.tokenizer,
+                        &[token_id as u32],
+                        state.chat_family,
+                    );
                     decoded_text.push_str(&tok_str);
 
                     let mut visible_text = decoded_text.clone();
@@ -3348,10 +3831,11 @@ async fn chat_completions_stream(
         }
 
         let raw_text = {
-            let mut full = state
-                .tokenizer
-                .decode(&output_tokens, true)
-                .unwrap_or_default();
+            let mut full = decode_completion_text(
+                &state.tokenizer,
+                &output_tokens,
+                state.chat_family,
+            );
             trim_stop_sequences(&mut full, request_stop.as_deref());
             full
         };
@@ -3472,57 +3956,130 @@ pub fn create_router(state: Arc<AppState>) -> Router {
         .with_state(state)
 }
 
-pub async fn run_server(model: Gemma4GpuModel, tokenizer: tokenizers::Tokenizer, port: u16) {
-    run_server_with_mtp(model, tokenizer, port, None).await
+pub async fn run_server<M: ServeGpuModel>(model: M, tokenizer: tokenizers::Tokenizer, port: u16) {
+    run_server_with_chat(
+        model,
+        tokenizer,
+        port,
+        "Gemma Metal",
+        ChatFamily::Gemma4,
+        vec![1, 106],
+    )
+    .await
 }
 
-/// Serve mode with optional MTP (speculative draft/verify) decoding.
-///
-/// When `mtp_assistant` is `Some`, the server uses the serial MTP scheduler:
-/// requests are prefilled and decoded one at a time via draft/verify (the batched
-/// multi-slot scheduler is bypassed, since MTP is inherently single-sequence).
+pub async fn run_server_lfm2<M: ServeGpuModel>(
+    model: M,
+    tokenizer: tokenizers::Tokenizer,
+    port: u16,
+    eos_token_id: usize,
+) {
+    run_server_with_chat(
+        model,
+        tokenizer,
+        port,
+        "LFM2 Metal",
+        ChatFamily::Lfm2,
+        vec![eos_token_id, 124895], // <|im_end|> + <|endoftext|>
+    )
+    .await
+}
+
 pub async fn run_server_with_mtp(
     model: Gemma4GpuModel,
     tokenizer: tokenizers::Tokenizer,
     port: u16,
     mtp_assistant: Option<Gemma4MtpAssistant>,
 ) {
-    let max_context_len = model.kv_capacity as usize;
-    let runtime_config = ServerRuntimeConfig::from_env();
-    let metrics = Arc::new(Metrics::new());
-    let mtp_enabled = mtp_assistant.is_some();
-    let request_tx = if let Some(assistant) = mtp_assistant {
-        mtp_serve::spawn_mtp_scheduler(
+    if let Some(assistant) = mtp_assistant {
+        let max_context_len = model.kv_capacity as usize;
+        let runtime_config = ServerRuntimeConfig::from_env();
+        let metrics = Arc::new(Metrics::new());
+        let request_tx = mtp_serve::spawn_mtp_scheduler(
             model,
             assistant,
             runtime_config.queue_depth,
             metrics.clone(),
-        )
+        );
+        let state = Arc::new(AppState {
+            request_tx,
+            metrics,
+            tokenizer,
+            max_context_len,
+            runtime_config: runtime_config.clone(),
+            chat_family: ChatFamily::Gemma4,
+            eos_token_ids: vec![1, 106],
+        });
+        let app = create_router(state);
+        let addr = format!("0.0.0.0:{}", port);
+        println!("🚀 Gemma4 server listening on http://{} (MTP enabled)", addr);
+        println!("   Compatible with OpenAI API: /v1/chat/completions");
+        print_server_banner(&runtime_config, max_context_len, true);
+        let listener = tokio::net::TcpListener::bind(&addr).await.unwrap();
+        axum::serve(listener, app).await.unwrap();
     } else {
-        let scheduler_config = scheduler::SchedulerConfig {
-            max_prefill_tokens_per_tick: runtime_config.max_prefill_tokens_per_tick,
-        };
-        scheduler::spawn_scheduler_with_config(
-            model,
-            runtime_config.queue_depth,
-            runtime_config.kv_pool_slots,
-            metrics.clone(),
-            scheduler_config,
-        )
+        run_server(model, tokenizer, port).await;
+    }
+}
+
+async fn run_server_with_chat<M: ServeGpuModel>(
+    model: M,
+    tokenizer: tokenizers::Tokenizer,
+    port: u16,
+    label: &str,
+    chat_family: ChatFamily,
+    eos_token_ids: Vec<usize>,
+) {
+    run_server_inner(model, tokenizer, port, label, chat_family, eos_token_ids).await
+}
+
+async fn run_server_inner<M: ServeGpuModel>(
+    model: M,
+    tokenizer: tokenizers::Tokenizer,
+    port: u16,
+    label: &str,
+    chat_family: ChatFamily,
+    eos_token_ids: Vec<usize>,
+) {
+    let max_context_len = model.kv_capacity() as usize;
+    let runtime_config = ServerRuntimeConfig::from_env();
+    let metrics = Arc::new(Metrics::new());
+    let scheduler_config = scheduler::SchedulerConfig {
+        max_prefill_tokens_per_tick: runtime_config.max_prefill_tokens_per_tick,
     };
+    let request_tx = scheduler::spawn_scheduler_with_config(
+        model,
+        runtime_config.queue_depth,
+        runtime_config.kv_pool_slots,
+        metrics.clone(),
+        scheduler_config,
+    );
     let state = Arc::new(AppState {
         request_tx,
         metrics,
         tokenizer,
         max_context_len,
         runtime_config: runtime_config.clone(),
+        chat_family,
+        eos_token_ids,
     });
 
     let app = create_router(state);
 
     let addr = format!("0.0.0.0:{}", port);
-    println!("🚀 Gemma4 E4B server listening on http://{}", addr);
+    println!("🚀 {} server listening on http://{}", label, addr);
     println!("   Compatible with OpenAI API: /v1/chat/completions");
+    print_server_banner(&runtime_config, max_context_len, false);
+
+    let listener = tokio::net::TcpListener::bind(&addr).await.unwrap();
+    axum::serve(listener, app).await.unwrap();
+}
+
+fn print_server_banner(
+    runtime_config: &ServerRuntimeConfig,
+    max_context_len: usize,
+    mtp_enabled: bool,
+) {
     println!("   Models: /v1/models");
     println!("   Health: /health");
     println!("   Metrics: /metrics");
@@ -3543,9 +4100,6 @@ pub async fn run_server_with_mtp(
     if mtp_enabled {
         println!("   MTP: enabled (serial draft/verify decode; requests served FIFO)");
     }
-
-    let listener = tokio::net::TcpListener::bind(&addr).await.unwrap();
-    axum::serve(listener, app).await.unwrap();
 }
 
 #[cfg(test)]
@@ -4727,5 +5281,43 @@ think<channel|><|tool_call>call:bash{}<tool_call|>"#;
         assert!(metrics.contains("llama_config_kv_pool_slots 2"));
         assert!(metrics.contains("llama_config_request_timeout_secs 30"));
         assert!(metrics.contains("llama_config_prefill_tokens_per_tick 64"));
+    }
+}
+
+#[cfg(test)]
+mod lfm2_chat_tests {
+    use super::*;
+
+    #[test]
+    fn lfm2_template_matches_cli_shape() {
+        let messages = vec![Message {
+            role: "user".to_string(),
+            content: Some("hi".to_string()),
+            ..Default::default()
+        }];
+        let prompt = apply_lfm2_chat_template(&messages, None, None);
+        assert_eq!(
+            prompt,
+            "<|startoftext|><|im_start|>user\nhi<|im_end|>\n<|im_start|>assistant\n"
+        );
+    }
+
+    #[test]
+    fn lfm2_tool_call_parse_kwargs() {
+        let mut calls = Vec::new();
+        parse_lfm2_tool_calls(
+            "<|tool_call_start|>[bash(command='ls -la /tmp')]<|tool_call_end|>",
+            &mut calls,
+        );
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].function.name, "bash");
+        assert!(calls[0].function.arguments.contains("ls -la /tmp"));
+    }
+
+    #[test]
+    fn lfm2_think_split() {
+        let (r, c) = split_lfm2_think("<think>plan</think>answer");
+        assert_eq!(r, "plan");
+        assert_eq!(c, "answer");
     }
 }

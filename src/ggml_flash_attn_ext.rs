@@ -86,8 +86,8 @@ pub const MAX_TILED_PREFILL_KV: u32 = 65536;
 
 /// Use tiled flash_attn_ext when q_len ≥ 2 (`TILED_EXT_MIN_Q` to override).
 ///
-/// Enabled for h256 (SWA) and h512 (full) once pad/mask/NSG fixes landed.
-/// Host `nsg_for_head_dim` must match Metal entry NSG (h256=8, h512=4).
+/// Enabled for h64 (LFM2), h256 (Gemma SWA) and h512 (Gemma full).
+/// Host `nsg_for_head_dim` must match Metal entry NSG (≤256 → 8, else 4).
 /// llama.cpp switches vec→tiled at 20, but our alternative below 20 is per-row
 /// causal attention (one dispatch per q row); tiled shares KV tile loads across
 /// rows and wins for MTP verify batches (2–8 rows, +10% e2e).
@@ -99,7 +99,7 @@ pub fn prefill_use_tiled_ext(q_len: u32, head_dim: u32) -> bool {
             .and_then(|v| v.parse().ok())
             .unwrap_or(2)
     });
-    q_len >= min_q && matches!(head_dim, 256 | 512)
+    q_len >= min_q && matches!(head_dim, 64 | 256 | 512)
 }
 
 pub fn mask_bytes(q_len: u32, kv_seq: u32) -> u64 {
@@ -134,7 +134,7 @@ pub fn scratch_bytes(
 }
 
 /// Host NSG must match Metal entry points:
-/// - h256: NSG=8 (24 KB smem; matches llama.cpp for dk<512)
+/// - h64/h256: NSG=8
 /// - h512: NSG=4 (32 KB; NSG=8 would be 36 KB > Metal limit with Q4)
 pub fn nsg_for_head_dim(head_dim: u32) -> u32 {
     if head_dim <= 256 {

@@ -615,6 +615,7 @@ pub struct MetalContext {
     pub silu_mul_pipeline: ComputePipelineState,
     pub silu_mul_batch_pipeline: ComputePipelineState,
     pub lfm2_shortconv_decode_pipeline: ComputePipelineState,
+    pub lfm2_shortconv_prefill_pipeline: ComputePipelineState,
     pub attention_pipeline: ComputePipelineState,
     pub attention_causal_pipeline: ComputePipelineState,
     pub rotary_pipeline: ComputePipelineState,
@@ -672,6 +673,7 @@ pub struct MetalContext {
     pub attention_fused_q4_0_pipeline: ComputePipelineState,
     pub attention_fused_q4_0_h256_pipeline: ComputePipelineState,
     pub attention_fused_q4_0_h128_pipeline: ComputePipelineState,
+    pub attention_fused_q4_0_h64_pipeline: ComputePipelineState,
     pub attention_fused_q4_0_h512_pipeline: ComputePipelineState,
     pub attention_qknorm_rope_q4_0_h256_pipeline: ComputePipelineState,
     pub attention_qknorm_rope_q4_0_h128_pipeline: ComputePipelineState,
@@ -682,6 +684,8 @@ pub struct MetalContext {
     pub attention_full_fused_q4_0_h256_pipeline: ComputePipelineState,
     pub attention_full_fused_q4_0_h128_pipeline: ComputePipelineState,
     pub attention_full_fused_q4_0_h512_pipeline: ComputePipelineState,
+    /// LFM2: QK-norm+RoPE+flash+KV append without V-norm (h64).
+    pub attention_qk_fused_nov_q4_0_h64_pipeline: ComputePipelineState,
     pub flash_attn_ggml_q4_h256_pipeline: ComputePipelineState,
     pub flash_attn_ggml_q4_h128_pipeline: ComputePipelineState,
     pub flash_attn_ggml_q4_h512_pipeline: ComputePipelineState,
@@ -696,6 +700,7 @@ pub struct MetalContext {
     pub flash_attn_ext_prefill_blk_pipeline: ComputePipelineState,
     pub flash_attn_ext_prefill_mask_fill_pipeline: ComputePipelineState,
     /// [0]=safe (kvpad+bc_mask), [1]=aligned (no kvpad, no bc_mask).
+    pub flash_attn_ext_prefill_q4_h64_pipeline: [ComputePipelineState; 2],
     pub flash_attn_ext_prefill_q4_h256_pipeline: [ComputePipelineState; 2],
     pub flash_attn_ext_prefill_q4_h512_pipeline: [ComputePipelineState; 2],
     pub embed_gather_bf16_pipeline: ComputePipelineState,
@@ -890,6 +895,7 @@ impl MetalContext {
         let silu_mul_pipeline = get_fn("silu_mul");
         let silu_mul_batch_pipeline = get_fn("silu_mul_batch");
         let lfm2_shortconv_decode_pipeline = get_fn("lfm2_shortconv_decode");
+        let lfm2_shortconv_prefill_pipeline = get_fn("lfm2_shortconv_prefill");
         let attention_pipeline = get_fn("attention_single_token");
         let attention_causal_pipeline = get_fn("attention_causal");
         let rotary_pipeline = get_fn("apply_rotary");
@@ -965,6 +971,7 @@ impl MetalContext {
         let attention_fused_q4_0_pipeline = get_fn("attention_flash_decode_fused_q4_0");
         let attention_fused_q4_0_h256_pipeline = get_fn("attention_flash_decode_fused_q4_0_h256");
         let attention_fused_q4_0_h128_pipeline = get_fn("attention_flash_decode_fused_q4_0_h128");
+        let attention_fused_q4_0_h64_pipeline = get_fn("attention_flash_decode_fused_q4_0_h64");
         let attention_fused_q4_0_h512_pipeline = get_fn("attention_flash_decode_fused_q4_0_h512");
         let attention_qknorm_rope_q4_0_h256_pipeline =
             get_fn("attention_flash_decode_qknorm_rope_q4_0_h256");
@@ -984,6 +991,8 @@ impl MetalContext {
             get_fn("attention_flash_decode_full_fused_q4_0_h128");
         let attention_full_fused_q4_0_h512_pipeline =
             get_fn("attention_flash_decode_full_fused_q4_0_h512");
+        let attention_qk_fused_nov_q4_0_h64_pipeline =
+            get_fn("attention_flash_decode_qk_fused_nov_q4_0_h64");
         let flash_attn_ggml_q4_h256_pipeline = get_fn("flash_attn_ggml_q4_0_h256");
         let flash_attn_ggml_q4_h128_pipeline = get_fn("flash_attn_ggml_q4_0_h128");
         let flash_attn_ggml_q4_h512_pipeline = get_fn("flash_attn_ggml_q4_0_h512");
@@ -1009,6 +1018,10 @@ impl MetalContext {
         let flash_attn_ext_prefill_mask_fill_pipeline =
             get_fn("flash_attn_ext_prefill_mask_fill");
         // [0]=safe (always-correct), [1]=aligned fast path for q%8==0 && kv%64==0.
+        let flash_attn_ext_prefill_q4_h64_pipeline = [
+            get_fn_flash("flash_attn_ext_prefill_q4_0_h64", true, true),
+            get_fn_flash("flash_attn_ext_prefill_q4_0_h64", false, false),
+        ];
         let flash_attn_ext_prefill_q4_h256_pipeline = [
             get_fn_flash("flash_attn_ext_prefill_q4_0_h256", true, true),
             get_fn_flash("flash_attn_ext_prefill_q4_0_h256", false, false),
@@ -1028,7 +1041,7 @@ impl MetalContext {
             println!("  FlashAttention-style tiled kernels enabled (FLASH_ATTN=legacy to disable)");
             if prefill_flash_attn_ext_enabled() {
                 println!(
-                    "  Q4 prefill attention: tiled flash_attn_ext (h256/h512, q≥20; PREFILL_FLASH_ATTN=0 for legacy)"
+                    "  Q4 prefill attention: tiled flash_attn_ext (h64/h256/h512; PREFILL_FLASH_ATTN=0 for legacy)"
                 );
             } else {
                 println!(
@@ -1181,6 +1194,7 @@ impl MetalContext {
             silu_mul_pipeline,
             silu_mul_batch_pipeline,
             lfm2_shortconv_decode_pipeline,
+            lfm2_shortconv_prefill_pipeline,
             attention_pipeline,
             attention_causal_pipeline,
             rotary_pipeline,
@@ -1238,6 +1252,7 @@ impl MetalContext {
             attention_fused_q4_0_pipeline,
             attention_fused_q4_0_h256_pipeline,
             attention_fused_q4_0_h128_pipeline,
+            attention_fused_q4_0_h64_pipeline,
             attention_fused_q4_0_h512_pipeline,
             attention_qknorm_rope_q4_0_h256_pipeline,
             attention_qknorm_rope_q4_0_h128_pipeline,
@@ -1248,6 +1263,7 @@ impl MetalContext {
             attention_full_fused_q4_0_h256_pipeline,
             attention_full_fused_q4_0_h128_pipeline,
             attention_full_fused_q4_0_h512_pipeline,
+            attention_qk_fused_nov_q4_0_h64_pipeline,
             flash_attn_ggml_q4_h256_pipeline,
             flash_attn_ggml_q4_h128_pipeline,
             flash_attn_ggml_q4_h512_pipeline,
@@ -1261,6 +1277,7 @@ impl MetalContext {
             flash_attn_ext_prefill_pad_pipeline,
             flash_attn_ext_prefill_blk_pipeline,
             flash_attn_ext_prefill_mask_fill_pipeline,
+            flash_attn_ext_prefill_q4_h64_pipeline,
             flash_attn_ext_prefill_q4_h256_pipeline,
             flash_attn_ext_prefill_q4_h512_pipeline,
             embed_gather_bf16_pipeline,
@@ -5094,6 +5111,32 @@ impl MetalContext {
         );
     }
 
+    /// LFM2 short-conv prefill over `seq_len` tokens (updates state to final window).
+    pub fn encode_lfm2_shortconv_prefill(
+        &self,
+        encoder: &metal::ComputeCommandEncoderRef,
+        bcx_buf: &Buffer,
+        state_buf: &Buffer,
+        conv_w: &BufferView,
+        y_buf: &Buffer,
+        n_embd: u32,
+        l_cache: u32,
+        seq_len: u32,
+    ) {
+        encoder.set_compute_pipeline_state(&self.lfm2_shortconv_prefill_pipeline);
+        encoder.set_buffer(0, Some(bcx_buf), 0);
+        encoder.set_buffer(1, Some(state_buf), 0);
+        encoder.set_buffer(2, Some(&conv_w.buffer), conv_w.offset);
+        encoder.set_buffer(3, Some(y_buf), 0);
+        encoder.set_bytes(4, 4, &n_embd as *const u32 as *const _);
+        encoder.set_bytes(5, 4, &l_cache as *const u32 as *const _);
+        encoder.set_bytes(6, 4, &seq_len as *const u32 as *const _);
+        encoder.dispatch_threads(
+            MTLSize::new(n_embd as u64, 1, 1),
+            MTLSize::new(256.min(n_embd as u64), 1, 1),
+        );
+    }
+
     pub fn encode_silu_mul(
         &self,
         encoder: &metal::ComputeCommandEncoderRef,
@@ -5810,6 +5853,7 @@ impl MetalContext {
             match head_dim {
                 256 => return &self.attention_fused_q4_0_h256_pipeline,
                 128 => return &self.attention_fused_q4_0_h128_pipeline,
+                64 => return &self.attention_fused_q4_0_h64_pipeline,
                 512 => return &self.attention_fused_q4_0_h512_pipeline,
                 _ => {}
             }
@@ -6199,6 +6243,63 @@ impl MetalContext {
         eps: f32,
     ) {
         encoder.set_compute_pipeline_state(self.attention_full_fused_q4_0_pipeline_for(head_dim));
+        encoder.set_buffer(0, Some(q_raw_buf), 0);
+        encoder.set_buffer(1, Some(&q_norm_weight.buffer), q_norm_weight.offset);
+        encoder.set_buffer(2, Some(cos_buf), cos_offset);
+        encoder.set_buffer(3, Some(sin_buf), sin_offset);
+        encoder.set_buffer(4, Some(k_raw_buf), 0);
+        encoder.set_buffer(5, Some(&k_norm_weight.buffer), k_norm_weight.offset);
+        encoder.set_buffer(6, Some(v_raw_buf), 0);
+        encoder.set_buffer(7, Some(out_buf), 0);
+        encoder.set_buffer(8, Some(k_cache_buf), 0);
+        encoder.set_buffer(9, Some(v_cache_buf), 0);
+        encoder.set_bytes(10, 4, &num_heads as *const u32 as *const _);
+        encoder.set_bytes(11, 4, &num_kv_heads as *const u32 as *const _);
+        encoder.set_bytes(12, 4, &num_kv_groups as *const u32 as *const _);
+        encoder.set_bytes(13, 4, &head_dim as *const u32 as *const _);
+        encoder.set_bytes(14, 4, &kv_seq as *const u32 as *const _);
+        encoder.set_bytes(15, 4, &capacity as *const u32 as *const _);
+        encoder.set_bytes(16, 4, &scale as *const f32 as *const _);
+        encoder.set_bytes(17, 4, &kv_start as *const u32 as *const _);
+        encoder.set_bytes(18, 4, &groups_per_row as *const u32 as *const _);
+        encoder.set_bytes(19, 4, &row_bytes as *const u32 as *const _);
+        encoder.set_bytes(20, 4, &cur_seq as *const u32 as *const _);
+        encoder.set_bytes(21, 4, &eps as *const f32 as *const _);
+        let tg_size = attention_threadgroup_size(self.use_flash_attention);
+        encoder.dispatch_thread_groups(MTLSize::new(num_heads as u64, 1, 1), tg_size);
+    }
+
+    /// LFM2 decode: QK-norm+RoPE + flash + KV append without V-norm (h64).
+    pub fn encode_attention_qk_fused_nov_q4_0(
+        &self,
+        encoder: &metal::ComputeCommandEncoderRef,
+        q_raw_buf: &Buffer,
+        q_norm_weight: &BufferView,
+        cos_buf: &Buffer,
+        cos_offset: u64,
+        sin_buf: &Buffer,
+        sin_offset: u64,
+        k_raw_buf: &Buffer,
+        k_norm_weight: &BufferView,
+        v_raw_buf: &Buffer,
+        out_buf: &Buffer,
+        k_cache_buf: &Buffer,
+        v_cache_buf: &Buffer,
+        num_heads: u32,
+        num_kv_heads: u32,
+        num_kv_groups: u32,
+        head_dim: u32,
+        kv_seq: u32,
+        capacity: u32,
+        scale: f32,
+        kv_start: u32,
+        cur_seq: u32,
+        groups_per_row: u32,
+        row_bytes: u32,
+        eps: f32,
+    ) {
+        assert_eq!(head_dim, 64, "qk_fused_nov currently supports head_dim=64 only");
+        encoder.set_compute_pipeline_state(&self.attention_qk_fused_nov_q4_0_h64_pipeline);
         encoder.set_buffer(0, Some(q_raw_buf), 0);
         encoder.set_buffer(1, Some(&q_norm_weight.buffer), q_norm_weight.offset);
         encoder.set_buffer(2, Some(cos_buf), cos_offset);
@@ -7248,9 +7349,10 @@ impl MetalContext {
         let use_aligned = !has_kvpad && (q_len % NQPTG == 0);
         let pipe_idx = usize::from(use_aligned);
         let main_pipeline = match head_dim {
+            64 => &self.flash_attn_ext_prefill_q4_h64_pipeline[pipe_idx],
             256 => &self.flash_attn_ext_prefill_q4_h256_pipeline[pipe_idx],
             512 => &self.flash_attn_ext_prefill_q4_h512_pipeline[pipe_idx],
-            _ => unreachable!("prefill flash_attn_ext only supports h256/h512"),
+            _ => unreachable!("prefill flash_attn_ext only supports h64/h256/h512"),
         };
         encoder.set_compute_pipeline_state(main_pipeline);
         encoder.set_bytes(

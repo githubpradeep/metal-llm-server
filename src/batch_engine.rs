@@ -1,10 +1,10 @@
 use std::time::{Duration, Instant};
 
-use crate::gemma4_gpu_model::Gemma4GpuModel;
 use crate::kv_pool::{KvCachePool, KvPoolError, KvSlot};
+use crate::serve_model::ServeGpuModel;
 
-pub struct BatchEngine {
-    model: Gemma4GpuModel,
+pub struct BatchEngine<M: ServeGpuModel> {
+    model: M,
     kv_pool: KvCachePool,
 }
 
@@ -25,9 +25,9 @@ pub struct PrefillInput {
     pub want_logits: bool,
 }
 
-impl BatchEngine {
-    pub fn new(model: Gemma4GpuModel, kv_pool_slots: usize) -> Self {
-        let kv_pool = model.create_kv_pool(kv_pool_slots, model.kv_capacity);
+impl<M: ServeGpuModel> BatchEngine<M> {
+    pub fn new(model: M, kv_pool_slots: usize) -> Self {
+        let kv_pool = model.create_kv_pool(kv_pool_slots, model.kv_capacity());
         Self { model, kv_pool }
     }
 
