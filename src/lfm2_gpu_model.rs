@@ -5,8 +5,17 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use crate::gguf::{self, Gguf};
-use crate::gpu::{weight_fmt, BufferView, MetalContext};
+use crate::gpu::{weight_buf_is_kquant, weight_fmt, BufferView, MetalContext};
 use crate::lfm2_config::{lfm2_config_from_gguf, Lfm2Config};
+
+/// GPU RoPE params for one layer (must match `RopeLayerParams` in llama.metal).
+#[repr(C)]
+struct RopeLayerParams {
+    theta: f32,
+    factor: f32,
+    head_dim: u32,
+    rope_angles: u32,
+}
 
 fn configured_kv_capacity(max_position_embeddings: usize) -> u32 {
     const DEFAULT_KV_CAPACITY: usize = 8192;
@@ -103,6 +112,19 @@ enum Lfm2LayerKind {
     },
 }
 
+fn attn_uses_fused_qkv(kind: &Lfm2LayerKind) -> bool {
+    match kind {
+        Lfm2LayerKind::Attention {
+            q_proj, k_proj, v_proj, ..
+        } => {
+            weight_buf_is_kquant(q_proj)
+                && weight_buf_is_kquant(k_proj)
+                && weight_buf_is_kquant(v_proj)
+        }
+        Lfm2LayerKind::ShortConv { .. } => false,
+    }
+}
+
 struct Lfm2Layer {
     operator_norm: BufferView,
     ffn_norm: BufferView,
@@ -120,7 +142,6 @@ pub struct Lfm2GpuModel {
     lm_head: BufferView,
     embed: EmbedTable,
 
-    hidden_buf: Buffer,
     residual_buf: Buffer,
     normed_buf: Buffer,
     q_buf: Buffer,
@@ -138,6 +159,8 @@ pub struct Lfm2GpuModel {
     cos_buf: Buffer,
     sin_buf: Buffer,
     sample_buf: Buffer,
+    inv_rms_buf: Buffer,
+    rope_layer_params_buf: Buffer,
     embed_scratch: Vec<f32>,
 
     k_caches: Vec<Buffer>,
@@ -146,7 +169,6 @@ pub struct Lfm2GpuModel {
     kv_capacity: u32,
     /// Shared sequence length (attn KV + position).
     pub seq_len: u32,
-    inv_freq: Vec<f32>,
 }
 
 impl Lfm2GpuModel {
@@ -289,14 +311,6 @@ impl Lfm2GpuModel {
             conv_states.push(ctx.buffer_empty(state_elems));
         }
 
-        let inv_freq: Vec<f32> = (0..head_dim / 2)
-            .map(|i| {
-                1.0 / config
-                    .rope_theta
-                    .powf(2.0 * i as f64 / head_dim as f64) as f32
-            })
-            .collect();
-
         let max_kv_out = config
             .num_key_value_heads
             .iter()
@@ -306,7 +320,6 @@ impl Lfm2GpuModel {
             .max(1)
             * head_dim;
 
-        let hidden_buf = ctx.buffer_empty(hidden);
         let residual_buf = ctx.buffer_empty(hidden);
         let normed_buf = ctx.buffer_empty(hidden);
         let q_buf = ctx.buffer_empty(n_heads * head_dim);
@@ -324,6 +337,20 @@ impl Lfm2GpuModel {
         let cos_buf = ctx.buffer_empty(head_dim);
         let sin_buf = ctx.buffer_empty(head_dim);
         let sample_buf = ctx.buffer_empty_u32(1);
+        let inv_rms_buf = ctx.buffer_empty(1);
+        let rope_params = [RopeLayerParams {
+            theta: config.rope_theta as f32,
+            factor: 1.0,
+            head_dim: head_dim as u32,
+            rope_angles: (head_dim / 2) as u32,
+        }];
+        let rope_bytes = unsafe {
+            std::slice::from_raw_parts(
+                rope_params.as_ptr() as *const u8,
+                std::mem::size_of_val(&rope_params),
+            )
+        };
+        let rope_layer_params_buf = ctx.buffer_from_bytes(rope_bytes);
         let embed_scratch = vec![0.0; hidden];
 
         println!(
@@ -341,7 +368,6 @@ impl Lfm2GpuModel {
             final_norm,
             lm_head,
             embed,
-            hidden_buf,
             residual_buf,
             normed_buf,
             q_buf,
@@ -359,13 +385,14 @@ impl Lfm2GpuModel {
             cos_buf,
             sin_buf,
             sample_buf,
+            inv_rms_buf,
+            rope_layer_params_buf,
             embed_scratch,
             k_caches,
             v_caches,
             conv_states,
             kv_capacity,
             seq_len: 0,
-            inv_freq,
         }
     }
 
@@ -386,22 +413,6 @@ impl Lfm2GpuModel {
         self.config.bos_token_id
     }
 
-    fn fill_rope(&self, pos: f32) {
-        let head_dim = self.config.head_dim();
-        let half = head_dim / 2;
-        let mut cos = vec![0.0f32; head_dim];
-        let mut sin = vec![0.0f32; head_dim];
-        for (i, &freq) in self.inv_freq.iter().enumerate() {
-            let angle = pos * freq;
-            cos[i] = angle.cos();
-            cos[i + half] = angle.cos();
-            sin[i] = angle.sin();
-            sin[i + half] = angle.sin();
-        }
-        MetalContext::write_buffer(&self.cos_buf, &cos);
-        MetalContext::write_buffer(&self.sin_buf, &sin);
-    }
-
     /// Encode one token; if `sample` is true, return greedy argmax token, else update caches only.
     fn forward_one(&mut self, token_id: usize, sample: bool) -> Option<usize> {
         let hidden = self.config.hidden_size;
@@ -414,27 +425,38 @@ impl Lfm2GpuModel {
         let vocab = self.config.vocab_size;
         let groups_per_row = (head_dim / 32) as u32;
         let row_bytes = groups_per_row * 18;
+        let n_layers = self.layers.len();
 
         self.embed.decode_into(token_id, &mut self.embed_scratch);
-        MetalContext::write_buffer(&self.hidden_buf, &self.embed_scratch);
-        self.fill_rope(self.seq_len as f32);
+        MetalContext::write_buffer(&self.residual_buf, &self.embed_scratch);
 
         let cur_seq = self.seq_len;
         let cmd = self.ctx.queue.new_command_buffer();
         let encoder = cmd.new_compute_command_encoder();
 
-        for layer in &self.layers {
-            // residual = hidden; normed = RMS(operator_norm, hidden)
-            self.ctx
-                .encode_copy(encoder, &self.hidden_buf, &self.residual_buf, hidden as u32);
+        self.ctx.encode_rope_fill_decode(
+            encoder,
+            &self.cos_buf,
+            &self.sin_buf,
+            &self.rope_layer_params_buf,
+            1,
+            head_dim as u32,
+            cur_seq as f32,
+        );
+
+        if !attn_uses_fused_qkv(&self.layers[0].kind) {
             self.ctx.encode_rmsnorm_view(
                 encoder,
-                &self.hidden_buf,
-                &layer.operator_norm,
+                &self.residual_buf,
+                &self.layers[0].operator_norm,
                 &self.normed_buf,
                 hidden as u32,
                 eps,
             );
+        }
+
+        for layer_idx in 0..n_layers {
+            let layer = &self.layers[layer_idx];
 
             match &layer.kind {
                 Lfm2LayerKind::ShortConv {
@@ -483,31 +505,53 @@ impl Lfm2GpuModel {
                     let n_groups = (n_heads as u32) / n_kv;
                     let q_out = (n_heads * head_dim) as u32;
                     let kv_out = (*num_kv_heads * head_dim) as u32;
+                    let fused_qkv = weight_buf_is_kquant(q_proj)
+                        && weight_buf_is_kquant(k_proj)
+                        && weight_buf_is_kquant(v_proj);
 
-                    self.ctx.encode_matvec_auto_view(
-                        encoder,
-                        q_proj,
-                        &self.normed_buf,
-                        &self.q_buf,
-                        q_out,
-                        hidden as u32,
-                    );
-                    self.ctx.encode_matvec_auto_view(
-                        encoder,
-                        k_proj,
-                        &self.normed_buf,
-                        &self.k_buf,
-                        kv_out,
-                        hidden as u32,
-                    );
-                    self.ctx.encode_matvec_auto_view(
-                        encoder,
-                        v_proj,
-                        &self.normed_buf,
-                        &self.v_buf,
-                        kv_out,
-                        hidden as u32,
-                    );
+                    if fused_qkv {
+                        self.ctx.encode_rmsnorm_qkv_kquant_view(
+                            encoder,
+                            &self.residual_buf,
+                            &layer.operator_norm,
+                            &self.inv_rms_buf,
+                            q_proj,
+                            k_proj,
+                            v_proj,
+                            &self.q_buf,
+                            &self.k_buf,
+                            &self.v_buf,
+                            q_out,
+                            kv_out,
+                            hidden as u32,
+                            eps,
+                        );
+                    } else {
+                        self.ctx.encode_matvec_auto_view(
+                            encoder,
+                            q_proj,
+                            &self.normed_buf,
+                            &self.q_buf,
+                            q_out,
+                            hidden as u32,
+                        );
+                        self.ctx.encode_matvec_auto_view(
+                            encoder,
+                            k_proj,
+                            &self.normed_buf,
+                            &self.k_buf,
+                            kv_out,
+                            hidden as u32,
+                        );
+                        self.ctx.encode_matvec_auto_view(
+                            encoder,
+                            v_proj,
+                            &self.normed_buf,
+                            &self.v_buf,
+                            kv_out,
+                            hidden as u32,
+                        );
+                    }
 
                     self.ctx.encode_rmsnorm_per_head_at_view(
                         encoder,
@@ -573,47 +617,67 @@ impl Lfm2GpuModel {
                 }
             }
 
-            // hidden = residual + op_out
-            self.ctx.encode_vec_add(
-                encoder,
-                &self.residual_buf,
-                &self.o_out_buf,
-                &self.hidden_buf,
-                hidden as u32,
-            );
+            let fuse_gate_up = layer.gate_proj.format == weight_fmt::Q4_K
+                && layer.up_proj.format == weight_fmt::Q4_K;
 
-            // FFN: norm → gate/up SiLU → down → residual
-            self.ctx.encode_rmsnorm_view(
-                encoder,
-                &self.hidden_buf,
-                &layer.ffn_norm,
-                &self.normed_buf,
-                hidden as u32,
-                eps,
-            );
-            self.ctx.encode_matvec_auto_view(
-                encoder,
-                &layer.gate_proj,
-                &self.normed_buf,
-                &self.gate_buf,
-                inter as u32,
-                hidden as u32,
-            );
-            self.ctx.encode_matvec_auto_view(
-                encoder,
-                &layer.up_proj,
-                &self.normed_buf,
-                &self.up_buf,
-                inter as u32,
-                hidden as u32,
-            );
-            self.ctx.encode_silu_mul(
-                encoder,
-                &self.gate_buf,
-                &self.up_buf,
-                &self.silu_buf,
-                inter as u32,
-            );
+            if fuse_gate_up {
+                self.ctx.encode_vec_add(
+                    encoder,
+                    &self.residual_buf,
+                    &self.o_out_buf,
+                    &self.residual_buf,
+                    hidden as u32,
+                );
+                self.ctx.encode_rmsnorm_qk_silu_mul_kquant_at_view(
+                    encoder,
+                    &layer.gate_proj,
+                    &layer.up_proj,
+                    &self.residual_buf,
+                    0,
+                    &layer.ffn_norm,
+                    &self.inv_rms_buf,
+                    &self.silu_buf,
+                    0,
+                    inter as u32,
+                    hidden as u32,
+                    eps,
+                );
+            } else {
+                self.ctx.encode_rmsnorm_add_save_residual(
+                    encoder,
+                    &self.residual_buf,
+                    &self.o_out_buf,
+                    &layer.ffn_norm.buffer,
+                    &self.normed_buf,
+                    &self.residual_buf,
+                    hidden as u32,
+                    eps,
+                );
+                self.ctx.encode_matvec_auto_view(
+                    encoder,
+                    &layer.gate_proj,
+                    &self.normed_buf,
+                    &self.gate_buf,
+                    inter as u32,
+                    hidden as u32,
+                );
+                self.ctx.encode_matvec_auto_view(
+                    encoder,
+                    &layer.up_proj,
+                    &self.normed_buf,
+                    &self.up_buf,
+                    inter as u32,
+                    hidden as u32,
+                );
+                self.ctx.encode_silu_mul(
+                    encoder,
+                    &self.gate_buf,
+                    &self.up_buf,
+                    &self.silu_buf,
+                    inter as u32,
+                );
+            }
+
             self.ctx.encode_matvec_auto_view(
                 encoder,
                 &layer.down_proj,
@@ -622,34 +686,50 @@ impl Lfm2GpuModel {
                 hidden as u32,
                 inter as u32,
             );
-            self.ctx.encode_vec_add(
-                encoder,
-                &self.hidden_buf,
-                &self.down_buf,
-                &self.hidden_buf,
-                hidden as u32,
-            );
-        }
 
-        if sample {
-            self.ctx.encode_rmsnorm_view(
-                encoder,
-                &self.hidden_buf,
-                &self.final_norm,
-                &self.normed_buf,
-                hidden as u32,
-                eps,
-            );
-            self.ctx.encode_matvec_auto_view(
-                encoder,
-                &self.lm_head,
-                &self.normed_buf,
-                &self.logits_buf,
-                vocab as u32,
-                hidden as u32,
-            );
-            self.ctx
-                .encode_argmax_f32(encoder, &self.logits_buf, &self.sample_buf, vocab as u32);
+            if layer_idx + 1 < n_layers {
+                let next = &self.layers[layer_idx + 1];
+                if attn_uses_fused_qkv(&next.kind) {
+                    self.ctx.encode_vec_add(
+                        encoder,
+                        &self.residual_buf,
+                        &self.down_buf,
+                        &self.residual_buf,
+                        hidden as u32,
+                    );
+                } else {
+                    self.ctx.encode_rmsnorm_add_save_residual(
+                        encoder,
+                        &self.residual_buf,
+                        &self.down_buf,
+                        &next.operator_norm.buffer,
+                        &self.normed_buf,
+                        &self.residual_buf,
+                        hidden as u32,
+                        eps,
+                    );
+                }
+            } else if sample {
+                self.ctx.encode_rmsnorm_add(
+                    encoder,
+                    &self.residual_buf,
+                    &self.down_buf,
+                    &self.final_norm.buffer,
+                    &self.normed_buf,
+                    hidden as u32,
+                    eps,
+                );
+                self.ctx.encode_matvec_auto_view(
+                    encoder,
+                    &self.lm_head,
+                    &self.normed_buf,
+                    &self.logits_buf,
+                    vocab as u32,
+                    hidden as u32,
+                );
+                self.ctx
+                    .encode_argmax_f32(encoder, &self.logits_buf, &self.sample_buf, vocab as u32);
+            }
         }
 
         encoder.end_encoding();

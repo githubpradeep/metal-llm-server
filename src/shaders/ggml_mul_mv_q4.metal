@@ -1613,9 +1613,10 @@ MV_EXT_KQ_GELU_KERNEL(matvec_ggml_ext_q4K_gelu_nx8_r3, 8, 3)
 MV_EXT_KQ_GELU_KERNEL(matvec_ggml_ext_q4K_gelu_nx8_r4, 8, 4)
 MV_EXT_KQ_GELU_KERNEL(matvec_ggml_ext_q4K_gelu_nx8_r5, 8, 5)
 
-// Fused gate+up+GeLU for Q4_K weights. Shared activation loads, dual weight streams.
-template<short nr0>
-void mul_vec_q4_K_gelu_f32_impl(
+// Fused gate+up+act for Q4_K weights. Shared activation loads, dual weight streams.
+// SILU=false → GeLU(gate)*up (Gemma); SILU=true → SiLU(gate)*up (LFM2).
+template<short nr0, bool SILU>
+void mul_vec_q4_K_gate_up_act_f32_impl(
         constant ggml_mul_mv_args& args,
         device const char * src0_gate,
         device const char * src0_up,
@@ -1754,11 +1755,30 @@ void mul_vec_q4_K_gelu_f32_impl(
     for (int row = 0; row < nr0 && first_row + row < args.ne0; ++row) {
         const float gate = simd_sum(sumf_gate[row]);
         const float up   = simd_sum(sumf_up[row]);
-        const float gelu = gelu_pytorch_tanh_q4(gate) * up;
+        float act;
+        if (SILU) {
+            act = (gate / (1.0f + exp(-gate))) * up;
+        } else {
+            act = gelu_pytorch_tanh_q4(gate) * up;
+        }
         if (tiisg == 0) {
-            dst_f32[first_row + row] = gelu;
+            dst_f32[first_row + row] = act;
         }
     }
+}
+
+template<short nr0>
+void mul_vec_q4_K_gelu_f32_impl(
+        constant ggml_mul_mv_args& args,
+        device const char * src0_gate,
+        device const char * src0_up,
+        device const char * src1,
+        device       char * dst,
+        uint3  tgpig,
+        ushort tiisg,
+        ushort sgitg) {
+    mul_vec_q4_K_gate_up_act_f32_impl<nr0, false>(
+        args, src0_gate, src0_up, src1, dst, tgpig, tiisg, sgitg);
 }
 
 kernel void matvec_ggml_q4_K_gelu_mul(
@@ -1772,6 +1792,19 @@ kernel void matvec_ggml_q4_K_gelu_mul(
     uint sgitg  [[simdgroup_index_in_threadgroup]]
 ) {
     mul_vec_q4_K_gelu_f32_impl<KQ_NR0>(args, W0, W1, x, y, tgpig, tiisg, sgitg);
+}
+
+kernel void matvec_ggml_q4_K_silu_mul(
+    device const char * W0 [[buffer(0)]],
+    device const char * W1 [[buffer(1)]],
+    device const char * x  [[buffer(2)]],
+    device char       * y  [[buffer(3)]],
+    constant ggml_mul_mv_args& args [[buffer(4)]],
+    uint3 tgpig [[threadgroup_position_in_grid]],
+    uint tiisg  [[thread_index_in_simdgroup]],
+    uint sgitg  [[simdgroup_index_in_threadgroup]]
+) {
+    mul_vec_q4_K_gate_up_act_f32_impl<KQ_NR0, true>(args, W0, W1, x, y, tgpig, tiisg, sgitg);
 }
 
 // ─── K-quant RMSNorm fusion helpers (QKV + MLP) ─────────────────────────────
@@ -1788,9 +1821,10 @@ inline float kquant_rms_y(
     return hidden[k_idx] * norm_weight[k_idx] * inv_rms;
 }
 
-// Fused pre-FF RMSNorm + gate∥up Q4_K + GeLU (decode). inv_rms via rmsnorm_inv_rms.
-template<short nr0>
-void mul_vec_q4_K_rmsnorm_gelu_f32_impl(
+// Fused pre-FF RMSNorm + gate∥up Q4_K + act (decode). inv_rms via rmsnorm_inv_rms.
+// SILU=false → GeLU; SILU=true → SiLU (LFM2).
+template<short nr0, bool SILU>
+void mul_vec_q4_K_rmsnorm_gate_up_act_f32_impl(
         uint K,
         uint M,
         device const char * src0_gate,
@@ -1920,11 +1954,33 @@ void mul_vec_q4_K_rmsnorm_gelu_f32_impl(
     for (int row = 0; row < nr0 && first_row + row < int(M); ++row) {
         const float gate = simd_sum(sumf_gate[row]);
         const float up   = simd_sum(sumf_up[row]);
-        const float gelu = gelu_pytorch_tanh_q4(gate) * up;
+        float act;
+        if (SILU) {
+            act = (gate / (1.0f + exp(-gate))) * up;
+        } else {
+            act = gelu_pytorch_tanh_q4(gate) * up;
+        }
         if (tiisg == 0) {
-            dst[first_row + row] = gelu;
+            dst[first_row + row] = act;
         }
     }
+}
+
+template<short nr0>
+void mul_vec_q4_K_rmsnorm_gelu_f32_impl(
+        uint K,
+        uint M,
+        device const char * src0_gate,
+        device const char * src0_up,
+        device const float * hidden,
+        device const float * norm_weight,
+        float inv_rms,
+        device float * dst,
+        uint3  tgpig,
+        ushort tiisg,
+        ushort sgitg) {
+    mul_vec_q4_K_rmsnorm_gate_up_act_f32_impl<nr0, false>(
+        K, M, src0_gate, src0_up, hidden, norm_weight, inv_rms, dst, tgpig, tiisg, sgitg);
 }
 
 kernel void matvec_ggml_q4_K_rmsnorm_gelu_mul(
@@ -1942,6 +1998,24 @@ kernel void matvec_ggml_q4_K_rmsnorm_gelu_mul(
 ) {
     float inv_rms = *inv_rms_ptr;
     mul_vec_q4_K_rmsnorm_gelu_f32_impl<KQ_NR0>(
+        K, M, W_gate, W_up, hidden, norm_weight, inv_rms, y, tgpig, tiisg, sgitg);
+}
+
+kernel void matvec_ggml_q4_K_rmsnorm_silu_mul(
+    device const char * W_gate [[buffer(0)]],
+    device const char * W_up [[buffer(1)]],
+    device const float * hidden [[buffer(2)]],
+    device const float * norm_weight [[buffer(3)]],
+    device const float * inv_rms_ptr [[buffer(4)]],
+    device float * y [[buffer(5)]],
+    constant uint& M [[buffer(6)]],
+    constant uint& K [[buffer(7)]],
+    uint3 tgpig [[threadgroup_position_in_grid]],
+    ushort tiisg [[thread_index_in_simdgroup]],
+    ushort sgitg [[simdgroup_index_in_threadgroup]]
+) {
+    float inv_rms = *inv_rms_ptr;
+    mul_vec_q4_K_rmsnorm_gate_up_act_f32_impl<KQ_NR0, true>(
         K, M, W_gate, W_up, hidden, norm_weight, inv_rms, y, tgpig, tiisg, sgitg);
 }
 

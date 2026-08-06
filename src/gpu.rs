@@ -568,6 +568,8 @@ pub struct MetalContext {
     pub matvec_ggml_q8_0_sum8_pipeline: ComputePipelineState,
     pub matvec_ggml_q5_1_sum8_pipeline: ComputePipelineState,
     pub matvec_ggml_q4k_rmsnorm_gelu_mul_pipeline: ComputePipelineState,
+    pub matvec_ggml_q4k_silu_mul_pipeline: ComputePipelineState,
+    pub matvec_ggml_q4k_rmsnorm_silu_mul_pipeline: ComputePipelineState,
     /// Lazy: prefill Q4_K matrix-matrix (llama.cpp `kernel_mul_mm_q4_K_f32`).
     mul_mm_q4k_pipeline: OnceLock<ComputePipelineState>,
     /// Lazy: prefill Q6_K matrix-matrix (llama.cpp `kernel_mul_mm_q6_K_f32`).
@@ -826,6 +828,8 @@ impl MetalContext {
         let matvec_ggml_q8_0_sum8_pipeline = get_fn("matvec_ggml_q8_0_sum8");
         let matvec_ggml_q5_1_sum8_pipeline = get_fn("matvec_ggml_q5_1_sum8");
         let matvec_ggml_q4k_rmsnorm_gelu_mul_pipeline = get_fn("matvec_ggml_q4_K_rmsnorm_gelu_mul");
+        let matvec_ggml_q4k_silu_mul_pipeline = get_fn("matvec_ggml_q4_K_silu_mul");
+        let matvec_ggml_q4k_rmsnorm_silu_mul_pipeline = get_fn("matvec_ggml_q4_K_rmsnorm_silu_mul");
         let matvec_ggml_q3_pipeline = get_fn("matvec_ggml_q3_0");
         let matvec_ggml_q3_dual_pipeline = get_fn("matvec_ggml_q3_0_dual");
         let matvec_ggml_q3_gelu_mul_pipeline = get_fn("matvec_ggml_q3_0_gelu_mul");
@@ -1141,6 +1145,8 @@ impl MetalContext {
             matvec_ggml_q8_0_sum8_pipeline,
             matvec_ggml_q5_1_sum8_pipeline,
             matvec_ggml_q4k_rmsnorm_gelu_mul_pipeline,
+            matvec_ggml_q4k_silu_mul_pipeline,
+            matvec_ggml_q4k_rmsnorm_silu_mul_pipeline,
             mul_mm_q4k_pipeline: OnceLock::new(),
             mul_mm_q6k_pipeline: OnceLock::new(),
             mul_mm_q4k_f16_pipeline: OnceLock::new(),
@@ -2889,6 +2895,40 @@ impl MetalContext {
         );
     }
 
+    /// Fused gate+up Q4_K GEMV with SiLU(gate)*up (LFM2 MLP).
+    pub fn encode_matvec_qk_silu_mul_at_view(
+        &self,
+        encoder: &metal::ComputeCommandEncoderRef,
+        gate: &BufferView,
+        up: &BufferView,
+        x_buf: &Buffer,
+        x_offset: u64,
+        silu_out: &Buffer,
+        silu_offset: u64,
+        m: u32,
+        k: u32,
+    ) {
+        debug_assert_eq!(gate.format, weight_fmt::Q4_K);
+        debug_assert_eq!(up.format, weight_fmt::Q4_K);
+        use crate::ggml_gemv::{mul_mv_args_k, mul_mv_k_dispatch, Q4_K_BLOCK_BYTES};
+        let args = mul_mv_args_k(m, k, 1, Q4_K_BLOCK_BYTES);
+        encoder.set_compute_pipeline_state(&self.matvec_ggml_q4k_silu_mul_pipeline);
+        encoder.set_buffer(0, Some(&gate.buffer), gate.offset);
+        encoder.set_buffer(1, Some(&up.buffer), up.offset);
+        encoder.set_buffer(2, Some(x_buf), x_offset);
+        encoder.set_buffer(3, Some(silu_out), silu_offset);
+        encoder.set_bytes(
+            4,
+            std::mem::size_of::<crate::ggml_gemv::GgmlMulMvArgs>() as u64,
+            &args as *const _ as *const _,
+        );
+        let (tg_x, tg_y, tg_z, tw, nsg) = mul_mv_k_dispatch(m, 1);
+        encoder.dispatch_thread_groups(
+            metal::MTLSize::new(tg_x, tg_y, tg_z),
+            metal::MTLSize::new(tw, nsg, 1),
+        );
+    }
+
     /// Fused MoE gate∥up+GeLU for ≤8 resident experts in one dispatch (`tgpig.z`).
     /// Writes `weights[e] * GeLU(gate_e·x)*(up_e·x)` into `mid[mid_ids[e] * m ..]`.
     pub fn encode_moe_slots8_q4k_gelu(
@@ -3033,6 +3073,49 @@ impl MetalContext {
         encoder.set_buffer(3, Some(&norm_weight.buffer), norm_weight.offset);
         encoder.set_buffer(4, Some(inv_rms_buf), 0);
         encoder.set_buffer(5, Some(gelu_out), gelu_offset);
+        encoder.set_bytes(6, 4, &m as *const u32 as *const _);
+        encoder.set_bytes(7, 4, &k as *const u32 as *const _);
+        let (tg_x, tg_y, tg_z, tw, nsg) = crate::ggml_gemv::mul_mv_k_dispatch(m, 1);
+        encoder.dispatch_thread_groups(
+            metal::MTLSize::new(tg_x, tg_y, tg_z),
+            metal::MTLSize::new(tw, nsg, 1),
+        );
+    }
+
+    /// Fused pre-FF RMSNorm + Q4_K gate∥up + SiLU(gate)*up (LFM2 MLP decode).
+    pub fn encode_rmsnorm_qk_silu_mul_kquant_at_view(
+        &self,
+        encoder: &metal::ComputeCommandEncoderRef,
+        gate: &BufferView,
+        up: &BufferView,
+        hidden: &Buffer,
+        hidden_offset: u64,
+        norm_weight: &BufferView,
+        inv_rms_buf: &Buffer,
+        silu_out: &Buffer,
+        silu_offset: u64,
+        m: u32,
+        k: u32,
+        eps: f32,
+    ) {
+        debug_assert_eq!(gate.format, weight_fmt::Q4_K);
+        debug_assert_eq!(up.format, weight_fmt::Q4_K);
+        self.encode_rmsnorm_inv_rms_at_view(
+            encoder,
+            hidden,
+            hidden_offset,
+            inv_rms_buf,
+            0,
+            k,
+            eps,
+        );
+        encoder.set_compute_pipeline_state(&self.matvec_ggml_q4k_rmsnorm_silu_mul_pipeline);
+        encoder.set_buffer(0, Some(&gate.buffer), gate.offset);
+        encoder.set_buffer(1, Some(&up.buffer), up.offset);
+        encoder.set_buffer(2, Some(hidden), hidden_offset);
+        encoder.set_buffer(3, Some(&norm_weight.buffer), norm_weight.offset);
+        encoder.set_buffer(4, Some(inv_rms_buf), 0);
+        encoder.set_buffer(5, Some(silu_out), silu_offset);
         encoder.set_bytes(6, 4, &m as *const u32 as *const _);
         encoder.set_bytes(7, 4, &k as *const u32 as *const _);
         let (tg_x, tg_y, tg_z, tw, nsg) = crate::ggml_gemv::mul_mv_k_dispatch(m, 1);
