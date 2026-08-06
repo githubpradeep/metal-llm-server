@@ -50,8 +50,9 @@ pub struct ChatCompletionRequest {
     pub max_tokens: Option<usize>,
     #[serde(default)]
     pub max_completion_tokens: Option<usize>,
-    #[serde(default = "default_temperature")]
-    pub temperature: f32,
+    /// Omitted → family default (Gemma 1.0, LFM2 0.1 per Liquid). Explicit 0 = greedy.
+    #[serde(default)]
+    pub temperature: Option<f32>,
     #[serde(default)]
     pub stream: bool,
     #[serde(default)]
@@ -1584,9 +1585,21 @@ fn infer_tool_calls_without_generation(
 ) -> Vec<ToolCall> {
     resolve_tool_calls("", messages, tools, tool_choice)
 }
-fn default_temperature() -> f32 {
-    1.0
+fn default_temperature_for(family: ChatFamily) -> f32 {
+    match family {
+        // Liquid llama-server / agent harness defaults for LFM2.5.
+        ChatFamily::Lfm2 => 0.1,
+        ChatFamily::Gemma4 => 1.0,
+    }
 }
+
+fn default_top_k_for(family: ChatFamily) -> usize {
+    match family {
+        ChatFamily::Lfm2 => 50,
+        ChatFamily::Gemma4 => 0,
+    }
+}
+
 fn default_min_p() -> f32 {
     0.05
 }
@@ -3016,12 +3029,29 @@ fn generation_params_from_request(
 ) -> Result<GenerationParams, ApiError> {
     validate_request(req)?;
 
+    let temperature = req
+        .temperature
+        .unwrap_or_else(|| default_temperature_for(chat_family));
+    let top_k = if req.top_k == 0 {
+        default_top_k_for(chat_family)
+    } else {
+        req.top_k
+    };
+    let repetition_penalty = if matches!(chat_family, ChatFamily::Lfm2)
+        && (req.repetition_penalty - default_repetition_penalty()).abs() < f32::EPSILON
+    {
+        // Liquid recommend ~1.1 for LFM2 instruct/agent; keep Gemma at 1.0.
+        1.1
+    } else {
+        req.repetition_penalty
+    };
+
     Ok(GenerationParams {
         max_tokens: effective_max_tokens(req),
-        temperature: req.temperature,
+        temperature,
         min_p: req.min_p,
-        top_k: req.top_k,
-        repetition_penalty: req.repetition_penalty,
+        top_k,
+        repetition_penalty,
         frequency_penalty: req.frequency_penalty,
         eos_token_ids: eos_token_ids.to_vec(),
         min_decode_tokens: min_decode_tokens_for_request(
@@ -3049,11 +3079,13 @@ fn validate_request(req: &ChatCompletionRequest) -> Result<(), ApiError> {
         ));
     }
 
-    if !req.temperature.is_finite() || req.temperature < 0.0 || req.temperature > 5.0 {
-        return Err(ApiError::bad_request(
-            "invalid_temperature",
-            "temperature must be between 0 and 5",
-        ));
+    if let Some(temperature) = req.temperature {
+        if !temperature.is_finite() || temperature < 0.0 || temperature > 5.0 {
+            return Err(ApiError::bad_request(
+                "invalid_temperature",
+                "temperature must be between 0 and 5",
+            ));
+        }
     }
 
     if !req.min_p.is_finite() || req.min_p < 0.0 || req.min_p > 1.0 {
@@ -3254,6 +3286,9 @@ fn decode_completion_text(tokenizer: &tokenizers::Tokenizer, ids: &[u32], family
 /// `tokenizers` can drop LFM2 control / think tokens even with
 /// `skip_special_tokens=false`. Rebuild from vocab so `<think>` / `<|im_end|>`
 /// survive stop trim and reasoning split.
+///
+/// Always rebuild from the full id list (not concat of prior + one new token):
+/// ByteLevel BPE pieces are not always stable under incremental concat.
 fn decode_preserving_specials(tokenizer: &tokenizers::Tokenizer, ids: &[u32]) -> String {
     let mut out = String::new();
     for &id in ids {
@@ -3265,7 +3300,11 @@ fn decode_preserving_specials(tokenizer: &tokenizers::Tokenizer, ids: &[u32]) ->
         let Some(tok) = tokenizer.id_to_token(id) else {
             continue;
         };
-        if let Some(rest) = tok.strip_prefix('\u{2581}') {
+        // Gemma metaspace ▁ or GPT-2 / LFM2 ByteLevel Ġ.
+        if let Some(rest) = tok
+            .strip_prefix('\u{2581}')
+            .or_else(|| tok.strip_prefix('\u{0120}'))
+        {
             if !out.is_empty() && !out.ends_with(char::is_whitespace) {
                 out.push(' ');
             }
@@ -3645,12 +3684,13 @@ async fn chat_completions_stream(
                         first_token_at = Some(Instant::now());
                     }
 
-                    let tok_str = decode_completion_text(
+                    // Full-sequence decode each step: LFM2 ByteLevel BPE (and
+                    // some specials) are not stable as concat(decode([t_i])).
+                    decoded_text = decode_completion_text(
                         &state.tokenizer,
-                        &[token_id as u32],
+                        &output_tokens,
                         state.chat_family,
                     );
-                    decoded_text.push_str(&tok_str);
 
                     let mut visible_text = decoded_text.clone();
                     if visible_text.contains(NATIVE_TOOL_CALL_TRIGGER) {
@@ -4121,7 +4161,7 @@ mod tests {
             }],
             max_tokens: Some(16),
             max_completion_tokens: None,
-            temperature: 0.7,
+            temperature: Some(0.7),
             stream: false,
             stop: None,
             min_p: 0.05,
@@ -5215,6 +5255,47 @@ think<channel|><|tool_call>call:bash{}<tool_call|>"#;
     }
 
     #[test]
+    fn lfm2_generation_defaults_match_liquid() {
+        let req = ChatCompletionRequest {
+            temperature: None,
+            top_k: 0,
+            repetition_penalty: 1.0,
+            ..valid_request()
+        };
+        let params = match generation_params_from_request(
+            &req,
+            Duration::from_secs(60),
+            &[124_900],
+            ChatFamily::Lfm2,
+        ) {
+            Ok(p) => p,
+            Err(_) => panic!("expected ok generation params"),
+        };
+        assert!((params.temperature - 0.1).abs() < 1e-6);
+        assert_eq!(params.top_k, 50);
+        assert!((params.repetition_penalty - 1.1).abs() < 1e-6);
+
+        let greedy = ChatCompletionRequest {
+            temperature: Some(0.0),
+            top_k: 10,
+            repetition_penalty: 1.05,
+            ..valid_request()
+        };
+        let params = match generation_params_from_request(
+            &greedy,
+            Duration::from_secs(60),
+            &[124_900],
+            ChatFamily::Lfm2,
+        ) {
+            Ok(p) => p,
+            Err(_) => panic!("expected ok generation params"),
+        };
+        assert_eq!(params.temperature, 0.0);
+        assert_eq!(params.top_k, 10);
+        assert!((params.repetition_penalty - 1.05).abs() < 1e-6);
+    }
+
+    #[test]
     fn validate_request_rejects_common_bad_inputs() {
         let mut req = valid_request();
         req.messages.clear();
@@ -5230,7 +5311,7 @@ think<channel|><|tool_call>call:bash{}<tool_call|>"#;
         );
 
         let mut req = valid_request();
-        req.temperature = -0.1;
+        req.temperature = Some(-0.1);
         assert_eq!(
             validate_request(&req).unwrap_err().code,
             "invalid_temperature"

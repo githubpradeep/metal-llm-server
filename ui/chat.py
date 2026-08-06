@@ -98,7 +98,8 @@ def parse_args():
     parser.add_argument(
         "--temperature",
         type=float,
-        default=0.7,
+        default=None,
+        help="Sampling temperature (omit to use server family default: LFM2=0.1, Gemma=1.0)",
     )
     return parser.parse_args()
 
@@ -272,11 +273,12 @@ def chat_once(client, args, messages, stream: bool):
     kwargs = dict(
         model=args.model,
         messages=messages,
-        temperature=args.temperature,
         tools=[SEARCH_TOOL],
         tool_choice="auto",
         stream=stream,
     )
+    if args.temperature is not None:
+        kwargs["temperature"] = args.temperature
 
     if not stream:
         resp = client.chat.completions.create(**kwargs)
