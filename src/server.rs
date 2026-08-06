@@ -555,11 +555,14 @@ fn split_tool_generation_output(text: &str) -> (String, String) {
 
 /// During streaming on a tool-awaiting turn, use channel tags for reasoning/content
 /// when the model emits them. Fall back to tool-style split only for plain pre-tool
-/// preamble or while a native tool call is being streamed.
+/// preamble (when a tool call is required) or while a native tool call is being
+/// streamed. With `tool_choice=auto`, plain replies stream as content so clients
+/// that only render `delta.content` still see tokens live when no tool is called.
 fn use_tool_generation_stream_split(
     visible_text: &str,
     in_tool_call: bool,
     tool_generation_mode: bool,
+    plain_text_as_reasoning: bool,
 ) -> bool {
     if in_tool_call {
         return true;
@@ -570,7 +573,7 @@ fn use_tool_generation_stream_split(
     if visible_text.contains(CHANNEL_START) || visible_text.contains(CHANNEL_END) {
         return false;
     }
-    true
+    plain_text_as_reasoning
 }
 
 fn compute_stream_deltas(
@@ -3664,6 +3667,7 @@ async fn chat_completions_stream(
                         &visible_text,
                         in_tool_call,
                         tool_generation_mode,
+                        split_mode.plain_text_as_reasoning,
                     );
                     let (new_reasoning, new_content, new_er, new_ec) = {
                         let (nr, nc, er, ec) = compute_stream_deltas(
@@ -3787,6 +3791,7 @@ async fn chat_completions_stream(
                     &flush_text,
                     in_tool_call,
                     tool_generation_mode,
+                    split_mode.plain_text_as_reasoning,
                 );
                 let (mut reasoning, mut content) = if use_tool_split {
                     split_tool_generation_output(&flush_text)
@@ -4814,27 +4819,49 @@ mod tests {
             "<|channel>final\nHere is the summary.",
             false,
             true,
+            true,
         ));
         assert!(!use_tool_generation_stream_split(
             "planning<channel|>answer",
             false,
             true,
+            true,
         ));
+        // Required tool turn: hold plain preamble as reasoning.
         assert!(use_tool_generation_stream_split(
             "plain preamble before tool call",
             false,
             true,
+            true,
+        ));
+        // tool_choice=auto: stream plain replies as content (not reasoning).
+        assert!(!use_tool_generation_stream_split(
+            "Hello! How can I help?",
+            false,
+            true,
+            false,
         ));
         assert!(use_tool_generation_stream_split(
             "streaming tool args",
             true,
             true,
+            false,
         ));
         assert!(!use_tool_generation_stream_split(
             "plain answer text",
             false,
             false,
+            false,
         ));
+    }
+
+    #[test]
+    fn compute_stream_deltas_streams_plain_reply_as_content_when_not_tool_split() {
+        // tool_choice=auto path: use_tool_split=false so plain answers stream live.
+        let (new_reasoning, new_content, _, _) =
+            compute_stream_deltas("Hello!", 0, 0, false, ChannelSplitMode::default());
+        assert!(new_reasoning.is_empty());
+        assert_eq!(new_content, "Hello!");
     }
 
     #[test]

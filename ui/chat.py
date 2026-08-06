@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 """Simple chat UI for a local OpenAI-compatible server."""
 
+from __future__ import annotations
+
 import os
 import sys
 import json
