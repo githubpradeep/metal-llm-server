@@ -912,9 +912,12 @@ impl Dsv4GpuModel {
         let merge_cb1 = (gpu_swa || gpu_full)
             && std::env::var("DSV4_MERGE_CB1").ok().as_deref() != Some("0");
         let mut hash_fused_slots: Vec<usize> = Vec::new();
+        // Spec/hash miss keys deferred so pread can overlap CB2 (attn+router+shared)
+        // instead of running serially before encode under merge_cb1.
+        let mut deferred_early_pin: Option<Vec<ExpertKey>> = None;
         {
-            // I/O-first: start hash/spec preads; when merge_cb1, pin overlaps nothing
-            // here (CB1 kernels run in CB2) — pin still overlaps prior deferred MoE.
+            // I/O-first: start hash/spec preads; merge_cb1 hits only touch here —
+            // misses wait until CB2 is committed (see deferred_early_pin).
             let encode_cb1 = || {
                 let lg = &self.gpu_layers.as_ref().unwrap()[il];
                 let sc = self.scratch.as_ref().unwrap();
@@ -961,27 +964,27 @@ impl Dsv4GpuModel {
                 let t_e0 = Instant::now();
                 let all_hit = keys.iter().all(|k| eg.contains(*k));
                 let cmd = if merge_cb1 {
-                    // Pin only — CB1 kernels merge into CB2 below.
+                    // Hits: touch only. Misses: defer pread until CB2 commit so SSD
+                    // overlaps attn+router (+ shared when overlap_selected).
                     if all_hit {
                         for &k in keys {
                             let _ = eg.touch(k);
                         }
+                        if hash_one_cb {
+                            if let Some(ref hk) = hash_keys {
+                                if hk.iter().all(|k| eg.contains(*k)) {
+                                    let mut tmp = vec![0usize; hk.len()];
+                                    let _ = eg.classify_hits(hk, &mut tmp);
+                                    hash_fused_slots = tmp;
+                                }
+                            }
+                        }
                     } else {
+                        // Drain prior MoE before we will Shared-pread (UM safety).
                         if let Some(sc) = self.scratch.as_ref() {
                             sc.wait_pending(&self.metal);
                         }
-                        let _ = eg
-                            .pin_batch_with_gpu(&metal, &self.ssd, keys, &[], || ())
-                            .expect("early expert pread");
-                    }
-                    if hash_one_cb {
-                        if let Some(ref hk) = hash_keys {
-                            if hk.iter().all(|k| eg.contains(*k)) {
-                                let mut tmp = vec![0usize; hk.len()];
-                                let _ = eg.classify_hits(hk, &mut tmp);
-                                hash_fused_slots = tmp;
-                            }
-                        }
+                        deferred_early_pin = Some(keys.to_vec());
                     }
                     None
                 } else if all_hit {
@@ -1614,6 +1617,15 @@ impl Dsv4GpuModel {
             .min(self.scratch.as_ref().unwrap().max_routed);
         let use_slots6_fuse = n_routed_known == 6
             && std::env::var("DSV4_SLOTS6").ok().as_deref() != Some("0");
+        // ds4 selected-id overlap (default on for top-k GPU layers): signal after
+        // router, keep encoding shared MoE in the same CB, host-wait the event
+        // (not full CB) → read ids / SSD pin while shared still runs.
+        // `DSV4_OVERLAP_SELECTED=0` disables.
+        let overlap_selected = !fused_moe
+            && hash_keys.is_none()
+            && (gpu_swa || gpu_full)
+            && std::env::var("DSV4_OVERLAP_SELECTED").ok().as_deref() != Some("0");
+        let mut shared_preencoded = false;
 
         // Set when safe map-fuse needs a miss repair after the CB2 borrow scope.
         let mut map_fuse_ids: Option<Vec<u32>> = None;
@@ -1906,89 +1918,140 @@ impl Dsv4GpuModel {
                     );
                 }
             }
-            enc.end_encoding();
-            cmd.commit();
-            if fused_moe {
-                if fuse_via_spec {
-                    // Speculative MoE: wait once, compare route_ids to last_ids.
-                    let t0 = Instant::now();
-                    self.metal.wait_owned(&cmd, Some(sc));
-                    sc.clear_pending();
-                    let dt = t0.elapsed().as_nanos() as u64;
-                    t_gpu += dt;
-                    if profile {
-                        sc.prof_cb2_ns.set(sc.prof_cb2_ns.get() + dt);
-                    }
-                    let ids: Vec<u32> =
-                        super::metal_ctx::Dsv4Metal::read_i32(&sc.route_ids, cfg.n_expert_used)
-                            .into_iter()
-                            .map(|x| x as u32)
-                            .collect();
-                    let guess = spec_guess_ids.take().unwrap_or_default();
-                    if ids == guess {
-                        sc.spec_moe_match.set(sc.spec_moe_match.get() + 1);
-                        map_fuse_ids = Some(ids);
-                        early_fused_return = true;
+            if overlap_selected {
+                // Close router encoder → signal → reopen for shared MoE.
+                enc.end_encoding();
+                let ev = self.metal.next_selected_event_value();
+                self.metal.encode_signal_selected(&cmd, ev);
+                {
+                    let enc = cmd.new_compute_command_encoder();
+                    if !skip_shared {
+                        encode_shared(&self.metal, lg, sc, &enc);
                     } else {
-                        sc.spec_moe_miss.set(sc.spec_moe_miss.get() + 1);
-                        let set_hit = ids.iter().filter(|e| guess.contains(e)).count();
-                        sc.spec_moe_overlap_sum
-                            .set(sc.spec_moe_overlap_sum.get() + set_hit as u64);
-                        if set_hit == ids.len() && ids.len() == guess.len() {
-                            sc.spec_moe_set_eq.set(sc.spec_moe_set_eq.get() + 1);
-                        }
-                        if std::env::var("DSV4_SPEC_MOE_DEBUG").ok().as_deref() == Some("1")
-                            && il == 5
-                        {
-                            eprintln!(
-                                "SPEC_MOE L{il} overlap={set_hit}/{} guess={guess:?} ids={ids:?}",
-                                ids.len()
-                            );
-                        }
-                        map_fuse_ids = Some(ids);
-                        map_fuse_need_repair = true;
-                        early_fused_return = true;
+                        self.metal.encode_zero(&enc, &sc.shared, n_embd as i32);
                     }
-                } else if fuse_via_map && fuse_map_safe {
-                    // Correct map-fuse: wait, check miss_flag; repair outside this scope.
-                    let t0 = Instant::now();
-                    self.metal.wait_owned(&cmd, Some(sc));
-                    sc.clear_pending();
-                    let dt = t0.elapsed().as_nanos() as u64;
-                    t_gpu += dt;
-                    if profile {
-                        sc.prof_cb2_ns.set(sc.prof_cb2_ns.get() + dt);
-                    }
-                    let miss = super::metal_ctx::Dsv4Metal::read_i32(&sc.moe_miss_flag, 1)
-                        .into_iter()
-                        .next()
-                        .unwrap_or(1);
-                    let ids: Vec<u32> =
-                        super::metal_ctx::Dsv4Metal::read_i32(&sc.route_ids, cfg.n_expert_used)
-                            .into_iter()
-                            .map(|x| x as u32)
-                            .collect();
-                    map_fuse_ids = Some(ids);
-                    map_fuse_need_repair = miss != 0;
-                    early_fused_return = true;
-                } else {
-                    // Hash / optimistic map: defer — next layer CB covers this CB.
-                    sc.defer_cmd(cmd);
-                    if let Some(ref keys) = hash_keys {
-                        map_fuse_ids =
-                            Some(keys.iter().map(|k| k.expert as u32).collect());
-                    }
-                    early_fused_return = true;
+                    // Experts axpy into routed; clear before the post-pin MoE CB.
+                    self.metal.encode_zero(&enc, &sc.routed, n_embd as i32);
+                    enc.end_encoding();
                 }
-            } else {
+                cmd.commit();
+                // Spec/hash miss pread ∥ in-flight CB2 (attn+router+shared).
+                if let Some(keys) = deferred_early_pin.take() {
+                    let metal = self.metal.clone();
+                    let mut eg = self.expert_gpu.take().expect("expert_gpu");
+                    let t_e0 = Instant::now();
+                    let _ = eg
+                        .pin_batch_with_gpu(&metal, &self.ssd, &keys, &[], || ())
+                        .expect("deferred early expert pread");
+                    t_exp += t_e0.elapsed().as_nanos() as u64;
+                    self.expert_gpu = Some(eg);
+                }
                 let t0 = Instant::now();
-                self.metal.wait_owned(&cmd, Some(sc));
-                // Prior deferred MoE CB completed on the same queue.
+                self.metal.wait_selected(ev, Some(sc));
+                // Prior deferred MoE finished before this CB's router (same queue).
                 sc.clear_pending();
                 let dt = t0.elapsed().as_nanos() as u64;
                 t_gpu += dt;
                 if profile {
                     sc.prof_cb2_ns.set(sc.prof_cb2_ns.get() + dt);
+                }
+                shared_preencoded = true;
+            } else {
+                enc.end_encoding();
+                cmd.commit();
+                // Spec/hash miss pread ∥ in-flight CB2.
+                if let Some(keys) = deferred_early_pin.take() {
+                    let metal = self.metal.clone();
+                    let mut eg = self.expert_gpu.take().expect("expert_gpu");
+                    let t_e0 = Instant::now();
+                    let _ = eg
+                        .pin_batch_with_gpu(&metal, &self.ssd, &keys, &[], || ())
+                        .expect("deferred early expert pread");
+                    t_exp += t_e0.elapsed().as_nanos() as u64;
+                    self.expert_gpu = Some(eg);
+                }
+                if fused_moe {
+                    if fuse_via_spec {
+                        // Speculative MoE: wait once, compare route_ids to last_ids.
+                        let t0 = Instant::now();
+                        self.metal.wait_owned(&cmd, Some(sc));
+                        sc.clear_pending();
+                        let dt = t0.elapsed().as_nanos() as u64;
+                        t_gpu += dt;
+                        if profile {
+                            sc.prof_cb2_ns.set(sc.prof_cb2_ns.get() + dt);
+                        }
+                        let ids: Vec<u32> =
+                            super::metal_ctx::Dsv4Metal::read_i32(&sc.route_ids, cfg.n_expert_used)
+                                .into_iter()
+                                .map(|x| x as u32)
+                                .collect();
+                        let guess = spec_guess_ids.take().unwrap_or_default();
+                        if ids == guess {
+                            sc.spec_moe_match.set(sc.spec_moe_match.get() + 1);
+                            map_fuse_ids = Some(ids);
+                            early_fused_return = true;
+                        } else {
+                            sc.spec_moe_miss.set(sc.spec_moe_miss.get() + 1);
+                            let set_hit = ids.iter().filter(|e| guess.contains(e)).count();
+                            sc.spec_moe_overlap_sum
+                                .set(sc.spec_moe_overlap_sum.get() + set_hit as u64);
+                            if set_hit == ids.len() && ids.len() == guess.len() {
+                                sc.spec_moe_set_eq.set(sc.spec_moe_set_eq.get() + 1);
+                            }
+                            if std::env::var("DSV4_SPEC_MOE_DEBUG").ok().as_deref() == Some("1")
+                                && il == 5
+                            {
+                                eprintln!(
+                                    "SPEC_MOE L{il} overlap={set_hit}/{} guess={guess:?} ids={ids:?}",
+                                    ids.len()
+                                );
+                            }
+                            map_fuse_ids = Some(ids);
+                            map_fuse_need_repair = true;
+                            early_fused_return = true;
+                        }
+                    } else if fuse_via_map && fuse_map_safe {
+                        // Correct map-fuse: wait, check miss_flag; repair outside this scope.
+                        let t0 = Instant::now();
+                        self.metal.wait_owned(&cmd, Some(sc));
+                        sc.clear_pending();
+                        let dt = t0.elapsed().as_nanos() as u64;
+                        t_gpu += dt;
+                        if profile {
+                            sc.prof_cb2_ns.set(sc.prof_cb2_ns.get() + dt);
+                        }
+                        let miss = super::metal_ctx::Dsv4Metal::read_i32(&sc.moe_miss_flag, 1)
+                            .into_iter()
+                            .next()
+                            .unwrap_or(1);
+                        let ids: Vec<u32> =
+                            super::metal_ctx::Dsv4Metal::read_i32(&sc.route_ids, cfg.n_expert_used)
+                                .into_iter()
+                                .map(|x| x as u32)
+                                .collect();
+                        map_fuse_ids = Some(ids);
+                        map_fuse_need_repair = miss != 0;
+                        early_fused_return = true;
+                    } else {
+                        // Hash / optimistic map: defer — next layer CB covers this CB.
+                        sc.defer_cmd(cmd);
+                        if let Some(ref keys) = hash_keys {
+                            map_fuse_ids =
+                                Some(keys.iter().map(|k| k.expert as u32).collect());
+                        }
+                        early_fused_return = true;
+                    }
+                } else {
+                    let t0 = Instant::now();
+                    self.metal.wait_owned(&cmd, Some(sc));
+                    // Prior deferred MoE CB completed on the same queue.
+                    sc.clear_pending();
+                    let dt = t0.elapsed().as_nanos() as u64;
+                    t_gpu += dt;
+                    if profile {
+                        sc.prof_cb2_ns.set(sc.prof_cb2_ns.get() + dt);
+                    }
                 }
             }
         }
@@ -2114,7 +2177,7 @@ impl Dsv4GpuModel {
         let split_moe = !hit_idxs.is_empty() && !miss_keys.is_empty();
 
         if split_moe {
-            // I/O-first: miss preads ∥ shared+hit encode/commit; wait once on miss CB.
+            // I/O-first: miss preads ∥ hit encode (shared already in-flight if overlap).
             let protect: Vec<usize> = hit_idxs.iter().map(|&i| gpu_slots[i]).collect();
             let hit_bufs: Vec<(metal::Buffer, metal::Buffer, metal::Buffer, usize)> = {
                 let eg = self.expert_gpu.as_ref().unwrap();
@@ -2146,11 +2209,13 @@ impl Dsv4GpuModel {
                         let sc = self.scratch.as_ref().unwrap();
                         let cmd = self.metal.queue.new_command_buffer().to_owned();
                         let enc = cmd.new_compute_command_encoder();
-                        if !skip_shared {
-                            encode_shared(&self.metal, lg, sc, &enc);
-                        } else {
-                            self.metal.encode_zero(&enc, &sc.shared, n_embd as i32);
-                            self.metal.encode_zero(&enc, &sc.routed, n_embd as i32);
+                        if !shared_preencoded {
+                            if !skip_shared {
+                                encode_shared(&self.metal, lg, sc, &enc);
+                            } else {
+                                self.metal.encode_zero(&enc, &sc.shared, n_embd as i32);
+                                self.metal.encode_zero(&enc, &sc.routed, n_embd as i32);
+                            }
                         }
                         if !skip_moe_routed {
                             for (gate, up, down, i) in &hit_bufs {
@@ -2203,18 +2268,20 @@ impl Dsv4GpuModel {
             // Fuse MoE wait: next layer CB2 (same queue) covers this CB.
             scratch.defer_cmd(cmd);
         } else if miss_keys.is_empty() {
-            // All resident: shared + experts + expand.
+            // All resident: experts + expand (shared may already be in CB2).
             let scratch = self.scratch.as_ref().unwrap();
             let lg = &self.gpu_layers.as_ref().unwrap()[il];
             let eg = self.expert_gpu.as_ref().unwrap();
             let cmd = self.metal.queue.new_command_buffer().to_owned();
             {
                 let enc = cmd.new_compute_command_encoder();
-                if !skip_shared {
-                    encode_shared(&self.metal, lg, scratch, &enc);
-                } else {
-                    self.metal.encode_zero(&enc, &scratch.shared, n_embd as i32);
-                    self.metal.encode_zero(&enc, &scratch.routed, n_embd as i32);
+                if !shared_preencoded {
+                    if !skip_shared {
+                        encode_shared(&self.metal, lg, scratch, &enc);
+                    } else {
+                        self.metal.encode_zero(&enc, &scratch.shared, n_embd as i32);
+                        self.metal.encode_zero(&enc, &scratch.routed, n_embd as i32);
+                    }
                 }
                 if !skip_moe_routed {
                     if use_slots6 && n_routed == 6 {
@@ -2285,6 +2352,62 @@ impl Dsv4GpuModel {
             } else {
                 scratch.defer_cmd(cmd);
             }
+        } else if shared_preencoded {
+            // All missing + shared already in-flight: pin only, then experts + expand.
+            let metal = self.metal.clone();
+            let mut eg = self.expert_gpu.take().expect("expert_gpu");
+            let t_e0 = Instant::now();
+            let _ = eg
+                .pin_misses_with_gpu(
+                    &metal,
+                    &self.ssd,
+                    &miss_keys,
+                    &mut gpu_slots,
+                    &[],
+                    || (),
+                )
+                .expect("expert pread");
+            t_exp += t_e0.elapsed().as_nanos() as u64;
+            self.expert_gpu = Some(eg);
+
+            let scratch = self.scratch.as_ref().unwrap();
+            let eg = self.expert_gpu.as_ref().unwrap();
+            let cmd = self.metal.queue.new_command_buffer().to_owned();
+            {
+                let enc = cmd.new_compute_command_encoder();
+                if !skip_moe_routed {
+                    if use_slots6 && n_routed == 6 {
+                        encode_slots6_all(&self.metal, eg, scratch, &enc, &gpu_slots);
+                    } else {
+                        for i in 0..n_routed {
+                            encode_expert_i(&self.metal, eg, scratch, &enc, &gpu_slots, i);
+                        }
+                    }
+                }
+                if !skip_hc_expand {
+                    encode_ffn_tail(&self.metal, scratch, &enc);
+                } else {
+                    self.metal.encode_add(
+                        &enc,
+                        &scratch.shared,
+                        &scratch.routed,
+                        &scratch.attn_in,
+                        n_embd as i32,
+                    );
+                    self.metal
+                        .encode_zero(&enc, &scratch.hc_flat, hc_dim as i32);
+                    self.metal.encode_add(
+                        &enc,
+                        &scratch.attn_in,
+                        &scratch.hc_flat,
+                        &scratch.hc_flat,
+                        n_embd as i32,
+                    );
+                }
+                enc.end_encoding();
+            }
+            cmd.commit();
+            scratch.defer_cmd(cmd);
         } else {
             // All missing: I/O-first shared encode ∥ pread, then experts + expand.
             let metal = self.metal.clone();

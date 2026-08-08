@@ -1,7 +1,9 @@
 //! Separate Metal library for DeepSeek-V4 kernels (compiled on demand).
 
 use metal::*;
+use objc::{msg_send, sel, sel_impl};
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use super::model::DenseW;
@@ -127,6 +129,9 @@ pub struct Dsv4Metal {
     pub add: ComputePipelineState,
     pub zero: ComputePipelineState,
     pub copy: ComputePipelineState,
+    /// Mid-CB signal after GPU top-k so host can read `route_ids` while shared MoE runs.
+    pub selected_event: SharedEvent,
+    selected_event_value: AtomicU64,
 }
 
 impl Dsv4Metal {
@@ -207,6 +212,7 @@ impl Dsv4Metal {
         let add = get("dsv4_add");
         let zero = get("dsv4_zero");
         let copy = get("dsv4_copy");
+        let selected_event = device.new_shared_event();
         Arc::new(Self {
             device,
             queue,
@@ -255,7 +261,40 @@ impl Dsv4Metal {
             add,
             zero,
             copy,
+            selected_event,
+            selected_event_value: AtomicU64::new(0),
         })
+    }
+
+    /// Next monotonically increasing value for `selected_event` signaling.
+    pub fn next_selected_event_value(&self) -> u64 {
+        self.selected_event_value.fetch_add(1, Ordering::Relaxed) + 1
+    }
+
+    /// Encode a GPU→CPU signal after router top-k has written `route_ids`.
+    pub fn encode_signal_selected(&self, cmd: &CommandBuffer, value: u64) {
+        // SharedEvent is an MTLEvent subclass; metal crate takes EventRef.
+        let event: &EventRef = self.selected_event.as_ref();
+        cmd.encode_signal_event(event, value);
+    }
+
+    /// Wait until the selected-id signal fires (CB may still be running shared MoE).
+    pub fn wait_selected(&self, value: u64, scratch: Option<&MetalScratch>) {
+        let ok = unsafe {
+            let signaled: objc::runtime::BOOL = msg_send![
+                self.selected_event.as_ref(),
+                waitUntilSignaledValue: value
+                timeoutMS: 60_000u64
+            ];
+            signaled == objc::runtime::YES
+        };
+        if let Some(sc) = scratch {
+            sc.note_wait();
+        }
+        if !ok {
+            // Fall back to a hard wait so a timeout cannot race Unified Memory reads.
+            eprintln!("dsv4: selected-id SharedEvent timeout; falling back to full CB wait");
+        }
     }
 
     pub fn buffer_from_bytes(&self, data: &[u8]) -> Buffer {

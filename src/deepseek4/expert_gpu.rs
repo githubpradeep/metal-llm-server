@@ -1,8 +1,9 @@
-//! GPU-resident expert cache: Shared MTLBuffers filled by explicit `pread`.
+//! GPU-resident expert cache: Shared MTLBuffers filled from the GGUF.
 //!
 //! ds4 SSD policy: dense weights stay mmap; routed experts live in reusable
-//! Shared buffers (unified-memory DRAM). `pread` into buffer contents — not
-//! mmap-no-copy (GPU page faults) and not mmap-memcpy on cold pages (fault storm).
+//! Shared buffers (unified-memory DRAM). Default fill is memcpy from the
+//! process mmap (warm page cache after prefill). `DSV4_EXPERT_MMAP=0` falls
+//! back to `pread` into buffer contents.
 
 use std::collections::{HashMap, HashSet};
 use std::os::unix::fs::FileExt;
@@ -11,7 +12,7 @@ use std::os::unix::io::AsRawFd;
 use metal::Buffer;
 
 use super::metal_ctx::Dsv4Metal;
-use super::ssd::{ExpertKey, ExpertSsdCache};
+use super::ssd::{ExpertBlobLayout, ExpertKey, ExpertSsdCache};
 
 struct GpuSlot {
     key: Option<ExpertKey>,
@@ -239,8 +240,9 @@ impl ExpertGpuCache {
     /// Pread only the miss list into LRU slots; writes `out_slots[out_i]`.
     /// Reserve miss slots and `pread` them while `gpu` runs on the calling thread
     /// (ds4/gemma I/O-first: hide SSD latency behind encode+commit).
-    /// Preads start as soon as each slot is reserved (overlap alloc of later
-    /// misses + `gpu` encode/commit). `protect` slots are never evicted.
+    ///
+    /// Opt-in `DSV4_EXPERT_STAGE=1`: pread into heap staging, then memcpy into MTL
+    /// Shared after `gpu` returns (UM-fight experiment; default off was a wash).
     ///
     /// `DSV4_SKIP_EXPERT_IO=1`: reserve/install keys + ensure_buffers only — no
     /// preads (all-hit GPU ceiling probe; output text will be wrong).
@@ -257,64 +259,196 @@ impl ExpertGpuCache {
             return Ok(gpu());
         }
         let skip_io = std::env::var("DSV4_SKIP_EXPERT_IO").ok().as_deref() == Some("1");
+        // Default off: heap staging added a memcpy without hiding UM contention.
+        let stage = std::env::var("DSV4_EXPERT_STAGE").ok().as_deref() == Some("1");
+        // Default on: memcpy from process mmap (warm after prefill).
+        let use_mmap = std::env::var("DSV4_EXPERT_MMAP").ok().as_deref() != Some("0");
         let gate_bytes = self.gate_bytes;
         let up_bytes = self.up_bytes;
         let down_bytes = self.down_bytes;
         let file = ssd.file();
         let mut reserved_sis: HashSet<usize> = protect.iter().copied().collect();
         let mut reserved: Vec<(usize, ExpertKey, usize)> = Vec::with_capacity(misses.len());
+        let mut staged: Vec<(usize, Box<[u8]>, Box<[u8]>, Box<[u8]>)> =
+            Vec::with_capacity(misses.len());
+        let mut stage_jobs: Vec<(usize, ExpertKey, ExpertBlobLayout)> =
+            Vec::with_capacity(misses.len());
+        let mut direct_jobs: Vec<(usize, ExpertKey, ExpertBlobLayout)> =
+            Vec::with_capacity(misses.len());
 
-        // I/O-first: spawn preads as slots are reserved; gpu() overlaps on this thread.
+        for &(out_i, key) in misses {
+            if self.contains(key) {
+                out_slots[out_i] = self.touch(key);
+                continue;
+            }
+            let layout = ssd.layout(key).clone();
+            assert_eq!(layout.gate_bytes, gate_bytes);
+            assert_eq!(layout.up_bytes, up_bytes);
+            assert_eq!(layout.down_bytes, down_bytes);
+            let si = self.lru_slot_excluding(&reserved_sis);
+            reserved_sis.insert(si);
+            if let Some(old) = self.slots[si].key.take() {
+                self.index.remove(&old);
+            }
+            self.ensure_buffers(metal, si);
+            if !skip_io {
+                if stage {
+                    let g = vec![0u8; gate_bytes].into_boxed_slice();
+                    let u = vec![0u8; up_bytes].into_boxed_slice();
+                    let d = vec![0u8; down_bytes].into_boxed_slice();
+                    staged.push((si, g, u, d));
+                    stage_jobs.push((staged.len() - 1, key, layout));
+                } else {
+                    direct_jobs.push((si, key, layout));
+                }
+            }
+            reserved.push((out_i, key, si));
+        }
+
+        let stage_ptrs: Vec<(usize, usize, usize, ExpertKey, ExpertBlobLayout)> = stage_jobs
+            .iter()
+            .map(|&(idx, key, ref layout)| {
+                (
+                    staged[idx].1.as_mut_ptr() as usize,
+                    staged[idx].2.as_mut_ptr() as usize,
+                    staged[idx].3.as_mut_ptr() as usize,
+                    key,
+                    layout.clone(),
+                )
+            })
+            .collect();
+
+        // I/O-first: spawn fills; gpu() overlaps on this thread.
         let result = std::thread::scope(|scope| {
-            for &(out_i, key) in misses {
-                if self.contains(key) {
-                    out_slots[out_i] = self.touch(key);
-                    continue;
-                }
-                let layout = ssd.layout(key).clone();
-                assert_eq!(layout.gate_bytes, gate_bytes);
-                assert_eq!(layout.up_bytes, up_bytes);
-                assert_eq!(layout.down_bytes, down_bytes);
-                let si = self.lru_slot_excluding(&reserved_sis);
-                reserved_sis.insert(si);
-                if let Some(old) = self.slots[si].key.take() {
-                    self.index.remove(&old);
-                }
-                self.ensure_buffers(metal, si);
-                if !skip_io {
-                    let g_ptr = self.slots[si].gate.as_ref().unwrap().contents() as usize;
-                    let u_ptr = self.slots[si].up.as_ref().unwrap().contents() as usize;
-                    let d_ptr = self.slots[si].down.as_ref().unwrap().contents() as usize;
+            if !skip_io && stage {
+                for &(g_ptr, u_ptr, d_ptr, key, ref layout) in &stage_ptrs {
                     let layout_g = layout.clone();
                     scope.spawn(move || {
-                        Self::fadvise_willneed(file, layout_g.gate_offset, gate_bytes);
-                        let g = unsafe {
-                            std::slice::from_raw_parts_mut(g_ptr as *mut u8, gate_bytes)
-                        };
-                        file.read_exact_at(g, layout_g.gate_offset)
-                            .expect("gate pread");
-                    });
-                    let layout_u = layout.clone();
-                    scope.spawn(move || {
-                        Self::fadvise_willneed(file, layout_u.up_offset, up_bytes);
-                        let u = unsafe {
-                            std::slice::from_raw_parts_mut(u_ptr as *mut u8, up_bytes)
-                        };
-                        file.read_exact_at(u, layout_u.up_offset).expect("up pread");
-                    });
-                    scope.spawn(move || {
-                        Self::fadvise_willneed(file, layout.down_offset, down_bytes);
-                        let d = unsafe {
-                            std::slice::from_raw_parts_mut(d_ptr as *mut u8, down_bytes)
-                        };
-                        file.read_exact_at(d, layout.down_offset)
-                            .expect("down pread");
+                        if use_mmap {
+                            let (gs, us, ds) = ssd.mmap_bytes(key);
+                            unsafe {
+                                std::ptr::copy_nonoverlapping(
+                                    gs.as_ptr(),
+                                    g_ptr as *mut u8,
+                                    gate_bytes,
+                                );
+                                std::ptr::copy_nonoverlapping(
+                                    us.as_ptr(),
+                                    u_ptr as *mut u8,
+                                    up_bytes,
+                                );
+                                std::ptr::copy_nonoverlapping(
+                                    ds.as_ptr(),
+                                    d_ptr as *mut u8,
+                                    down_bytes,
+                                );
+                            }
+                        } else {
+                            Self::fadvise_willneed(file, layout_g.gate_offset, gate_bytes);
+                            let g = unsafe {
+                                std::slice::from_raw_parts_mut(g_ptr as *mut u8, gate_bytes)
+                            };
+                            file.read_exact_at(g, layout_g.gate_offset)
+                                .expect("gate pread");
+                            Self::fadvise_willneed(file, layout.up_offset, up_bytes);
+                            let u = unsafe {
+                                std::slice::from_raw_parts_mut(u_ptr as *mut u8, up_bytes)
+                            };
+                            file.read_exact_at(u, layout.up_offset).expect("up pread");
+                            Self::fadvise_willneed(file, layout.down_offset, down_bytes);
+                            let d = unsafe {
+                                std::slice::from_raw_parts_mut(d_ptr as *mut u8, down_bytes)
+                            };
+                            file.read_exact_at(d, layout.down_offset)
+                                .expect("down pread");
+                        }
                     });
                 }
-                reserved.push((out_i, key, si));
+            } else if !skip_io {
+                for (si, key, layout) in &direct_jobs {
+                    let g_ptr = self.slots[*si].gate.as_ref().unwrap().contents() as usize;
+                    let u_ptr = self.slots[*si].up.as_ref().unwrap().contents() as usize;
+                    let d_ptr = self.slots[*si].down.as_ref().unwrap().contents() as usize;
+                    let key = *key;
+                    let layout = layout.clone();
+                    if use_mmap {
+                        scope.spawn(move || {
+                            let (gs, us, ds) = ssd.mmap_bytes(key);
+                            unsafe {
+                                std::ptr::copy_nonoverlapping(
+                                    gs.as_ptr(),
+                                    g_ptr as *mut u8,
+                                    gate_bytes,
+                                );
+                                std::ptr::copy_nonoverlapping(
+                                    us.as_ptr(),
+                                    u_ptr as *mut u8,
+                                    up_bytes,
+                                );
+                                std::ptr::copy_nonoverlapping(
+                                    ds.as_ptr(),
+                                    d_ptr as *mut u8,
+                                    down_bytes,
+                                );
+                            }
+                        });
+                    } else {
+                        let layout_g = layout.clone();
+                        scope.spawn(move || {
+                            Self::fadvise_willneed(file, layout_g.gate_offset, gate_bytes);
+                            let g = unsafe {
+                                std::slice::from_raw_parts_mut(g_ptr as *mut u8, gate_bytes)
+                            };
+                            file.read_exact_at(g, layout_g.gate_offset)
+                                .expect("gate pread");
+                        });
+                        let layout_u = layout.clone();
+                        scope.spawn(move || {
+                            Self::fadvise_willneed(file, layout_u.up_offset, up_bytes);
+                            let u = unsafe {
+                                std::slice::from_raw_parts_mut(u_ptr as *mut u8, up_bytes)
+                            };
+                            file.read_exact_at(u, layout_u.up_offset).expect("up pread");
+                        });
+                        scope.spawn(move || {
+                            Self::fadvise_willneed(file, layout.down_offset, down_bytes);
+                            let d = unsafe {
+                                std::slice::from_raw_parts_mut(d_ptr as *mut u8, down_bytes)
+                            };
+                            file.read_exact_at(d, layout.down_offset)
+                                .expect("down pread");
+                        });
+                    }
+                }
             }
             gpu()
         });
+
+        if !skip_io && stage {
+            for (si, g, u, d) in staged {
+                let g_dst = unsafe {
+                    std::slice::from_raw_parts_mut(
+                        self.slots[si].gate.as_ref().unwrap().contents() as *mut u8,
+                        gate_bytes,
+                    )
+                };
+                let u_dst = unsafe {
+                    std::slice::from_raw_parts_mut(
+                        self.slots[si].up.as_ref().unwrap().contents() as *mut u8,
+                        up_bytes,
+                    )
+                };
+                let d_dst = unsafe {
+                    std::slice::from_raw_parts_mut(
+                        self.slots[si].down.as_ref().unwrap().contents() as *mut u8,
+                        down_bytes,
+                    )
+                };
+                g_dst.copy_from_slice(&g);
+                u_dst.copy_from_slice(&u);
+                d_dst.copy_from_slice(&d);
+            }
+        }
 
         for (out_i, key, si) in reserved {
             if !skip_io
