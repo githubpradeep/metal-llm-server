@@ -92,10 +92,20 @@ fn main() {
             .position(|a| a == "--ssd-streaming-cache-experts")
             .and_then(|i| args.get(i + 1))
             .and_then(|s| {
-                let t = s.trim_end_matches("GB").trim_end_matches("GiB");
-                t.parse::<usize>().ok()
-            })
-            .map(|g| g * 1024);
+                let s = s.trim();
+                let lower = s.to_ascii_lowercase();
+                if let Some(n) = lower.strip_suffix("gib").or_else(|| lower.strip_suffix("gb")) {
+                    n.trim().parse::<usize>().ok().map(|g| g * 1024)
+                } else if let Some(n) = lower
+                    .strip_suffix("mib")
+                    .or_else(|| lower.strip_suffix("mb"))
+                {
+                    n.trim().parse::<usize>().ok()
+                } else {
+                    // Bare number = MiB (ds4-style).
+                    s.parse::<usize>().ok()
+                }
+            });
         let nothink = args.iter().any(|a| a == "--nothink");
         let n_new: usize = args
             .iter()
@@ -126,11 +136,26 @@ fn main() {
             "Metal path: {} (DSV4_METAL)",
             if model.use_metal { "on" } else { "off" }
         );
+        if let Some(sc) = model.scratch.as_ref() {
+            sc.sync_waits.set(0);
+        }
         let t0 = Instant::now();
         model.reset();
         let prefill_t0 = Instant::now();
         let logits = model.forward_prefill(&ids);
         let prefill_dt = prefill_t0.elapsed().as_secs_f64();
+        let prefill_waits = model
+            .scratch
+            .as_ref()
+            .map(|s| s.sync_waits.get())
+            .unwrap_or(0);
+        if let Some(eg) = model.expert_gpu.as_mut() {
+            eg.compact_or_note_prefill_done();
+        }
+        if let Some(sc) = model.scratch.as_ref() {
+            sc.reset_profile();
+            sc.sync_waits.set(0);
+        }
         let first = deepseek4::Dsv4GpuModel::sample_greedy(&logits);
         let first_logit = logits.get(first).copied().unwrap_or(f32::NAN);
         let first_txt = tok
@@ -158,6 +183,11 @@ fn main() {
         }
         println!();
         let gen_dt = gen_t0.elapsed().as_secs_f64();
+        let gen_waits = model
+            .scratch
+            .as_ref()
+            .map(|s| s.sync_waits.get())
+            .unwrap_or(0);
         let dt = t0.elapsed().as_secs_f64();
         let text = tok
             .decode(
@@ -174,9 +204,54 @@ fn main() {
             text
         );
         println!(
+            "GPU sync waits: prefill={} gen={} (~{:.0}/token gen)",
+            prefill_waits,
+            gen_waits,
+            gen_waits as f64 / (out_ids.len().saturating_sub(1)).max(1) as f64
+        );
+        println!(
             "SSD cache hits={} misses={}",
             model.ssd.hits, model.ssd.misses
         );
+        if let Some(eg) = model.expert_gpu.as_ref() {
+            println!(
+                "GPU expert uploads={} skips={} hit={:.1}% slots={}/{} allocs={} reuses={} pread={:.2} GiB",
+                eg.uploads,
+                eg.skips,
+                100.0 * eg.hit_rate(),
+                eg.filled_slots(),
+                eg.n_slots(),
+                eg.buffer_allocs,
+                eg.buffer_reuses,
+                eg.pread_bytes as f64 / (1024.0 * 1024.0 * 1024.0)
+            );
+        }
+        if std::env::var("DSV4_PROFILE").ok().as_deref() == Some("1") {
+            if let Some(sc) = model.scratch.as_ref() {
+                let ms = |ns: u64| ns as f64 / 1e6;
+                println!(
+                    "PROFILE layer_total={:.0}ms gpu_waits={:.0}ms cpu_attn={:.0}ms expert_bind={:.0}ms | CB1={:.0} CB2={:.0} CB3={:.0} ms",
+                    ms(sc.prof_pin_ns.get()),
+                    ms(sc.prof_gpu_ns.get()),
+                    ms(sc.prof_attn_ns.get()),
+                    ms(sc.prof_copy_ns.get()),
+                    ms(sc.prof_cb1_ns.get()),
+                    ms(sc.prof_cb2_ns.get()),
+                    ms(sc.prof_cb3_ns.get()),
+                );
+                let sm = sc.spec_moe_match.get();
+                let sx = sc.spec_moe_miss.get();
+                let st = sm + sx;
+                if st > 0 {
+                    let set_eq = sc.spec_moe_set_eq.get();
+                    let avg_ov = sc.spec_moe_overlap_sum.get() as f64 / sx.max(1) as f64;
+                    println!(
+                        "SPEC_MOE match={sm} miss={sx} rate={:.1}% set_eq={set_eq} avg_overlap={avg_ov:.2}/6",
+                        100.0 * sm as f64 / st as f64
+                    );
+                }
+            }
+        }
         return;
     }
 

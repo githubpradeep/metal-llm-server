@@ -1,15 +1,14 @@
-//! SSD expert streaming cache for DeepSeek-V4-Flash routed experts.
+//! SSD expert streaming for DeepSeek-V4-Flash routed experts.
 //!
-//! Policy (studied from ds4 docs/behavior, implemented ourselves):
-//! - Dense / shared / HC / attn stay resident.
-//! - Routed `ffn_{gate,up,down}_exps` pages in per (layer, expert).
-//! - Overlap: caller can prefetch while shared expert runs.
+//! Experts are read from a mmap'd GGUF. The OS page cache is the host cache;
+//! optional LRU slots keep hot experts touched (mlock-ish residency via Vec).
 
 use std::collections::HashMap;
 use std::fs::File;
-use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
+
+use memmap2::Mmap;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct ExpertKey {
@@ -36,10 +35,12 @@ struct Slot {
     last_used: u64,
 }
 
-/// Host-side expert cache backed by pread from the GGUF file.
+/// Host-side expert cache backed by an open GGUF file (+ mmap for CPU path).
 pub struct ExpertSsdCache {
     path: PathBuf,
-    file: Mutex<File>,
+    /// Kept open for `pread` into GPU Shared buffers (ds4 SSD streaming).
+    file: File,
+    mmap: Mmap,
     layouts: HashMap<ExpertKey, ExpertBlobLayout>,
     slots: Vec<Slot>,
     clock: u64,
@@ -51,9 +52,12 @@ impl ExpertSsdCache {
     pub fn new(path: impl AsRef<Path>, n_slots: usize) -> std::io::Result<Self> {
         let path = path.as_ref().to_path_buf();
         let file = File::open(&path)?;
+        // Safety: GGUF is immutable while we run.
+        let mmap = unsafe { Mmap::map(&file)? };
         Ok(Self {
             path,
-            file: Mutex::new(file),
+            file,
+            mmap,
             layouts: HashMap::new(),
             slots: (0..n_slots)
                 .map(|_| Slot {
@@ -82,6 +86,33 @@ impl ExpertSsdCache {
         &self.path
     }
 
+    pub fn file(&self) -> &File {
+        &self.file
+    }
+
+    pub fn layout(&self, key: ExpertKey) -> &ExpertBlobLayout {
+        self.layouts.get(&key).unwrap_or_else(|| {
+            panic!(
+                "no layout for layer {} expert {}",
+                key.layer, key.expert
+            )
+        })
+    }
+
+    /// Zero-copy views into the mmap'd GGUF (page-cache backed).
+    pub fn mmap_bytes(&self, key: ExpertKey) -> (&[u8], &[u8], &[u8]) {
+        let l = self.layout(key);
+        let m = &self.mmap[..];
+        let g0 = l.gate_offset as usize;
+        let u0 = l.up_offset as usize;
+        let d0 = l.down_offset as usize;
+        (
+            &m[g0..g0 + l.gate_bytes],
+            &m[u0..u0 + l.up_bytes],
+            &m[d0..d0 + l.down_bytes],
+        )
+    }
+
     fn find_slot(&self, key: ExpertKey) -> Option<usize> {
         self.slots.iter().position(|s| s.key == Some(key))
     }
@@ -101,12 +132,7 @@ impl ExpertSsdCache {
         best
     }
 
-    fn read_exact_at(file: &mut File, offset: u64, buf: &mut [u8]) -> std::io::Result<()> {
-        file.seek(SeekFrom::Start(offset))?;
-        file.read_exact(buf)
-    }
-
-    /// Ensure experts are resident; returns slot indices in the same order as `keys`.
+    /// Ensure experts are resident in the optional LRU; returns slot indices.
     pub fn pin(&mut self, keys: &[ExpertKey]) -> std::io::Result<Vec<usize>> {
         let mut out = Vec::with_capacity(keys.len());
         for &key in keys {
@@ -118,27 +144,18 @@ impl ExpertSsdCache {
                 continue;
             }
             self.misses += 1;
-            let layout = self
-                .layouts
-                .get(&key)
-                .cloned()
-                .ok_or_else(|| {
-                    std::io::Error::new(
-                        std::io::ErrorKind::NotFound,
-                        format!("no layout for layer {} expert {}", key.layer, key.expert),
-                    )
-                })?;
+            let layout = self.layout(key).clone();
+            let g0 = layout.gate_offset as usize;
+            let u0 = layout.up_offset as usize;
+            let d0 = layout.down_offset as usize;
+            let gate_src = self.mmap[g0..g0 + layout.gate_bytes].to_vec();
+            let up_src = self.mmap[u0..u0 + layout.up_bytes].to_vec();
+            let down_src = self.mmap[d0..d0 + layout.down_bytes].to_vec();
             let slot_i = self.lru_slot();
             let slot = &mut self.slots[slot_i];
-            slot.gate.resize(layout.gate_bytes, 0);
-            slot.up.resize(layout.up_bytes, 0);
-            slot.down.resize(layout.down_bytes, 0);
-            {
-                let mut file = self.file.lock().unwrap();
-                Self::read_exact_at(&mut file, layout.gate_offset, &mut slot.gate)?;
-                Self::read_exact_at(&mut file, layout.up_offset, &mut slot.up)?;
-                Self::read_exact_at(&mut file, layout.down_offset, &mut slot.down)?;
-            }
+            slot.gate = gate_src;
+            slot.up = up_src;
+            slot.down = down_src;
             slot.key = Some(key);
             self.clock += 1;
             slot.last_used = self.clock;
@@ -157,7 +174,6 @@ impl ExpertSsdCache {
         &self.slots[slot].down
     }
 
-    /// Auto slot count from a memory budget (MiB) and per-expert byte size.
     pub fn slots_for_budget(budget_mib: usize, expert_bytes: usize) -> usize {
         if expert_bytes == 0 {
             return 1;
@@ -167,12 +183,10 @@ impl ExpertSsdCache {
     }
 }
 
-/// Shared handle for concurrent prefetch helpers.
 pub type SharedExpertCache = Arc<Mutex<ExpertSsdCache>>;
 
 use std::thread;
 
-/// Prefetch experts on a background thread (caller joins before reading slots).
 pub fn prefetch_experts_async(
     cache: SharedExpertCache,
     keys: Vec<ExpertKey>,
@@ -183,7 +197,6 @@ pub fn prefetch_experts_async(
     })
 }
 
-/// Estimate one Flash IQ2 expert footprint (gate IQ2 + up IQ2 + down Q2_K).
 pub fn estimate_expert_bytes(n_embd: usize, n_ff: usize) -> usize {
     use super::quant::{IQ2_XXS_BLOCK_BYTES, Q2_K_BLOCK_BYTES, QK_K};
     let iq2_row = |rows: usize, cols: usize| -> usize {
@@ -192,6 +205,5 @@ pub fn estimate_expert_bytes(n_embd: usize, n_ff: usize) -> usize {
     let q2k_row = |rows: usize, cols: usize| -> usize {
         rows * (cols / QK_K) * Q2_K_BLOCK_BYTES
     };
-    // gate/up: [ff, embd], down: [embd, ff]
     iq2_row(n_ff, n_embd) + iq2_row(n_ff, n_embd) + q2k_row(n_embd, n_ff)
 }

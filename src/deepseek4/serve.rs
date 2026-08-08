@@ -135,6 +135,7 @@ async fn chat_completions(State(st): State<AppState>, Json(req): Json<ChatReques
             let mut m = model.lock().unwrap();
             m.reset();
             let mut logits = m.forward_prefill(&ids);
+            m.note_prefill_done();
             let _ = tx.blocking_send(format!(
                 "{}",
                 json!({
@@ -186,6 +187,7 @@ async fn chat_completions(State(st): State<AppState>, Json(req): Json<ChatReques
         let mut m = model.lock().unwrap();
         m.reset();
         let mut logits = m.forward_prefill(&ids);
+        m.note_prefill_done();
         let mut out_ids = Vec::new();
         for _ in 0..max_new {
             let next = sample_next(&logits, temperature);

@@ -116,9 +116,45 @@ pub fn compressor_step(
     rms_eps: f32,
     use_compress_rope: bool,
 ) -> Option<Vec<f32>> {
+    let width = state.width;
+    let mut kv_cur = vec![0.0f32; width];
+    let mut sc_cur = vec![0.0f32; width];
+    wkv.matvec_ggml(x_normed, &mut kv_cur);
+    wgate.matvec_ggml(x_normed, &mut sc_cur);
+    compressor_step_from_proj(
+        state,
+        &kv_cur,
+        &sc_cur,
+        ape,
+        norm,
+        pos,
+        n_rot,
+        layer,
+        rope_freq,
+        rms_eps,
+        use_compress_rope,
+    )
+}
+
+/// Same as `compressor_step` but with kv/gate projections already computed (GPU path).
+pub fn compressor_step_from_proj(
+    state: &mut CompressorState,
+    kv_cur: &[f32],
+    sc_cur: &[f32],
+    ape: &DenseW,
+    norm: &[f32],
+    pos: usize,
+    n_rot: usize,
+    layer: usize,
+    rope_freq: f32,
+    rms_eps: f32,
+    use_compress_rope: bool,
+) -> Option<Vec<f32>> {
     let ratio = state.ratio as usize;
     let width = state.width;
     let head_dim = state.head_dim;
+    assert_eq!(kv_cur.len(), width);
+    assert_eq!(sc_cur.len(), width);
     let pos_mod = pos % ratio;
     let row = if state.ratio == 4 {
         ratio + pos_mod
@@ -127,15 +163,12 @@ pub fn compressor_step(
     };
     let should_compress = (pos + 1) % ratio == 0;
 
-    let mut kv_cur = vec![0.0f32; width];
-    let mut sc_cur = vec![0.0f32; width];
-    wkv.matvec_ggml(x_normed, &mut kv_cur);
-    wgate.matvec_ggml(x_normed, &mut sc_cur);
+    let mut sc_row = sc_cur.to_vec();
     for j in 0..width {
-        sc_cur[j] += ape_at(ape, j, pos_mod);
+        sc_row[j] += ape_at(ape, j, pos_mod);
     }
-    state.state_kv[row * width..(row + 1) * width].copy_from_slice(&kv_cur);
-    state.state_score[row * width..(row + 1) * width].copy_from_slice(&sc_cur);
+    state.state_kv[row * width..(row + 1) * width].copy_from_slice(kv_cur);
+    state.state_score[row * width..(row + 1) * width].copy_from_slice(&sc_row);
 
     if !should_compress {
         return None;

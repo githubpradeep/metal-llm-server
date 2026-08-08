@@ -11,6 +11,8 @@ use super::forward_metal::LayerGpu;
 use super::gguf_validate::{print_inspect, validate_dsv4_gguf};
 use super::compressor::CompressorState;
 use super::kv::{LayerKvConfig, LayerKvState};
+use super::expert_gpu::ExpertGpuCache;
+use super::gpu_kv::GpuLayerKv;
 use super::metal_ctx::{Dsv4Metal, GpuWeight, MetalScratch};
 use super::quant::{IQ2_XXS_BLOCK_BYTES, Q2_K_BLOCK_BYTES, QK_K};
 use super::ssd::{estimate_expert_bytes, ExpertBlobLayout, ExpertKey, ExpertSsdCache};
@@ -228,10 +230,17 @@ pub struct Dsv4GpuModel {
     /// When true, prefer Metal matvecs / FFN / lm_head (default; `DSV4_METAL=0` disables).
     pub use_metal: bool,
     pub gpu_layers: Option<Vec<LayerGpu>>,
+    pub gpu_kv: Option<Vec<GpuLayerKv>>,
     pub gpu_output: Option<GpuWeight>,
     pub gpu_output_hc_fn: Option<GpuWeight>,
     pub gpu_output_norm: Option<Buffer>,
     pub scratch: Option<MetalScratch>,
+    /// GPU-resident copies of SSD expert slots (upload-once on hit).
+    pub expert_gpu: Option<ExpertGpuCache>,
+    /// Prior-token routed expert ids per layer (speculative pin for top-k).
+    pub last_expert_ids: Vec<Vec<u32>>,
+    /// Token t−2 routed ids per layer (union with `last_expert_ids` for spec pin).
+    pub prev_expert_ids: Vec<Vec<u32>>,
 }
 
 fn load_f32(g: &Gguf, name: &str) -> Vec<f32> {
@@ -296,7 +305,7 @@ impl Dsv4GpuModel {
         };
 
         let expert_bytes = estimate_expert_bytes(cfg.n_embd, cfg.n_ff_exp);
-        let budget_mib = cache_experts_mib.unwrap_or(if ssd_streaming { 2048 } else { 4096 });
+        let budget_mib = cache_experts_mib.unwrap_or(if ssd_streaming { 512 } else { 4096 });
         let n_slots = ExpertSsdCache::slots_for_budget(budget_mib, expert_bytes);
         println!(
             "  SSD expert cache: {n_slots} slots (~{budget_mib} MiB, {:.2} MiB/expert)",
@@ -407,6 +416,7 @@ impl Dsv4GpuModel {
 
         println!("  DeepSeek-V4-Flash ready (ssd_streaming={ssd_streaming})");
         let hc_elems = cfg.hc_state_elems();
+        let n_layer = cfg.n_layer;
         let use_metal = crate::deepseek4::forward_metal::metal_enabled();
         let mut model = Self {
             path,
@@ -434,10 +444,14 @@ impl Dsv4GpuModel {
             down_row_bytes,
             use_metal,
             gpu_layers: None,
+            gpu_kv: None,
             gpu_output: None,
             gpu_output_hc_fn: None,
             gpu_output_norm: None,
             scratch: None,
+            expert_gpu: None,
+            last_expert_ids: vec![Vec::new(); n_layer],
+            prev_expert_ids: vec![Vec::new(); n_layer],
         };
         if use_metal {
             model.ensure_gpu_weights();
@@ -445,9 +459,23 @@ impl Dsv4GpuModel {
         model
     }
 
+    /// Call after prefill completes: reset expert upload stats for the gen
+    /// PROFILE window.
+    pub fn note_prefill_done(&mut self) {
+        if let Some(eg) = self.expert_gpu.as_mut() {
+            eg.compact_or_note_prefill_done();
+        }
+    }
+
     pub fn reset(&mut self) {
         self.pos = 0;
         self.hc.fill(0.0);
+        for ids in &mut self.last_expert_ids {
+            ids.clear();
+        }
+        for ids in &mut self.prev_expert_ids {
+            ids.clear();
+        }
         for kv in &mut self.kv {
             kv.clear();
         }
@@ -459,6 +487,11 @@ impl Dsv4GpuModel {
         for s in &mut self.idx_comp_state {
             if let Some(st) = s.as_mut() {
                 st.clear();
+            }
+        }
+        if let Some(gkv) = self.gpu_kv.as_ref() {
+            for g in gkv {
+                g.clear();
             }
         }
     }

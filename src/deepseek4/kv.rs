@@ -103,25 +103,34 @@ impl LayerKvState {
         let hd = self.cfg.head_dim;
         assert_eq!(k.len(), hd);
         assert_eq!(v.len(), hd);
-        let slot = if self.raw_len < self.cfg.swa {
-            let s = self.raw_len;
-            self.raw_len += 1;
-            s
-        } else {
-            // drop oldest: shift (simple for CPU; Metal uses ring index)
+        if self.raw_len >= self.cfg.swa {
             for i in 1..self.cfg.swa {
                 let dst = (i - 1) * hd;
                 let src = i * hd;
                 self.raw_k.copy_within(src..src + hd, dst);
                 self.raw_v.copy_within(src..src + hd, dst);
+            }
+        }
+        let slot = self.note_raw_push(pos);
+        self.raw_k[slot * hd..(slot + 1) * hd].copy_from_slice(k);
+        self.raw_v[slot * hd..(slot + 1) * hd].copy_from_slice(v);
+    }
+
+    /// Advance SWA ring metadata without copying K/V (GPU ring is source of truth).
+    pub fn note_raw_push(&mut self, pos: usize) -> usize {
+        let slot = if self.raw_len < self.cfg.swa {
+            let s = self.raw_len;
+            self.raw_len += 1;
+            s
+        } else {
+            for i in 1..self.cfg.swa {
                 self.raw_pos[i - 1] = self.raw_pos[i];
             }
             self.cfg.swa - 1
         };
-        self.raw_k[slot * hd..(slot + 1) * hd].copy_from_slice(k);
-        self.raw_v[slot * hd..(slot + 1) * hd].copy_from_slice(v);
         self.raw_pos[slot] = pos;
         self.token_count += 1;
+        slot
     }
 
     /// Push one compressed KV row (K≡V for Flash MQA latent).
@@ -136,6 +145,11 @@ impl LayerKvState {
         }
         self.comp_k[dst * hd..(dst + 1) * hd].copy_from_slice(k);
         self.comp_v[dst * hd..(dst + 1) * hd].copy_from_slice(v);
+        self.comp_len += 1;
+    }
+
+    /// Bump compressed-row length after a GPU emit (no host copy).
+    pub fn note_comp_push(&mut self) {
         self.comp_len += 1;
     }
 
