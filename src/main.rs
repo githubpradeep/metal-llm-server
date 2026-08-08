@@ -176,6 +176,9 @@ fn main() {
         for _ in 1..n_new {
             logits = model.forward_token_logits(out_ids[out_ids.len() - 1]);
             let next = deepseek4::Dsv4GpuModel::sample_greedy(&logits);
+            if next as u32 == deepseek4::DSV4_EOS_ID {
+                break;
+            }
             out_ids.push(next);
             let piece = tok.decode(&[next as u32], true).unwrap_or_default();
             print!("{piece}");

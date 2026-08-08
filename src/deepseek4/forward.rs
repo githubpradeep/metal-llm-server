@@ -2543,6 +2543,9 @@ impl Dsv4GpuModel {
         let mut out = Vec::new();
         for _ in 0..n_new {
             let next = Self::sample_greedy(&logits);
+            if next as u32 == crate::deepseek4::DSV4_EOS_ID {
+                break;
+            }
             out.push(next);
             on_token(next);
             logits = self.forward_token_logits(next);
