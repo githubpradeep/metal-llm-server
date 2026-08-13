@@ -17,6 +17,7 @@ kernel void dsv4_attn_swa_mqa(
     constant int &n_kv [[buffer(7)]],
     constant int &has_sinks [[buffer(8)]],
     constant float &scale [[buffer(9)]],
+    constant int &kv_origin [[buffer(10)]],
     uint3 tgpig [[threadgroup_position_in_grid]],
     ushort tiisg [[thread_index_in_simdgroup]],
     threadgroup float *tg [[threadgroup(0)]])
@@ -47,9 +48,11 @@ kernel void dsv4_attn_swa_mqa(
     const float sink = (has_sinks != 0) ? sinks[h] : -1.0e30f;
     float max_s = sink;
     const int nkv = metal::min(n_kv, 128);
+    const int origin = kv_origin;
 
     for (int t = 0; t < nkv; ++t) {
-        device const float *kt = k + (ulong)t * hd;
+        int row = (origin == 0) ? t : ((origin + t) % nkv);
+        device const float *kt = k + (ulong)row * hd;
         float qk = q0 * kt[lane] + q1 * kt[lane + 32] + q2 * kt[lane + 64]
             + q3 * kt[lane + 96] + q4 * kt[lane + 128] + q5 * kt[lane + 160]
             + q6 * kt[lane + 192] + q7 * kt[lane + 224] + q8 * kt[lane + 256]
@@ -80,7 +83,8 @@ kernel void dsv4_attn_swa_mqa(
     float a12 = 0.f, a13 = 0.f, a14 = 0.f, a15 = 0.f;
     for (int t = 0; t < nkv; ++t) {
         const float w = tg[t] * inv;
-        device const float *vt = v + (ulong)t * hd;
+        int row = (origin == 0) ? t : ((origin + t) % nkv);
+        device const float *vt = v + (ulong)row * hd;
         a0 += w * vt[lane];
         a1 += w * vt[lane + 32];
         a2 += w * vt[lane + 64];
@@ -132,6 +136,7 @@ kernel void dsv4_attn_mixed_mqa(
     constant int &n_comp_sel [[buffer(11)]],
     constant int &has_sinks [[buffer(12)]],
     constant float &scale [[buffer(13)]],
+    constant int &kv_origin [[buffer(14)]],
     uint3 tgpig [[threadgroup_position_in_grid]],
     ushort tiisg [[thread_index_in_simdgroup]],
     threadgroup float *tg [[threadgroup(0)]])
@@ -162,11 +167,16 @@ kernel void dsv4_attn_mixed_mqa(
     const float sink = (has_sinks != 0) ? sinks[h] : -1.0e30f;
     float max_s = sink;
     const int n_total = metal::min(n_raw + n_comp_sel, 640);
+    const int origin = kv_origin;
 
     for (int t = 0; t < n_total; ++t) {
-        device const float *kt = (t < n_raw)
-            ? (k_raw + (ulong)t * hd)
-            : (k_comp + (ulong)comp_idx[t - n_raw] * hd);
+        device const float *kt;
+        if (t < n_raw) {
+            int row = (origin == 0) ? t : ((origin + t) % n_raw);
+            kt = k_raw + (ulong)row * hd;
+        } else {
+            kt = k_comp + (ulong)comp_idx[t - n_raw] * hd;
+        }
         float qk = q0 * kt[lane] + q1 * kt[lane + 32] + q2 * kt[lane + 64]
             + q3 * kt[lane + 96] + q4 * kt[lane + 128] + q5 * kt[lane + 160]
             + q6 * kt[lane + 192] + q7 * kt[lane + 224] + q8 * kt[lane + 256]
@@ -197,9 +207,13 @@ kernel void dsv4_attn_mixed_mqa(
     float a12 = 0.f, a13 = 0.f, a14 = 0.f, a15 = 0.f;
     for (int t = 0; t < n_total; ++t) {
         const float w = tg[t] * inv;
-        device const float *vt = (t < n_raw)
-            ? (v_raw + (ulong)t * hd)
-            : (v_comp + (ulong)comp_idx[t - n_raw] * hd);
+        device const float *vt;
+        if (t < n_raw) {
+            int row = (origin == 0) ? t : ((origin + t) % n_raw);
+            vt = v_raw + (ulong)row * hd;
+        } else {
+            vt = v_comp + (ulong)comp_idx[t - n_raw] * hd;
+        }
         a0 += w * vt[lane];
         a1 += w * vt[lane + 32];
         a2 += w * vt[lane + 64];

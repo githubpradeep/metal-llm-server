@@ -77,7 +77,7 @@ kernel void dsv4_indexer_scores(
     scores[row] = acc / (float)n_heads;
 }
 
-// CSA: each thread scores one compressed row into `scores` (device scratch).
+// CSA: 1 simdgroup per compressed row (32-lane Q·K, ReLU-sum across heads).
 kernel void dsv4_select_comp_score(
     device const float *q [[buffer(0)]],
     device const float *k_comp [[buffer(1)]],
@@ -85,19 +85,22 @@ kernel void dsv4_select_comp_score(
     constant int &n_head [[buffer(3)]],
     constant int &head_dim [[buffer(4)]],
     constant int &n_comp [[buffer(5)]],
-    uint gid [[thread_position_in_grid]])
+    uint3 tgpig [[threadgroup_position_in_grid]],
+    ushort tiisg [[thread_index_in_simdgroup]])
 {
-    int ci = (int)gid;
+    int ci = (int)tgpig.x;
     if (ci >= n_comp) return;
+    const uint lane = (uint)tiisg;
     device const float *kt = k_comp + (ulong)ci * head_dim;
     float s = 0.0f;
     for (int h = 0; h < n_head; ++h) {
         device const float *qh = q + (ulong)h * head_dim;
         float qk = 0.0f;
-        for (int d = 0; d < head_dim; ++d) qk += qh[d] * kt[d];
+        for (int d = (int)lane; d < head_dim; d += 32) qk += qh[d] * kt[d];
+        qk = simd_sum(qk);
         s += max(qk, 0.0f);
     }
-    scores[ci] = s;
+    if (lane == 0) scores[ci] = s;
 }
 
 // Top-k from `scores` → sorted ascending indices. Single-thread (k ≤ 512, n ≤ 2048).
@@ -111,6 +114,10 @@ kernel void dsv4_select_comp_topk(
     if (gid != 0) return;
     if (n_comp <= 0) return;
     int k = min(top_k, n_comp);
+    if (k >= n_comp) {
+        for (int t = 0; t < n_comp; ++t) out_idx[t] = t;
+        return;
+    }
     constexpr int MAX_N = 2048;
     int n = min(n_comp, MAX_N);
     thread int alive[MAX_N];

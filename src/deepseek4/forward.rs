@@ -559,6 +559,7 @@ impl Dsv4GpuModel {
                     n_kv as i32,
                     1,
                     scale,
+                    0,
                 );
                 enc.end_encoding();
                 cmd.commit();
@@ -584,6 +585,7 @@ impl Dsv4GpuModel {
                     n_kv as i32,
                     1,
                     scale,
+                    0,
                 );
                 enc.end_encoding();
                 cmd.commit();
@@ -1289,6 +1291,7 @@ impl Dsv4GpuModel {
                     n_kv as i32,
                     1,
                     scale,
+                    0,
                 );
                 enc.end_encoding();
                 cmd.commit();
@@ -1312,6 +1315,7 @@ impl Dsv4GpuModel {
                     n_kv as i32,
                     1,
                     scale,
+                    0,
                 );
                 enc.end_encoding();
                 cmd.commit();

@@ -1017,6 +1017,7 @@ impl Dsv4Metal {
         n_kv: i32,
         has_sinks: i32,
         scale: f32,
+        kv_origin: i32,
     ) {
         encoder.set_compute_pipeline_state(&self.attn_swa_mqa);
         encoder.set_buffer(0, Some(q), 0);
@@ -1029,6 +1030,7 @@ impl Dsv4Metal {
         encoder.set_bytes(7, 4, &n_kv as *const i32 as *const _);
         encoder.set_bytes(8, 4, &has_sinks as *const i32 as *const _);
         encoder.set_bytes(9, 4, &scale as *const f32 as *const _);
+        encoder.set_bytes(10, 4, &kv_origin as *const i32 as *const _);
         // 1 simdgroup (32 threads) per head — two-pass softmax in dsv4_attn_swa_mqa.
         // scores[128] + inv slot.
         encoder.set_threadgroup_memory_length(0, 129 * 4);
@@ -1058,9 +1060,9 @@ impl Dsv4Metal {
         encoder.set_bytes(5, 4, &eps as *const f32 as *const _);
         let has_w: i32 = if weight.is_some() { 1 } else { 0 };
         encoder.set_bytes(6, 4, &has_w as *const i32 as *const _);
-        encoder.dispatch_threads(
-            MTLSize::new(n_rows as u64, 1, 1),
-            MTLSize::new(1, 1, 1),
+        encoder.dispatch_thread_groups(
+            MTLSize::new(n_rows.max(1) as u64, 1, 1),
+            MTLSize::new(32, 1, 1),
         );
     }
 
@@ -1084,9 +1086,9 @@ impl Dsv4Metal {
         encoder.set_bytes(5, 4, &freq_base as *const f32 as *const _);
         let inv: i32 = if inverse { 1 } else { 0 };
         encoder.set_bytes(6, 4, &inv as *const i32 as *const _);
-        encoder.dispatch_threads(
-            MTLSize::new(n_heads as u64, 1, 1),
-            MTLSize::new(1, 1, 1),
+        encoder.dispatch_thread_groups(
+            MTLSize::new(n_heads.max(1) as u64, 1, 1),
+            MTLSize::new(32, 1, 1),
         );
     }
 
@@ -1101,7 +1103,9 @@ impl Dsv4Metal {
         encoder.set_buffer(0, Some(kv), 0);
         encoder.set_bytes(1, 4, &head_dim as *const i32 as *const _);
         encoder.set_bytes(2, 4, &n_rot as *const i32 as *const _);
-        encoder.dispatch_threads(MTLSize::new(1, 1, 1), MTLSize::new(1, 1, 1));
+        let n_nope = (head_dim - n_rot).max(0);
+        let n_groups = ((n_nope + 63) / 64).max(1) as u64;
+        encoder.dispatch_thread_groups(MTLSize::new(n_groups, 1, 1), MTLSize::new(32, 1, 1));
     }
 
     pub fn encode_kv_store_row(
@@ -1168,11 +1172,10 @@ impl Dsv4Metal {
             encoder, kv_lat, 1, head_dim, n_rot, pos, freq_base, false,
         );
         self.encode_fp8_e4m3fn_nope(encoder, kv_lat, head_dim, n_rot);
-        let (store_row, n_kv) = if raw_len < swa {
-            (raw_len, raw_len + 1)
+        let (store_row, n_kv, kv_origin) = if raw_len < swa {
+            (raw_len, raw_len + 1, 0)
         } else {
-            self.encode_kv_shift_left(encoder, kv_cache, head_dim, swa);
-            (swa - 1, swa)
+            (raw_len % swa, swa, (raw_len + 1) % swa)
         };
         self.encode_kv_store_row(encoder, kv_lat, kv_cache, head_dim, store_row);
         let scale = 1.0 / (head_dim as f32).sqrt();
@@ -1188,6 +1191,7 @@ impl Dsv4Metal {
             n_kv,
             1,
             scale,
+            kv_origin,
         );
         self.encode_rope_tail(
             encoder, head_out, n_head, head_dim, n_rot, pos, freq_base, true,
@@ -1227,9 +1231,9 @@ impl Dsv4Metal {
         encoder.set_bytes(11, 4, &n_ctx_orig as *const u32 as *const _);
         let inv: i32 = if inverse { 1 } else { 0 };
         encoder.set_bytes(12, 4, &inv as *const i32 as *const _);
-        encoder.dispatch_threads(
-            MTLSize::new(n_heads as u64, 1, 1),
-            MTLSize::new(1, 1, 1),
+        encoder.dispatch_thread_groups(
+            MTLSize::new(n_heads.max(1) as u64, 1, 1),
+            MTLSize::new(32, 1, 1),
         );
     }
 
@@ -1281,6 +1285,7 @@ impl Dsv4Metal {
         n_comp_sel: i32,
         has_sinks: i32,
         scale: f32,
+        kv_origin: i32,
     ) {
         encoder.set_compute_pipeline_state(&self.attn_mixed_mqa);
         encoder.set_buffer(0, Some(q), 0);
@@ -1297,6 +1302,7 @@ impl Dsv4Metal {
         encoder.set_bytes(11, 4, &n_comp_sel as *const i32 as *const _);
         encoder.set_bytes(12, 4, &has_sinks as *const i32 as *const _);
         encoder.set_bytes(13, 4, &scale as *const f32 as *const _);
+        encoder.set_bytes(14, 4, &kv_origin as *const i32 as *const _);
         // 1 simdgroup (32 threads) per head — two-pass softmax in dsv4_attn_mixed_mqa.
         // scores[640] + inv slot.
         encoder.set_threadgroup_memory_length(0, 641 * 4);
@@ -1321,7 +1327,6 @@ impl Dsv4Metal {
         if n_comp <= 0 {
             return;
         }
-        // Parallel score: one thread per compressed row.
         encoder.set_compute_pipeline_state(&self.select_comp_score);
         encoder.set_buffer(0, Some(q), 0);
         encoder.set_buffer(1, Some(k_comp), 0);
@@ -1329,10 +1334,9 @@ impl Dsv4Metal {
         encoder.set_bytes(3, 4, &n_head as *const i32 as *const _);
         encoder.set_bytes(4, 4, &head_dim as *const i32 as *const _);
         encoder.set_bytes(5, 4, &n_comp as *const i32 as *const _);
-        let tg = 64u64.min(n_comp as u64).max(1);
-        encoder.dispatch_threads(
-            MTLSize::new(n_comp as u64, 1, 1),
-            MTLSize::new(tg, 1, 1),
+        encoder.dispatch_thread_groups(
+            MTLSize::new(n_comp.max(1) as u64, 1, 1),
+            MTLSize::new(32, 1, 1),
         );
         // Serial top-k from scores.
         encoder.set_compute_pipeline_state(&self.select_comp_topk);
@@ -1417,19 +1421,19 @@ impl Dsv4Metal {
                 MTLSize::new(head_dim.max(1) as u64, 1, 1),
                 MTLSize::new(tg(head_dim), 1, 1),
             );
-            // Stage 3: rms + rope + fp8
-            encoder.set_compute_pipeline_state(&self.compressor_rms_rope_fp8);
-            encoder.set_buffer(0, Some(out_row), 0);
-            encoder.set_buffer(1, Some(norm), 0);
-            encoder.set_bytes(2, 4, &head_dim as *const i32 as *const _);
-            encoder.set_bytes(3, 4, &n_rot as *const i32 as *const _);
-            encoder.set_bytes(4, 4, &pos as *const i32 as *const _);
-            encoder.set_bytes(5, 4, &ratio as *const i32 as *const _);
-            encoder.set_bytes(6, 4, &rms_eps as *const f32 as *const _);
-            let use_cr: i32 = if use_compress_rope { 1 } else { 0 };
-            encoder.set_bytes(7, 4, &use_cr as *const i32 as *const _);
-            encoder.set_bytes(8, 4, &rope_freq as *const f32 as *const _);
-            encoder.dispatch_threads(MTLSize::new(1, 1, 1), MTLSize::new(1, 1, 1));
+            // Stage 3: rms + rope + fp8 (parallel kernels; rope pos is emit index).
+            let comp_pos = pos + 1 - ratio;
+            self.encode_rms_norm(encoder, out_row, Some(norm), out_row, head_dim, rms_eps);
+            if use_compress_rope {
+                self.encode_rope_tail_compress(
+                    encoder, out_row, 1, head_dim, n_rot, comp_pos, false,
+                );
+            } else {
+                self.encode_rope_tail(
+                    encoder, out_row, 1, head_dim, n_rot, comp_pos, rope_freq, false,
+                );
+            }
+            self.encode_fp8_e4m3fn_nope(encoder, out_row, head_dim, n_rot);
         }
 
         // Stage 4: CSA shuffle on emit
@@ -1519,11 +1523,10 @@ impl Dsv4Metal {
             encoder, kv_lat, 1, head_dim, n_rot, pos, false,
         );
         self.encode_fp8_e4m3fn_nope(encoder, kv_lat, head_dim, n_rot);
-        let (store_row, n_raw) = if raw_len < swa {
-            (raw_len, raw_len + 1)
+        let (store_row, n_raw, kv_origin) = if raw_len < swa {
+            (raw_len, raw_len + 1, 0)
         } else {
-            self.encode_kv_shift_left(encoder, kv_raw, head_dim, swa);
-            (swa - 1, swa)
+            (raw_len % swa, swa, (raw_len + 1) % swa)
         };
         self.encode_kv_store_row(encoder, kv_lat, kv_raw, head_dim, store_row);
 
@@ -1621,17 +1624,22 @@ impl Dsv4Metal {
             0
         } else if ratio == 4 {
             let k = top_k.min(n_comp_attn);
-            self.encode_select_comp_rows(
-                encoder,
-                q_heads,
-                kv_comp,
-                comp_idx,
-                comp_scores,
-                n_head,
-                head_dim,
-                n_comp_attn,
-                k,
-            );
+            if n_comp_attn <= top_k {
+                // All compressed rows fit in top-k — iota, skip Q·K score.
+                self.encode_iota_i32(encoder, comp_idx, n_comp_attn);
+            } else {
+                self.encode_select_comp_rows(
+                    encoder,
+                    q_heads,
+                    kv_comp,
+                    comp_idx,
+                    comp_scores,
+                    n_head,
+                    head_dim,
+                    n_comp_attn,
+                    k,
+                );
+            }
             k
         } else {
             self.encode_iota_i32(encoder, comp_idx, n_comp_attn);
@@ -1655,6 +1663,7 @@ impl Dsv4Metal {
             n_comp_sel,
             1,
             scale,
+            kv_origin,
         );
         self.encode_rope_tail_compress(
             encoder, head_out, n_head, head_dim, n_rot, pos, true,

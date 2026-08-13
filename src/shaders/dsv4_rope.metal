@@ -65,6 +65,51 @@ static inline void dsv4_rope_tail_ext_one(
     }
 }
 
+// 32-lane RoPE: lane p applies pair p (theta via the same multiply chain as serial).
+static inline void dsv4_rope_tail_ext_lanes(
+    device float *xh,
+    int head_dim,
+    int n_rot,
+    int pos,
+    float freq_base,
+    float freq_scale,
+    float ext_factor,
+    float attn_factor,
+    float beta_fast,
+    float beta_slow,
+    uint n_ctx_orig,
+    int inverse,
+    uint lane)
+{
+    int n_nope = head_dim - n_rot;
+    int n_pairs = n_rot / 2;
+    float theta_scale = pow(freq_base, -2.0f / (float)n_rot);
+    float sin_sign = (inverse != 0) ? -1.0f : 1.0f;
+    float corr[2] = {0.0f, 0.0f};
+    if (ext_factor != 0.0f) {
+        dsv4_yarn_corr_dims(n_rot, n_ctx_orig, freq_base, beta_fast, beta_slow, corr);
+    }
+    for (int p = (int)lane; p < n_pairs; p += 32) {
+        float theta_extrap = (float)pos;
+        for (int j = 0; j < p; ++j) theta_extrap *= theta_scale;
+        float theta_interp = freq_scale * theta_extrap;
+        float theta = theta_interp;
+        float mscale = attn_factor;
+        if (ext_factor != 0.0f) {
+            float ramp_mix = dsv4_yarn_ramp(corr[0], corr[1], p * 2) * ext_factor;
+            theta = theta_interp * (1.0f - ramp_mix) + theta_extrap * ramp_mix;
+            mscale *= 1.0f + 0.1f * log(1.0f / freq_scale);
+        }
+        float c = cos(theta) * mscale;
+        float s = sin_sign * sin(theta) * mscale;
+        int i = p * 2;
+        float x0 = xh[n_nope + i];
+        float x1 = xh[n_nope + i + 1];
+        xh[n_nope + i] = x0 * c - x1 * s;
+        xh[n_nope + i + 1] = x0 * s + x1 * c;
+    }
+}
+
 kernel void dsv4_rope_tail(
     device float *x [[buffer(0)]],
     constant int &n_heads [[buffer(1)]],
@@ -73,14 +118,15 @@ kernel void dsv4_rope_tail(
     constant int &pos [[buffer(4)]],
     constant float &freq_base [[buffer(5)]],
     constant int &inverse [[buffer(6)]],
-    uint gid [[thread_position_in_grid]])
+    uint3 tgpig [[threadgroup_position_in_grid]],
+    ushort tiisg [[thread_index_in_simdgroup]])
 {
-    int h = (int)gid;
+    int h = (int)tgpig.x;
     if (h >= n_heads) return;
     device float *xh = x + (ulong)h * head_dim;
-    // SWA: freq_scale=1, no YaRN.
-    dsv4_rope_tail_ext_one(
-        xh, head_dim, n_rot, pos, freq_base, 1.0f, 0.0f, 1.0f, 32.0f, 1.0f, 65536u, inverse);
+    dsv4_rope_tail_ext_lanes(
+        xh, head_dim, n_rot, pos, freq_base, 1.0f, 0.0f, 1.0f, 32.0f, 1.0f, 65536u,
+        inverse, (uint)tiisg);
 }
 
 // Full YaRN / compress RoPE (Flash compress: base 160000, scale 1/16, yarn on).
@@ -98,14 +144,15 @@ kernel void dsv4_rope_tail_ext(
     constant float &beta_slow [[buffer(10)]],
     constant uint &n_ctx_orig [[buffer(11)]],
     constant int &inverse [[buffer(12)]],
-    uint gid [[thread_position_in_grid]])
+    uint3 tgpig [[threadgroup_position_in_grid]],
+    ushort tiisg [[thread_index_in_simdgroup]])
 {
-    int h = (int)gid;
+    int h = (int)tgpig.x;
     if (h >= n_heads) return;
     device float *xh = x + (ulong)h * head_dim;
-    dsv4_rope_tail_ext_one(
+    dsv4_rope_tail_ext_lanes(
         xh, head_dim, n_rot, pos, freq_base, freq_scale, ext_factor, attn_factor,
-        beta_fast, beta_slow, n_ctx_orig, inverse);
+        beta_fast, beta_slow, n_ctx_orig, inverse, (uint)tiisg);
 }
 
 // Per-row RMS (Q heads): out[h,:] = rms(x[h,:]) [* weight].
@@ -117,19 +164,22 @@ kernel void dsv4_rms_norm_rows(
     constant int &row_dim [[buffer(4)]],
     constant float &eps [[buffer(5)]],
     constant int &has_weight [[buffer(6)]],
-    uint gid [[thread_position_in_grid]])
+    uint3 tgpig [[threadgroup_position_in_grid]],
+    ushort tiisg [[thread_index_in_simdgroup]])
 {
-    int h = (int)gid;
+    int h = (int)tgpig.x;
     if (h >= n_rows) return;
+    const uint lane = (uint)tiisg;
     device const float *xh = x + (ulong)h * row_dim;
     device float *oh = out + (ulong)h * row_dim;
     float ss = 0.0f;
-    for (int d = 0; d < row_dim; ++d) {
+    for (int d = (int)lane; d < row_dim; d += 32) {
         float v = xh[d];
         ss += v * v;
     }
+    ss = simd_sum(ss);
     float scale = rsqrt(ss / (float)row_dim + eps);
-    for (int d = 0; d < row_dim; ++d) {
+    for (int d = (int)lane; d < row_dim; d += 32) {
         float v = xh[d] * scale;
         if (has_weight != 0) v *= weight[d];
         oh[d] = v;
@@ -185,14 +235,35 @@ static inline void dsv4_fp8_e4m3fn_nope_inplace(device float *kv, int head_dim, 
     }
 }
 
+// One simdgroup per 64-wide NoPE group (Flash: 7 groups × 32 lanes).
 kernel void dsv4_fp8_e4m3fn_nope(
     device float *kv [[buffer(0)]],
     constant int &head_dim [[buffer(1)]],
     constant int &n_rot [[buffer(2)]],
-    uint gid [[thread_position_in_grid]])
+    uint3 tgpig [[threadgroup_position_in_grid]],
+    ushort tiisg [[thread_index_in_simdgroup]])
 {
-    if (gid != 0) return;
-    dsv4_fp8_e4m3fn_nope_inplace(kv, head_dim, n_rot);
+    int n_nope = head_dim - n_rot;
+    int off = (int)tgpig.x * 64;
+    if (off >= n_nope) return;
+    int end = min(off + 64, n_nope);
+    const uint lane = (uint)tiisg;
+    int i0 = off + (int)lane;
+    int i1 = off + (int)lane + 32;
+    float v0 = (i0 < end) ? kv[i0] : 0.0f;
+    float v1 = (i1 < end) ? kv[i1] : 0.0f;
+    float amax = max(fabs(v0), fabs(v1));
+    amax = simd_max(amax);
+    if (amax < 1e-4f) amax = 1e-4f;
+    float scale = pow(2.0f, ceil(log2(amax / 448.0f)));
+    if (i0 < end) {
+        float v = clamp(v0 / scale, -448.0f, 448.0f);
+        kv[i0] = dsv4_e4m3fn_round_trip(v) * scale;
+    }
+    if (i1 < end) {
+        float v = clamp(v1 / scale, -448.0f, 448.0f);
+        kv[i1] = dsv4_e4m3fn_round_trip(v) * scale;
+    }
 }
 
 kernel void dsv4_fp8_store(
