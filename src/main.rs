@@ -229,6 +229,10 @@ fn main() {
                 eg.pread_bytes as f64 / (1024.0 * 1024.0 * 1024.0)
             );
         }
+        let (ph, ps, pd) = deepseek4::pilot::stats();
+        if ph + ps + pd > 0 {
+            println!("PILOT hints={ph} skip_resident={ps} dropped={pd}");
+        }
         if std::env::var("DSV4_PROFILE").ok().as_deref() == Some("1") {
             if let Some(sc) = model.scratch.as_ref() {
                 let ms = |ns: u64| ns as f64 / 1e6;
@@ -242,6 +246,14 @@ fn main() {
                     ms(sc.prof_cb2_ns.get()),
                     ms(sc.prof_cb3_ns.get()),
                 );
+                if sc.prof_stage_hc_ns.get() + sc.prof_stage_router_ns.get() > 0 {
+                    println!(
+                        "STAGE attn(CB1)={:.0}ms hc={:.0}ms router={:.0}ms",
+                        ms(sc.prof_cb1_ns.get()),
+                        ms(sc.prof_stage_hc_ns.get()),
+                        ms(sc.prof_stage_router_ns.get()),
+                    );
+                }
                 let sm = sc.spec_moe_match.get();
                 let sx = sc.spec_moe_miss.get();
                 let st = sm + sx;

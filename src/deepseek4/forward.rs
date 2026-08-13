@@ -792,6 +792,51 @@ impl Dsv4GpuModel {
         self.prev_expert_ids[il] = std::mem::replace(&mut self.last_expert_ids[il], ids);
     }
 
+    /// Predict experts for `il` (hash row, else last∪prev token ids).
+    fn pilot_keys_for_layer(&self, il: usize, token: usize) -> Vec<ExpertKey> {
+        if il >= self.cfg.n_layer {
+            return Vec::new();
+        }
+        let k = self.cfg.n_expert_used;
+        if let Some(tid2eid) = self.layers[il].tid2eid.as_ref() {
+            let row = &tid2eid[token * k..(token + 1) * k];
+            return row
+                .iter()
+                .map(|&e| ExpertKey {
+                    layer: il as u16,
+                    expert: e as u16,
+                })
+                .collect();
+        }
+        let mut keys: Vec<ExpertKey> = Vec::with_capacity(k * 2);
+        let mut push_ids = |ids: &[u32]| {
+            for &e in ids {
+                let key = ExpertKey {
+                    layer: il as u16,
+                    expert: e as u16,
+                };
+                if !keys.iter().any(|x| *x == key) {
+                    keys.push(key);
+                }
+            }
+        };
+        if self.last_expert_ids[il].len() == k {
+            push_ids(&self.last_expert_ids[il]);
+        }
+        if self.prev_expert_ids[il].len() == k {
+            push_ids(&self.prev_expert_ids[il]);
+        }
+        keys
+    }
+
+    fn maybe_pilot_next(&self, il: usize, token: usize) {
+        if !super::pilot::enabled() || il + 1 >= self.cfg.n_layer {
+            return;
+        }
+        let keys = self.pilot_keys_for_layer(il + 1, token);
+        super::pilot::submit(&self.ssd, &keys, self.expert_gpu.as_ref());
+    }
+
     /// Fused Metal layer: ~2–3 GPU waits (vs ~6 with decomposed hc/attn/ffn).
     /// Hash-MoE pins experts before CB1 so SSD I/O overlaps later GPU work.
     fn layer_forward_metal(&mut self, il: usize, token: usize) {
@@ -802,6 +847,7 @@ impl Dsv4GpuModel {
         let skip_moe_routed = std::env::var("DSV4_SKIP_MOE_ROUTED").ok().as_deref() == Some("1");
         let skip_shared = std::env::var("DSV4_SKIP_SHARED").ok().as_deref() == Some("1");
         let pread_event = std::env::var("DSV4_PREAD_EVENT").ok().as_deref() != Some("0");
+        let stage = std::env::var("DSV4_STAGE").ok().as_deref() == Some("1");
         let t_layer = Instant::now();
         let mut t_attn = 0u64;
         let mut t_gpu = 0u64;
@@ -910,8 +956,10 @@ impl Dsv4GpuModel {
         // HC lives in scratch.hc_flat across fused layers (uploaded once per token).
         // When attn stays on GPU (SWA/CSA/HCA), merge CB1 into CB2 (one commit).
         // Hash layers additionally fuse MoE into that same CB when experts are resident.
+        // STAGE unmerges CB1 so attn wait is measurable (`prof_cb1`).
         let merge_cb1 = (gpu_swa || gpu_full)
-            && std::env::var("DSV4_MERGE_CB1").ok().as_deref() != Some("0");
+            && std::env::var("DSV4_MERGE_CB1").ok().as_deref() != Some("0")
+            && !stage;
         let mut hash_fused_slots: Vec<usize> = Vec::new();
         {
             // I/O-first: start hash/spec preads; when merge_cb1, pin overlaps nothing
@@ -1013,13 +1061,14 @@ impl Dsv4GpuModel {
             // Same Metal queue: CB2 may encode/commit without waiting CB1 when
             // head_out stays on GPU (gpu_swa / gpu_full). Legacy path still waits.
             if let Some(cmd1) = cmd1 {
-                if !gpu_swa && !gpu_full {
+                if stage || (!gpu_swa && !gpu_full) {
+                    self.maybe_pilot_next(il, token);
                     let sc = self.scratch.as_ref().unwrap();
                     let t0 = Instant::now();
                     self.metal.wait_owned(&cmd1, Some(sc));
                     let dt = t0.elapsed().as_nanos() as u64;
                     t_gpu += dt;
-                    if profile {
+                    if profile || stage {
                         sc.prof_cb1_ns.set(sc.prof_cb1_ns.get() + dt);
                     }
                 }
@@ -1630,8 +1679,52 @@ impl Dsv4GpuModel {
             if !head_out_on_gpu {
                 super::metal_ctx::Dsv4Metal::write_f32(&sc.head_out, &head_out);
             }
+            let encode_router = |enc: &metal::ComputeCommandEncoderRef| {
+                self.metal.encode_matvec_kind(
+                    enc,
+                    lg.ffn_gate_inp.kind,
+                    &lg.ffn_gate_inp.buf,
+                    &sc.x,
+                    &sc.logits,
+                    cfg.n_expert as i32,
+                    n_embd as i32,
+                    0,
+                );
+                self.metal.encode_router_sqrt_softplus(
+                    enc,
+                    &sc.logits,
+                    &sc.probs,
+                    cfg.n_expert as i32,
+                );
+                if let Some(ref tid2eid) = lg.tid2eid {
+                    let off = (token * cfg.n_expert_used * 4) as u64;
+                    self.metal.encode_router_hash_select(
+                        enc,
+                        &sc.probs,
+                        tid2eid,
+                        off,
+                        &sc.route_ids,
+                        &sc.route_w,
+                        cfg.n_expert_used as i32,
+                        cfg.expert_weight_scale,
+                    );
+                } else {
+                    self.metal.encode_router_topk(
+                        enc,
+                        &sc.probs,
+                        lg.exp_probs_b.as_ref(),
+                        &sc.route_ids,
+                        &sc.route_w,
+                        cfg.n_expert as i32,
+                        cfg.n_expert_used as i32,
+                        cfg.expert_weight_scale,
+                    );
+                }
+            };
             // residual still in hc_flat; attn split still has post|comb
-            let cmd = self.metal.queue.new_command_buffer().to_owned();
+            let split_router = stage && !fused_moe;
+            let mut cmd = self.metal.queue.new_command_buffer().to_owned();
+            {
             let enc = cmd.new_compute_command_encoder();
             if merge_cb1 {
                 Self::encode_layer_cb1(
@@ -1786,48 +1879,9 @@ impl Dsv4GpuModel {
                 n_embd as i32,
                 cfg.rms_eps,
             );
+            if !split_router {
             // Router + GPU select — wait for route_ids unless MoE fused below.
-            self.metal.encode_matvec_kind(
-                &enc,
-                lg.ffn_gate_inp.kind,
-                &lg.ffn_gate_inp.buf,
-                &sc.x,
-                &sc.logits,
-                cfg.n_expert as i32,
-                n_embd as i32,
-                0,
-            );
-            // √softplus + top-k / hash select stay on GPU; host only reads ≤k ids for SSD.
-            self.metal.encode_router_sqrt_softplus(
-                &enc,
-                &sc.logits,
-                &sc.probs,
-                cfg.n_expert as i32,
-            );
-            if let Some(ref tid2eid) = lg.tid2eid {
-                let off = (token * cfg.n_expert_used * 4) as u64;
-                self.metal.encode_router_hash_select(
-                    &enc,
-                    &sc.probs,
-                    tid2eid,
-                    off,
-                    &sc.route_ids,
-                    &sc.route_w,
-                    cfg.n_expert_used as i32,
-                    cfg.expert_weight_scale,
-                );
-            } else {
-                self.metal.encode_router_topk(
-                    &enc,
-                    &sc.probs,
-                    lg.exp_probs_b.as_ref(),
-                    &sc.route_ids,
-                    &sc.route_w,
-                    cfg.n_expert as i32,
-                    cfg.n_expert_used as i32,
-                    cfg.expert_weight_scale,
-                );
-            }
+            encode_router(&enc);
             if fused_moe {
                 // Same CB: shared + routed + HC expand — no mid-layer wait.
                 // Speculative path: snapshot attn-expanded HC (`y`) before MoE
@@ -1907,11 +1961,33 @@ impl Dsv4GpuModel {
                     );
                 }
             }
+            }
             enc.end_encoding();
+            }
+            if split_router {
+                cmd.commit();
+                self.maybe_pilot_next(il, token);
+                let t0 = Instant::now();
+                self.metal.wait_owned(&cmd, Some(sc));
+                sc.clear_pending();
+                let dt = t0.elapsed().as_nanos() as u64;
+                t_gpu += dt;
+                if profile || stage {
+                    sc.prof_stage_hc_ns.set(sc.prof_stage_hc_ns.get() + dt);
+                    sc.prof_cb2_ns.set(sc.prof_cb2_ns.get() + dt);
+                }
+                cmd = self.metal.queue.new_command_buffer().to_owned();
+                {
+                    let enc = cmd.new_compute_command_encoder();
+                    encode_router(&enc);
+                    enc.end_encoding();
+                }
+            }
             cmd.commit();
             if fused_moe {
                 if fuse_via_spec {
                     // Speculative MoE: wait once, compare route_ids to last_ids.
+                    self.maybe_pilot_next(il, token);
                     let t0 = Instant::now();
                     self.metal.wait_owned(&cmd, Some(sc));
                     sc.clear_pending();
@@ -1952,6 +2028,7 @@ impl Dsv4GpuModel {
                     }
                 } else if fuse_via_map && fuse_map_safe {
                     // Correct map-fuse: wait, check miss_flag; repair outside this scope.
+                    self.maybe_pilot_next(il, token);
                     let t0 = Instant::now();
                     self.metal.wait_owned(&cmd, Some(sc));
                     sc.clear_pending();
@@ -1974,6 +2051,7 @@ impl Dsv4GpuModel {
                     early_fused_return = true;
                 } else {
                     // Hash / optimistic map: defer — next layer CB covers this CB.
+                    self.maybe_pilot_next(il, token);
                     sc.defer_cmd(cmd);
                     if let Some(ref keys) = hash_keys {
                         map_fuse_ids =
@@ -1982,6 +2060,7 @@ impl Dsv4GpuModel {
                     early_fused_return = true;
                 }
             } else {
+                self.maybe_pilot_next(il, token);
                 let t0 = Instant::now();
                 self.metal.wait_owned(&cmd, Some(sc));
                 // Prior deferred MoE CB completed on the same queue.
@@ -1990,6 +2069,10 @@ impl Dsv4GpuModel {
                 t_gpu += dt;
                 if profile {
                     sc.prof_cb2_ns.set(sc.prof_cb2_ns.get() + dt);
+                }
+                if stage {
+                    sc.prof_stage_router_ns
+                        .set(sc.prof_stage_router_ns.get() + dt);
                 }
             }
         }

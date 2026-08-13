@@ -14,6 +14,7 @@ pub mod kv;
 pub mod metal_ctx;
 pub mod model;
 pub mod moe;
+pub mod pilot;
 pub mod quant;
 pub mod serve;
 pub mod ssd;

@@ -1850,6 +1850,9 @@ pub struct MetalScratch {
     pub prof_cb1_ns: std::cell::Cell<u64>,
     pub prof_cb2_ns: std::cell::Cell<u64>,
     pub prof_cb3_ns: std::cell::Cell<u64>,
+    /// `DSV4_STAGE=1`: extra waits splitting CB2 (attn is `prof_cb1` when unmerged).
+    pub prof_stage_hc_ns: std::cell::Cell<u64>,
+    pub prof_stage_router_ns: std::cell::Cell<u64>,
     /// Speculative MoE-in-CB: ids == last_ids.
     pub spec_moe_match: std::cell::Cell<u64>,
     /// Speculative MoE-in-CB: ids != last_ids (corrective MoE).
@@ -1946,6 +1949,8 @@ impl MetalScratch {
             prof_cb1_ns: std::cell::Cell::new(0),
             prof_cb2_ns: std::cell::Cell::new(0),
             prof_cb3_ns: std::cell::Cell::new(0),
+            prof_stage_hc_ns: std::cell::Cell::new(0),
+            prof_stage_router_ns: std::cell::Cell::new(0),
             spec_moe_match: std::cell::Cell::new(0),
             spec_moe_miss: std::cell::Cell::new(0),
             spec_moe_set_eq: std::cell::Cell::new(0),
@@ -1981,6 +1986,8 @@ impl MetalScratch {
         self.prof_cb1_ns.set(0);
         self.prof_cb2_ns.set(0);
         self.prof_cb3_ns.set(0);
+        self.prof_stage_hc_ns.set(0);
+        self.prof_stage_router_ns.set(0);
         self.spec_moe_match.set(0);
         self.spec_moe_miss.set(0);
         self.spec_moe_set_eq.set(0);
