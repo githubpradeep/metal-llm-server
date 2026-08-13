@@ -2,6 +2,7 @@
 
 use metal::*;
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use super::model::DenseW;
@@ -127,6 +128,9 @@ pub struct Dsv4Metal {
     pub add: ComputePipelineState,
     pub zero: ComputePipelineState,
     pub copy: ComputePipelineState,
+    /// CPU→GPU: miss-expert kernels wait until preads have filled Shared slots.
+    pread_event: SharedEvent,
+    pread_epoch: AtomicU64,
 }
 
 impl Dsv4Metal {
@@ -207,6 +211,7 @@ impl Dsv4Metal {
         let add = get("dsv4_add");
         let zero = get("dsv4_zero");
         let copy = get("dsv4_copy");
+        let pread_event = device.new_shared_event();
         Arc::new(Self {
             device,
             queue,
@@ -255,6 +260,8 @@ impl Dsv4Metal {
             add,
             zero,
             copy,
+            pread_event,
+            pread_epoch: AtomicU64::new(0),
         })
     }
 
@@ -1757,6 +1764,20 @@ impl Dsv4Metal {
     /// Wait on an owned CB (same-queue prior commits are covered).
     pub fn wait_owned(&self, cmd: &metal::CommandBuffer, scratch: Option<&MetalScratch>) {
         self.wait_cmd(cmd, scratch);
+    }
+
+    /// GPU waits until `signal_pread` (CPU) after miss preads complete.
+    pub fn next_pread_epoch(&self) -> u64 {
+        self.pread_epoch.fetch_add(1, Ordering::Relaxed) + 1
+    }
+
+    pub fn encode_wait_pread(&self, cmd: &metal::CommandBuffer, epoch: u64) {
+        let event: &EventRef = self.pread_event.as_ref();
+        cmd.encode_wait_for_event(event, epoch);
+    }
+
+    pub fn signal_pread(&self, epoch: u64) {
+        self.pread_event.set_signaled_value(epoch);
     }
 }
 

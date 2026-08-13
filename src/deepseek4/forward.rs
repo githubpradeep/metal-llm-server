@@ -801,6 +801,7 @@ impl Dsv4GpuModel {
         let skip_hc_expand = std::env::var("DSV4_SKIP_HC_EXPAND").ok().as_deref() == Some("1");
         let skip_moe_routed = std::env::var("DSV4_SKIP_MOE_ROUTED").ok().as_deref() == Some("1");
         let skip_shared = std::env::var("DSV4_SKIP_SHARED").ok().as_deref() == Some("1");
+        let pread_event = std::env::var("DSV4_PREAD_EVENT").ok().as_deref() != Some("0");
         let t_layer = Instant::now();
         let mut t_attn = 0u64;
         let mut t_gpu = 0u64;
@@ -2134,41 +2135,60 @@ impl Dsv4GpuModel {
             let metal = self.metal.clone();
             let mut eg = self.expert_gpu.take().expect("expert_gpu");
             let t_e0 = Instant::now();
-            let hit_cmd = eg
-                .pin_misses_with_gpu(
+            let epoch = if pread_event {
+                Some(metal.next_pread_epoch())
+            } else {
+                None
+            };
+            let encode_hits = || {
+                let lg = &self.gpu_layers.as_ref().unwrap()[il];
+                let sc = self.scratch.as_ref().unwrap();
+                let cmd = self.metal.queue.new_command_buffer().to_owned();
+                let enc = cmd.new_compute_command_encoder();
+                if !skip_shared {
+                    encode_shared(&self.metal, lg, sc, &enc);
+                } else {
+                    self.metal.encode_zero(&enc, &sc.shared, n_embd as i32);
+                    self.metal.encode_zero(&enc, &sc.routed, n_embd as i32);
+                }
+                if !skip_moe_routed {
+                    for (gate, up, down, i) in &hit_bufs {
+                        encode_expert_bufs(&self.metal, sc, &enc, gate, up, down, *i);
+                    }
+                }
+                enc.end_encoding();
+                cmd.commit();
+                cmd
+            };
+            let hit_cmd = if epoch.is_some() {
+                eg.pin_misses_defer_io(
                     &metal,
                     &self.ssd,
                     &miss_keys,
                     &mut gpu_slots,
                     &protect,
-                    || {
-                        let lg = &self.gpu_layers.as_ref().unwrap()[il];
-                        let sc = self.scratch.as_ref().unwrap();
-                        let cmd = self.metal.queue.new_command_buffer().to_owned();
-                        let enc = cmd.new_compute_command_encoder();
-                        if !skip_shared {
-                            encode_shared(&self.metal, lg, sc, &enc);
-                        } else {
-                            self.metal.encode_zero(&enc, &sc.shared, n_embd as i32);
-                            self.metal.encode_zero(&enc, &sc.routed, n_embd as i32);
-                        }
-                        if !skip_moe_routed {
-                            for (gate, up, down, i) in &hit_bufs {
-                                encode_expert_bufs(&self.metal, sc, &enc, gate, up, down, *i);
-                            }
-                        }
-                        enc.end_encoding();
-                        cmd.commit();
-                        cmd
-                    },
+                    encode_hits,
                 )
-                .expect("expert pread");
+            } else {
+                eg.pin_misses_with_gpu(
+                    &metal,
+                    &self.ssd,
+                    &miss_keys,
+                    &mut gpu_slots,
+                    &protect,
+                    encode_hits,
+                )
+            }
+            .expect("expert pread");
             t_exp += t_e0.elapsed().as_nanos() as u64;
             self.expert_gpu = Some(eg);
 
             let scratch = self.scratch.as_ref().unwrap();
             let eg = self.expert_gpu.as_ref().unwrap();
             let cmd = self.metal.queue.new_command_buffer().to_owned();
+            if let Some(epoch) = epoch {
+                self.metal.encode_wait_pread(&cmd, epoch);
+            }
             {
                 let enc = cmd.new_compute_command_encoder();
                 if !skip_moe_routed {
@@ -2199,6 +2219,12 @@ impl Dsv4GpuModel {
                 enc.end_encoding();
             }
             cmd.commit();
+            if let Some(epoch) = epoch {
+                let t_w = Instant::now();
+                super::expert_gpu::ExpertGpuCache::wait_inflight_preads();
+                self.metal.signal_pread(epoch);
+                t_exp += t_w.elapsed().as_nanos() as u64;
+            }
             let _ = hit_cmd;
             // Fuse MoE wait: next layer CB2 (same queue) covers this CB.
             scratch.defer_cmd(cmd);
@@ -2290,36 +2316,55 @@ impl Dsv4GpuModel {
             let metal = self.metal.clone();
             let mut eg = self.expert_gpu.take().expect("expert_gpu");
             let t_e0 = Instant::now();
-            let shared_cmd = eg
-                .pin_misses_with_gpu(
+            let epoch = if pread_event {
+                Some(metal.next_pread_epoch())
+            } else {
+                None
+            };
+            let encode_shared_cb = || {
+                let lg = &self.gpu_layers.as_ref().unwrap()[il];
+                let sc = self.scratch.as_ref().unwrap();
+                let cmd = self.metal.queue.new_command_buffer().to_owned();
+                let enc = cmd.new_compute_command_encoder();
+                if !skip_shared {
+                    encode_shared(&self.metal, lg, sc, &enc);
+                } else {
+                    self.metal.encode_zero(&enc, &sc.shared, n_embd as i32);
+                    self.metal.encode_zero(&enc, &sc.routed, n_embd as i32);
+                }
+                enc.end_encoding();
+                cmd.commit();
+                cmd
+            };
+            let shared_cmd = if epoch.is_some() {
+                eg.pin_misses_defer_io(
                     &metal,
                     &self.ssd,
                     &miss_keys,
                     &mut gpu_slots,
                     &[],
-                    || {
-                        let lg = &self.gpu_layers.as_ref().unwrap()[il];
-                        let sc = self.scratch.as_ref().unwrap();
-                        let cmd = self.metal.queue.new_command_buffer().to_owned();
-                        let enc = cmd.new_compute_command_encoder();
-                        if !skip_shared {
-                            encode_shared(&self.metal, lg, sc, &enc);
-                        } else {
-                            self.metal.encode_zero(&enc, &sc.shared, n_embd as i32);
-                            self.metal.encode_zero(&enc, &sc.routed, n_embd as i32);
-                        }
-                        enc.end_encoding();
-                        cmd.commit();
-                        cmd
-                    },
+                    encode_shared_cb,
                 )
-                .expect("expert pread");
+            } else {
+                eg.pin_misses_with_gpu(
+                    &metal,
+                    &self.ssd,
+                    &miss_keys,
+                    &mut gpu_slots,
+                    &[],
+                    encode_shared_cb,
+                )
+            }
+            .expect("expert pread");
             t_exp += t_e0.elapsed().as_nanos() as u64;
             self.expert_gpu = Some(eg);
 
             let scratch = self.scratch.as_ref().unwrap();
             let eg = self.expert_gpu.as_ref().unwrap();
             let cmd = self.metal.queue.new_command_buffer().to_owned();
+            if let Some(epoch) = epoch {
+                self.metal.encode_wait_pread(&cmd, epoch);
+            }
             {
                 let enc = cmd.new_compute_command_encoder();
                 if !skip_moe_routed {
@@ -2354,6 +2399,12 @@ impl Dsv4GpuModel {
                 enc.end_encoding();
             }
             cmd.commit();
+            if let Some(epoch) = epoch {
+                let t_w = Instant::now();
+                super::expert_gpu::ExpertGpuCache::wait_inflight_preads();
+                self.metal.signal_pread(epoch);
+                t_exp += t_w.elapsed().as_nanos() as u64;
+            }
             let _ = shared_cmd;
             scratch.defer_cmd(cmd);
         }

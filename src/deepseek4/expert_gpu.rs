@@ -59,6 +59,12 @@ fn expert_lfu_enabled() -> bool {
     std::env::var("DSV4_EXPERT_LFU").ok().as_deref() != Some("0")
 }
 
+/// Queue miss MoE behind a CPU-signaled SharedEvent so shared+hits run during
+/// pread. `DSV4_PREAD_EVENT=0` restores wait-then-encode-miss.
+fn pread_event_enabled() -> bool {
+    std::env::var("DSV4_PREAD_EVENT").ok().as_deref() != Some("0")
+}
+
 const HOTNESS_DECAY_TOKENS: u64 = 16;
 
 fn pread_exact(fd: i32, dst: &mut [u8], offset: u64) {
@@ -491,6 +497,19 @@ impl ExpertGpuCache {
         protect: &[usize],
         gpu: impl FnOnce() -> R,
     ) -> std::io::Result<R> {
+        self.pin_misses_inner(metal, ssd, misses, out_slots, protect, gpu, false)
+    }
+
+    fn pin_misses_inner<R>(
+        &mut self,
+        metal: &Dsv4Metal,
+        ssd: &ExpertSsdCache,
+        misses: &[(usize, ExpertKey)],
+        out_slots: &mut [usize],
+        protect: &[usize],
+        gpu: impl FnOnce() -> R,
+        defer_io: bool,
+    ) -> std::io::Result<R> {
         if misses.is_empty() {
             return Ok(gpu());
         }
@@ -501,7 +520,6 @@ impl ExpertGpuCache {
         let file = ssd.file();
         let fd = file.as_raw_fd();
         let mut reserved_sis: HashSet<usize> = protect.iter().copied().collect();
-        let mut reserved: Vec<(usize, ExpertKey, usize)> = Vec::with_capacity(misses.len());
         let mut tasks: Vec<PreadTask> = Vec::new();
 
         for &(out_i, key) in misses {
@@ -545,30 +563,8 @@ impl ExpertGpuCache {
                     fd,
                 });
             }
-            reserved.push((out_i, key, si));
-        }
-
-        // I/O-first: persistent pool (ds4) overlaps gpu() on this thread.
-        let result = if skip_io || tasks.is_empty() {
-            gpu()
-        } else if pread_pool_begin(&tasks) {
-            let r = gpu();
-            pread_pool_wait();
-            r
-        } else if !pread_pool_enabled() {
-            std::thread::scope(|scope| {
-                for t in &tasks {
-                    let t = *t;
-                    scope.spawn(move || run_pread_task(t));
-                }
-                gpu()
-            })
-        } else {
-            // Single-task inline already done in begin; just run gpu.
-            gpu()
-        };
-
-        for (out_i, key, si) in reserved {
+            // Slot identity is known before pread; miss kernels can encode now
+            // and GPU-wait for the CPU signal after I/O.
             self.slots[si].key = Some(key);
             self.clock += 1;
             self.slots[si].last_used = self.clock;
@@ -579,7 +575,52 @@ impl ExpertGpuCache {
             }
             out_slots[out_i] = si;
         }
+
+        // I/O-first: persistent pool (ds4) overlaps gpu() on this thread.
+        // `wait_io=false`: caller encodes miss kernels that GPU-wait on the
+        // CPU pread signal, then `wait_inflight_preads`.
+        let wait_io = !defer_io || skip_io || tasks.is_empty() || !pread_event_enabled();
+        let result = if skip_io || tasks.is_empty() {
+            gpu()
+        } else if pread_pool_begin(&tasks) {
+            let r = gpu();
+            if wait_io {
+                pread_pool_wait();
+            }
+            r
+        } else if !pread_pool_enabled() {
+            std::thread::scope(|scope| {
+                for t in &tasks {
+                    let t = *t;
+                    scope.spawn(move || run_pread_task(t));
+                }
+                gpu()
+            })
+        } else {
+            gpu()
+        };
         Ok(result)
+    }
+
+    /// Like `pin_misses_with_gpu` but leaves preads running; caller must
+    /// `wait_inflight_preads` before the next pin (and before GPU miss kernels
+    /// if not using `encode_wait_pread`).
+    pub fn pin_misses_defer_io<R>(
+        &mut self,
+        metal: &Dsv4Metal,
+        ssd: &ExpertSsdCache,
+        misses: &[(usize, ExpertKey)],
+        out_slots: &mut [usize],
+        protect: &[usize],
+        gpu: impl FnOnce() -> R,
+    ) -> std::io::Result<R> {
+        self.pin_misses_inner(metal, ssd, misses, out_slots, protect, gpu, true)
+    }
+
+    pub fn wait_inflight_preads() {
+        if pread_pool_enabled() {
+            pread_pool_wait();
+        }
     }
 
     pub fn pin_misses_from_ssd(
