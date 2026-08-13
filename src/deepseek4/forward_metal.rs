@@ -235,6 +235,7 @@ impl Dsv4GpuModel {
             up_bytes,
             down_bytes,
             self.cfg.n_expert,
+            self.cfg.n_layer,
         ));
         println!("  dense Metal: no-copy shared views");
         println!(
